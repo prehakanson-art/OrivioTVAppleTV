@@ -230,7 +230,9 @@ struct NuvioCollection: Codable, Identifiable, Hashable {
     var backdropImageUrl: String?
     var pinToTop: Bool = false
     var focusGlowEnabled: Bool?
-    var viewMode: String = "TABBED_GRID"
+    /// Default presentation for a collection. ROWS (each folder its own
+    /// horizontal row) is the default; TABBED_GRID is the folder-tab grid.
+    var viewMode: String = "ROWS"
     var showAllTab: Bool = true
     var folders: [NuvioCollectionFolder] = []
 
@@ -241,7 +243,7 @@ struct NuvioCollection: Codable, Identifiable, Hashable {
         backdropImageUrl = try c.decodeIfPresent(String.self, forKey: .backdropImageUrl)
         pinToTop = try c.decodeIfPresent(Bool.self, forKey: .pinToTop) ?? false
         focusGlowEnabled = try c.decodeIfPresent(Bool.self, forKey: .focusGlowEnabled)
-        viewMode = try c.decodeIfPresent(String.self, forKey: .viewMode) ?? "TABBED_GRID"
+        viewMode = try c.decodeIfPresent(String.self, forKey: .viewMode) ?? "ROWS"
         showAllTab = try c.decodeIfPresent(Bool.self, forKey: .showAllTab) ?? true
         // Lenient element decode: a bad folder doesn't drop the collection.
         folders = (try c.decodeIfPresent([Lenient<NuvioCollectionFolder>].self, forKey: .folders) ?? []).compactMap(\.value)

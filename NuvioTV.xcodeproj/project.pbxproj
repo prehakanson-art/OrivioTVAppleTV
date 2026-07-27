@@ -108,6 +108,7 @@
 		AE0CFA7CB5922AEB4625975A /* CollectionView.swift in Sources */ = {isa = PBXBuildFile; fileRef = EAE1265EE9F6B43BD02CCC9F /* CollectionView.swift */; };
 		AE8A26A212CF6A062EA2F0B7 /* StremioAccount.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2BFA3A5175DFB66B5ED3B94 /* StremioAccount.swift */; };
 		B694AA4934DA1692E9FE5BE3 /* HuluSidebar.swift in Sources */ = {isa = PBXBuildFile; fileRef = F96730C97830E457BF3C64FE /* HuluSidebar.swift */; };
+		B93CF80ADD1404E1ED522216 /* AnimatedGIFView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0F6A4BAC8E2E8B139AFA4C3 /* AnimatedGIFView.swift */; };
 		B98A93E06913372E0DF322E3 /* MaxTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2984806852BDC134F255AC3A /* MaxTheme.swift */; };
 		B99589BE4621E7B4EDD07A19 /* LiveTVView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E2E52DF7CD06E99777E79CD5 /* LiveTVView.swift */; };
 		BAFA27E5E9E52210E0D89DA5 /* AccountView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4581D56301494EB1525328EA /* AccountView.swift */; };
@@ -240,6 +241,7 @@
 		AD681267F7BC35D3CC1F797C /* RequestCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RequestCache.swift; sourceTree = "<group>"; };
 		ADBB2C0716736EF000BE1068 /* HomeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeView.swift; sourceTree = "<group>"; };
 		AE307D5699497B04FCA96EE9 /* MaxComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaxComponents.swift; sourceTree = "<group>"; };
+		B0F6A4BAC8E2E8B139AFA4C3 /* AnimatedGIFView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnimatedGIFView.swift; sourceTree = "<group>"; };
 		B1008C82BF4E819E8E025196 /* LiveTVSettingsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveTVSettingsStore.swift; sourceTree = "<group>"; };
 		B2BFA3A5175DFB66B5ED3B94 /* StremioAccount.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StremioAccount.swift; sourceTree = "<group>"; };
 		B453879DDCDBBC1441013D02 /* FocusTour.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusTour.swift; sourceTree = "<group>"; };
@@ -492,6 +494,7 @@
 		AB128350F79BF81294821AF5 /* Components */ = {
 			isa = PBXGroup;
 			children = (
+				B0F6A4BAC8E2E8B139AFA4C3 /* AnimatedGIFView.swift */,
 				49BAA0E54FBA5A8CFE9473FA /* Components.swift */,
 				48C7489E80217819FDE6A04B /* FPSOverlay.swift */,
 				44180118E0397498DE32CF39 /* NuvioDropdown.swift */,
@@ -707,6 +710,7 @@
 				E443BC9DF49F9CC79A5971CD /* AddonCatalogService.swift in Sources */,
 				8E628727D4B4241A39973930 /* AddonDiscoverView.swift in Sources */,
 				14C76B28C6CFAB66591F7FEB /* AddonManager.swift in Sources */,
+				B93CF80ADD1404E1ED522216 /* AnimatedGIFView.swift in Sources */,
 				D93146472B6B7BF5F92096A7 /* AnimeSkipService.swift in Sources */,
 				E9F427CC46D1D7C9E4D65EBE /* AppGroupResolver.swift in Sources */,
 				97189F552A08D00D804936BA /* BoundedConcurrency.swift in Sources */,

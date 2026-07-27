@@ -260,6 +260,10 @@ struct CollectionFolderCard: View {
     @EnvironmentObject private var theme: ThemeManager
     @ObservedObject private var perf = PerformanceSettingsStore.shared
     @Environment(\.isFocused) private var isFocused
+    /// True once this tile's focus GIF has decoded and started playing, so the
+    /// still cover can fade out. Stays false if the GIF fails, keeping the
+    /// static artwork on screen.
+    @State private var gifPlaying = false
     /// Dark/Bright choice per community category (Community Collections
     /// picker), keyed by THIS folder's own id — a group collection (e.g.
     /// "Streaming Services") holds several categories, each with its own
@@ -286,6 +290,16 @@ struct CollectionFolderCard: View {
     }
 
     private var title: String { folder?.title ?? fallbackTitle }
+
+    /// The folder's focus GIF, when it has one AND hasn't switched it off.
+    /// `focusGifEnabled` is nil on older/imported folders — treat a present URL
+    /// as opt-in there, matching how the Android app behaves.
+    private var focusGifURL: String? {
+        guard let url = folder?.focusGifUrl, !url.isEmpty,
+              folder?.focusGifEnabled != false else { return nil }
+        return url
+    }
+
     private var isPoster: Bool { folder?.tileShape == "POSTER" }
     private var isLandscape: Bool { folder?.tileShape == "LANDSCAPE" }
 
@@ -307,6 +321,9 @@ struct CollectionFolderCard: View {
                     RemoteImage(url: TMDBService.originalSize(cover) ?? cover, contentMode: .fit)
                         .padding(NuvioSpacing.xl)
                         .clipShape(RoundedRectangle(cornerRadius: NuvioRadius.md))
+                        // Fade the still out only once the GIF is actually
+                        // playing, so a slow/failed GIF never leaves a blank tile.
+                        .opacity(gifPlaying ? 0 : 1)
                 } else if let emoji = folder?.coverEmoji, !emoji.isEmpty {
                     Text(emoji).font(.system(size: 84))
                 } else {
@@ -314,8 +331,24 @@ struct CollectionFolderCard: View {
                         .font(.system(size: 56))
                         .foregroundStyle(theme.palette.textSecondary)
                 }
+
+                // Focus GIF. The model has carried `focusGifUrl` /
+                // `focusGifEnabled` since the Android port, but nothing ever
+                // drew them — that's why "the gifs don't work". Only mounted
+                // while focused, so a 100-folder collection isn't animating a
+                // hundred GIFs at once, and it fades in over the still art.
+                if let gif = focusGifURL, isFocused {
+                    AnimatedGIFView(url: gif, contentMode: .scaleAspectFill) { ok in
+                        withAnimation(.easeOut(duration: 0.22)) { gifPlaying = ok }
+                    }
+                    .clipShape(RoundedRectangle(cornerRadius: NuvioRadius.md))
+                    .opacity(gifPlaying ? 1 : 0)
+                    .allowsHitTesting(false)
+                }
             }
             .frame(width: cardSize.width, height: cardSize.height)
+            // Unfocusing tears the GIF down; reset so the still returns.
+            .onChange(of: isFocused) { _, focused in if !focused { gifPlaying = false } }
             // Fusion (§27): layered-stack backing behind the tile.
             .background {
                 if theme.isAppleTVTheme {

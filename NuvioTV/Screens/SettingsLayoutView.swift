@@ -622,7 +622,7 @@ struct CollectionEditorView: View {
     @State private var pinToTop = false
     @State private var focusGlowEnabled = true
     @State private var showAllTab = true
-    @State private var viewMode = "TABBED_GRID"
+    @State private var viewMode = "ROWS"
     /// Stable id used for every autosave write (a new collection keeps the same
     /// id across edits instead of creating duplicates).
     @State private var collectionID = ""
