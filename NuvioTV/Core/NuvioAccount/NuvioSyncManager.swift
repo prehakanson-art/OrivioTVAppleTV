@@ -610,7 +610,11 @@ final class NuvioSyncManager: ObservableObject {
             )
         }
         pulled = await enrichMetadata(pulled)
+        let before = progressStore.continueWatching(sortMode: .recentlyWatched).count
         progressStore.mergeRemote(pulled)
+        let after = progressStore.continueWatching(sortMode: .recentlyWatched).count
+        NSLog("[OrivioCWSync] pullWatchProgress: %d rows from account, continue-watching %d -> %d",
+              rows.count, before, after)
     }
 
     /// The backend stores no titles/artwork with progress, so pulled Continue
