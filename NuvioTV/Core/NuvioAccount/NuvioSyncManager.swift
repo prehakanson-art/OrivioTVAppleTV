@@ -177,8 +177,15 @@ final class NuvioSyncManager: ObservableObject {
         // manifest that failed to fetch), pushing would delete it from the
         // account. Device→account changes still sync via onLocalChange.
         addonManager.onSyncRequested = { [weak self] in
-            guard let self, account.accessToken != nil else { return }
-            try? await pullAddons()
+            guard let self else { return }
+            // Was `guard account.accessToken != nil else { return }` followed by
+            // `try? await pullAddons()` — so a signed-out session and every
+            // network/decode failure both looked identical to success. Throw
+            // instead; AddonManager.refresh() turns it into a real message.
+            guard account.accessToken != nil else {
+                throw NuvioAuthError.message("not signed in")
+            }
+            try await pullAddons()
         }
         progressStore.onLocalUpdate = { [weak self] in self?.pushWatchProgress() }
         progressStore.onRemove = { [weak self] keys in self?.deleteWatchProgress(keys: keys) }
@@ -355,12 +362,18 @@ final class NuvioSyncManager: ObservableObject {
     }
 
     private func pullAddons() async throws {
-        guard let userID = account.currentUserID else { return }
+        guard let userID = account.currentUserID else {
+            // Signed in far enough to hold a token but the JWT never yielded a
+            // user id — silently returning here made "Refresh Add-ons" a no-op
+            // with no explanation.
+            throw NuvioAuthError.message("account not fully signed in")
+        }
         // PostgREST select, filtered to our rows for the default profile.
         let path = "/rest/v1/addons?user_id=eq.\(userID)&profile_id=eq.1&select=url,sort_order,enabled,name"
         let data = try await authedGet(path)
         let rows = try JSONDecoder().decode([SupabaseAddon].self, from: data)
         let orderedURLs = rows.sorted { $0.sortOrder < $1.sortOrder }.map(\.url)
+        NSLog("[OrivioAddonSync] pullAddons: %d rows for user %@", rows.count, userID)
         guard !orderedURLs.isEmpty else { return }
         await addonManager.applyRemote(urls: orderedURLs)
     }

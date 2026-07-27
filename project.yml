@@ -93,6 +93,21 @@ targets:
         # Groups. Only uncomment with a paid Developer Program membership,
         # together with the other two TOP SHELF spots.
         # CODE_SIGN_ENTITLEMENTS: Config/NuvioTV.entitlements
+      configs:
+        # DEVELOPMENT identity — used when you Run onto a real Apple TV from
+        # Xcode. Building to a device REGISTERS the bundle id against your
+        # team, and `com.orivio.tv.appletv` is already registered to another
+        # team, so a Personal Team gets:
+        #   "Failed Registering Bundle Identifier … cannot be registered to
+        #    your development team because it is not available"
+        # A distinct Debug id sidesteps that without touching the release
+        # identity above (which the published IPAs keep, so sideloaded users
+        # don't lose their data on update). It only has to be unique across
+        # Apple's registry — if this one is taken too, put anything of your own
+        # here. Note the dev build installs ALONGSIDE a sideloaded Orivio
+        # rather than replacing it: two icons, separate local data.
+        Debug:
+          PRODUCT_BUNDLE_IDENTIFIER: com.orivio.tv.appletv.dev
     postBuildScripts:
       # FFmpegKit (pulled in transitively by KSPlayer) ships
       # libshaderc_combined.framework with an underscore in its

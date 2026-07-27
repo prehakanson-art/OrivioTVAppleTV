@@ -599,9 +599,24 @@ final class PlayerViewModel: ObservableObject {
 
     /// Delete every remux directory. Only safe once playback is done.
     private func purgeDVDirectories() {
-        for remuxer in dvRetiredRemuxers { remuxer.cleanup() }
-        dvRetiredRemuxers = []
+        purgeRetiredDVDirectories()
         dvRemuxer?.cleanup()
+    }
+
+    /// Delete the segment directories of RETIRED remuxers only — the live one
+    /// is left alone. Safe to call once playback has settled on the current
+    /// source (see markPlaybackProgressed): the retired dirs were kept around
+    /// solely to cover the window where AVPlayer might still be reading the old
+    /// playlist mid-restart.
+    private func purgeRetiredDVDirectories() {
+        guard !dvRetiredRemuxers.isEmpty else { return }
+        let retired = dvRetiredRemuxers
+        dvRetiredRemuxers = []
+        // Off the main actor: removing a directory of fMP4 segments is real
+        // filesystem work and this runs from the playback clock callback.
+        Task.detached(priority: .utility) {
+            for remuxer in retired { remuxer.cleanup() }
+        }
     }
 
     // Post-play / auto-next
@@ -626,6 +641,11 @@ final class PlayerViewModel: ObservableObject {
     private var hideControlsTask: Task<Void, Never>?
     private var scrubTimeoutTask: Task<Void, Never>?
     private var seekDebounceTask: Task<Void, Never>?
+    /// Highest resume target this session has aimed for. Survives the window
+    /// where `position` hasn't caught up yet and `pendingResume` is already
+    /// consumed, so a failover during a resume seek doesn't silently restart
+    /// the next source from 0. Advanced by real playback in `seek(to:)`.
+    private var sessionResumeFloor: Double = 0
     private var scanTask: Task<Void, Never>?
     private var toastTask: Task<Void, Never>?
     private var lastProgressSave = Date.distantPast
@@ -733,12 +753,18 @@ final class PlayerViewModel: ObservableObject {
         SubtitleModel.textBold = false
     }
 
+    /// Mirrors "Show unaired next up" (Settings → Layout). Passed in rather than
+    /// read from a store because the player owns no layout-settings dependency.
+    private let allowUnairedNextUp: Bool
+
     init(
         request: PlaybackRequest,
         addonManager: AddonManager,
         progressStore: ProgressStore,
-        settings: PlayerSettings = .default
+        settings: PlayerSettings = .default,
+        allowUnairedNextUp: Bool = true
     ) {
+        self.allowUnairedNextUp = allowUnairedNextUp
         self.meta = request.meta
         self.currentVideo = request.video
         self.currentEntry = request.entry
@@ -1067,7 +1093,25 @@ final class PlayerViewModel: ObservableObject {
             }
         }
         KSOptions.firstPlayerType = needsFFmpeg ? KSMEPlayer.self : KSAVPlayer.self
-        KSOptions.secondPlayerType = needsFFmpeg ? KSAVPlayer.self : KSMEPlayer.self
+        // Second engine = KSPlayer's own transparent retry when the first one
+        // errors. It is only worth having when the other engine could actually
+        // play this container.
+        //
+        // For a KNOWN AVPlayer-hostile container (mkv/avi/ts/…) it is worse
+        // than useless: KSPlayerLayer.finish() swallows the FFmpeg error,
+        // silently re-opens the same URL on AVPlayer — which cannot demux MKV
+        // at all — and only notifies us when THAT fails too. On a big remote
+        // remux that doomed second open is the "grinds for a minute doing
+        // nothing" gap before the app's own source failover starts, and it also
+        // means the error we finally surface is a misleading AVFoundation
+        // "media may be damaged" instead of the real FFmpeg one.
+        //
+        // Unknown/extensionless links keep AVPlayer as a fallback — those are
+        // often plain MP4 behind a debrid redirect, where it's a real recovery.
+        let secondEngineIsHopeless = needsFFmpeg && ffmpegContainers.contains(ext)
+        let secondEngine: MediaPlayerProtocol.Type? = needsFFmpeg
+            ? KSAVPlayer.self : KSMEPlayer.self
+        KSOptions.secondPlayerType = secondEngineIsHopeless ? nil : secondEngine
 
         // Fast probe for EVERY direct file (only HLS playlists need the full
         // scan). This previously applied only to known extensions — an
@@ -1407,6 +1451,7 @@ final class PlayerViewModel: ObservableObject {
 
     private func vlcTimeChanged(current: Double, total: Double) {
         if current > 0, !hasStartedPlayback { hasStartedPlayback = true; loadPhase = nil }
+        if current.isFinite { markPlaybackProgressed(currentTime: current) }
         position = current
         if total > 0 { duration = total }
         buffered = 0   // VLC doesn't expose an ahead-buffer, so no cache line
@@ -1640,13 +1685,28 @@ final class PlayerViewModel: ObservableObject {
                 overlay = .pauseInfo
             }
         } else {
-            if let pausedAt, Date().timeIntervalSince(pausedAt) > staleResumeAfter {
+            // Only reconnect-by-seek when the stream can actually seek — a live
+            // / non-seekable source would stash the seek and never play, so the
+            // press would do nothing.
+            let canReconnectBySeek = usingVLC || (playerLayer?.player.seekable ?? false)
+            if let pausedAt, canReconnectBySeek,
+               Date().timeIntervalSince(pausedAt) > staleResumeAfter {
                 // Long pause: reconnect in place instead of trusting the idle
                 // socket. Nudge back a second so the seek lands on content
                 // that's certainly still valid keyframe-wise.
+                //
+                // The seek AUTOPLAYS on completion — do not also call
+                // enginePlay(). Same trap as the resume path in `.readyToPlay`:
+                // a synchronous play() lands inside the seek and stomps
+                // KSMEPlayer's `.seeking` back to `.playing`, restarting both
+                // outputs mid-flush. The seek then flushes audio only, so audio
+                // re-primes at the new position while the video output keeps
+                // stale frames — picture freezes, sound carries on. FFmpeg
+                // engine only (AVPlayer has no such state).
                 engineSeek(to: max(position - 1, 0), autoPlay: true)
+            } else {
+                enginePlay()
             }
-            enginePlay()
             if overlay == .pauseInfo {
                 overlay = .none
             }
@@ -1670,6 +1730,10 @@ final class PlayerViewModel: ObservableObject {
         position = target
         clock.position = target   // instant UI feedback, no waiting for a tick
         lastUserSeekAt = Date()
+        // The user's own seek replaces the resume target outright (including
+        // seeking BACKWARDS — otherwise the floor would drag them forward again
+        // on the next failover).
+        sessionResumeFloor = target
         engineSeek(to: target, autoPlay: true)
     }
 
@@ -2537,6 +2601,8 @@ final class PlayerViewModel: ObservableObject {
     /// (Re)arm the watchdog for a fresh load. Called from `load`/`loadViaVLC`.
     private func startLoadWatchdog() {
         currentLoadStarted = false
+        playbackProgressConfirmed = false
+        playbackProgressBaseline = nil
         loadWatchdogTask?.cancel()
         let targetURL = currentURL
         let timeout = loadTimeoutSeconds
@@ -2571,13 +2637,52 @@ final class PlayerViewModel: ObservableObject {
         currentLoadStarted = true
         loadWatchdogTask?.cancel()
         loadWatchdogTask = nil
-        // A source is alive again — allow the next stall to re-scrape fresh
-        // links once more (so a link that goes bad mid-session can still
-        // recover via a re-resolve), and let a later stall re-capture the
-        // "prefer this addon/quality" target from whatever is now playing.
+        // NOTE: the failover-chain reset deliberately does NOT happen here.
+        // See markPlaybackProgressed().
+        playbackProgressBaseline = nil
+    }
+
+    /// Wall-clock-independent proof that the current source is actually
+    /// PLAYING, not merely open: the engine's clock has advanced ~2s past
+    /// wherever this load started.
+    private var playbackProgressBaseline: Double?
+    private var playbackProgressConfirmed = false
+
+    /// A source is genuinely alive — allow the next stall to re-scrape fresh
+    /// links once more (so a link that goes bad mid-session can still recover
+    /// via a re-resolve), and let a later stall re-capture the "prefer this
+    /// addon/quality" target from whatever is now playing.
+    ///
+    /// This used to live in `markLoadStarted()`, i.e. it fired at
+    /// `.readyToPlay` — when the CONTAINER opens, before a single frame is
+    /// presented. Every source opens, so a failure that happens after the open
+    /// (the resume-seek freeze above, an IP-locked debrid link that serves
+    /// headers then cuts off) reset the chain on every candidate: the failover
+    /// forgot which addon/quality it was aiming for, re-granted itself the
+    /// expensive full re-scrape each hop, and chewed through the entire source
+    /// list reporting "every available source was tried". Opening is not
+    /// playing — only advancing the clock is.
+    private func markPlaybackProgressed(currentTime: Double) {
+        guard !playbackProgressConfirmed, currentLoadStarted else { return }
+        guard let baseline = playbackProgressBaseline else {
+            playbackProgressBaseline = currentTime
+            return
+        }
+        // Tolerate the resume seek's jump: only forward progress from the
+        // settled baseline counts, and a backwards jump re-baselines.
+        if currentTime < baseline { playbackProgressBaseline = currentTime; return }
+        guard currentTime - baseline >= 2 else { return }
+        playbackProgressConfirmed = true
         didFailoverRefetch = false
         chainPreferredAddon = nil
         chainPreferredResolution = nil
+        // Playback has demonstrably moved onto the CURRENT source, so any
+        // retired DV remuxer's segment directory is no longer being read and
+        // can go now rather than at teardown. Each retired remux is a stream
+        // COPY of the source — tens of GB on a 4K DV remux — and every
+        // out-of-window seek retires another one, so holding them all for the
+        // whole session could fill the box's storage mid-movie.
+        purgeRetiredDVDirectories()
     }
 
     // MARK: - Automatic source failover
@@ -2623,7 +2728,10 @@ final class PlayerViewModel: ObservableObject {
         }
         failedSourceIDs.insert(currentEntry.id)
         if let deadURL = currentEntry.stream.url { failedSourceURLs.insert(deadURL) }
-        let resumeAt = max(position, pendingResume ?? 0)
+        // `position` is ~0 while a resume seek is still in flight and
+        // `pendingResume` is cleared the moment it lands, so neither alone
+        // survives a failure in that window — hence the session floor.
+        let resumeAt = max(max(position, pendingResume ?? 0), sessionResumeFloor)
         isSwitchingSource = true
         Task { [weak self] in
             guard let self else { return }
@@ -2767,8 +2875,14 @@ final class PlayerViewModel: ObservableObject {
                 ($0.season ?? 0, $0.episode ?? 0) < ($1.season ?? 0, $1.episode ?? 0)
             }
         guard let index = ordered.firstIndex(where: { $0.id == current.id }) else { return nil }
-        let next = ordered.dropFirst(index + 1).first
-        return next?.hasAired == true ? next : nil
+        guard let next = ordered.dropFirst(index + 1).first else { return nil }
+        // "Show unaired next up" (Settings → Layout). This used to hard-require
+        // hasAired, so the player's Up Next disagreed with the detail page,
+        // which honours the setting. Note the setting is ON by default: an
+        // unaired episode CAN become the auto-advance target, and since it has
+        // no sources yet that advance will fail over and report no working
+        // source. Turn the setting off to keep the old skip-unaired behaviour.
+        return (allowUnairedNextUp || next.hasAired) ? next : nil
     }
 
     // MARK: - Post-play / auto-next
@@ -3004,6 +3118,9 @@ final class PlayerViewModel: ObservableObject {
             currentVideo = episode
             allEntries = panelEntries
             pendingResume = progressStore.progress(for: episode.id)?.positionSeconds
+            // New episode = new timeline; the previous episode's resume target
+            // must not follow it into a failover.
+            sessionResumeFloor = 0
 
             if let preferred, !presentSources {
                 currentEntry = preferred
@@ -3243,12 +3360,19 @@ final class PlayerViewModel: ObservableObject {
             // Hold until the playback cache is essentially full (reader idle)
             // so the pass never competes with the initial buffering.
             let waitStart = Date()
+            // Gate on a fraction of the cache the session ACTUALLY got, not a
+            // fixed 18s. The tier defaults (24s/36s/90s) are only the starting
+            // point — the device-memory ceiling then clamps them to 6s on the
+            // 2 GB Apple TV HD and 12s on the 3 GB 4K gen-1, so a hardcoded 18
+            // was unsatisfiable on exactly the boxes this gate protects. They
+            // fell through to the 120s timeout every time and then ran the
+            // preview pass against live playback — the opposite of the intent.
+            let cap = await MainActor.run { self?.currentOptions?.maxBufferDuration ?? 24 }
+            let gate = max(min(18, cap * 0.75), 4)
             while !Task.isCancelled {
                 guard let self else { return }
                 let ahead = self.buffered - self.position
-                // 18s ahead ≈ near-full under the tightened buffer caps
-                // (24s/36s) — reader mostly idle, safe to share the pipe.
-                if self.hasStartedPlayback && ahead >= 18 { break }
+                if self.hasStartedPlayback && ahead >= gate { break }
                 if Date().timeIntervalSince(waitStart) > 120 { break }
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
@@ -3557,14 +3681,48 @@ extension PlayerViewModel: KSPlayerLayerDelegate {
                 // Over" button in the controls bar (only shown when this title
                 // had saved progress) lets the viewer jump back to 0 anytime.
                 if cacheTargetSeconds <= 0 {
-                    // Small file: no hold — straight into the movie.
+                    // No hold — straight into the movie.
+                    //
+                    // The seek and the play() are MUTUALLY EXCLUSIVE, and that
+                    // matters enormously. `KSPlayerLayer.seek(autoPlay: true)`
+                    // already calls play() from its completion handler, so an
+                    // extra play() here doesn't just duplicate it — it runs
+                    // SYNCHRONOUSLY, inside the seek. KSMEPlayer.seek sets
+                    // playbackState = .seeking (which pauses both outputs while
+                    // the flush runs) and our play() stomped that straight back
+                    // to .playing, restarting audio + video mid-seek. When the
+                    // seek then landed it called audioOutput.flush() — audio
+                    // only — so audio re-primed at the resume point while the
+                    // video output kept stale pre-seek frames against a timebase
+                    // that had jumped forward. That is the "resumes, then the
+                    // picture freezes while the audio keeps playing" bug.
+                    //
+                    // It only showed up on BIG files because the race window is
+                    // the duration of the seek: a small file's seek completes in
+                    // milliseconds, while a large high-bitrate long-GOP file
+                    // needs a range request and a keyframe hunt.
                     if meaningfulResume {
-                        playerLayer?.seek(time: resume, autoPlay: true) { _ in }
+                        // Remember the target for the whole session BEFORE the
+                        // seek: `position` is still ~0 until it lands, so a
+                        // failover in that window used to restart the next
+                        // source from the beginning.
+                        sessionResumeFloor = max(sessionResumeFloor, resume)
+                        playerLayer?.seek(time: resume, autoPlay: true) { [weak self] finished in
+                            guard let self else { return }
+                            // Cleared either way: leaving it set would make a
+                            // later `.readyToPlay` (engine failover) yank the
+                            // viewer back here after they'd scrubbed elsewhere.
+                            self.pendingResume = nil
+                            // Engine refused the seek (not seekable) — don't
+                            // leave the session parked on a paused frame.
+                            if !finished { self.playerLayer?.play() }
+                        }
+                    } else {
+                        pendingResume = nil
+                        playerLayer?.play()
                     }
-                    pendingResume = nil
                     loadPhase = nil
                     hasStartedPlayback = true
-                    playerLayer?.play()
                 } else {
                     if meaningfulResume {
                         playerLayer?.seek(time: resume, autoPlay: false) { _ in }
@@ -3580,7 +3738,15 @@ extension PlayerViewModel: KSPlayerLayerDelegate {
                 // switch, so without this an unwatched episode set up its stream
                 // but never left pause, spinning on the loading state forever.
                 if resume > 5, duration == 0 || resume < duration - 30 {
-                    layer.seek(time: resume, autoPlay: true) { _ in }
+                    // `resume` is an ABSOLUTE source time, but a native-DV
+                    // session's layer timeline is the local playlist, whose t=0
+                    // is `dvTimeOffset` into the source. Seeking the raw value
+                    // there would land dvTimeOffset seconds too deep (or past
+                    // the written window entirely). Everything else in the app
+                    // goes through engineSeek, which does this translation —
+                    // this call predates that and didn't.
+                    let target = usingNativeDV ? max(resume - dvTimeOffset, 0) : resume
+                    layer.seek(time: target, autoPlay: true) { _ in }
                 } else {
                     layer.play()
                 }
@@ -3630,6 +3796,7 @@ extension PlayerViewModel: KSPlayerLayerDelegate {
             hasStartedPlayback = true
             loadPhase = nil
         }
+        if currentTime.isFinite { markPlaybackProgressed(currentTime: currentTime) }
         if currentTime.isFinite { position = currentTime }
         if totalTime.isFinite, totalTime > 0, !usingNativeDV { duration = totalTime }
         buffered = layer.player.playableTime + (usingNativeDV ? dvTimeOffset : 0)

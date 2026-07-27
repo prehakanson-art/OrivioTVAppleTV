@@ -15,13 +15,15 @@ struct PlayerScreen: View {
         addonManager: AddonManager,
         progressStore: ProgressStore,
         playerSettings: PlayerSettings = .default,
+        allowUnairedNextUp: Bool = true,
         dismiss: @escaping () -> Void
     ) {
         _viewModel = StateObject(wrappedValue: PlayerViewModel(
             request: request,
             addonManager: addonManager,
             progressStore: progressStore,
-            settings: playerSettings
+            settings: playerSettings,
+            allowUnairedNextUp: allowUnairedNextUp
         ))
         self.dismiss = dismiss
     }

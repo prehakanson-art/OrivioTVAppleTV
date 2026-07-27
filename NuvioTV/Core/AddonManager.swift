@@ -9,9 +9,10 @@ final class AddonManager: ObservableObject {
     /// fired while applying remote data (guarded by `suppressChange`).
     var onLocalChange: (() -> Void)?
     /// Called when the user taps "Refresh Add-ons" — the sync manager wires this
-    /// to pull the account's addons (so ones added on other devices appear) and
-    /// push the merged set back. `nil` (signed out) is a no-op.
-    var onSyncRequested: (() async -> Void)?
+    /// to pull the account's addons so ones added on other devices appear.
+    /// THROWS so the caller can tell the user WHY nothing arrived; `nil` means
+    /// no sync manager is attached at all (signed out).
+    var onSyncRequested: (() async throws -> Void)?
     private var suppressChange = false
 
     private static let storageKey = "nuvio.addons.v1"
@@ -38,7 +39,8 @@ final class AddonManager: ObservableObject {
     /// Installs any remote addon URLs not already present, preserving remote
     /// order for the new ones. Manifests are fetched in parallel. Does not fire
     /// `onLocalChange` (no echo back).
-    func applyRemote(urls: [String]) async {
+    @discardableResult
+    func applyRemote(urls: [String]) async -> Int {
         suppressChange = true
         defer { suppressChange = false }
         let existing = Set(addons.map { $0.baseURL })
@@ -48,7 +50,9 @@ final class AddonManager: ObservableObject {
                 ? String(normalized.dropLast("/manifest.json".count)) : normalized
             return !existing.contains(base)
         }
-        guard !toInstall.isEmpty else { return }
+        NSLog("[OrivioAddonSync] pull: %d from account, %d already installed, %d to add",
+              urls.count, urls.count - toInstall.count, toInstall.count)
+        guard !toInstall.isEmpty else { return 0 }
 
         // Fetch the new manifests a few at a time, then apply in the original
         // order so the installed list is deterministic. A manifest that fails
@@ -63,15 +67,18 @@ final class AddonManager: ObservableObject {
             return (manifestURL, manifest)
         }
 
+        var added = 0
         for (manifestURL, manifest) in fetched {
             let addon = InstalledAddon(manifestURL: manifestURL, manifest: manifest)
             if let existing = addons.firstIndex(where: { $0.manifestURL == manifestURL }) {
                 addons[existing] = addon
             } else {
                 addons.append(addon)
+                added += 1
             }
         }
         save()
+        return added
     }
 
     /// Re-fetch manifests for enabled PLACEHOLDER addons — ones installed (by
@@ -183,9 +190,54 @@ final class AddonManager: ObservableObject {
     /// Re-fetch every installed addon's manifest (the APK's "Refresh Add-ons")
     /// AND sync with the account: pull addons added on other devices, then push
     /// the merged list back.
-    func refresh() async {
+    /// Result of a user-initiated "Refresh Add-ons", so the UI can say what
+    /// actually happened. Previously this returned nothing and every failure —
+    /// signed out, HTTP error, decode error, empty account — was swallowed by a
+    /// `try?`, while the button unconditionally reported "Add-ons refreshed
+    /// just now". That is why account add-ons appeared not to sync with no
+    /// indication of why.
+    enum RefreshOutcome {
+        case notSignedIn
+        case added(Int)
+        case alreadyUpToDate
+        case failed(String)
+
+        var message: String {
+            switch self {
+            case .notSignedIn:     return "Manifests refreshed — sign in to sync add-ons from your account"
+            case .added(let n):    return "Added \(n) add-on\(n == 1 ? "" : "s") from your account"
+            case .alreadyUpToDate: return "Add-ons refreshed — already up to date"
+            case .failed(let why): return "Couldn't sync from your account: \(why)"
+            }
+        }
+    }
+
+    @discardableResult
+    func refresh() async -> RefreshOutcome {
         await refreshManifests()
-        await onSyncRequested?()
+        guard let onSyncRequested else {
+            NSLog("[OrivioAddonSync] refresh: no sync manager attached (signed out)")
+            return .notSignedIn
+        }
+        let before = addons.count
+        do {
+            try await onSyncRequested()
+        } catch {
+            NSLog("[OrivioAddonSync] refresh FAILED: %@", String(describing: error))
+            return .failed(Self.shortReason(error))
+        }
+        let added = addons.count - before
+        NSLog("[OrivioAddonSync] refresh ok: %d added", added)
+        return added > 0 ? .added(added) : .alreadyUpToDate
+    }
+
+    private static func shortReason(_ error: Error) -> String {
+        if let urlError = error as? URLError {
+            return urlError.code == .notConnectedToInternet ? "no internet" : "network error"
+        }
+        if error is DecodingError { return "unexpected response from the server" }
+        let text = "\(error)"
+        return text.count > 90 ? String(text.prefix(90)) + "…" : text
     }
 
     private func refreshManifests() async {

@@ -411,7 +411,8 @@ struct RootView: View {
                 request: request,
                 addonManager: addonManager,
                 progressStore: progressStore,
-                playerSettings: playerSettings.settings
+                playerSettings: playerSettings.settings,
+                allowUnairedNextUp: homeCatalogSettings.showUnairedNextUp
             ) {
                 // Just dismiss the cover; the auto-play pop runs in onDismiss.
                 playback = nil

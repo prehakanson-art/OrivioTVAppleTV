@@ -1421,10 +1421,16 @@ private struct AddonsManagementView: View {
         guard !refreshing else { return }
         refreshing = true
         Task {
-            await addonManager.refresh()
+            // Report what ACTUALLY happened. This used to say "Add-ons
+            // refreshed just now" unconditionally, including when the account
+            // pull had failed or been skipped entirely.
+            let outcome = await addonManager.refresh()
             refreshing = false
-            refreshSubtitle = "Add-ons refreshed just now"
-            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            refreshSubtitle = outcome.message
+            // Leave a failure on screen longer than a success — it's the one
+            // the user needs to read.
+            let linger: UInt64 = { if case .failed = outcome { return 10 } else { return 4 } }()
+            try? await Task.sleep(nanoseconds: linger * 1_000_000_000)
             refreshSubtitle = Self.refreshIdle
         }
     }

@@ -34,6 +34,15 @@ enum SubtitleProbe {
         guard avformat_open_input(&ctx, url, nil, &opts) == 0, let ctx else { return false }
         defer { var c: UnsafeMutablePointer<AVFormatContext>? = ctx; avformat_close_input(&c) }
 
+        // Bound the probe the same way the playback path does (PlayerViewModel
+        // sets probesize/maxAnalyzeDuration). This runs on a SECOND connection
+        // to the same remote file while the player is still filling its initial
+        // buffer, and FFmpeg's defaults here are 5 MB and up to 5 SECONDS of
+        // content — a meaningful bandwidth competitor on a debrid link right at
+        // the moment startup is most sensitive. The subtitle stream list comes
+        // from the container header, so a small probe is entirely sufficient.
+        ctx.pointee.probesize = 2 << 20              // 2 MB
+        ctx.pointee.max_analyze_duration = 1_000_000 // 1s (microseconds)
         guard avformat_find_stream_info(ctx, nil) >= 0 else { return false }
 
         for i in 0 ..< Int(ctx.pointee.nb_streams) {
