@@ -1426,6 +1426,12 @@ final class NuvioSyncManager: ObservableObject {
         /// are the account-wide library; this is the per-profile opt-out, so a
         /// newly added pack shows everywhere until a profile turns it off.
         var hiddenCollectionIDs: [String]?
+        /// Folder ids this profile switched off (e.g. keep Streaming Services
+        /// but drop HBO Max).
+        var hiddenFolderIDs: [String]?
+        /// Folder ids switched off account-wide — the catalog default that all
+        /// profiles inherit and can trim further.
+        var globalHiddenFolderIDs: [String]?
     }
 
     /// Set when a local app-pref-backed change (collections included) is waiting
@@ -1479,6 +1485,16 @@ final class NuvioSyncManager: ObservableObject {
             collectionsStore.mergeIntoLibrary(collections)
         }
         collectionsStore.applyRemoteHidden(Set(snapshot.hiddenCollectionIDs ?? []))
+        // Only apply when the remote blob actually CARRIES these keys. A blob
+        // written before they existed decodes them as nil, and treating nil as
+        // "empty" let the pull wipe a local choice before the push in the same
+        // sync could upload it — which is exactly what made a folder hidden on
+        // this device come back as visible.
+        if snapshot.hiddenFolderIDs != nil || snapshot.globalHiddenFolderIDs != nil {
+            collectionsStore.applyRemoteHiddenFolders(
+                profile: Set(snapshot.hiddenFolderIDs ?? []),
+                global: Set(snapshot.globalHiddenFolderIDs ?? []))
+        }
     }
 
     /// READ-MERGE-WRITE: fetch the blob, replace only our own feature key, push
@@ -1499,7 +1515,9 @@ final class NuvioSyncManager: ObservableObject {
             // profile's opt-outs. Pushing the visible subset here would delete
             // other profiles' collections from the account.
             collections: collectionsStore.library,
-            hiddenCollectionIDs: collectionsStore.hiddenIDsForSync
+            hiddenCollectionIDs: collectionsStore.hiddenIDsForSync,
+            hiddenFolderIDs: collectionsStore.hiddenFolderIDsForSync,
+            globalHiddenFolderIDs: collectionsStore.globalHiddenFolderIDsForSync
         )
         guard let data = try? JSONEncoder().encode(snapshot),
               let json = String(data: data, encoding: .utf8) else { return }

@@ -469,6 +469,7 @@ struct ProfileEditView: View {
     @State private var showRemovePin = false
     @State private var pinError: String?
     @State private var confirmingDelete = false
+    @State private var editingCollection: NuvioCollection?
 
     private var current: UserProfile {
         profiles.profiles.first { $0.id == profile.id } ?? profile
@@ -591,6 +592,11 @@ struct ProfileEditView: View {
         .onAppear { name = current.name }
         // Same as pressing Done: commit the pending name edit, then dismiss.
         .onExitCommand { commitName(); onDone() }
+        .fullScreenCover(item: $editingCollection) { collection in
+            ProfileCollectionFoldersView(collection: collection) { editingCollection = nil }
+                .environmentObject(theme)
+                .environmentObject(collections)
+        }
         .fullScreenCover(isPresented: $showSetPin) {
             PinEntryView(
                 title: "Set a 4-digit PIN",
@@ -668,16 +674,14 @@ struct ProfileEditView: View {
         return [head] + names.map { NuvioDropdownOption($0) }
     }
 
-    /// Per-profile collection visibility.
+    /// Per-profile collection visibility, as a drill-down: pick a collection,
+    /// then switch its individual FOLDERS on or off (keep Streaming Services
+    /// but drop HBO Max). Folders also have an account-wide default in
+    /// Settings → Collections; this only trims further for THIS profile.
     ///
-    /// Collections are an ACCOUNT-WIDE library — a pack added on any profile is
-    /// available to all of them (that's why "Kaptain's Collection" used to be
-    /// stuck on one profile). Each profile only chooses what to SHOW, and it's
-    /// an opt-OUT so anything newly added appears everywhere until turned off.
-    ///
-    /// Only meaningful for the ACTIVE profile: the hidden set is stored per
-    /// profile and this store is scoped to whichever profile is signed in, so
-    /// editing another profile's list from here would write to the wrong one.
+    /// Only meaningful for the ACTIVE profile: the hidden sets are stored per
+    /// profile and the store is scoped to whoever is signed in, so editing
+    /// another profile's list from here would write to the wrong one.
     @ViewBuilder
     private var collectionsSection: some View {
         if !collections.library.isEmpty {
@@ -687,37 +691,22 @@ struct ProfileEditView: View {
                     .foregroundStyle(theme.palette.textPrimary)
 
                 if profile.id == profiles.activeProfileID {
-                    Text("Choose which collections show on this profile. They stay on your account either way.")
+                    Text("Choose what this profile sees. Open a collection to pick individual folders.")
                         .font(.system(size: 20))
                         .foregroundStyle(theme.palette.textSecondary)
 
                     ForEach(collections.library) { collection in
-                        let shown = collections.isVisible(collection.id)
-                        Button {
-                            collections.setVisible(!shown, id: collection.id)
-                        } label: {
-                            HStack(spacing: NuvioSpacing.md) {
-                                Image(systemName: shown ? "checkmark.circle.fill" : "circle")
-                                    .font(.system(size: 26))
-                                    .foregroundStyle(shown ? theme.palette.focusRing : theme.palette.textTertiary)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(collection.title)
-                                        .font(.system(size: 24, weight: .medium))
-                                        .foregroundStyle(theme.palette.textPrimary)
-                                    Text("\(collection.folders.count) folder\(collection.folders.count == 1 ? "" : "s")")
-                                        .font(.system(size: 18))
-                                        .foregroundStyle(theme.palette.textTertiary)
-                                }
-                                Spacer()
-                            }
-                            .padding(.vertical, NuvioSpacing.sm)
-                            .contentShape(Rectangle())
+                        Button { editingCollection = collection } label: {
+                            ProfileCollectionRow(
+                                title: collection.title,
+                                detail: folderSummary(collection),
+                                shown: collections.isVisible(collection.id),
+                                showsChevron: true
+                            )
                         }
                         .buttonStyle(PlainCardButtonStyle())
                     }
                 } else {
-                    // Switch to the profile to edit its own visibility — the
-                    // hidden set follows the ACTIVE profile.
                     Text("Switch to “\(current.name)” to choose which of the \(collections.library.count) collections it shows.")
                         .font(.system(size: 20))
                         .foregroundStyle(theme.palette.textSecondary)
@@ -725,6 +714,14 @@ struct ProfileEditView: View {
             }
             .padding(.top, NuvioSpacing.lg)
         }
+    }
+
+    /// "3 of 19 folders" — so the row says what's on without opening it.
+    private func folderSummary(_ collection: NuvioCollection) -> String {
+        guard collections.isVisible(collection.id) else { return "Hidden on this profile" }
+        let total = collection.folders.count
+        let on = collection.folders.filter { collections.isFolderVisible($0.id) }.count
+        return on == total ? "All \(total) folders" : "\(on) of \(total) folders"
     }
 
     private var autoLinkSection: some View {
@@ -807,5 +804,128 @@ struct ProfileEditView: View {
     private func commitName() {
         let trimmed = name.trimmingCharacters(in: .whitespaces)
         if !trimmed.isEmpty { profiles.rename(id: profile.id, to: trimmed) }
+    }
+}
+
+
+/// A row in the profile editor's collection list. Rendered with an explicit
+/// FOCUS state — the previous version used a bare checkmark and, on tvOS,
+/// focus only moved a system highlight the row didn't respond to, so you
+/// couldn't tell what was selected while moving over it.
+private struct ProfileCollectionRow: View {
+    @EnvironmentObject private var theme: ThemeManager
+    @Environment(\.isFocused) private var isFocused
+    let title: String
+    let detail: String
+    let shown: Bool
+    var showsChevron = false
+
+    var body: some View {
+        HStack(spacing: NuvioSpacing.md) {
+            Image(systemName: shown ? "checkmark.circle.fill" : "circle")
+                .font(.system(size: 30))
+                .foregroundStyle(shown ? theme.palette.focusRing : theme.palette.textTertiary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.system(size: 25, weight: .medium))
+                    .foregroundStyle(isFocused ? theme.palette.textPrimary : theme.palette.textSecondary)
+                Text(detail)
+                    .font(.system(size: 19))
+                    .foregroundStyle(theme.palette.textTertiary)
+            }
+            Spacer()
+            if showsChevron {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundStyle(theme.palette.textTertiary)
+            }
+        }
+        .padding(.horizontal, NuvioSpacing.lg)
+        .padding(.vertical, NuvioSpacing.md)
+        .background(
+            RoundedRectangle(cornerRadius: NuvioRadius.md, style: .continuous)
+                .fill(isFocused ? theme.palette.surface : Color.clear)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: NuvioRadius.md, style: .continuous)
+                .strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 3)
+        )
+        .contentShape(Rectangle())
+    }
+}
+
+/// Folder picker for ONE collection on the active profile. Mirrors the
+/// collection's own folder layout so it reads like the row it controls.
+struct ProfileCollectionFoldersView: View {
+    @EnvironmentObject private var theme: ThemeManager
+    @EnvironmentObject private var collections: CollectionsStore
+    let collection: NuvioCollection
+    let onDone: () -> Void
+
+    /// Live copy — `collection` is a snapshot taken when the cover opened.
+    private var live: NuvioCollection {
+        collections.library.first { $0.id == collection.id } ?? collection
+    }
+
+    var body: some View {
+        ZStack {
+            theme.palette.background.ignoresSafeArea()
+            ScrollView(.vertical) {
+                VStack(alignment: .leading, spacing: NuvioSpacing.lg) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(live.title)
+                                .font(.system(size: 40, weight: .bold))
+                                .foregroundStyle(theme.palette.textPrimary)
+                            Text("Choose which folders this profile sees")
+                                .font(.system(size: 22))
+                                .foregroundStyle(theme.palette.textSecondary)
+                        }
+                        Spacer()
+                        Button("Done", action: onDone)
+                    }
+
+                    Button {
+                        collections.setVisible(!collections.isVisible(live.id), id: live.id)
+                    } label: {
+                        ProfileCollectionRow(
+                            title: "Show this collection",
+                            detail: collections.isVisible(live.id)
+                                ? "Appears on this profile" : "Hidden on this profile",
+                            shown: collections.isVisible(live.id))
+                    }
+                    .buttonStyle(PlainCardButtonStyle())
+
+                    if collections.isVisible(live.id) {
+                        Text("Folders")
+                            .font(.system(size: 26, weight: .semibold))
+                            .foregroundStyle(theme.palette.textPrimary)
+                            .padding(.top, NuvioSpacing.md)
+
+                        ForEach(live.folders) { folder in
+                            let globallyOff = !collections.isFolderGloballyVisible(folder.id)
+                            Button {
+                                guard !globallyOff else { return }
+                                collections.setFolderVisible(
+                                    !collections.isFolderVisible(folder.id), id: folder.id)
+                            } label: {
+                                ProfileCollectionRow(
+                                    title: folder.title,
+                                    detail: globallyOff
+                                        ? "Off for everyone — Settings → Collections"
+                                        : (collections.isFolderVisible(folder.id) ? "Shown" : "Hidden"),
+                                    shown: collections.isFolderVisible(folder.id))
+                            }
+                            .buttonStyle(PlainCardButtonStyle())
+                            .disabled(globallyOff)
+                            .opacity(globallyOff ? 0.45 : 1)
+                        }
+                    }
+                }
+                .padding(NuvioSpacing.huge)
+            }
+            .scrollClipDisabled()
+        }
+        .onExitCommand(perform: onDone)
     }
 }

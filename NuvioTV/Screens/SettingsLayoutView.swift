@@ -697,14 +697,34 @@ struct CollectionEditorView: View {
 
                     ForEach(folders) { folder in
                         HStack(spacing: NuvioSpacing.md) {
+                            // Account-wide on/off for this folder. Every profile
+                            // inherits it; a profile can hide MORE in Profile
+                            // Manager but can't re-enable what's off here — so
+                            // this is the shared baseline everyone starts from.
+                            Button {
+                                collections.setFolderGloballyVisible(
+                                    !collections.isFolderGloballyVisible(folder.id), id: folder.id)
+                            } label: {
+                                Image(systemName: collections.isFolderGloballyVisible(folder.id)
+                                      ? "checkmark.circle.fill" : "circle")
+                                    .font(.system(size: 30))
+                                    .foregroundStyle(collections.isFolderGloballyVisible(folder.id)
+                                                     ? theme.palette.focusRing : theme.palette.textTertiary)
+                            }
+                            .buttonStyle(PlainCardButtonStyle())
+
                             Button { editingFolder = folder } label: {
                                 SettingsActionRow(
                                     title: folder.title.isEmpty ? "Untitled folder" : folder.title,
-                                    subtitle: folderSubtitle(folder),
+                                    subtitle: collections.isFolderGloballyVisible(folder.id)
+                                        ? folderSubtitle(folder)
+                                        : "Off for all profiles — " + folderSubtitle(folder),
                                     leadingIcon: "folder.fill"
                                 )
                             }
                             .buttonStyle(PlainCardButtonStyle())
+                            .opacity(collections.isFolderGloballyVisible(folder.id) ? 1 : 0.45)
+
                             Button(role: .destructive) {
                                 folders.removeAll { $0.id == folder.id }
                                 persist()

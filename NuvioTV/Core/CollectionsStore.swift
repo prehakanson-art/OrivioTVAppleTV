@@ -293,6 +293,16 @@ final class CollectionsStore: ObservableObject {
     /// so a newly added collection appears everywhere by default.
     @Published private(set) var hiddenIDs: Set<String> = []
 
+    /// FOLDER ids this profile has switched off — e.g. keep "Streaming
+    /// Services" but drop HBO Max from it. Per-profile, opt-out like the above.
+    @Published private(set) var hiddenFolderIDs: Set<String> = []
+
+    /// Folder ids switched off for the WHOLE account (Settings → Collections).
+    /// This is the catalog-wide default; a profile can still hide more on top,
+    /// so the effective rule is `global ∪ profile`. Lets you curate one shared
+    /// set and let individual profiles trim it further.
+    @Published private(set) var globalHiddenFolderIDs: Set<String> = []
+
     /// Fired after a user-initiated change so account sync can push. Not
     /// fired while applying remote data (guarded by `suppressChange`).
     var onLocalChange: (() -> Void)?
@@ -312,6 +322,8 @@ final class CollectionsStore: ObservableObject {
         profileID == 1 ? Self.baseKey : "\(Self.baseKey).p\(profileID)"
     }
     private var hiddenKey: String { "nuvio.collections.hidden.p\(profileID)" }
+    private var hiddenFoldersKey: String { "nuvio.collections.hiddenFolders.p\(profileID)" }
+    private static let globalHiddenFoldersKey = "nuvio.collections.hiddenFolders.global.v1"
 
     init() {
         load()
@@ -323,6 +335,7 @@ final class CollectionsStore: ObservableObject {
         guard id != profileID else { return }
         profileID = id
         hiddenIDs = Set(UserDefaults.standard.stringArray(forKey: hiddenKey) ?? [])
+        hiddenFolderIDs = Set(UserDefaults.standard.stringArray(forKey: hiddenFoldersKey) ?? [])
         recomputeVisible()
     }
 
@@ -369,6 +382,20 @@ final class CollectionsStore: ObservableObject {
 
     /// This profile's hidden ids, for the per-profile side of the sync.
     var hiddenIDsForSync: [String] { Array(hiddenIDs).sorted() }
+    var hiddenFolderIDsForSync: [String] { Array(hiddenFolderIDs).sorted() }
+    /// Account-wide folder opt-outs — pushed with the shared library, not the
+    /// per-profile blob.
+    var globalHiddenFolderIDsForSync: [String] { Array(globalHiddenFolderIDs).sorted() }
+
+    func applyRemoteHiddenFolders(profile: Set<String>, global: Set<String>) {
+        guard profile != hiddenFolderIDs || global != globalHiddenFolderIDs else { return }
+        suppressChange = true
+        defer { suppressChange = false }
+        hiddenFolderIDs = profile
+        globalHiddenFolderIDs = global
+        saveHidden()
+        recomputeVisible()
+    }
 
     /// Apply a remote blob. Mirrors Android: remote-empty-while-local-has-data
     /// preserves local; identical JSON is a no-op. Returns true when applied.
@@ -458,8 +485,58 @@ final class CollectionsStore: ObservableObject {
         recomputeVisible()
     }
 
+    // MARK: Folder visibility
+
+    /// Effective hidden-folder set: the account-wide default plus this
+    /// profile's own extra opt-outs.
+    private var effectiveHiddenFolders: Set<String> {
+        globalHiddenFolderIDs.union(hiddenFolderIDs)
+    }
+
+    func isFolderVisible(_ id: String) -> Bool { !effectiveHiddenFolders.contains(id) }
+    /// Whether the folder is hidden ACCOUNT-WIDE (the catalog-settings switch).
+    func isFolderGloballyVisible(_ id: String) -> Bool { !globalHiddenFolderIDs.contains(id) }
+
+    /// Show/hide a folder on the ACTIVE profile only.
+    func setFolderVisible(_ visible: Bool, id: String) {
+        let changed = visible ? hiddenFolderIDs.remove(id) != nil
+                              : hiddenFolderIDs.insert(id).inserted
+        guard changed else { return }
+        saveHidden()
+        recomputeVisible()
+        guard !suppressChange else { return }
+        onVisibilityChange?()
+    }
+
+    /// Show/hide a folder for the WHOLE account (catalog settings default).
+    func setFolderGloballyVisible(_ visible: Bool, id: String) {
+        let changed = visible ? globalHiddenFolderIDs.remove(id) != nil
+                              : globalHiddenFolderIDs.insert(id).inserted
+        guard changed else { return }
+        saveLibrary()          // global set rides with the shared library
+        saveHidden()
+        recomputeVisible()
+        guard !suppressChange else { return }
+        onLocalChange?()       // account-wide → push the shared blob
+    }
+
+    /// The folders of `collection` that this profile should actually see.
+    func visibleFolders(in collection: NuvioCollection) -> [NuvioCollectionFolder] {
+        let hidden = effectiveHiddenFolders
+        return collection.folders.filter { !hidden.contains($0.id) }
+    }
+
     private func recomputeVisible() {
-        collections = library.filter { !hiddenIDs.contains($0.id) }
+        let hiddenFolders = effectiveHiddenFolders
+        collections = library.compactMap { collection in
+            guard !hiddenIDs.contains(collection.id) else { return nil }
+            guard !hiddenFolders.isEmpty else { return collection }
+            var trimmed = collection
+            trimmed.folders = collection.folders.filter { !hiddenFolders.contains($0.id) }
+            // A collection whose folders are all switched off has nothing to
+            // show — drop the empty row rather than render a dead tile.
+            return trimmed.folders.isEmpty ? nil : trimmed
+        }
     }
 
     // MARK: Persistence
@@ -467,6 +544,8 @@ final class CollectionsStore: ObservableObject {
     private func load() {
         // The hidden set is a tiny string array — safe to read inline.
         hiddenIDs = Set(UserDefaults.standard.stringArray(forKey: hiddenKey) ?? [])
+        hiddenFolderIDs = Set(UserDefaults.standard.stringArray(forKey: hiddenFoldersKey) ?? [])
+        globalHiddenFolderIDs = Set(UserDefaults.standard.stringArray(forKey: Self.globalHiddenFoldersKey) ?? [])
 
         // The LIBRARY is not: ~700 KB of nested JSON (493 folders on a real
         // account). Decoding it synchronously here — this runs from the store's
@@ -558,11 +637,13 @@ final class CollectionsStore: ObservableObject {
     }
 
     private func saveHidden() {
-        if hiddenIDs.isEmpty {
-            UserDefaults.standard.removeObject(forKey: hiddenKey)
-            return
+        func write(_ ids: Set<String>, _ key: String) {
+            if ids.isEmpty { UserDefaults.standard.removeObject(forKey: key) }
+            else { UserDefaults.standard.set(Array(ids), forKey: key) }
         }
-        UserDefaults.standard.set(Array(hiddenIDs), forKey: hiddenKey)
+        write(hiddenIDs, hiddenKey)
+        write(hiddenFolderIDs, hiddenFoldersKey)
+        write(globalHiddenFolderIDs, Self.globalHiddenFoldersKey)
     }
 
     private func save() {
