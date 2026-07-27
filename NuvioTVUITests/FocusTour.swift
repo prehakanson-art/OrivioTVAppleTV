@@ -73,6 +73,20 @@ final class FocusTour: XCTestCase {
         r.press(.down); sleep(2); log("lp_02_down")
     }
 
+    /// Account → Stremio: the new QR sign-in row + the Stremio Link QR page.
+    func testStremioAccount() {
+        app.launchEnvironment["MTL_DEBUG_LAYER"] = "0"
+        app.launchEnvironment["MTL_SHADER_VALIDATION"] = "0"
+        app.launchArguments = ["-settingsDemo", "-paneAccount"]
+        app.launch()
+        let r = XCUIRemote.shared
+        sleep(8); r.press(.select); sleep(2); log("sa_00_after_gate")   // dismiss profile gate if shown
+        r.press(.right); sleep(1); log("sa_01_pane")                    // focus into the account pane
+        r.press(.down); sleep(1); r.press(.down); sleep(1); log("sa_02_rows")
+        r.press(.select); sleep(3); log("sa_03_stremio_view")           // open the Stremio account view
+        r.press(.select); sleep(7); log("sa_04_qr")                     // Connect → QR page (creates link)
+    }
+
     /// Diagnose the Modern theme: CW hold menu vs poster hold menu, deterministic.
     func testModernDiagnostics() {
         app.launchEnvironment["MTL_DEBUG_LAYER"] = "0"
@@ -92,6 +106,23 @@ final class FocusTour: XCTestCase {
         app.descendants(matching: .any)
             .matching(NSPredicate(format: "label CONTAINS 'Play Manually' OR label CONTAINS 'Remove from' OR label CONTAINS 'Start from Beginning' OR label CONTAINS 'Add to Library' OR label CONTAINS 'Go to Details' OR label CONTAINS 'Mark as'"))
             .count
+    }
+
+    /// Drives focus across an Onyx row so the focused card's landscape
+    /// expansion (`View.focusExpand` / `FusionMotion.rowExpand`) can be
+    /// recorded with `simctl io recordVideo` and inspected frame-by-frame.
+    /// Each Right is a fresh expansion: the previous card collapses as the
+    /// next one grows.
+    func testOnyxExpandMotion() {
+        app.launchEnvironment["MTL_DEBUG_LAYER"] = "0"
+        app.launchEnvironment["MTL_SHADER_VALIDATION"] = "0"
+        app.launchArguments = ["-onyxTheme", "-homeDemo"]
+        app.launch()
+        let r = XCUIRemote.shared
+
+        sleep(14)                       // let home + artwork settle
+        r.press(.down); sleep(4)        // into the first row of cards
+        for _ in 0..<5 { r.press(.right); sleep(3) }
     }
 
     private func attach(_ name: String, _ value: Int) {

@@ -97,14 +97,29 @@ struct MaxTitle: Identifiable, Hashable {
 
 // MARK: - Focus helpers (ported from MaxTV FocusHelpers.swift)
 
-/// A button style that renders ONLY its label — no press dimming and none of
-/// tvOS's default focus platter. Focus appearance is driven entirely by each
-/// view's own `@FocusState`, matching Max's flat white highlights.
+/// A flat button style — none of tvOS's default focus platter. Focus appearance
+/// is driven entirely by each view's own `@FocusState`, matching Max's flat
+/// white highlights; the only chrome this adds is the shared Select-press dip,
+/// so a press registers here the same as in every other theme (with the platter
+/// off, these cards previously gave no press feedback at all).
 struct MaxFlatButtonStyle: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View { configuration.label }
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label.cardPressDip(configuration.isPressed)
+    }
 }
 extension ButtonStyle where Self == MaxFlatButtonStyle {
     static var maxFlat: MaxFlatButtonStyle { MaxFlatButtonStyle() }
+}
+
+extension View {
+    /// "Raise & move" toggle for Max's plain (scale-based) poster cards. When the
+    /// `cardParallax` setting is on, use tvOS's native card platter (lift + 3D
+    /// trackpad tilt); when off, Max's flat style so the card's own white border /
+    /// scale is the sole focus visual.
+    @ViewBuilder
+    func maxCardStyle(_ parallax: Bool) -> some View {
+        if parallax { buttonStyle(.card) } else { buttonStyle(.maxFlat) }
+    }
 }
 
 /// Applies an external `.focused(_:)` binding only when one is supplied.

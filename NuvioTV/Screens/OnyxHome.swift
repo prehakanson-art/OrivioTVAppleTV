@@ -40,9 +40,8 @@ enum OnyxLayout {
     static let sectionSpacing: CGFloat = 28
     static let heroHeight: CGFloat = 500
     static let borderWidth: CGFloat = 4
-    /// Focus expansion / row reflow: a smooth spring with a gentle settle (not
-    /// the old abrupt critically-damped snap).
-    static let focusSpring: Animation = .spring(response: 0.4, dampingFraction: 0.82)
+    // Focus expansion / row reflow uses the shared `View.focusExpand` /
+    // `FusionMotion.rowExpand` (bounce-free, and gated by Reduce Motion).
     static let watchedGreen = Color(red: 0.10, green: 0.68, blue: 0.34)
 }
 
@@ -174,6 +173,7 @@ struct OnyxHomeView: View {
 // MARK: - Full-screen crossfading backdrop
 
 private struct OnyxBackdrop: View {
+    @ObservedObject private var perf = PerformanceSettingsStore.shared
     let url: String?
     let placeholder: Color
 
@@ -187,7 +187,7 @@ private struct OnyxBackdrop: View {
                     .id(url)                       // remount → crossfade
                     .transition(.opacity)
             }
-            .animation(.easeInOut(duration: 0.30), value: url)
+            .animation(perf.heroCrossfadeEffective ? .easeInOut(duration: 0.30) : nil, value: url)
         }
     }
 }
@@ -294,12 +294,13 @@ private struct OnyxHero: View {
 // MARK: - Shared card button style (suppress the tvOS focus platter)
 
 /// The card's OWN white outline is the only focus visual — this kills the
-/// default tvOS focus platter/glow. A tiny press dip only.
+/// default tvOS focus platter/glow. Press feedback is the shared `cardPressDip`
+/// so Onyx dips exactly like every other theme, and not at all when "Button
+/// animations" is off / Reduce Motion is on.
 struct OnyxCardStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .scaleEffect(configuration.isPressed ? 0.985 : 1)
-            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+            .cardPressDip(configuration.isPressed)
     }
 }
 
@@ -339,9 +340,9 @@ private struct OnyxCatalogRow: View {
                 }
                 .padding(.horizontal, OnyxLayout.rowLeading)
                 .padding(.vertical, 28)
-                // One spring drives BOTH the focused card's growth and the
+                // One curve drives BOTH the focused card's growth and the
                 // neighbours' shift, so the whole row reflows as a single motion.
-                .animation(OnyxLayout.focusSpring, value: focusedID)
+                .focusExpand(focusedID)
             }
             .scrollClipDisabled()
         }
@@ -415,7 +416,7 @@ private struct OnyxPosterLabel: View {
         }
         .frame(width: expanded ? OnyxLayout.landscapeW : OnyxLayout.posterW,
                height: OnyxLayout.posterH, alignment: .leading)
-        .animation(OnyxLayout.focusSpring, value: expanded)
+        .focusExpand(expanded)
         .onFocusChange { onFocusChanged($0) }
     }
 }
@@ -457,7 +458,7 @@ private struct OnyxContinueRow: View {
                 }
                 .padding(.horizontal, OnyxLayout.rowLeading)
                 .padding(.vertical, 28)
-                .animation(OnyxLayout.focusSpring, value: focusedID)
+                .focusExpand(focusedID)
             }
             .scrollClipDisabled()
         }
@@ -538,7 +539,7 @@ private struct OnyxContinueLabel: View {
         }
         .frame(width: expanded ? OnyxLayout.landscapeW : OnyxLayout.posterW,
                height: OnyxLayout.posterH, alignment: .leading)
-        .animation(OnyxLayout.focusSpring, value: expanded)
+        .focusExpand(expanded)
         .onFocusChange { onFocusChanged($0) }
     }
 }

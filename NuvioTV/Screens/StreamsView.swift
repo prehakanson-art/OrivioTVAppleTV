@@ -291,7 +291,16 @@ final class StreamsViewModel: ObservableObject {
 
         failedAddons = [:]
         await withTaskGroup(of: (entries: [StreamEntry], failure: (name: String, reason: String)?).self) { group in
-            for addon in addons {
+            // Bounded window: with a large install this sweep queries dozens of
+            // addons. Firing them all at once spikes memory right when the user
+            // is waiting on the list, and the tail is set by the slowest addon
+            // either way.
+            let window = max(1, min(AddonSweepLimits.streams, addons.count))
+            var next = 0
+            func startNext() {
+                guard next < addons.count else { return }
+                let addon = addons[next]
+                next += 1
                 group.addTask { [meta] in
                     do {
                         let streams = try await StremioAPI.streams(addon: addon, type: meta.type, id: fetchID)
@@ -309,11 +318,13 @@ final class StreamsViewModel: ObservableObject {
                     }
                 }
             }
+            for _ in 0..<window { startNext() }
             // Re-curate on throttled batches: recomputing the tier selection per
             // addon made the whole list re-diff several times in the first
             // seconds — exactly while the user starts scrolling it.
             var lastFlush = Date.distantPast
             for await batch in group {
+                startNext()
                 finishedAddons += 1
                 pool.append(contentsOf: batch.entries)
                 if let failure = batch.failure { failedAddons[failure.name] = failure.reason }

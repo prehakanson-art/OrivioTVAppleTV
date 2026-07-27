@@ -139,7 +139,9 @@ final class StreamBadgeStore: ObservableObject {
     /// else an error description (also mirrored into `lastStatus`).
     @discardableResult
     func importConfig(from urlString: String) async -> String? {
-        let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Normalize paste-service links to their RAW endpoint so a plain
+        // pastebin.com/<id> link (which serves an HTML page) fetches the JSON.
+        let trimmed = Self.normalizePasteURL(urlString.trimmingCharacters(in: .whitespacesAndNewlines))
         guard let url = URL(string: trimmed), url.scheme?.hasPrefix("http") == true else {
             lastStatus = "Enter a valid http(s) URL"
             return lastStatus
@@ -164,6 +166,27 @@ final class StreamBadgeStore: ObservableObject {
             lastStatus = "Import failed: \(error.localizedDescription)"
             return lastStatus
         }
+    }
+
+    /// Turn a human paste link into its raw-text URL so `badges.json` hosted on a
+    /// paste service loads. Non-paste URLs (and already-raw links) pass through.
+    ///   pastebin.com/<id>       → pastebin.com/raw/<id>
+    ///   gist.github.com/…/<id>  → gist.githubusercontent.com/…/<id>/raw
+    ///   dpaste.org/<id>         → dpaste.org/<id>/raw
+    static func normalizePasteURL(_ s: String) -> String {
+        guard let u = URL(string: s), let host = u.host?.lowercased() else { return s }
+        let parts = u.path.split(separator: "/").map(String.init)
+        switch host {
+        case "pastebin.com", "www.pastebin.com":
+            if parts.count == 1, parts[0] != "raw" { return "https://pastebin.com/raw/\(parts[0])" }
+        case "dpaste.org", "dpaste.com":
+            if parts.count == 1 { return "https://\(host)/\(parts[0])/raw" }
+        case "gist.github.com":
+            if !s.hasSuffix("/raw") { return s + "/raw" }
+        default:
+            break
+        }
+        return s
     }
 
     func removeConfig() {
@@ -360,51 +383,68 @@ struct StreamBadgeChips: View {
     }
 }
 
+/// One chip, drawn the way the Badger editor / Nuvio app draw it: the badge's
+/// logo (or, image-less, its name text) sits inside a ROUNDED RECTANGLE filled
+/// with `tagColor` and stroked with `borderColor`. The color is the frame
+/// around the logo — earlier we drew the bare logo with no frame, so packs that
+/// carry their color only in the tag/border looked monochrome.
 private struct BadgeChip: View {
     let badge: StreamBadge
     var scale: CGFloat = 1
 
+    /// Badger bakes at 30px tall with a 6.2px face radius (radius ≈ 0.2·h);
+    /// keep that ratio at a TV-legible base height.
+    private var height: CGFloat { 26 * scale }
+    private var radius: CGFloat { 5.5 * scale }
+    private var fill: Color? { Color(badgeHex: badge.tagColor) }
+    private var border: Color? { Color(badgeHex: badge.borderColor) }
+    /// A chip carrying its own frame (fill and/or border) pads its content and
+    /// draws the rounded rect. When both are transparent (image-only "snapshot"
+    /// packs whose color is baked into the PNG) the logo is the whole badge.
+    private var hasFrame: Bool { fill != nil || border != nil }
+    private var padX: CGFloat { hasFrame ? 7 * scale : 0 }
+    private var padY: CGFloat { hasFrame ? 3.5 * scale : 0 }
+    /// Height of the logo/text inside the frame.
+    private var contentHeight: CGFloat { height - 2 * padY }
+
     var body: some View {
+        content
+            .frame(height: contentHeight)
+            .padding(.horizontal, padX)
+            .padding(.vertical, padY)
+            .background(RoundedRectangle(cornerRadius: radius, style: .continuous).fill(fill ?? .clear))
+            .overlay(
+                RoundedRectangle(cornerRadius: radius, style: .continuous)
+                    .strokeBorder(border ?? .clear, lineWidth: border != nil ? 1.5 * scale : 0)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+            .fixedSize()
+    }
+
+    /// The logo image (its natural aspect, sized to the chip height), or the
+    /// name text when image-less or the image can't be decoded.
+    @ViewBuilder private var content: some View {
         if badge.isImage {
             AsyncImage(url: URL(string: badge.imageURL)) { phase in
                 if case .success(let image) = phase {
                     image.resizable().scaledToFit()
                 } else {
-                    textChip   // visible placeholder / fallback
+                    textLabel   // visible placeholder / fallback
                 }
             }
-            .frame(height: 20 * scale)
-            .fixedSize()
         } else {
-            textChip
+            textLabel
         }
     }
 
-    /// Text-tag form. Transparent pack colors (#00000000 — common in
-    /// image-only packs) fall back to a readable default instead of vanishing.
-    private var textChip: some View {
-        let fill = Color(badgeHex: badge.tagColor)
-        let text = Color(badgeHex: badge.textColor)
-        let border = Color(badgeHex: badge.borderColor)
-        let filled = badge.tagStyle.lowercased().contains("filled")
-        // Non-filled styles still carry the pack's color: tint the text (and
-        // border) with tagColor when no explicit text/border color is set —
-        // packs looked black & white because the color was parsed but unused.
-        let effectiveText = text ?? (filled ? nil : fill) ?? .white.opacity(0.9)
-        let effectiveBorder = border ?? (filled ? nil : fill)
+    /// Text form — name in `textColor` (falling back to `tagColor`, then a
+    /// readable default so it never vanishes).
+    private var textLabel: some View {
+        let text = Color(badgeHex: badge.textColor) ?? fill ?? .white.opacity(0.9)
         return Text(badge.name)
-            .font(.system(size: 14 * scale, weight: .semibold))
+            .font(.system(size: 13 * scale, weight: .semibold))
             .lineLimit(1)
-            .foregroundStyle(effectiveText)
-            .padding(.horizontal, 8 * scale)
-            .frame(height: 20 * scale)
-            .background(
-                Capsule().fill(
-                    filled ? (fill ?? .white.opacity(0.14))
-                           : .white.opacity(fill == nil && border == nil ? 0.14 : 0)
-                )
-            )
-            .overlay(Capsule().strokeBorder(effectiveBorder ?? .clear, lineWidth: 1))
+            .foregroundStyle(text)
     }
 }
 

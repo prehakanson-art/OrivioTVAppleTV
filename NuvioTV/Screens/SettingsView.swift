@@ -939,8 +939,13 @@ struct AccountSettingsDetail: View {
     @EnvironmentObject private var account: NuvioAccountManager
     @EnvironmentObject private var profiles: ProfileStore
     @EnvironmentObject private var addonManager: AddonManager
+    @EnvironmentObject private var stremio: StremioAccountStore
+    @EnvironmentObject private var library: LibraryStore
+    @EnvironmentObject private var progressStore: ProgressStore
+    @EnvironmentObject private var watchedStore: WatchedStore
     @State private var showAccount = false
     @State private var showProfiles = false
+    @State private var showStremio = false
 
     var body: some View {
         DetailScaffold(title: SettingsCategory.account.title, subtitle: SettingsCategory.account.subtitle) {
@@ -965,7 +970,27 @@ struct AccountSettingsDetail: View {
                     )
                 }
                 .buttonStyle(PlainCardButtonStyle())
+
+                Button { showStremio = true } label: {
+                    SettingsValueCard(
+                        title: "Stremio",
+                        subtitle: "Sign in with QR to sync your Stremio library, Continue Watching and Watched",
+                        value: stremio.isSignedIn ? (stremio.email ?? "Connected") : ""
+                    )
+                }
+                .buttonStyle(PlainCardButtonStyle())
             }
+        }
+        .fullScreenCover(isPresented: $showStremio) {
+            ZStack {
+                theme.palette.background.ignoresSafeArea()
+                StremioAccountView(onClose: { showStremio = false })
+            }
+            .environmentObject(theme)
+            .environmentObject(stremio)
+            .environmentObject(library)
+            .environmentObject(progressStore)
+            .environmentObject(watchedStore)
         }
         .fullScreenCover(isPresented: $showAccount) {
             ZStack {
@@ -1115,7 +1140,7 @@ struct ContentDiscoveryDetail: View {
             }
         } else {
             HStack(spacing: NuvioSpacing.md) {
-                TextField("Badge config URL (https://…/badges.json)", text: $badgeURLInput)
+                TextField("Badge config URL or Pastebin link", text: $badgeURLInput)
                     .font(.system(size: 22))
                 Button {
                     guard !badgeImporting, !badgeURLInput.isEmpty else { return }

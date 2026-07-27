@@ -445,8 +445,7 @@ private struct HuluKeyButton: View {
                 .background(Circle().fill(focused ? Color.white : .clear))
         }
         .buttonStyle(.huluFlat).focused($focused).huluExternalFocus(focus)
-        .scaleEffect(focused ? 1.1 : 1)
-        .animation(.easeOut(duration: 0.12), value: focused)
+        .focusLift(1.1, focused)
     }
 }
 

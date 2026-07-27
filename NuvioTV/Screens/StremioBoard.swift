@@ -143,7 +143,7 @@ struct StremioBoardView: View {
                 .padding(.leading, 60)
                 .padding(.trailing, 60)
                 .allowsHitTesting(false)
-                .animation(perf.reduceMotion ? nil : .easeInOut(duration: 0.3), value: focusedItem?.id)
+                .animation(perf.heroCrossfadeEffective ? .easeInOut(duration: 0.3) : nil, value: focusedItem?.id)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .task {
@@ -320,12 +320,12 @@ private struct StremioCatalogRow: View {
                         ForEach(row.items) { item in
                             Button { onSelect(item) } label: {
                                 StremioPosterCard(item: item, width: landscape ? 340 : 190,
-                                                  landscape: landscape, parallax: perf.settings.cardParallax)
+                                                  landscape: landscape, parallax: perf.cardParallaxEffective)
                                     .onFocusChange { if $0 { onFocus(item) } }
                             }
                             // Native tvOS card style (lift + 3D trackpad tilt) when
                             // parallax is on; a plain scale-only focus on the A8.
-                            .stremioCardStyle(parallax: perf.settings.cardParallax)
+                            .stremioCardStyle(parallax: perf.cardParallaxEffective)
                             .posterHoldMenu(item) { onSelect(item) }
                             .focused($focusedID, equals: item.id)
                             .id(item.id)
@@ -449,10 +449,10 @@ struct StremioPosterCard: View {
         // Focus indicator: the native `.card` platter's lift/tilt when parallax is
         // on; a plain scale when it's off. Drop shadow rides the Card Shadows
         // switch (off by default on A8/A10X).
-        .scaleEffect(!parallax && isFocused ? StremioFocus.posterScale : 1)
+        .scaleEffect(perf.focusScale(StremioFocus.posterScale, !parallax && isFocused))
         .shadow(color: .black.opacity(isFocused && perf.settings.cardShadows ? 0.5 : 0), radius: 18, y: 8)
         .onChange(of: isFocused) { _, f in sheen = f }
-        .animation(StremioFocus.entry, value: isFocused)
+        .animation(perf.motion(StremioFocus.entry), value: isFocused)
     }
 
     /// A diagonal specular highlight on the focused card. It sweeps (repeatForever)
@@ -508,10 +508,10 @@ private struct StremioContinueRow: View {
                     LazyHStack(alignment: .top, spacing: 24) {
                         ForEach(items) { progress in
                             Button { onResume(progress) } label: {
-                                StremioContinueCard(progress: progress, parallax: perf.settings.cardParallax)
+                                StremioContinueCard(progress: progress, parallax: perf.cardParallaxEffective)
                                     .onFocusChange { if $0 { onFocus(metaFor(progress)) } }
                             }
-                            .stremioCardStyle(parallax: perf.settings.cardParallax)
+                            .stremioCardStyle(parallax: perf.cardParallaxEffective)
                             .posterHoldMenu(metaFor(progress)) { onSelect(metaFor(progress)) }
                             .focused($focusedID, equals: progress.id)
                             .id(progress.id)
@@ -568,10 +568,10 @@ private struct StremioContinueCard: View {
             .padding(.bottom, 8)
         }
         .frame(width: width, height: height)
-        .scaleEffect(!parallax && isFocused ? StremioFocus.posterScale : 1)
+        .scaleEffect(perf.focusScale(StremioFocus.posterScale, !parallax && isFocused))
         .shadow(color: .black.opacity(isFocused && perf.settings.cardShadows ? 0.5 : 0), radius: 18, y: 8)
         .onChange(of: isFocused) { _, f in sheen = f }
-        .animation(StremioFocus.entry, value: isFocused)
+        .animation(perf.motion(StremioFocus.entry), value: isFocused)
     }
 
     /// The same sweeping specular sheen the posters use, on the focused card only.

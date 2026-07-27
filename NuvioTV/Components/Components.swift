@@ -801,7 +801,7 @@ private struct MediaCardButtonStyleModifier: ViewModifier {
 
     @ViewBuilder
     func body(content: Content) -> some View {
-        if theme.isAppleTVTheme && perf.settings.cardParallax {
+        if theme.isAppleTVTheme && perf.cardParallaxEffective {
             // Native platter: raised card + trackpad tilt/parallax.
             content.buttonStyle(CardButtonStyle())
         } else if theme.isAppleTVTheme {
@@ -833,11 +833,11 @@ struct FlatCardButtonStyle: ButtonStyle {
         let onPressChanged: ((Bool) -> Void)?
 
         var body: some View {
-            let zoom = PerformanceSettingsStore.shared.focusZoomEffective
+            let perf = PerformanceSettingsStore.shared
             return configuration.label
-                .scaleEffect((zoom && isFocused ? 1.06 : 1) * (configuration.isPressed ? 0.97 : 1))
-                .animation(.easeOut(duration: 0.18), value: isFocused)
-                .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+                .scaleEffect(perf.focusScale(1.06, isFocused))
+                .animation(perf.motion(.easeOut(duration: 0.18)), value: isFocused)
+                .cardPressDip(configuration.isPressed)
                 .onChange(of: configuration.isPressed) { _, pressed in
                     onPressChanged?(pressed)
                 }
@@ -859,13 +859,83 @@ struct PlainCardButtonStyle: ButtonStyle {
     var onPressChanged: ((Bool) -> Void)? = nil
 
     func makeBody(configuration: Configuration) -> some View {
-        let anims = PerformanceSettingsStore.shared.buttonAnimationsEffective
-        return configuration.label
-            .scaleEffect(anims && configuration.isPressed ? 0.97 : 1)
-            .animation(anims ? .easeOut(duration: 0.12) : nil, value: configuration.isPressed)
+        configuration.label
+            .cardPressDip(configuration.isPressed)
             .onChange(of: configuration.isPressed) { _, pressed in
                 onPressChanged?(pressed)
             }
+    }
+}
+
+/// The shared Select-press feedback for a card button style. Every theme that
+/// suppresses the native tvOS platter (Classic, Onyx, Cinematic, Marquee,
+/// Streamline, and Apple TV with parallax off) draws its own press, so they all
+/// go through this: the same dip, the same curve, and **nothing at all** when
+/// "Button animations" is off or Reduce Motion is on. Before this, Marquee and
+/// Streamline cards had no press response whatsoever and Onyx/Cinematic dipped
+/// regardless of the setting.
+private struct CardPressDip: ViewModifier {
+    @ObservedObject private var perf = PerformanceSettingsStore.shared
+    let isPressed: Bool
+
+    func body(content: Content) -> some View {
+        content
+            .scaleEffect(perf.buttonAnimationsEffective && isPressed ? FusionFocus.pressScale : 1)
+            .animation(perf.buttonMotion(FusionFocus.pressAnimation), value: isPressed)
+    }
+}
+
+/// The shared focus lift for a themed card/tile: the theme's own scale, but
+/// gated by "Cards spring slightly larger when focused" + Reduce Motion, and
+/// animated on one curve so a focus move settles at the same rate in every
+/// theme. The `.animation` also carries the card's focus ring / colour change,
+/// so under Reduce Motion those snap instead of easing.
+private struct FocusLift: ViewModifier {
+    @ObservedObject private var perf = PerformanceSettingsStore.shared
+    let scale: CGFloat
+    let focused: Bool
+    let animation: Animation
+
+    func body(content: Content) -> some View {
+        content
+            .scaleEffect(perf.focusScale(scale, focused))
+            .animation(perf.motion(animation), value: focused)
+    }
+}
+
+extension View {
+    /// Apply inside a card `ButtonStyle.makeBody` to get the shared press dip.
+    func cardPressDip(_ isPressed: Bool) -> some View {
+        modifier(CardPressDip(isPressed: isPressed))
+    }
+
+    /// Replaces a hand-rolled `.scaleEffect(focused ? x : 1)` +
+    /// `.animation(…, value: focused)` pair so the themes ported from other
+    /// apps (Marquee, Streamline, Onyx, Cinematic, Aurora) obey the same
+    /// performance switches Classic and Apple TV always have.
+    func focusLift(_ scale: CGFloat, _ focused: Bool,
+                   animation: Animation = FusionFocus.liftAnimation) -> some View {
+        modifier(FocusLift(scale: scale, focused: focused, animation: animation))
+    }
+
+    /// The row-reflow animation for themes whose focused card expands into a
+    /// landscape tile (Onyx, Marquee). One bounce-free curve drives both the
+    /// card's growth and the neighbours' shift so the row moves as a single
+    /// motion, and Reduce Motion makes the swap instant.
+    func focusExpand<V: Equatable>(_ value: V,
+                                   animation: Animation = FusionMotion.rowExpand) -> some View {
+        modifier(FocusExpand(value: value, animation: animation))
+    }
+}
+
+/// See `View.focusExpand(_:animation:)`.
+private struct FocusExpand<V: Equatable>: ViewModifier {
+    @ObservedObject private var perf = PerformanceSettingsStore.shared
+    let value: V
+    let animation: Animation
+
+    func body(content: Content) -> some View {
+        content.animation(perf.motion(animation), value: value)
     }
 }
 

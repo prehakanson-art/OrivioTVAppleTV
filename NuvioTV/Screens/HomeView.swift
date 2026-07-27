@@ -83,6 +83,7 @@ final class HomeViewModel: ObservableObject {
         fingerprint.append(settings.orderKeys.joined(separator: ","))
         fingerprint.append(settings.disabledKeys.sorted().joined(separator: ","))
         fingerprint.append(settings.customTitles.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: ","))
+        fingerprint.append("hideUnreleased=\(settings.hideUnreleasedContent)")
         fingerprint.append(collections.collections.map {
             "\($0.id)#\($0.folders.count)#\($0.title)#\($0.viewMode)#\($0.pinToTop)"
         }.joined(separator: ","))
@@ -129,8 +130,26 @@ final class HomeViewModel: ObservableObject {
         // the catalogs instead of wherever the merged order placed it.
         let pinnedKeys = Set(collections.collections.filter(\.pinToTop)
             .map { HomeCatalogSettingsStore.collectionKey($0.id) })
-        let orderedKeys = pinnedKeys.isEmpty ? mergedKeys
+        let prioritized = pinnedKeys.isEmpty ? mergedKeys
             : mergedKeys.filter { pinnedKeys.contains($0) } + mergedKeys.filter { !pinnedKeys.contains($0) }
+
+        // Cap the number of CATALOG rows Home will build. Row layouts render
+        // their rows eagerly (see rowsContent), so an account carrying 40+
+        // addons — each declaring up to 6 catalogs — would materialize hundreds
+        // of rows and fetch every one of them on a single load. That is the
+        // "app dies after signing in with lots of addons" case: it isn't the
+        // login, it's the Home load that follows it. Collections are exempt:
+        // they're markers with no fetch, and the user explicitly created them.
+        // The order is the user's own (Settings → Layout), so the cut is always
+        // "the rows you ranked lowest", and everything remains reachable from
+        // Discover.
+        var catalogRowBudget = AddonSweepLimits.maxHomeRows
+        let orderedKeys = prioritized.filter { key in
+            guard catalogByKey[key] != nil else { return true }   // collections: always keep
+            guard catalogRowBudget > 0 else { return false }
+            catalogRowBudget -= 1
+            return true
+        }
 
         // STALE: on a cold start, paint the last-saved catalog items instantly
         // (paired with the live addon/catalog so "See All" still works), then
@@ -150,12 +169,19 @@ final class HomeViewModel: ObservableObject {
                     // fetch) in every view mode, so all paint instantly.
                     stale.append(.collection(collection))
                 } else if let request = catalogByKey[key], let items = cached[key], !items.isEmpty {
+                    // Dedup: a cache written before the source-side dedup
+                    // shipped could still hold duplicate ids. Unreleased items
+                    // are dropped here too — the cache may predate the setting
+                    // (or the title's release date may have passed since).
+                    var staleItems = items.deduplicatedByID()
+                    if settings.hideUnreleasedContent {
+                        staleItems = staleItems.filter { !$0.isUnreleased }
+                    }
+                    guard !staleItems.isEmpty else { continue }
                     stale.append(.catalog(HomeRow(
                         id: Self.rowID(request),
                         title: Self.rowTitle(key: key, request: request, settings: settings),
-                        // Dedup: a cache written before the source-side dedup
-                        // shipped could still hold duplicate ids.
-                        items: items.deduplicatedByID(), addon: request.addon, catalog: request.catalog
+                        items: staleItems, addon: request.addon, catalog: request.catalog
                     )))
                 }
             }
@@ -174,22 +200,49 @@ final class HomeViewModel: ObservableObject {
             loadingStep = "Loading catalogs…"
         }
 
-        // REVALIDATE: fetch every catalog in parallel. Collections are just
-        // markers here — Home shows them as buttons/tiles; their catalog content
-        // is resolved on demand when the user opens a folder/collection's
-        // discover page, so Home never eagerly fetches collection content.
+        // REVALIDATE: fetch the catalogs, a bounded number at a time.
+        // Collections are just markers here — Home shows them as buttons/tiles;
+        // their catalog content is resolved on demand when the user opens a
+        // folder/collection's discover page, so Home never eagerly fetches
+        // collection content.
         var fetched: [(index: Int, key: String?, entry: HomeEntry)] = []
-        await withTaskGroup(of: (Int, String?, HomeEntry?).self) { group in
-            for (index, key) in orderedKeys.enumerated() {
-                if let collection = collectionByKey[key] {
-                    fetched.append((index, nil, .collection(collection)))
-                    continue
-                }
-                guard let request = catalogByKey[key] else { continue }
-                let title = Self.rowTitle(key: key, request: request, settings: settings)
-                let rowID = Self.rowID(request)
+        // The catalog rows still to fetch, paired with their slot in
+        // orderedKeys. Titles and row ids are resolved HERE, on the main actor,
+        // so the fetch loop below needs no isolated state of its own.
+        var pending: [(index: Int, key: String, title: String, rowID: String,
+                       request: (addon: InstalledAddon, catalog: ManifestCatalog))] = []
+        for (index, key) in orderedKeys.enumerated() {
+            if let collection = collectionByKey[key] {
+                fetched.append((index, nil, .collection(collection)))
+            } else if let request = catalogByKey[key] {
+                pending.append((
+                    index, key,
+                    Self.rowTitle(key: key, request: request, settings: settings),
+                    Self.rowID(request),
+                    request
+                ))
+            }
+        }
+        if !fetched.isEmpty { entries = fetched.sorted { $0.index < $1.index }.map(\.entry) }
+
+        await withTaskGroup(of: (Int, String, HomeEntry?).self) { group in
+            // Keep at most `catalogs` requests outstanding. Unbounded, a large
+            // install fired one request per row simultaneously and held every
+            // decoded response at once — the peak that killed the app.
+            let window = max(1, min(AddonSweepLimits.catalogs, pending.count))
+            var next = 0
+            // Read once here, not inside the task: `settings` is main-actor state.
+            let hideUnreleased = settings.hideUnreleasedContent
+            func startNext() {
+                guard next < pending.count else { return }
+                let (index, key, title, rowID, request) = pending[next]
+                next += 1
                 group.addTask {
-                    let items = (try? await StremioAPI.catalog(addon: request.addon, catalog: request.catalog)) ?? []
+                    var items = (try? await StremioAPI.catalog(addon: request.addon, catalog: request.catalog)) ?? []
+                    // "Hide unreleased content" (Settings → Layout). Filtered
+                    // BEFORE the 30-item trim so a row full of upcoming titles
+                    // still fills up with things you can actually watch.
+                    if hideUnreleased { items = items.filter { !$0.isUnreleased } }
                     guard !items.isEmpty else { return (index, key, nil) }
                     let row = HomeRow(
                         id: rowID,
@@ -201,15 +254,25 @@ final class HomeViewModel: ObservableObject {
                     return (index, key, .catalog(row))
                 }
             }
-            if !fetched.isEmpty { entries = fetched.sorted { $0.index < $1.index }.map(\.entry) }
+            for _ in 0..<window { startNext() }
+
+            // Reveal rows AS SOURCES RESPOND so a slow aggregator doesn't hold
+            // up the whole screen — but coalesce the republishes. Re-sorting and
+            // reassigning `entries` on every single completion made SwiftUI
+            // rebuild the entire (eagerly-built) row stack once per row; with
+            // many rows that is quadratic work on the main actor. Same throttle
+            // the Sources sweep uses.
+            var lastFlush = Date.distantPast
             for await (index, key, entry) in group {
-                if let entry {
-                    fetched.append((index, key, entry))
-                    // Reveal rows AS EACH SOURCE RESPONDS so a slow aggregator
-                    // doesn't hold up the whole screen.
+                startNext()
+                guard let entry else { continue }
+                fetched.append((index: index, key: String?.some(key), entry: entry))
+                if Date().timeIntervalSince(lastFlush) > 0.4 {
                     entries = fetched.sorted { $0.index < $1.index }.map(\.entry)
+                    lastFlush = Date()
                 }
             }
+            entries = fetched.sorted { $0.index < $1.index }.map(\.entry)
         }
 
         if isLoading { loadingStep = "Loading artwork…" }
@@ -1028,7 +1091,10 @@ private struct HomePosterRow: View {
                     .padding(.vertical, NuvioSpacing.lg)
                 }
                 .scrollClipDisabled()
-                // No .focusSection() — preserves the column on vertical moves.
+                // No .focusSection() here: it blocks the card's long-press hold
+                // menu on tvOS (verified). Full poster rows never get skipped on
+                // vertical moves anyway (there's always a card under any column),
+                // so the "never skip" fix only needs the SPARSE rows (collections).
                 // Back: jump to the first card if scrolled in; on the first
                 // card, bubble up (sidebar / tab bar).
                 .onExitCommand { backToStart(proxy) }

@@ -96,9 +96,9 @@ struct StremioDiscoverView: View {
                     LazyVGrid(columns: columns, alignment: .leading, spacing: 30) {
                         ForEach(model.items) { item in
                             Button { onSelect(item) } label: {
-                                StremioPosterCard(item: item, width: 200, parallax: perf.settings.cardParallax)
+                                StremioPosterCard(item: item, width: 200, parallax: perf.cardParallaxEffective)
                             }
-                            .stremioCardStyle(parallax: perf.settings.cardParallax)
+                            .stremioCardStyle(parallax: perf.cardParallaxEffective)
                         }
                     }
                     .focusSection()
@@ -194,7 +194,6 @@ private struct StremioDropdownLabel: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .fill(isFocused ? StremioSurfaces.accent : StremioSurfaces.card)
         )
-        .scaleEffect(isFocused ? 1.03 : 1)
-        .animation(StremioFocus.entry, value: isFocused)
+        .focusLift(1.03, isFocused, animation: StremioFocus.entry)
     }
 }

@@ -259,8 +259,7 @@ private struct MaxGenreTile: View {
         .buttonStyle(.maxFlat)
         .focused($focused)
         .maxExternalFocus(focus)
-        .scaleEffect(focused ? 1.06 : 1)
-        .animation(.easeOut(duration: 0.16), value: focused)
+        .focusLift(1.06, focused)
         .padding(.vertical, 14)
     }
 }
@@ -520,8 +519,7 @@ private struct MaxKeyButton: View {
                 .background(Circle().fill(focused ? Color.white : .clear))
         }
         .buttonStyle(.maxFlat).focused($focused).maxExternalFocus(focus)
-        .scaleEffect(focused ? 1.1 : 1)
-        .animation(.easeOut(duration: 0.12), value: focused)
+        .focusLift(1.1, focused)
     }
 }
 

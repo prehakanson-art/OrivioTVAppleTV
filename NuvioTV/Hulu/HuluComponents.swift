@@ -54,8 +54,7 @@ struct HuluRichTile: View {
         .posterHoldMenu(ifAvailable: title.meta, onDetails: action)
         .focused($focused)
         .huluExternalFocus(focus)
-        .scaleEffect(focused ? 1.06 : 1)
-        .animation(.easeOut(duration: 0.16), value: focused)
+        .focusLift(1.06, focused)
         .onChange(of: focused) { _, f in onFocusChanged?(f) }
         .padding(.vertical, 16)
     }
@@ -86,8 +85,7 @@ struct HuluLandscapeCard: View {
             .posterHoldMenu(ifAvailable: title.meta, onDetails: action)
             .focused($focused)
             .huluExternalFocus(focus)
-            .scaleEffect(focused ? 1.05 : 1)
-            .animation(.easeOut(duration: 0.16), value: focused)
+            .focusLift(1.05, focused)
             .onChange(of: focused) { _, f in onFocusChanged?(f) }
 
             VStack(alignment: .leading, spacing: 4) {
@@ -106,6 +104,7 @@ struct HuluLandscapeCard: View {
 
 struct HuluPosterCard: View {
     @EnvironmentObject private var theme: ThemeManager
+    @ObservedObject private var perf = PerformanceSettingsStore.shared
     let title: HuluTitle
     var rank: Int? = nil
     var width: CGFloat = 220
@@ -115,6 +114,7 @@ struct HuluPosterCard: View {
 
     @FocusState private var focused: Bool
     private var height: CGFloat { width * 3 / 2 }
+    private var parallax: Bool { perf.cardParallaxEffective }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -135,12 +135,12 @@ struct HuluPosterCard: View {
                     .watchedBadge(title.meta)
                     .huluFocusRing(focused, cornerRadius: 8, lineWidth: 5)
             }
-            .buttonStyle(.huluFlat)
+            .huluCardStyle(parallax)
             .posterHoldMenu(ifAvailable: title.meta, onDetails: action)
             .focused($focused)
             .huluExternalFocus(focus)
-            .scaleEffect(focused ? 1.07 : 1)
-            .animation(.easeOut(duration: 0.16), value: focused)
+            // Native platter supplies the lift; only add the manual scale when off.
+            .focusLift(1.07, !parallax && focused)
             .onChange(of: focused) { _, f in onFocusChanged?(f) }
 
             Text(title.name).font(HuluStyle.medium(20))
@@ -156,6 +156,7 @@ struct HuluPosterCard: View {
 
 struct HuluProgressCard: View {
     @EnvironmentObject private var theme: ThemeManager
+    @ObservedObject private var perf = PerformanceSettingsStore.shared
     let title: HuluTitle
     var label: String
     var subtitle: String
@@ -166,6 +167,7 @@ struct HuluProgressCard: View {
 
     @FocusState private var focused: Bool
     private var height: CGFloat { width * 9 / 16 }
+    private var parallax: Bool { perf.cardParallaxEffective }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -194,10 +196,9 @@ struct HuluProgressCard: View {
                     .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                     .huluFocusRing(focused, cornerRadius: 8, lineWidth: 5)
             }
-            .buttonStyle(.huluFlat)
+            .huluCardStyle(parallax)
             .focused($focused)
-            .scaleEffect(focused ? 1.05 : 1)
-            .animation(.easeOut(duration: 0.16), value: focused)
+            .focusLift(1.05, !parallax && focused)
 
             VStack(alignment: .leading, spacing: 4) {
                 Text(label.uppercased()).font(HuluStyle.semibold(16))
@@ -317,8 +318,7 @@ private struct HuluGenreButton: View {
         }
         .buttonStyle(.huluFlat)
         .focused($focused)
-        .scaleEffect(focused ? 1.03 : 1)
-        .animation(.easeOut(duration: 0.14), value: focused)
+        .focusLift(1.03, focused)
     }
 }
 
@@ -432,8 +432,7 @@ struct HuluHeroButton: View {
         .buttonStyle(.huluFlat)
         .focused($focused)
         .huluExternalFocus(playFocus)
-        .scaleEffect(focused ? 1.05 : 1)
-        .animation(.easeOut(duration: 0.14), value: focused)
+        .focusLift(1.05, focused)
     }
 }
 

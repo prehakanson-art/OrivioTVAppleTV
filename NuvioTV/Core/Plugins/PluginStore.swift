@@ -105,20 +105,18 @@ final class PluginStore: ObservableObject {
     func streams(tmdbID: String, mediaType: String, season: Int?, episode: Int?) async -> [StreamEntry] {
         let scrapers = enabledScrapers.filter { $0.supports(type: mediaType) }
         guard !scrapers.isEmpty else { return [] }
-        return await withTaskGroup(of: [StreamEntry].self) { group in
-            for scraper in scrapers {
-                group.addTask { [runtime] in
-                    guard let js = await Self.jsCache.value(for: scraper.id, ttl: .greatestFiniteMagnitude) else { return [] }
-                    let results = await runtime.run(
-                        scraperJS: js, tmdbID: tmdbID, mediaType: mediaType, season: season, episode: episode
-                    )
-                    return results.map { Self.entry(from: $0, scraperName: scraper.name) }
-                }
-            }
-            var all: [StreamEntry] = []
-            for await batch in group { all.append(contentsOf: batch) }
-            return all
+        // Bounded: each concurrent run stands up its OWN JSContext (JSCore isn't
+        // thread-safe, so PluginRuntime can't share one), and a JSContext is
+        // several MB apiece. Running every enabled scraper at once is what makes
+        // a long plugin list expensive rather than just slow.
+        let batches = await boundedConcurrentMap(scrapers, limit: AddonSweepLimits.plugins) { [runtime] scraper in
+            guard let js = await Self.jsCache.value(for: scraper.id, ttl: .greatestFiniteMagnitude) else { return [StreamEntry]() }
+            let results = await runtime.run(
+                scraperJS: js, tmdbID: tmdbID, mediaType: mediaType, season: season, episode: episode
+            )
+            return results.map { Self.entry(from: $0, scraperName: scraper.name) }
         }
+        return batches.flatMap { $0 }
     }
 
     nonisolated private static func entry(from result: ScraperResult, scraperName: String) -> StreamEntry {

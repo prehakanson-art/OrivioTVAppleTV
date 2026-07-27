@@ -14,7 +14,7 @@ enum MaxLayout {
     static let cardRadius: CGFloat = 6
     static let border: CGFloat = 4
     static let heroHeight: CGFloat = 760
-    static let focusSpring: Animation = .spring(response: 0.4, dampingFraction: 0.82)
+    // Row reflow on focus uses the shared `View.focusExpand` / `FusionMotion.rowExpand`.
 }
 
 // MARK: - Poster rail (portrait → landscape on focus)
@@ -65,7 +65,7 @@ struct MaxPosterRail: View {
                     }
                     .padding(.horizontal, MaxLayout.railInset)
                     .padding(.vertical, 16)
-                    .animation(MaxLayout.focusSpring, value: focusedID)
+                    .focusExpand(focusedID)
                 }
                 .scrollClipDisabled()
                 // Keep the focused card centered as you scroll (so the expanding
@@ -140,7 +140,7 @@ struct MaxPosterCard: View {
                 .frame(width: expanded ? (MaxLayout.landscapeW - MaxLayout.posterW) : 0,
                        height: MaxLayout.posterH)
         }
-        .animation(MaxLayout.focusSpring, value: expanded)
+        .focusExpand(expanded)
     }
 }
 
@@ -225,6 +225,7 @@ private struct MaxLandscapeArt: View {
 struct MaxPortraitCard: View {
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var watched: WatchedStore
+    @ObservedObject private var perf = PerformanceSettingsStore.shared
     let title: MaxTitle
     var width: CGFloat = 210
     var focus: FocusState<Bool>.Binding? = nil
@@ -233,6 +234,7 @@ struct MaxPortraitCard: View {
 
     @FocusState private var focused: Bool
     private var height: CGFloat { width * 3 / 2 }
+    private var parallax: Bool { perf.cardParallaxEffective }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -244,11 +246,11 @@ struct MaxPortraitCard: View {
                     .overlay(RoundedRectangle(cornerRadius: MaxLayout.cardRadius)
                         .stroke(.white, lineWidth: focused ? MaxLayout.border : 0))
             }
-            .buttonStyle(.maxFlat)
+            .maxCardStyle(parallax)
             .focused($focused)
             .maxExternalFocus(focus)
-            .scaleEffect(focused ? 1.08 : 1)
-            .animation(.easeOut(duration: 0.16), value: focused)
+            // Native platter supplies the lift; only add the manual scale when off.
+            .focusLift(1.08, !parallax && focused)
             .contextMenu { MaxCardMenu(title: title, onSelect: action) }
             .onChange(of: focused) { _, f in onFocusChanged?(f) }
 
@@ -284,8 +286,7 @@ struct MaxGridCard: View {
             .buttonStyle(.maxFlat)
             .focused($focused)
             .maxExternalFocus(focus)
-            .scaleEffect(focused ? 1.06 : 1)
-            .animation(.easeOut(duration: 0.16), value: focused)
+            .focusLift(1.06, focused)
             .contextMenu { MaxCardMenu(title: title, onSelect: action) }
 
             Text(title.name)
@@ -615,8 +616,7 @@ struct MaxHeroPlayButton: View {
         .buttonStyle(.maxFlat)
         .focused($focused)
         .modifier(MaxOptionalFocus(binding: playFocus))
-        .scaleEffect(focused ? 1.05 : 1)
-        .animation(.easeOut(duration: 0.14), value: focused)
+        .focusLift(1.05, focused)
         .modifier(MaxDefaultFocus(ns: defaultFocusNS))
         // While Play holds focus, Left/Right steps the featured carousel and
         // Down drops into the content (the dots aren't focusable). Up is a no-op

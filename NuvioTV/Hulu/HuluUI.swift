@@ -81,13 +81,28 @@ struct HuluTitle: Identifiable, Hashable {
 
 // MARK: - Focus helpers (ported from HuluTV FocusHelpers.swift)
 
-/// A flat button style — renders only its label, no tvOS focus plate. Focus is
-/// drawn by each view via the accent focus ring / lift.
+/// A flat button style — no tvOS focus plate. Focus is drawn by each view via
+/// the accent focus ring / lift; the only chrome this adds is the shared
+/// Select-press dip, so a press registers here the same as in every other theme
+/// (with the platter off, these cards previously gave no press feedback).
 struct HuluFlatButtonStyle: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View { configuration.label }
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label.cardPressDip(configuration.isPressed)
+    }
 }
 extension ButtonStyle where Self == HuluFlatButtonStyle {
     static var huluFlat: HuluFlatButtonStyle { HuluFlatButtonStyle() }
+}
+
+extension View {
+    /// "Raise & move" toggle for Hulu's plain (scale-based) poster cards. When the
+    /// `cardParallax` setting is on, use tvOS's native card platter (lift + 3D
+    /// trackpad tilt); when off, Hulu's flat style so the accent focus ring / scale
+    /// is the sole focus visual.
+    @ViewBuilder
+    func huluCardStyle(_ parallax: Bool) -> some View {
+        if parallax { buttonStyle(.card) } else { buttonStyle(.huluFlat) }
+    }
 }
 
 private struct HuluExternalFocus: ViewModifier {

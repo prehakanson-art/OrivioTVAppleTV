@@ -73,6 +73,14 @@ enum FusionMotion {
     static let controlsDismiss = exit(0.26)
     static let upNext = enter(0.30)
 
+    /// Row reflow when a focused card grows into its landscape form (Onyx and
+    /// Marquee): the card's width animates 210→560pt while every neighbour
+    /// shifts, which is the largest layout move in the app. It settles with NO
+    /// bounce — the previous 0.82-damped spring overshot, so the whole row
+    /// visibly wobbled back into place — and runs slightly longer than a focus
+    /// move so the growth reads as deliberate rather than snapped.
+    static let rowExpand: Animation = .smooth(duration: 0.45)
+
     /// Background-focus debounce and toast dwell (§12), in seconds.
     static let backgroundFocusDelay: Double = 0.16
     static let toastVisibleSeconds: Double = 2.6
@@ -94,6 +102,16 @@ enum FusionFocus {
     static let borderWidth: CGFloat = 2
     static let borderColor = Color.white.opacity(0.88)
     static func shadow(_ focused: Bool) -> Color { .black.opacity(focused ? 0.58 : 0) }
+    /// The Select-press dip, shared by every theme's card button style so a
+    /// press reads the same in Classic, Apple TV, Onyx, Cinematic, Marquee and
+    /// Streamline. Applied via `View.cardPressDip(_:)`, which gates it on
+    /// "Button animations" + Reduce Motion.
+    static let pressScale: CGFloat = 0.97
+    static let pressAnimation: Animation = .easeOut(duration: 0.12)
+    /// The curve a focus move settles on for themes that draw their own lift
+    /// (via `View.focusLift`). One value so Marquee, Streamline, Onyx,
+    /// Cinematic and Aurora don't each drift to their own duration.
+    static let liftAnimation: Animation = .easeOut(duration: 0.16)
 }
 
 // MARK: - Materials (§11)

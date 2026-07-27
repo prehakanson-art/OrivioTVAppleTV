@@ -30,6 +30,7 @@
 		26142DF8D7225D3AC3BEA184 /* MDBListService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 414898F11CD091C483A70A67 /* MDBListService.swift */; };
 		274B3436429C0A39118709A3 /* PerformanceProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0BC906D3D943CBF695266313 /* PerformanceProfile.swift */; };
 		276BD4FAF524DAD3A6C360DE /* Secrets.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2C9C87FFBAD0E1EECA829F5A /* Secrets.swift */; };
+		2945B18F2B9F38E9C256ED3F /* SettingsStremioView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 207E49F7F218C29823075727 /* SettingsStremioView.swift */; };
 		2B0385C407CF63C38D4453C5 /* PluginStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9033005E03573788ECC97D1 /* PluginStore.swift */; };
 		2DCA83982721109BBFD27A97 /* StreamBadges.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5780AD496BA8A2CFBBCD07CB /* StreamBadges.swift */; };
 		2F285C593B479C27A9A8069E /* RemoteInput.swift in Sources */ = {isa = PBXBuildFile; fileRef = 33E98DE3FF2BD0DC102D80F4 /* RemoteInput.swift */; };
@@ -93,6 +94,7 @@
 		954267FE8B47C238B5ED55D1 /* WatchedStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B526B12FF40C35C8286806C2 /* WatchedStore.swift */; };
 		95D56F234169C4D3C66B6EC7 /* ProfilesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1B7D256E3B5029E76D7C03D /* ProfilesView.swift */; };
 		96D2CB47BCA0FE3E4D612153 /* HomeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = ADBB2C0716736EF000BE1068 /* HomeView.swift */; };
+		97189F552A08D00D804936BA /* BoundedConcurrency.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6AD5B18FB74FBC61C79F0A2C /* BoundedConcurrency.swift */; };
 		9AD59B3BF5A0C489ADD1AA58 /* PlayerScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 75C74274D8317A3EC634F256 /* PlayerScreen.swift */; };
 		9B3FA2260743150105A9D5B4 /* DeepLinkService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0CEDB85725047F73A8229A81 /* DeepLinkService.swift */; };
 		9B9E605EC0039FC1C05A6A1C /* VLCKitSPM in Frameworks */ = {isa = PBXBuildFile; productRef = 02A6139CD1D7A76A7D0AC3DC /* VLCKitSPM */; };
@@ -104,6 +106,7 @@
 		A9F8E8B54CCF719E19974568 /* ScrubberViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = E6F178D2C0DFC1696A87DB92 /* ScrubberViews.swift */; };
 		AB5B766D183A7565977D32AE /* FusionTokens.swift in Sources */ = {isa = PBXBuildFile; fileRef = F6445656DB7DCAD1E90A05A4 /* FusionTokens.swift */; };
 		AE0CFA7CB5922AEB4625975A /* CollectionView.swift in Sources */ = {isa = PBXBuildFile; fileRef = EAE1265EE9F6B43BD02CCC9F /* CollectionView.swift */; };
+		AE8A26A212CF6A062EA2F0B7 /* StremioAccount.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2BFA3A5175DFB66B5ED3B94 /* StremioAccount.swift */; };
 		B694AA4934DA1692E9FE5BE3 /* HuluSidebar.swift in Sources */ = {isa = PBXBuildFile; fileRef = F96730C97830E457BF3C64FE /* HuluSidebar.swift */; };
 		B98A93E06913372E0DF322E3 /* MaxTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2984806852BDC134F255AC3A /* MaxTheme.swift */; };
 		B99589BE4621E7B4EDD07A19 /* LiveTVView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E2E52DF7CD06E99777E79CD5 /* LiveTVView.swift */; };
@@ -171,6 +174,7 @@
 		1D9B0235B6A7831146A9FD28 /* StremioTokens.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StremioTokens.swift; sourceTree = "<group>"; };
 		1EC4C10B5219C8C94F5868AA /* SettingsTraktView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsTraktView.swift; sourceTree = "<group>"; };
 		1F2F3D404F8090E645BED64F /* CollectionSourcePickerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CollectionSourcePickerView.swift; sourceTree = "<group>"; };
+		207E49F7F218C29823075727 /* SettingsStremioView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsStremioView.swift; sourceTree = "<group>"; };
 		22A3239B20466111CD42A79A /* StremioDetail.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StremioDetail.swift; sourceTree = "<group>"; };
 		23BB59F8EC142A8F67E0D28F /* SettingsPerformanceView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsPerformanceView.swift; sourceTree = "<group>"; };
 		243ACB41C793BA410B49B210 /* DetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DetailView.swift; sourceTree = "<group>"; };
@@ -214,6 +218,7 @@
 		676CA4D59378C69F96C9C2EF /* CinemaHome.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CinemaHome.swift; sourceTree = "<group>"; };
 		67C3D9E5D44C2B237BF0AE30 /* StremioDiscover.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StremioDiscover.swift; sourceTree = "<group>"; };
 		6A77D0DFF73779D6393DDF7A /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+		6AD5B18FB74FBC61C79F0A2C /* BoundedConcurrency.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BoundedConcurrency.swift; sourceTree = "<group>"; };
 		757A803B163112348471FFDB /* DiagnosticsService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticsService.swift; sourceTree = "<group>"; };
 		75C74274D8317A3EC634F256 /* PlayerScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerScreen.swift; sourceTree = "<group>"; };
 		760F22FDFFEF572A2AB98E3D /* VLCEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VLCEngine.swift; sourceTree = "<group>"; };
@@ -236,6 +241,7 @@
 		ADBB2C0716736EF000BE1068 /* HomeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeView.swift; sourceTree = "<group>"; };
 		AE307D5699497B04FCA96EE9 /* MaxComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaxComponents.swift; sourceTree = "<group>"; };
 		B1008C82BF4E819E8E025196 /* LiveTVSettingsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveTVSettingsStore.swift; sourceTree = "<group>"; };
+		B2BFA3A5175DFB66B5ED3B94 /* StremioAccount.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StremioAccount.swift; sourceTree = "<group>"; };
 		B453879DDCDBBC1441013D02 /* FocusTour.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusTour.swift; sourceTree = "<group>"; };
 		B526B12FF40C35C8286806C2 /* WatchedStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchedStore.swift; sourceTree = "<group>"; };
 		B6DB589DC0A8FBFAF5AE8C3F /* DoviConverter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DoviConverter.swift; sourceTree = "<group>"; };
@@ -410,6 +416,7 @@
 				23BB59F8EC142A8F67E0D28F /* SettingsPerformanceView.swift */,
 				553617D03EC21CCE1DC07E6F /* SettingsPlaybackView.swift */,
 				7EC7EEE05D52CC374B75AF0F /* SettingsPluginsView.swift */,
+				207E49F7F218C29823075727 /* SettingsStremioView.swift */,
 				1EC4C10B5219C8C94F5868AA /* SettingsTraktView.swift */,
 				6A77D0DFF73779D6393DDF7A /* SettingsView.swift */,
 				D5A881246C6166C28BCD7C8B /* SidebarNav.swift */,
@@ -435,6 +442,7 @@
 				EDBD5D6D83637232496C5D02 /* AddonManager.swift */,
 				33630A3CF4A4B769A36A3404 /* AnimeSkipService.swift */,
 				7F886347A1FAA3C2686A4A49 /* AppGroupResolver.swift */,
+				6AD5B18FB74FBC61C79F0A2C /* BoundedConcurrency.swift */,
 				CB57AA419192D7276E5E56DC /* CloudLibraryService.swift */,
 				13F14405A1BC5A41FC21B2E4 /* CollectionResolver.swift */,
 				3A901073E967FB097E347259 /* CollectionsStore.swift */,
@@ -458,6 +466,7 @@
 				AD681267F7BC35D3CC1F797C /* RequestCache.swift */,
 				4D4C53D8C6A8B8FC9F1C1216 /* SourceSelection.swift */,
 				5780AD496BA8A2CFBBCD07CB /* StreamBadges.swift */,
+				B2BFA3A5175DFB66B5ED3B94 /* StremioAccount.swift */,
 				8E7D954FA6B8F52309A05490 /* StremioAPI.swift */,
 				E3BA0288809B5DD6BEFC91DE /* TMDBService.swift */,
 				F2F37340DE97CB402D9FE2DE /* TopShelfExporter.swift */,
@@ -700,6 +709,7 @@
 				14C76B28C6CFAB66591F7FEB /* AddonManager.swift in Sources */,
 				D93146472B6B7BF5F92096A7 /* AnimeSkipService.swift in Sources */,
 				E9F427CC46D1D7C9E4D65EBE /* AppGroupResolver.swift in Sources */,
+				97189F552A08D00D804936BA /* BoundedConcurrency.swift in Sources */,
 				8C3C2D551DB191D562E74637 /* CastDetailView.swift in Sources */,
 				E70E13C52AD92FE35CBC2E4C /* CatalogSeeAllView.swift in Sources */,
 				56C8FCF7F945FB20A21DD1DF /* CinemaHome.swift in Sources */,
@@ -787,6 +797,7 @@
 				627408A14DE3DD180AAE8831 /* SettingsPerformanceView.swift in Sources */,
 				0F24DF0540C57C77690AA0B1 /* SettingsPlaybackView.swift in Sources */,
 				72F37280A6685C9D48A69C16 /* SettingsPluginsView.swift in Sources */,
+				2945B18F2B9F38E9C256ED3F /* SettingsStremioView.swift in Sources */,
 				14112BEF124289B4FC2A911A /* SettingsTraktView.swift in Sources */,
 				21DF981C8F7FCF69FA6358DB /* SettingsView.swift in Sources */,
 				87BE6E3BECE882078235D494 /* SidePanels.swift in Sources */,
@@ -795,6 +806,7 @@
 				2DCA83982721109BBFD27A97 /* StreamBadges.swift in Sources */,
 				7000373F832F741F5E30C8D0 /* StreamsView.swift in Sources */,
 				8BEFD722640C2C3DCF9F0E71 /* StremioAPI.swift in Sources */,
+				AE8A26A212CF6A062EA2F0B7 /* StremioAccount.swift in Sources */,
 				C5645FFFF564BFED04BDB619 /* StremioAddons.swift in Sources */,
 				384DD89C13C36311A334B2C8 /* StremioBoard.swift in Sources */,
 				72DB3D1A7FB8719BD20C8E21 /* StremioDetail.swift in Sources */,

@@ -15,6 +15,7 @@ struct NuvioTVApp: App {
     @StateObject private var mdblistSettings = MDBListSettingsStore()
     @StateObject private var debrid = DebridStore()
     @StateObject private var trakt = TraktStore()
+    @StateObject private var stremioAccount = StremioAccountStore()
     @StateObject private var playerSettings = PlayerSettingsStore()
     @StateObject private var streamBadges = StreamBadgeStore()
     @StateObject private var plugins = PluginStore()
@@ -38,6 +39,7 @@ struct NuvioTVApp: App {
                 .environmentObject(mdblistSettings)
                 .environmentObject(debrid)
                 .environmentObject(trakt)
+                .environmentObject(stremioAccount)
                 .environmentObject(playerSettings)
                 .environmentObject(streamBadges)
                 .environmentObject(plugins)
@@ -455,6 +457,15 @@ struct RootView: View {
             .tabItem { Label("Library", systemImage: "bookmark.fill") }
             .tag(2)
 
+            NavigationStack {
+                ATVSettingsView(onOpenProfiles: { showProfileGate = true })
+                    .onExitCommand { }
+            }
+            .tabItem { Label("Settings", systemImage: "gearshape.fill") }
+            .tag(3)
+
+            // Conditional tab declared LAST so toggling Live TV doesn't re-diff
+            // (and reset) the Settings tab that would otherwise follow it.
             if liveTV.enabled {
                 NavigationStack(path: $liveTVPath) {
                     liveTVRoot
@@ -464,13 +475,6 @@ struct RootView: View {
                 .tabItem { Label("Live TV", systemImage: "tv.fill") }
                 .tag(4)
             }
-
-            NavigationStack {
-                ATVSettingsView(onOpenProfiles: { showProfileGate = true })
-                    .onExitCommand { }
-            }
-            .tabItem { Label("Settings", systemImage: "gearshape.fill") }
-            .tag(3)
         }
         .background(ATVBackground())
     }
@@ -506,6 +510,18 @@ struct RootView: View {
             .tabItem { Label("Library", systemImage: "bookmark.fill") }
             .tag(2)
 
+            NavigationStack {
+                SettingsView()
+                    .onExitCommand { }
+            }
+            .tabItem { Label("Settings", systemImage: "gearshape.fill") }
+            .tag(3)
+
+            // Live TV is the ONLY conditional tab, so it must be declared LAST:
+            // toggling it then adds/removes the final child, leaving every other
+            // tab's structural position (and NavigationStack identity) intact.
+            // Declared before Settings, toggling it re-created the Settings stack
+            // and reset the pane mid-use.
             if liveTV.enabled {
                 NavigationStack(path: $liveTVPath) {
                     liveTVRoot
@@ -515,13 +531,6 @@ struct RootView: View {
                 .tabItem { Label("Live TV", systemImage: "tv.fill") }
                 .tag(4)
             }
-
-            NavigationStack {
-                SettingsView()
-                    .onExitCommand { }
-            }
-            .tabItem { Label("Settings", systemImage: "gearshape.fill") }
-            .tag(3)
         }
         .background(theme.palette.background.ignoresSafeArea())
     }
@@ -570,6 +579,15 @@ struct RootView: View {
             .tabItem { Label("Library", systemImage: "bookmark") }
             .tag(2)
 
+            NavigationStack {
+                SettingsView()
+                    .onExitCommand { }
+            }
+            .tabItem { Label("Settings", systemImage: "gearshape") }
+            .tag(3)
+
+            // Conditional tab declared LAST so toggling Live TV doesn't re-diff
+            // (and reset) the Settings tab that would otherwise follow it.
             if liveTV.enabled {
                 NavigationStack(path: $liveTVPath) {
                     liveTVRoot
@@ -579,13 +597,6 @@ struct RootView: View {
                 .tabItem { Label("Live TV", systemImage: "tv") }
                 .tag(4)
             }
-
-            NavigationStack {
-                SettingsView()
-                    .onExitCommand { }
-            }
-            .tabItem { Label("Settings", systemImage: "gearshape") }
-            .tag(3)
         }
         .modifier(OnyxSidebarTabStyle())
         .background(theme.palette.background.ignoresSafeArea())

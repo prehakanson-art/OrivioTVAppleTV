@@ -54,6 +54,11 @@ struct CollectionRowSection: View {
                 .padding(.vertical, NuvioSpacing.lg)
             }
             .scrollClipDisabled()
+            // Focus section so Down/Up always STOP on this row instead of
+            // skipping it when it's sparse (e.g. a collection with one folder
+            // sitting below a wide poster row). Safe here — these tiles carry no
+            // long-press hold menu, so the focus section can't swallow one.
+            .focusSection()
             // Back: scroll to + focus the first tile if scrolled in; on the
             // first tile, bubble up (sidebar / tab bar).
             .onExitCommand {
@@ -115,6 +120,9 @@ struct CollectionsRowSection: View {
             .padding(.vertical, NuvioSpacing.lg)
         }
         .scrollClipDisabled()
+        // Focus section so a sparse collections row is never skipped on vertical
+        // moves. Safe — collection tiles have no long-press hold menu.
+        .focusSection()
         // Back: scroll to + focus the first tile if scrolled in; on the first
         // tile, bubble up (sidebar / tab bar).
         .onExitCommand {
@@ -525,8 +533,15 @@ struct CollectionView: View {
                     }
                 }
                 .padding(.horizontal, NuvioSpacing.huge)
-                .padding(.top, headerInset)
                 .padding(.bottom, NuvioSpacing.xxl)
+            }
+            // Reserve the pinned header's height as a top safe-area inset (not a
+            // content padding): posters still scroll UP under the scrim, but the
+            // focus engine now keeps the FOCUSED poster below the header — before,
+            // navigating up through rows scrolled the focused card behind the
+            // title/tabs where you couldn't see it.
+            .safeAreaInset(edge: .top, spacing: 0) {
+                Color.clear.frame(height: headerInset)
             }
         }
     }

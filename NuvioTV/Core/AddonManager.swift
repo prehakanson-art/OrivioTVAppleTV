@@ -50,24 +50,20 @@ final class AddonManager: ObservableObject {
         }
         guard !toInstall.isEmpty else { return }
 
-        // Fetch every new manifest concurrently, then apply in the original
+        // Fetch the new manifests a few at a time, then apply in the original
         // order so the installed list is deterministic. A manifest that fails
         // to fetch still installs as a placeholder (never dropped): dropping it
         // would let a later push delete this account addon from the server.
-        let fetched = await withTaskGroup(of: (Int, String, AddonManifest).self) { group in
-            for (index, manifestURL) in toInstall.enumerated() {
-                group.addTask {
-                    let manifest = (try? await StremioAPI.manifest(url: manifestURL))
-                        ?? AddonManifest.placeholder(manifestURL: manifestURL)
-                    return (index, manifestURL, manifest)
-                }
-            }
-            var results: [(Int, String, AddonManifest)] = []
-            for await result in group { results.append(result) }
-            return results.sorted { $0.0 < $1.0 }
+        // The window matters here: this runs during the first-login sync, when
+        // an account with dozens of addons would otherwise fire every manifest
+        // request at once while Home is also loading.
+        let fetched = await boundedConcurrentMap(toInstall, limit: AddonSweepLimits.manifests) { manifestURL in
+            let manifest = (try? await StremioAPI.manifest(url: manifestURL))
+                ?? AddonManifest.placeholder(manifestURL: manifestURL)
+            return (manifestURL, manifest)
         }
 
-        for (_, manifestURL, manifest) in fetched {
+        for (manifestURL, manifest) in fetched {
             let addon = InstalledAddon(manifestURL: manifestURL, manifest: manifest)
             if let existing = addons.firstIndex(where: { $0.manifestURL == manifestURL }) {
                 addons[existing] = addon
@@ -193,23 +189,16 @@ final class AddonManager: ObservableObject {
     }
 
     private func refreshManifests() async {
-        // Snapshot the current list, re-fetch every manifest in parallel, then
-        // reassemble in the original order.
+        // Snapshot the current list, re-fetch the manifests a few at a time,
+        // then reassemble in the original order.
         let current = addons
         guard !current.isEmpty else { return }
-        let refreshed = await withTaskGroup(of: (Int, InstalledAddon).self) { group in
-            for (index, addon) in current.enumerated() {
-                group.addTask {
-                    if let manifest = try? await StremioAPI.manifest(url: addon.manifestURL) {
-                        // Preserve the user's enable/disable choice across a refresh.
-                        return (index, InstalledAddon(manifestURL: addon.manifestURL, manifest: manifest, enabled: addon.enabled))
-                    }
-                    return (index, addon)
-                }
+        let refreshed = await boundedConcurrentMap(current, limit: AddonSweepLimits.manifests) { addon in
+            if let manifest = try? await StremioAPI.manifest(url: addon.manifestURL) {
+                // Preserve the user's enable/disable choice across a refresh.
+                return InstalledAddon(manifestURL: addon.manifestURL, manifest: manifest, enabled: addon.enabled)
             }
-            var results = [InstalledAddon?](repeating: nil, count: current.count)
-            for await (index, addon) in group { results[index] = addon }
-            return results.compactMap { $0 }
+            return addon
         }
         // Bail if the installed set changed while we were fetching (e.g. the
         // user added/removed an addon), so we don't clobber their edit.

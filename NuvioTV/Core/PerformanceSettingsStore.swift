@@ -83,6 +83,32 @@ final class PerformanceSettingsStore: ObservableObject {
     var sidebarAnimationEffective: Bool { settings.sidebarAnimation && !reduceMotion }
     var buttonAnimationsEffective: Bool { settings.buttonAnimations && !reduceMotion }
     var artworkFadeInEffective: Bool { settings.artworkFadeIn && !reduceMotion }
+    /// The native tvOS card platter's trackpad tilt/parallax. It is a *motion*
+    /// effect like the rest, so Reduce Motion suppresses it too — themes that
+    /// branch on this fall back to their own flat focus visual.
+    var cardParallaxEffective: Bool { settings.cardParallax && !reduceMotion }
+
+    // MARK: Motion helpers — so every theme gates focus motion the same way
+    // instead of each porting its own hardcoded scale/animation.
+
+    /// Focus zoom for a card/tile: the theme's scale when "Cards spring
+    /// slightly larger when focused" is on and Reduce Motion is off, else 1
+    /// (no lift at all). Every theme's focus scale should go through this.
+    func focusScale(_ scale: CGFloat, _ focused: Bool) -> CGFloat {
+        focusZoomEffective && focused ? scale : 1
+    }
+
+    /// A focus/state animation that snaps instead of animating under Reduce
+    /// Motion. Returns `nil` (SwiftUI's "no animation") when motion is off.
+    func motion(_ animation: Animation) -> Animation? {
+        reduceMotion ? nil : animation
+    }
+
+    /// A press/control animation, additionally gated by the "Button
+    /// animations" switch (Settings → Performance).
+    func buttonMotion(_ animation: Animation) -> Animation? {
+        buttonAnimationsEffective ? animation : nil
+    }
 
     // MARK: Master "Performance mode"
     /// True when every optional visual effect is off — the lightest look.

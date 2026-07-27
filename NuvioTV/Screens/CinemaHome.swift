@@ -119,6 +119,7 @@ struct CinemaHomeView: View {
 
 private struct CinemaHero: View {
     @EnvironmentObject private var theme: ThemeManager
+    @ObservedObject private var perf = PerformanceSettingsStore.shared
     let item: MetaItem?
     let onPlay: () -> Void
 
@@ -147,7 +148,7 @@ private struct CinemaHero: View {
             }
             .id(item?.id)                       // crossfade on change
             .transition(.opacity)
-            .animation(.easeInOut(duration: 0.35), value: item?.id)
+            .animation(perf.heroCrossfadeEffective ? .easeInOut(duration: 0.35) : nil, value: item?.id)
 
             VStack(alignment: .leading, spacing: 16) {
                 if let logo = item?.logo {
@@ -199,6 +200,7 @@ private struct CinemaPlayButton: View {
 
 private struct CinemaPlayLabel: View {
     @EnvironmentObject private var theme: ThemeManager
+    @ObservedObject private var perf = PerformanceSettingsStore.shared
     @Environment(\.isFocused) private var isFocused
     let title: String
     var body: some View {
@@ -212,10 +214,10 @@ private struct CinemaPlayLabel: View {
             Capsule().fill(isFocused ? theme.palette.secondary : Color.white.opacity(0.92))
         )
         .overlay(Capsule().strokeBorder(isFocused ? Color.white.opacity(0.9) : .clear, lineWidth: CinemaFocus.ringWidth))
-        .scaleEffect(isFocused ? 1.05 : 1)
+        .scaleEffect(perf.focusScale(1.05, isFocused))
         .shadow(color: isFocused ? theme.palette.secondary.opacity(CinemaFocus.glowOpacity) : .black.opacity(0.18),
                 radius: isFocused ? CinemaFocus.glowRadius : 6, y: 6)
-        .animation(CinemaFocus.entry, value: isFocused)
+        .animation(perf.motion(CinemaFocus.entry), value: isFocused)
     }
 }
 
@@ -243,12 +245,12 @@ private struct CinemaContinueRow: View {
                         ForEach(items) { p in
                             CinemaContinueCard(
                                 progress: p,
+                                focusID: $focusedID,
                                 onResume: { onResume(p) },
                                 onResumeFromStart: { onResumeFromStart(p) },
                                 onDetails: { onDetails(p) },
                                 onFocus: { onFocusItem(p) }
                             )
-                            .focused($focusedID, equals: p.id)
                             .id(p.id)
                         }
                     }
@@ -263,77 +265,100 @@ private struct CinemaContinueRow: View {
 
 /// Suppresses tvOS's default focus platter so the card's OWN ring/scale/glow are
 /// the only focus visual. A tiny press dip; focus itself is drawn by the label
-/// (which reads `\.isFocused`).
+/// (which reads `\.isFocused`). Press feedback is the shared `cardPressDip`.
 struct CinemaCardStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .scaleEffect(configuration.isPressed ? 0.985 : 1)
-            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+            .cardPressDip(configuration.isPressed)
+    }
+}
+
+extension View {
+    /// When "raise & move" (`cardParallax`) is on, use tvOS's native card platter
+    /// (lift + 3D trackpad tilt); when off, use Cinema's flat scale-only style so
+    /// the label's own ring/glow/scale are the sole focus visual.
+    @ViewBuilder
+    func cinemaCardStyle(_ parallax: Bool) -> some View {
+        if parallax { buttonStyle(.card) } else { buttonStyle(CinemaCardStyle()) }
     }
 }
 
 private struct CinemaContinueCard: View {
     @EnvironmentObject private var progressStore: ProgressStore
+    @EnvironmentObject private var theme: ThemeManager
+    @ObservedObject private var perf = PerformanceSettingsStore.shared
+    @FocusState private var focused: Bool
     let progress: WatchProgress
+    var focusID: FocusState<String?>.Binding
     let onResume: () -> Void
     let onResumeFromStart: () -> Void
     let onDetails: () -> Void
     let onFocus: () -> Void
 
-    var body: some View {
-        Button(action: onResume) {
-            CinemaContinueLabel(progress: progress, onFocus: onFocus)
-        }
-        .buttonStyle(CinemaCardStyle())
-        .contextMenu {
-            Button { onDetails() } label: { Label("Go to Details", systemImage: "info.circle") }
-            Button { onResumeFromStart() } label: { Label("Start from Beginning", systemImage: "gobackward") }
-            Button(role: .destructive) {
-                progressStore.removeShow(metaID: progress.metaID, notifyTrakt: true)
-            } label: { Label("Remove from Continue Watching", systemImage: "xmark") }
-        }
-    }
-}
-
-private struct CinemaContinueLabel: View {
-    @EnvironmentObject private var theme: ThemeManager
-    @Environment(\.isFocused) private var isFocused   // button's own focus
-    let progress: WatchProgress
-    let onFocus: () -> Void
     private let width: CGFloat = 360
+    private var parallax: Bool { perf.cardParallaxEffective }
+    /// Ring/glow/scale are the card's OWN focus visuals — only when the native
+    /// card platter (parallax) isn't already providing the lift.
+    private var ringActive: Bool { focused && !parallax }
 
     var body: some View {
+        // Title lives BELOW the button, not inside its label: the native card
+        // platter draws a raised slab behind its whole label, so a title kept
+        // inside gets bridged to the artwork by a connecting bar (the "weird bar
+        // below the name"). As a sibling, the art tile stays clean.
         VStack(alignment: .leading, spacing: 10) {
-            ZStack(alignment: .bottom) {
-                RemoteImage(url: progress.episodeThumbnail ?? progress.background ?? progress.poster,
-                            contentMode: .fill, maxDimension: width)
-                    .frame(width: width, height: width * 9 / 16)
-                    .clipShape(RoundedRectangle(cornerRadius: CinemaFocus.cardRadius, style: .continuous))
-                GeometryReader { geo in
-                    ZStack(alignment: .leading) {
-                        Capsule().fill(Color.white.opacity(0.3)).frame(height: 5)
-                        Capsule().fill(theme.palette.secondary)
-                            .frame(width: geo.size.width * CGFloat(min(max(progress.fraction, 0.02), 1)), height: 5)
-                    }
-                }
-                .frame(height: 5).padding(.horizontal, 10).padding(.bottom, 10)
+            Button(action: onResume) {
+                CinemaContinueArt(progress: progress, width: width, ringActive: ringActive)
             }
-            .frame(width: width, height: width * 9 / 16)
-            .overlay(
-                RoundedRectangle(cornerRadius: CinemaFocus.cardRadius, style: .continuous)
-                    .strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: CinemaFocus.ringWidth)
-            )
-            .shadow(color: isFocused ? theme.palette.secondary.opacity(CinemaFocus.glowOpacity) : .clear,
-                    radius: isFocused ? CinemaFocus.glowRadius : 0, y: 6)
+            .cinemaCardStyle(parallax)
+            .focused($focused)
+            .focused(focusID, equals: progress.id)
+            .contextMenu {
+                Button { onDetails() } label: { Label("Go to Details", systemImage: "info.circle") }
+                Button { onResumeFromStart() } label: { Label("Start from Beginning", systemImage: "gobackward") }
+                Button(role: .destructive) {
+                    progressStore.removeShow(metaID: progress.metaID, notifyTrakt: true)
+                } label: { Label("Remove from Continue Watching", systemImage: "xmark") }
+            }
+            .onChange(of: focused) { _, f in if f { onFocus() } }
 
             Text(progress.name)
                 .font(.system(size: 22, weight: .medium))
-                .foregroundStyle(isFocused ? theme.palette.textPrimary : theme.palette.textSecondary)
+                .foregroundStyle(focused ? theme.palette.textPrimary : theme.palette.textSecondary)
                 .lineLimit(1).frame(width: width, alignment: .leading)
         }
-        .scaleEffect(isFocused ? CinemaFocus.landscapeScale : 1)
-        .animation(CinemaFocus.entry, value: isFocused)
-        .onFocusChange { if $0 { onFocus() } }
+        .focusLift(CinemaFocus.landscapeScale, ringActive, animation: CinemaFocus.entry)
+    }
+}
+
+private struct CinemaContinueArt: View {
+    @EnvironmentObject private var theme: ThemeManager
+    let progress: WatchProgress
+    let width: CGFloat
+    let ringActive: Bool
+
+    var body: some View {
+        ZStack(alignment: .bottom) {
+            RemoteImage(url: progress.episodeThumbnail ?? progress.background ?? progress.poster,
+                        contentMode: .fill, maxDimension: width)
+                .frame(width: width, height: width * 9 / 16)
+                .clipShape(RoundedRectangle(cornerRadius: CinemaFocus.cardRadius, style: .continuous))
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.white.opacity(0.3)).frame(height: 5)
+                    Capsule().fill(theme.palette.secondary)
+                        .frame(width: geo.size.width * CGFloat(min(max(progress.fraction, 0.02), 1)), height: 5)
+                }
+            }
+            .frame(height: 5).padding(.horizontal, 10).padding(.bottom, 10)
+        }
+        .frame(width: width, height: width * 9 / 16)
+        .overlay(
+            RoundedRectangle(cornerRadius: CinemaFocus.cardRadius, style: .continuous)
+                .strokeBorder(ringActive ? theme.palette.focusRing : .clear, lineWidth: CinemaFocus.ringWidth)
+        )
+        .shadow(color: ringActive ? theme.palette.secondary.opacity(CinemaFocus.glowOpacity) : .clear,
+                radius: ringActive ? CinemaFocus.glowRadius : 0, y: 6)
     }
 }
 
@@ -371,9 +396,8 @@ private struct CinemaCatalogRow: View {
                 ScrollView(.horizontal) {
                     LazyHStack(spacing: landscape ? 28 : 24) {
                         ForEach(row.items) { item in
-                            CinemaPosterCard(item: item, landscape: landscape,
+                            CinemaPosterCard(item: item, landscape: landscape, focusID: $focusedID,
                                              onSelect: { onSelect(item) }, onFocus: { onFocusItem(item) })
-                            .focused($focusedID, equals: item.id)
                             .id(item.id)
                         }
                     }
@@ -400,66 +424,80 @@ private func cinemaBackToStart(_ proxy: ScrollViewProxy, first: String?, focused
 private struct CinemaPosterCard: View {
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var watched: WatchedStore
+    @EnvironmentObject private var theme: ThemeManager
+    @ObservedObject private var perf = PerformanceSettingsStore.shared
+    @FocusState private var focused: Bool
     let item: MetaItem
     let landscape: Bool
+    var focusID: FocusState<String?>.Binding
     let onSelect: () -> Void
     let onFocus: () -> Void
 
+    private var width: CGFloat { landscape ? 360 : 200 }
+    private var parallax: Bool { perf.cardParallaxEffective }
+    private var ringActive: Bool { focused && !parallax }
+
     var body: some View {
-        Button(action: onSelect) {
-            CinemaPosterLabel(item: item, landscape: landscape, onFocus: onFocus)
-        }
-        .buttonStyle(CinemaCardStyle())
-        .contextMenu {
-            Button { onSelect() } label: { Label("Go to Details", systemImage: "info.circle") }
-            Button { library.toggle(item) } label: {
-                Label(library.contains(item) ? "Remove from Library" : "Add to Library",
-                      systemImage: library.contains(item) ? "bookmark.slash" : "bookmark")
+        // Landscape title sits BELOW the button (a sibling), not inside its
+        // label: the native card platter would otherwise bridge it to the
+        // artwork with a connecting slab (the "weird bar below the name").
+        VStack(alignment: .leading, spacing: 10) {
+            Button(action: onSelect) {
+                CinemaPosterArt(item: item, landscape: landscape, ringActive: ringActive)
             }
-            Button { watched.toggleMovie(item) } label: {
-                Label(watched.isWatched(item) ? "Mark as Unwatched" : "Mark as Watched",
-                      systemImage: watched.isWatched(item) ? "eye.slash" : "checkmark.circle")
+            .cinemaCardStyle(parallax)
+            .focused($focused)
+            .focused(focusID, equals: item.id)
+            .contextMenu {
+                Button { onSelect() } label: { Label("Go to Details", systemImage: "info.circle") }
+                Button { library.toggle(item) } label: {
+                    Label(library.contains(item) ? "Remove from Library" : "Add to Library",
+                          systemImage: library.contains(item) ? "bookmark.slash" : "bookmark")
+                }
+                Button { watched.toggleMovie(item) } label: {
+                    Label(watched.isWatched(item) ? "Mark as Unwatched" : "Mark as Watched",
+                          systemImage: watched.isWatched(item) ? "eye.slash" : "checkmark.circle")
+                }
+            }
+            .onChange(of: focused) { _, f in if f { onFocus() } }
+
+            if landscape {
+                Text(item.name).font(.system(size: 22, weight: .medium))
+                    .foregroundStyle(focused ? theme.palette.textPrimary : theme.palette.textSecondary)
+                    .lineLimit(1).frame(width: width, alignment: .leading)
             }
         }
+        .focusLift(landscape ? CinemaFocus.landscapeScale : CinemaFocus.posterScale,
+                   ringActive, animation: CinemaFocus.entry)
     }
 }
 
-private struct CinemaPosterLabel: View {
+private struct CinemaPosterArt: View {
     @EnvironmentObject private var theme: ThemeManager
-    @Environment(\.isFocused) private var isFocused
     let item: MetaItem
     let landscape: Bool
-    let onFocus: () -> Void
+    let ringActive: Bool
 
     private var width: CGFloat { landscape ? 360 : 200 }
     private var height: CGFloat { landscape ? width * 9 / 16 : width * 3 / 2 }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            RemoteImage(url: landscape ? (item.background ?? item.poster) : item.poster,
-                        contentMode: .fill, maxDimension: height)
-                .frame(width: width, height: height)
-                .clipShape(RoundedRectangle(cornerRadius: CinemaFocus.cardRadius, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: CinemaFocus.cardRadius, style: .continuous)
-                        .strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: CinemaFocus.ringWidth)
-                )
-                .shadow(color: isFocused ? theme.palette.secondary.opacity(CinemaFocus.glowOpacity) : .clear,
-                        radius: isFocused ? CinemaFocus.glowRadius : 0, y: 6)
-            if landscape {
-                Text(item.name).font(.system(size: 22, weight: .medium))
-                    .foregroundStyle(isFocused ? theme.palette.textPrimary : theme.palette.textSecondary)
-                    .lineLimit(1).frame(width: width, alignment: .leading)
-            }
-        }
-        .scaleEffect(isFocused ? (landscape ? CinemaFocus.landscapeScale : CinemaFocus.posterScale) : 1)
-        .animation(CinemaFocus.entry, value: isFocused)
-        .onFocusChange { if $0 { onFocus() } }
+        RemoteImage(url: landscape ? (item.background ?? item.poster) : item.poster,
+                    contentMode: .fill, maxDimension: height)
+            .frame(width: width, height: height)
+            .clipShape(RoundedRectangle(cornerRadius: CinemaFocus.cardRadius, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: CinemaFocus.cardRadius, style: .continuous)
+                    .strokeBorder(ringActive ? theme.palette.focusRing : .clear, lineWidth: CinemaFocus.ringWidth)
+            )
+            .shadow(color: ringActive ? theme.palette.secondary.opacity(CinemaFocus.glowOpacity) : .clear,
+                    radius: ringActive ? CinemaFocus.glowRadius : 0, y: 6)
     }
 }
 
 private struct CinemaSeeAll: View {
     @EnvironmentObject private var theme: ThemeManager
+    @ObservedObject private var perf = PerformanceSettingsStore.shared
     @Environment(\.isFocused) private var isFocused
     var body: some View {
         HStack(spacing: 8) {
@@ -469,6 +507,6 @@ private struct CinemaSeeAll: View {
         .foregroundStyle(isFocused ? .white : theme.palette.textSecondary)
         .padding(.horizontal, 20).frame(height: 48)
         .background(Capsule().fill(isFocused ? theme.palette.secondary : theme.palette.backgroundCard))
-        .animation(CinemaFocus.entry, value: isFocused)
+        .animation(perf.buttonMotion(CinemaFocus.entry), value: isFocused)
     }
 }

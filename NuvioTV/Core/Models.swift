@@ -321,6 +321,34 @@ struct MetaItem: Codable, Identifiable, Hashable {
         return String(releaseInfo.prefix(4))
     }
 
+    /// Whether this title hasn't come out yet — drives "Hide unreleased
+    /// content" (Settings → Layout).
+    ///
+    /// `releaseInfo` arrives in a few shapes depending on the addon: a bare year
+    /// ("2027"), a full date ("2027-03-14"), or a series span ("2019-2023", or
+    /// "2019–" for one still airing). Taking the START of the span is right for
+    /// all of them — an ongoing series that premiered in 2019 is released, it
+    /// just isn't finished. An item with NO date counts as released: addons
+    /// leave the field off constantly, and hiding undated items would quietly
+    /// empty half of most catalogs.
+    var isUnreleased: Bool {
+        guard let releaseInfo, !releaseInfo.isEmpty else { return false }
+        // Full date: compare properly, so something due later THIS year is
+        // still correctly hidden.
+        if releaseInfo.count >= 10 {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.timeZone = TimeZone(secondsFromGMT: 0)
+            formatter.dateFormat = "yyyy-MM-dd"
+            if let date = formatter.date(from: String(releaseInfo.prefix(10))) {
+                return date > Date()
+            }
+        }
+        let start = releaseInfo.prefix { $0 != "-" && $0 != "–" && $0 != "—" }
+        guard let year = Int(start), year > 1800 else { return false }
+        return year > Calendar.current.component(.year, from: Date())
+    }
+
     var isSeries: Bool { type == "series" || type == "tv" }
 
     /// Capitalized content type for meta lines ("Movie" / "Series"), matching the APK.

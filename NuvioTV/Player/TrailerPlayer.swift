@@ -6,25 +6,31 @@ import YouTubeKit
 /// WebKit, so the iframe embed is out — YouTubeKit extracts native streams.
 ///
 /// YouTube only *muxes* audio+video up to ~720p; 1080p and up exist solely as
-/// separate adaptive tracks (DASH). To match the Android app's full-HD trailers
-/// we merge the best H.264 video-only stream with the best AAC audio-only
-/// stream into one composition instead of settling for the ≤720p muxed stream.
+/// separate adaptive tracks (DASH). A merged 1080p composition looks sharper,
+/// but AVPlayer then has to buffer and mux TWO separate remote streams before
+/// it can start — which is what made trailers slow to open. For a short
+/// trailer, a fast start matters more than the extra sharpness, so we play the
+/// single muxed (≤720p) progressive URL — one stream AVPlayer can begin almost
+/// immediately — and only fall back to the merge when no muxed stream exists.
 enum TrailerResolver {
-    /// Highest-quality natively-playable item: a merged 1080p video + audio
-    /// composition when available, otherwise the best muxed (≤720p) stream.
+    /// Fastest-starting natively-playable item: the best muxed (≤720p) stream,
+    /// falling back to a merged 1080p video + audio composition only when the
+    /// video offers no muxed stream at all.
     static func playerItem(youtubeKey: String) async -> AVPlayerItem? {
         guard let streams = try? await YouTube(videoID: youtubeKey).streams else { return nil }
         // isNativelyPlayable keeps only codecs AVPlayer decodes (H.264/AAC),
         // dropping VP9/AV1 webm — so the "highest" video-only is 1080p H.264.
         let playable = streams.filter { $0.isNativelyPlayable }
 
+        // Single progressive URL → near-instant start.
+        if let muxed = playable.filterVideoAndAudio().highestResolutionStream() {
+            return AVPlayerItem(url: muxed.url)
+        }
+        // No muxed stream: fall back to merging the adaptive tracks for 1080p.
         if let video = playable.filterVideoOnly().highestResolutionStream(),
            let audio = playable.filterAudioOnly().highestAudioBitrateStream(),
            let merged = await mergedItem(video: video.url, audio: audio.url) {
             return merged
-        }
-        if let muxed = playable.filterVideoAndAudio().highestResolutionStream() {
-            return AVPlayerItem(url: muxed.url)
         }
         return nil
     }
@@ -125,6 +131,9 @@ struct TrailerPlayerView: View {
                 return
             }
             let player = AVPlayer(playerItem: item)
+            // Start on the first available buffer instead of waiting to build a
+            // stall-proof one — a trailer should pop up, not spin.
+            player.automaticallyWaitsToMinimizeStalling = false
             self.player = player
             player.play()
         }
