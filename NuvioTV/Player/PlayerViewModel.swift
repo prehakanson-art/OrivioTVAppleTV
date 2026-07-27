@@ -774,6 +774,10 @@ final class PlayerViewModel: ObservableObject {
         self.settings = settings
         self.pendingResume = request.resumePosition
 
+        // Pause the 30s account auto-sync for the duration of playback — a
+        // multi-endpoint sync competing for bandwidth mid-stream is exactly the
+        // wrong time on a high-bitrate remux.
+        NuvioSyncManager.playbackActive = true
         Self.configureEngineDefaults()
         // Subtitle presentation follows the user's Playback settings.
         SubtitleModel.textFontSize = CGFloat(settings.subtitleSize)
@@ -3214,6 +3218,7 @@ final class PlayerViewModel: ObservableObject {
     }
 
     func teardown() {
+        NuvioSyncManager.playbackActive = false   // resume periodic account sync
         // The player is gone: any in-flight failover / watchdog / seek callback
         // must NOT restart playback from here (they all gate on isExiting).
         // Also swallows engine state callbacks arriving mid-teardown.

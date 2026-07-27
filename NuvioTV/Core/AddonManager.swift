@@ -36,11 +36,23 @@ final class AddonManager: ObservableObject {
         return s
     }
 
-    /// Installs any remote addon URLs not already present, preserving remote
-    /// order for the new ones. Manifests are fetched in parallel. Does not fire
-    /// `onLocalChange` (no echo back).
+    /// Applies the account's addon list.
+    ///
+    /// `reconcile: false` is additive — install anything new, never remove.
+    /// Used for the FIRST pull on a profile, where the account may legitimately
+    /// know less than this device and the follow-up push uploads the union.
+    ///
+    /// `reconcile: true` makes the account authoritative: addons the account no
+    /// longer lists are REMOVED locally, so a delete on another device
+    /// propagates here. Only safe once this profile is "seeded" (has synced
+    /// addon data before) and once any pending local change has been pushed —
+    /// both enforced by the caller (NuvioSyncManager.pullAddons), because
+    /// reconciling against a stale account would delete addons this device
+    /// added while offline.
+    ///
+    /// Does not fire `onLocalChange` (no echo back). Returns the number added.
     @discardableResult
-    func applyRemote(urls: [String]) async -> Int {
+    func applyRemote(urls: [String], reconcile: Bool = false) async -> Int {
         suppressChange = true
         defer { suppressChange = false }
         let existing = Set(addons.map { $0.baseURL })
@@ -50,8 +62,22 @@ final class AddonManager: ObservableObject {
                 ? String(normalized.dropLast("/manifest.json".count)) : normalized
             return !existing.contains(base)
         }
-        NSLog("[OrivioAddonSync] pull: %d from account, %d already installed, %d to add",
-              urls.count, urls.count - toInstall.count, toInstall.count)
+        // Removals first, so the count logged below reflects the real delta.
+        var removed = 0
+        if reconcile {
+            let remoteBases = Set(urls.map { u -> String in
+                let n = Self.normalizeManifestURL(u)
+                return n.hasSuffix("/manifest.json")
+                    ? String(n.dropLast("/manifest.json".count)) : n
+            })
+            let before = addons.count
+            addons.removeAll { !remoteBases.contains($0.baseURL) }
+            removed = before - addons.count
+            if removed > 0 { save() }
+        }
+        NSLog("[OrivioAddonSync] pull: %d from account, %d already installed, %d to add, %d removed (reconcile=%@)",
+              urls.count, urls.count - toInstall.count, toInstall.count, removed,
+              reconcile ? "yes" : "no")
         guard !toInstall.isEmpty else { return 0 }
 
         // Fetch the new manifests a few at a time, then apply in the original
@@ -198,37 +224,53 @@ final class AddonManager: ObservableObject {
     /// indication of why.
     enum RefreshOutcome {
         case notSignedIn
-        case added(Int)
+        case changed(added: Int, removed: Int)
         case alreadyUpToDate
         case failed(String)
 
         var message: String {
             switch self {
-            case .notSignedIn:     return "Manifests refreshed — sign in to sync add-ons from your account"
-            case .added(let n):    return "Added \(n) add-on\(n == 1 ? "" : "s") from your account"
-            case .alreadyUpToDate: return "Add-ons refreshed — already up to date"
-            case .failed(let why): return "Couldn't sync from your account: \(why)"
+            case .notSignedIn:
+                return "Manifests refreshed — sign in to sync add-ons with your account"
+            case .changed(let added, let removed):
+                var parts: [String] = []
+                if added > 0 { parts.append("added \(added)") }
+                if removed > 0 { parts.append("removed \(removed)") }
+                return "Synced with your account — " + parts.joined(separator: ", ")
+            case .alreadyUpToDate:
+                return "Add-ons synced — already up to date"
+            case .failed(let why):
+                return "Couldn't sync with your account: \(why)"
             }
         }
     }
 
+    /// TWO-WAY add-on sync (the "Sync Add-ons" button).
+    ///
+    /// Re-fetches every manifest, then hands off to the sync manager, which
+    /// pushes any pending local change UP first and then pulls the account down
+    /// with reconciliation — so an add-on deleted on another device is deleted
+    /// here too, and one added here survives rather than being reconciled away.
     @discardableResult
-    func refresh() async -> RefreshOutcome {
+    func syncWithAccount() async -> RefreshOutcome {
         await refreshManifests()
         guard let onSyncRequested else {
-            NSLog("[OrivioAddonSync] refresh: no sync manager attached (signed out)")
+            NSLog("[OrivioAddonSync] sync: no sync manager attached (signed out)")
             return .notSignedIn
         }
-        let before = addons.count
+        let before = Set(addons.map(\.manifestURL))
         do {
             try await onSyncRequested()
         } catch {
-            NSLog("[OrivioAddonSync] refresh FAILED: %@", String(describing: error))
+            NSLog("[OrivioAddonSync] sync FAILED: %@", String(describing: error))
             return .failed(Self.shortReason(error))
         }
-        let added = addons.count - before
-        NSLog("[OrivioAddonSync] refresh ok: %d added", added)
-        return added > 0 ? .added(added) : .alreadyUpToDate
+        let after = Set(addons.map(\.manifestURL))
+        let added = after.subtracting(before).count
+        let removed = before.subtracting(after).count
+        NSLog("[OrivioAddonSync] sync ok: +%d -%d", added, removed)
+        return (added + removed) > 0
+            ? .changed(added: added, removed: removed) : .alreadyUpToDate
     }
 
     private static func shortReason(_ error: Error) -> String {

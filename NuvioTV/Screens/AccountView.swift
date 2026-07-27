@@ -128,6 +128,37 @@ struct AccountView: View {
                 .font(.system(size: 26, weight: .medium))
                 .foregroundStyle(theme.palette.textSecondary)
 
+            // Manual full-account sync, sitting directly under the account it
+            // belongs to. Everything syncs automatically every
+            // `NuvioSyncManager.autoSyncInterval` seconds; this is for "do it
+            // now" after changing something on another device.
+            AccountPrimaryButton(
+                title: syncing ? "Syncing…" : "Sync Now",
+                systemImage: "arrow.triangle.2.circlepath"
+            ) {
+                guard !syncing, let sync else { return }
+                syncing = true
+                syncStatus = nil
+                Task {
+                    await sync.syncNow()
+                    syncing = false
+                    syncStatus = sync.lastSyncError.map { "Sync failed: \($0)" }
+                        ?? "Everything synced just now"
+                    try? await Task.sleep(nanoseconds: 6_000_000_000)
+                    syncStatus = nil
+                }
+            }
+            .disabled(syncing)
+
+            if let syncStatus {
+                Text(syncStatus)
+                    .font(.system(size: 20))
+                    .foregroundStyle(syncStatus.hasPrefix("Sync failed")
+                                     ? NuvioPrimitives.error : theme.palette.textTertiary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 760)
+            }
+
             AccountPrimaryButton(title: "Sign Out", systemImage: "rectangle.portrait.and.arrow.right", filled: false) {
                 confirmSignOut = true
             }
@@ -145,6 +176,9 @@ struct AccountView: View {
     }
 
     @State private var confirmSignOut = false
+    @State private var syncing = false
+    @State private var syncStatus: String?
+    private var sync: NuvioSyncManager? { NuvioSyncManager.shared }
 
     private func errorLabel(_ text: String) -> some View {
         Text(text)

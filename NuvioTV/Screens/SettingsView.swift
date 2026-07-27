@@ -1225,7 +1225,7 @@ private struct AddonsManagementView: View {
     @State private var showExport = false
     @State private var pendingRemoval: InstalledAddon?
 
-    private static let refreshIdle = "Re-fetch installed add-on manifests"
+    private static let refreshIdle = "Two-way sync with your account — uploads your changes, pulls others' and removes add-ons deleted elsewhere"
     @State private var refreshSubtitle = AddonsManagementView.refreshIdle
 
     var body: some View {
@@ -1308,10 +1308,10 @@ private struct AddonsManagementView: View {
             }
             .buttonStyle(PlainCardButtonStyle())
 
-            // Refresh Add-ons
+            // Sync Add-ons (two-way)
             Button { refresh() } label: {
                 SettingsActionRow(
-                    title: "Refresh Add-ons",
+                    title: "Sync Add-ons",
                     subtitle: refreshSubtitle,
                     value: refreshing ? "…" : nil,
                     leadingIcon: "arrow.clockwise"
@@ -1424,7 +1424,7 @@ private struct AddonsManagementView: View {
             // Report what ACTUALLY happened. This used to say "Add-ons
             // refreshed just now" unconditionally, including when the account
             // pull had failed or been skipped entirely.
-            let outcome = await addonManager.refresh()
+            let outcome = await addonManager.syncWithAccount()
             refreshing = false
             refreshSubtitle = outcome.message
             // Leave a failure on screen longer than a success — it's the one

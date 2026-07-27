@@ -143,14 +143,28 @@ final class PluginStore: ObservableObject {
     }
     var snapshot: PluginSyncSnapshot { PluginSyncSnapshot(repositoryURLs: repositories.map(\.url)) }
 
-    /// Install any repos present remotely but missing locally (best-effort).
-    func applyRemote(_ s: PluginSyncSnapshot) async {
+    /// Apply the account's repo list.
+    ///
+    /// `reconcile: false` is additive (first pull / fresh account).
+    /// `reconcile: true` also REMOVES repos the account no longer lists, so a
+    /// plugin repo deleted on another device is deleted here — matching how
+    /// add-ons, library and watched now behave. Gated by the caller's `seeded`
+    /// check so a fresh account can't wipe this device.
+    func applyRemote(_ s: PluginSyncSnapshot, reconcile: Bool = false) async {
         applyingRemote = true
         defer { applyingRemote = false }
         let existing = Set(repositories.map(\.url))
         for url in s.repositoryURLs where !existing.contains(url) {
             await addRepository(url)
         }
+        guard reconcile else { return }
+        let remote = Set(s.repositoryURLs)
+        let goneIDs = repositories.filter { !remote.contains($0.url) }.map(\.id)
+        guard !goneIDs.isEmpty else { return }
+        repositories.removeAll { goneIDs.contains($0.id) }
+        scrapers.removeAll { goneIDs.contains($0.repoID) }
+        NSLog("[OrivioSync] plugins: removed %d repo(s) deleted on another device", goneIDs.count)
+        save()
     }
 
     // MARK: Helpers / persistence

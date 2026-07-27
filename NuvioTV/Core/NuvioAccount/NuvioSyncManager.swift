@@ -15,6 +15,11 @@ final class NuvioSyncManager: ObservableObject {
     @Published private(set) var isSyncing = false
     @Published private(set) var lastSyncError: String?
 
+    /// The live instance, so views that aren't handed one (AccountView is used
+    /// from two places, neither of which owns it) can trigger a manual sync.
+    /// Weak: RootView's `@State` owns the lifetime.
+    private(set) static weak var shared: NuvioSyncManager?
+
     private let account: NuvioAccountManager
     private let addonManager: AddonManager
     private let progressStore: ProgressStore
@@ -171,21 +176,16 @@ final class NuvioSyncManager: ObservableObject {
 
         // Push local changes upward (debounced for addons/library/watched/profiles, immediate for progress).
         addonManager.onLocalChange = { [weak self] in self?.scheduleAddonPush() }
-        // "Refresh Add-ons" → PULL ONLY. Bring in addons added on the account
-        // elsewhere; never push here. A push replaces the account's addon list
-        // with the local one, so if the pull couldn't materialize an addon (a
-        // manifest that failed to fetch), pushing would delete it from the
-        // account. Device→account changes still sync via onLocalChange.
+        // "Sync Add-ons" → TWO-WAY. Pending local edits go up first, then the
+        // account comes down with reconciliation so a removal made on another
+        // device lands here. Ordering matters: pull-then-push would let a stale
+        // account delete a local add-on that had never been pushed.
         addonManager.onSyncRequested = { [weak self] in
             guard let self else { return }
-            // Was `guard account.accessToken != nil else { return }` followed by
-            // `try? await pullAddons()` — so a signed-out session and every
-            // network/decode failure both looked identical to success. Throw
-            // instead; AddonManager.refresh() turns it into a real message.
-            guard account.accessToken != nil else {
-                throw NuvioAuthError.message("not signed in")
-            }
-            try await pullAddons()
+            // Two-way now: push pending local edits, then pull + reconcile.
+            // (Was pull-only with `try?`, so a signed-out session and every
+            // network/decode failure looked identical to success.)
+            try await syncAddonsBothWays()
         }
         progressStore.onLocalUpdate = { [weak self] in self?.pushWatchProgress() }
         progressStore.onRemove = { [weak self] keys in self?.deleteWatchProgress(keys: keys) }
@@ -247,12 +247,16 @@ final class NuvioSyncManager: ObservableObject {
         // Scope local stores to the persisted active profile at startup (no-op
         // for profile 1); works offline before any sync happens.
         applyActiveProfileScope()
+        Self.shared = self
     }
 
     private func handleAuthChange(_ state: NuvioAuthState) {
+        NSLog("[OrivioSync] authChange -> %@ (wasSignedIn=%@)",
+              String(describing: state), wasSignedIn ? "true" : "false")
         switch state {
         case .signedIn:
             profileStore.accountAvailable = true
+            startAutoSync()
             guard !wasSignedIn else { return }
             wasSignedIn = true
             let previous = fullSyncTask
@@ -263,6 +267,7 @@ final class NuvioSyncManager: ObservableObject {
         case .signedOut:
             wasSignedIn = false
             profileStore.accountAvailable = false
+            stopAutoSync()
         case .loading:
             break
         }
@@ -270,8 +275,48 @@ final class NuvioSyncManager: ObservableObject {
 
     // MARK: - Full sync
 
+    // MARK: - Periodic auto-sync
+
+    /// Seconds between automatic full syncs while signed in and foregrounded.
+    static let autoSyncInterval: TimeInterval = 30
+    private var autoSyncTask: Task<Void, Never>?
+    /// Set by the player so a heavy multi-endpoint sync doesn't contend with
+    /// streaming for bandwidth mid-playback (this app already fights rebuffering
+    /// on high-bitrate remuxes). The tick is skipped, not dropped — the next one
+    /// after playback ends runs normally.
+    @MainActor static var playbackActive = false
+
+    /// Start (or restart) the periodic sync loop. Idempotent.
+    private func startAutoSync() {
+        autoSyncTask?.cancel()
+        autoSyncTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(Self.autoSyncInterval * 1_000_000_000))
+                guard !Task.isCancelled, let self else { return }
+                guard account.accessToken != nil else { continue }
+                // Never stack syncs: a slow one must not have a second start
+                // behind it.
+                guard !isSyncing else { continue }
+                if Self.playbackActive {
+                    NSLog("[OrivioSync] auto-sync tick skipped — playback active")
+                    continue
+                }
+                await syncNow()
+            }
+        }
+    }
+
+    private func stopAutoSync() {
+        autoSyncTask?.cancel()
+        autoSyncTask = nil
+    }
+
     func syncNow() async {
-        guard account.accessToken != nil else { return }
+        guard account.accessToken != nil else {
+            NSLog("[OrivioSync] syncNow skipped — no access token")
+            return
+        }
+        NSLog("[OrivioSync] syncNow starting")
         isSyncing = true
         lastSyncError = nil
         defer { isSyncing = false }
@@ -319,8 +364,15 @@ final class NuvioSyncManager: ObservableObject {
             await pushProviderCredentials()  // dual-write to the Android table
             try? await pushPlugins()
         } catch {
+            // A full-sync failure used to vanish into `lastSyncError` with no
+            // console trace, so "my stuff isn't syncing" was undiagnosable from
+            // a device log. The step that threw is the one that aborted every
+            // later pull/push in this run.
+            NSLog("[OrivioSync] syncNow FAILED: %@", String(describing: error))
             lastSyncError = describe(error)
+            return
         }
+        NSLog("[OrivioSync] syncNow finished ok")
     }
 
     private func applyActiveProfileScope() {
@@ -333,13 +385,33 @@ final class NuvioSyncManager: ObservableObject {
 
     // MARK: - Addons
 
+    /// Set on any local add/remove/reorder, cleared only once a push actually
+    /// lands. Guards reconciliation: pulling the account down and deleting
+    /// whatever it doesn't list would destroy an add-on added on THIS device
+    /// while the push was failing (offline, token expired). Dirty ⇒ push first.
+    private var addonsDirty = false
+
     private func scheduleAddonPush() {
+        addonsDirty = true
         pushAddonsTask?.cancel()
         pushAddonsTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 1_200_000_000)
             guard !Task.isCancelled else { return }
             try? await self?.pushAddons()
         }
+    }
+
+    /// Full two-way add-on sync: local changes up, then the account down with
+    /// reconciliation so deletions from other devices land here.
+    private func syncAddonsBothWays() async throws {
+        guard account.accessToken != nil else {
+            throw NuvioAuthError.message("not signed in")
+        }
+        if addonsDirty {
+            // Local edits go first or the pull below would reconcile them away.
+            try await pushAddons()
+        }
+        try await pullAddons()
     }
 
     private func pushAddons() async throws {
@@ -359,6 +431,12 @@ final class NuvioSyncManager: ObservableObject {
             "p_origin_client_id": clientID
         ]
         _ = try await authedPost(RPC.url(RPC.pushAddons), body: body)
+        // Only now is the account known to hold this device's list, so a later
+        // pull may safely reconcile against it.
+        addonsDirty = false
+        // A push proves this profile has add-on data on the account, which lets
+        // a subsequent empty pull be read as a genuine "cleared elsewhere".
+        setSeeded("addons")
     }
 
     private func pullAddons() async throws {
@@ -374,8 +452,22 @@ final class NuvioSyncManager: ObservableObject {
         let rows = try JSONDecoder().decode([SupabaseAddon].self, from: data)
         let orderedURLs = rows.sorted { $0.sortOrder < $1.sortOrder }.map(\.url)
         NSLog("[OrivioAddonSync] pullAddons: %d rows for user %@", rows.count, userID)
-        guard !orderedURLs.isEmpty else { return }
-        await addonManager.applyRemote(urls: orderedURLs)
+
+        // Same seeded policy library/watched use. Reconciling (deleting local
+        // add-ons the account doesn't list) is only correct once we know the
+        // account genuinely represents this profile's add-ons — otherwise a
+        // first sign-in against a fresh account would wipe the device.
+        let seeded = isSeeded("addons")
+        if orderedURLs.isEmpty {
+            // Empty account list: only a real "removed everything elsewhere"
+            // when seeded. Unseeded + empty = fresh account; keep local and let
+            // the push upload it.
+            guard seeded else { return }
+            await addonManager.applyRemote(urls: [], reconcile: true)
+            return
+        }
+        await addonManager.applyRemote(urls: orderedURLs, reconcile: seeded)
+        setSeeded("addons")
     }
 
     // MARK: - Watch progress
@@ -1492,8 +1584,18 @@ final class NuvioSyncManager: ObservableObject {
             .filter { ($0["repo_type"] as? String)?.uppercased() != "EXTERNAL_DEX" }  // JS only
             .filter { ($0["enabled"] as? Bool) ?? true }   // don't install repos disabled elsewhere
             .compactMap { $0["url"] as? String }
-        guard !urls.isEmpty else { return }
-        await pluginStore.applyRemote(PluginStore.PluginSyncSnapshot(repositoryURLs: urls))
+        let seeded = isSeeded("plugins")
+        if urls.isEmpty {
+            // Only a genuine "removed everywhere" once seeded; otherwise this is
+            // a fresh account and local repos should survive to be pushed up.
+            guard seeded else { return }
+            await pluginStore.applyRemote(PluginStore.PluginSyncSnapshot(repositoryURLs: []),
+                                          reconcile: true)
+            return
+        }
+        await pluginStore.applyRemote(PluginStore.PluginSyncSnapshot(repositoryURLs: urls),
+                                      reconcile: seeded)
+        setSeeded("plugins")
     }
 
     private func authedPost(_ endpoint: String, body: [String: Any]) async throws -> Data {
