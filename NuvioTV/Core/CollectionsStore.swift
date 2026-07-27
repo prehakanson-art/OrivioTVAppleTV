@@ -465,17 +465,33 @@ final class CollectionsStore: ObservableObject {
     // MARK: Persistence
 
     private func load() {
-        // Account-wide library, else a one-time migration from the old
-        // per-profile stores.
-        if let data = UserDefaults.standard.data(forKey: Self.libraryKey),
-           let decoded = try? JSONDecoder().decode([NuvioCollection].self, from: data) {
-            library = decoded
-        } else {
-            library = Self.migrateLegacyProfileCollections()
-            if !library.isEmpty { saveLibrary() }
-        }
+        // The hidden set is a tiny string array — safe to read inline.
         hiddenIDs = Set(UserDefaults.standard.stringArray(forKey: hiddenKey) ?? [])
-        recomputeVisible()
+
+        // The LIBRARY is not: ~700 KB of nested JSON (493 folders on a real
+        // account). Decoding it synchronously here — this runs from the store's
+        // init during app startup — is what froze the Apple TV 4K gen 1 before
+        // it could draw anything or accept a sign-in. Decode off-thread and
+        // publish when it lands; the UI simply has no collections for the first
+        // moment, which is how every other store behaves anyway.
+        Task.detached(priority: .userInitiated) { [libraryKey = Self.libraryKey] in
+            let decoded: [NuvioCollection]
+            if let data = UserDefaults.standard.data(forKey: libraryKey),
+               let d = try? JSONDecoder().decode([NuvioCollection].self, from: data) {
+                decoded = d
+            } else {
+                decoded = Self.migrateLegacyProfileCollections()
+            }
+            await MainActor.run { [weak self] in
+                guard let self, self.library.isEmpty else { return }
+                self.library = decoded
+                self.recomputeVisible()
+                // Persist only if this came from the legacy migration.
+                if UserDefaults.standard.data(forKey: libraryKey) == nil, !decoded.isEmpty {
+                    self.saveLibrary()
+                }
+            }
+        }
     }
 
     /// One-time union of the legacy per-profile collection stores into a single
@@ -483,7 +499,7 @@ final class CollectionsStore: ObservableObject {
     /// same-named collection the RICHER one wins (more folders, then more
     /// artwork: gifs / hero backdrops / hero video / logos) — profile 6's
     /// "Streaming Services" carries GIFs and hero art that profile 1's does not.
-    private static func migrateLegacyProfileCollections() -> [NuvioCollection] {
+    nonisolated private static func migrateLegacyProfileCollections() -> [NuvioCollection] {
         var byTitle: [String: NuvioCollection] = [:]
         var order: [String] = []
         for pid in 1...12 {
@@ -510,7 +526,7 @@ final class CollectionsStore: ObservableObject {
 
     /// How much presentation data a collection carries — the tie-break when the
     /// same collection exists on two profiles.
-    private static func richness(_ c: NuvioCollection) -> Int {
+    nonisolated private static func richness(_ c: NuvioCollection) -> Int {
         var score = c.folders.count * 10
         if c.backdropImageUrl?.isEmpty == false { score += 5 }
         for f in c.folders {
@@ -529,8 +545,16 @@ final class CollectionsStore: ObservableObject {
             UserDefaults.standard.removeObject(forKey: Self.libraryKey)
             return
         }
-        guard let data = try? JSONEncoder().encode(library) else { return }
-        UserDefaults.standard.set(data, forKey: Self.libraryKey)
+        // Encode + write OFF the main thread. The merged library is ~700 KB of
+        // nested JSON (493 folders); encoding it synchronously on the
+        // @MainActor store stalled the UI on an A10X every time anything
+        // touched collections. Persistence is fire-and-forget — the in-memory
+        // `library` is the source of truth for this session.
+        let snapshot = library
+        Task.detached(priority: .utility) {
+            guard let data = try? JSONEncoder().encode(snapshot) else { return }
+            UserDefaults.standard.set(data, forKey: Self.libraryKey)
+        }
     }
 
     private func saveHidden() {

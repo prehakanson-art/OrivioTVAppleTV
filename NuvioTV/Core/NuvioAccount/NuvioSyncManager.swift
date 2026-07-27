@@ -1038,8 +1038,21 @@ final class NuvioSyncManager: ObservableObject {
         _ = try await authedPost(RPC.url(RPC.pushCollections), body: body)
     }
 
+    /// Whether the one-time "adopt every profile's collections into the shared
+    /// library" scan has run. That scan pulls EVERY profile's row (1.4 MB and
+    /// ~1000 folders on a real account) and is only needed to migrate packs
+    /// that predate the shared library — repeating it on every 30s sync froze
+    /// the Apple TV 4K gen 1.
+    private var adoptedAllProfileCollections = false
+
     private func pullCollections() async throws {
         guard let userID = account.currentUserID else { return }
+        // Steady state: just this profile's row, like every other pull.
+        guard !adoptedAllProfileCollections else {
+            try await pullCollectionsForActiveProfile()
+            return
+        }
+        adoptedAllProfileCollections = true
         // Collections are now an ACCOUNT-WIDE library. The backing table is
         // still keyed per profile (and Android writes it that way), so read
         // EVERY profile's row and merge them — that's what makes a pack added
@@ -1047,20 +1060,43 @@ final class NuvioSyncManager: ObservableObject {
         // all of them. Per-profile choice is visibility only, synced separately.
         let path = "/rest/v1/collections?user_id=eq.\(userID)&select=profile_id,collections_json"
         let data = try await authedGet(path)
-        let rows = try JSONDecoder().decode([SupabaseCollectionsRow].self, from: data)
-        var adopted: [NuvioCollection] = []
-        for row in rows.sorted(by: { $0.profileID < $1.profileID }) {
-            guard let json = row.collectionsJSON.data(using: .utf8),
-                  let lenient = try? JSONDecoder().decode([Lenient<NuvioCollection>].self, from: json)
-            else { continue }
-            adopted.append(contentsOf: lenient.compactMap(\.value))
-        }
-        NSLog("[OrivioCollections] pulled %d profile rows -> %d collections before merge",
-              rows.count, adopted.count)
+        // Decode OFF the main actor. This is ~1.4 MB of deeply nested JSON and
+        // the lenient per-element decode is slow; doing it inline on the
+        // @MainActor store blocked the UI hard enough that a 3 GB Apple TV
+        // appeared frozen at launch and the sign-in screen never responded.
+        let adopted: [NuvioCollection] = await Task.detached(priority: .utility) {
+            guard let rows = try? JSONDecoder().decode([SupabaseCollectionsRow].self, from: data)
+            else { return [] }
+            var out: [NuvioCollection] = []
+            for row in rows.sorted(by: { $0.profileID < $1.profileID }) {
+                guard let json = row.collectionsJSON.data(using: .utf8),
+                      let lenient = try? JSONDecoder().decode([Lenient<NuvioCollection>].self, from: json)
+                else { continue }
+                out.append(contentsOf: lenient.compactMap(\.value))
+            }
+            return out
+        }.value
+        NSLog("[OrivioCollections] one-time adoption: %d collections from all profiles", adopted.count)
         guard !adopted.isEmpty else { return }
         let changed = collectionsStore.mergeIntoLibrary(adopted)
         NSLog("[OrivioCollections] shared library now %d collections (changed=%@)",
               collectionsStore.library.count, changed ? "yes" : "no")
+    }
+
+    /// Steady-state pull: only the active profile's row, decoded off-main.
+    private func pullCollectionsForActiveProfile() async throws {
+        guard account.accessToken != nil else { return }
+        let data = try await authedPost(RPC.url(RPC.pullCollections), body: ["p_profile_id": pid])
+        let decoded: [NuvioCollection]? = await Task.detached(priority: .utility) {
+            guard let rows = try? JSONDecoder().decode([SupabaseCollectionsBlob].self, from: data),
+                  let blob = rows.first,
+                  let json = blob.collectionsJSON.data(using: .utf8),
+                  let lenient = try? JSONDecoder().decode([Lenient<NuvioCollection>].self, from: json)
+            else { return nil }
+            return lenient.compactMap(\.value)
+        }.value
+        guard let decoded, !decoded.isEmpty else { return }
+        collectionsStore.mergeIntoLibrary(decoded)
     }
 
     // MARK: - Home catalog settings
