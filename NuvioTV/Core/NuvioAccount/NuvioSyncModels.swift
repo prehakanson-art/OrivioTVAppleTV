@@ -229,6 +229,51 @@ struct SupabaseLibraryItem: Decodable {
 /// Row shape returned by `sync_pull_collections` — the whole profile's
 /// collections as one JSON blob (arbitrary nested JSON, decoded downstream
 /// by CollectionsStore).
+/// A `collections` table row read directly (PostgREST select), used to gather
+/// EVERY profile's collections into the shared library. `collections_json` can
+/// come back as a JSON string or as already-parsed JSON depending on the column
+/// type, so decode both shapes.
+struct SupabaseCollectionsRow: Decodable {
+    let profileID: Int
+    let collectionsJSON: String
+
+    private enum CodingKeys: String, CodingKey {
+        case profileID = "profile_id"
+        case collectionsJSON = "collections_json"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        profileID = (try? c.decode(Int.self, forKey: .profileID)) ?? 1
+        if let s = try? c.decode(String.self, forKey: .collectionsJSON) {
+            collectionsJSON = s
+        } else if let raw = try? c.decode(AnyDecodableJSON.self, forKey: .collectionsJSON),
+                  let data = try? JSONSerialization.data(withJSONObject: raw.value),
+                  let s = String(data: data, encoding: .utf8) {
+            collectionsJSON = s
+        } else {
+            collectionsJSON = "[]"
+        }
+    }
+}
+
+/// Minimal passthrough for a column that may be `jsonb` rather than `text`.
+struct AnyDecodableJSON: Decodable {
+    let value: Any
+    init(from decoder: Decoder) throws {
+        if let c = try? decoder.singleValueContainer() {
+            if let a = try? c.decode([AnyDecodableJSON].self) { value = a.map(\.value); return }
+            if let d = try? c.decode([String: AnyDecodableJSON].self) {
+                value = d.mapValues(\.value); return
+            }
+            if let s = try? c.decode(String.self) { value = s; return }
+            if let n = try? c.decode(Double.self) { value = n; return }
+            if let b = try? c.decode(Bool.self) { value = b; return }
+        }
+        value = NSNull()
+    }
+}
+
 struct SupabaseCollectionsBlob: Decodable {
     let profileID: Int
     let collectionsJSON: String

@@ -460,6 +460,7 @@ struct ProfileEditView: View {
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var profiles: ProfileStore
     @EnvironmentObject private var addonManager: AddonManager
+    @EnvironmentObject private var collections: CollectionsStore
     let profile: UserProfile
     let onDone: () -> Void
 
@@ -572,6 +573,8 @@ struct ProfileEditView: View {
 
                     autoLinkSection
 
+                    collectionsSection
+
                     if profile.id != 1 {
                         Button(role: .destructive) {
                             confirmingDelete = true
@@ -663,6 +666,65 @@ struct ProfileEditView: View {
         }
         let head = NuvioDropdownOption("", includeNone ? "None" : "Any addon")
         return [head] + names.map { NuvioDropdownOption($0) }
+    }
+
+    /// Per-profile collection visibility.
+    ///
+    /// Collections are an ACCOUNT-WIDE library — a pack added on any profile is
+    /// available to all of them (that's why "Kaptain's Collection" used to be
+    /// stuck on one profile). Each profile only chooses what to SHOW, and it's
+    /// an opt-OUT so anything newly added appears everywhere until turned off.
+    ///
+    /// Only meaningful for the ACTIVE profile: the hidden set is stored per
+    /// profile and this store is scoped to whichever profile is signed in, so
+    /// editing another profile's list from here would write to the wrong one.
+    @ViewBuilder
+    private var collectionsSection: some View {
+        if !collections.library.isEmpty {
+            VStack(alignment: .leading, spacing: NuvioSpacing.md) {
+                Text("Collections")
+                    .font(.system(size: 28, weight: .semibold))
+                    .foregroundStyle(theme.palette.textPrimary)
+
+                if profile.id == profiles.activeProfileID {
+                    Text("Choose which collections show on this profile. They stay on your account either way.")
+                        .font(.system(size: 20))
+                        .foregroundStyle(theme.palette.textSecondary)
+
+                    ForEach(collections.library) { collection in
+                        let shown = collections.isVisible(collection.id)
+                        Button {
+                            collections.setVisible(!shown, id: collection.id)
+                        } label: {
+                            HStack(spacing: NuvioSpacing.md) {
+                                Image(systemName: shown ? "checkmark.circle.fill" : "circle")
+                                    .font(.system(size: 26))
+                                    .foregroundStyle(shown ? theme.palette.focusRing : theme.palette.textTertiary)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(collection.title)
+                                        .font(.system(size: 24, weight: .medium))
+                                        .foregroundStyle(theme.palette.textPrimary)
+                                    Text("\(collection.folders.count) folder\(collection.folders.count == 1 ? "" : "s")")
+                                        .font(.system(size: 18))
+                                        .foregroundStyle(theme.palette.textTertiary)
+                                }
+                                Spacer()
+                            }
+                            .padding(.vertical, NuvioSpacing.sm)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(PlainCardButtonStyle())
+                    }
+                } else {
+                    // Switch to the profile to edit its own visibility — the
+                    // hidden set follows the ACTIVE profile.
+                    Text("Switch to “\(current.name)” to choose which of the \(collections.library.count) collections it shows.")
+                        .font(.system(size: 20))
+                        .foregroundStyle(theme.palette.textSecondary)
+                }
+            }
+            .padding(.top, NuvioSpacing.lg)
+        }
     }
 
     private var autoLinkSection: some View {

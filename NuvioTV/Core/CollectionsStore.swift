@@ -277,47 +277,77 @@ struct NuvioCollection: Codable, Identifiable, Hashable {
 /// JSON blob (matching Android's CollectionsDataStore + CollectionSyncService).
 @MainActor
 final class CollectionsStore: ObservableObject {
+    /// Collections VISIBLE on the active profile — what Home, Discover and the
+    /// rest of the app render. This is `library` minus the profile's hidden set.
     @Published private(set) var collections: [NuvioCollection] = []
+
+    /// Every collection on the account, regardless of which profile hides it.
+    /// Collections used to be stored per-profile, which is why a pack added on
+    /// one profile ("Kaptain's Collection") was invisible to every other. The
+    /// library is now account-wide and each profile only chooses what to SHOW.
+    @Published private(set) var library: [NuvioCollection] = []
+
+    /// Collection ids this profile has switched off. Per-profile, and an opt-OUT
+    /// so a newly added collection appears everywhere by default.
+    @Published private(set) var hiddenIDs: Set<String> = []
 
     /// Fired after a user-initiated change so account sync can push. Not
     /// fired while applying remote data (guarded by `suppressChange`).
     var onLocalChange: (() -> Void)?
+    /// Fired when only this profile's visibility changed — the library itself is
+    /// untouched, so the sync manager pushes the per-profile blob, not the
+    /// shared one.
+    var onVisibilityChange: (() -> Void)?
     private var suppressChange = false
     private var profileID = 1
 
     private static let baseKey = "nuvio.collections.v1"
+    /// Account-wide library key (no profile suffix).
+    private static let libraryKey = "nuvio.collections.library.v1"
 
-    private var storageKey: String {
+    /// Legacy per-profile key, still read once during migration.
+    private var legacyStorageKey: String {
         profileID == 1 ? Self.baseKey : "\(Self.baseKey).p\(profileID)"
     }
+    private var hiddenKey: String { "nuvio.collections.hidden.p\(profileID)" }
 
     init() {
         load()
     }
 
-    /// Re-scope local storage to a profile. Profile 1 keeps the unsuffixed key.
+    /// Re-scope to a profile. The LIBRARY is account-wide and unaffected; only
+    /// the hidden set is per-profile, so switching profiles just re-filters.
     func setProfile(_ id: Int) {
         guard id != profileID else { return }
         profileID = id
-        load()
+        hiddenIDs = Set(UserDefaults.standard.stringArray(forKey: hiddenKey) ?? [])
+        recomputeVisible()
     }
 
+    /// Add to the shared library. Visible on every profile that hasn't hidden
+    /// it — including the ones that didn't add it.
     func add(_ collection: NuvioCollection) {
-        collections.append(collection)
+        library.append(collection)
         save()
+        recomputeVisible()
         notifyLocalChange()
     }
 
     func update(_ collection: NuvioCollection) {
-        guard let index = collections.firstIndex(where: { $0.id == collection.id }) else { return }
-        collections[index] = collection
+        guard let index = library.firstIndex(where: { $0.id == collection.id }) else { return }
+        library[index] = collection
         save()
+        recomputeVisible()
         notifyLocalChange()
     }
 
+    /// Remove from the account entirely (all profiles). To hide it on just this
+    /// profile use `setVisible(false:id:)`.
     func remove(id: String) {
-        collections.removeAll { $0.id == id }
+        library.removeAll { $0.id == id }
+        hiddenIDs.remove(id)
         save()
+        recomputeVisible()
         notifyLocalChange()
     }
 
@@ -325,13 +355,18 @@ final class CollectionsStore: ObservableObject {
 
     // MARK: Sync plumbing
 
-    /// The JSON array blob pushed to `sync_push_collections`.
+    /// The JSON array blob pushed to `sync_push_collections`. Exports the whole
+    /// LIBRARY, not the visible subset — otherwise hiding a collection on one
+    /// profile would delete it from the account for everyone.
     func exportJSON() -> String {
-        guard !collections.isEmpty,
-              let data = try? JSONEncoder().encode(collections),
+        guard !library.isEmpty,
+              let data = try? JSONEncoder().encode(library),
               let json = String(data: data, encoding: .utf8) else { return "[]" }
         return json
     }
+
+    /// This profile's hidden ids, for the per-profile side of the sync.
+    var hiddenIDsForSync: [String] { Array(hiddenIDs).sorted() }
 
     /// Apply a remote blob. Mirrors Android: remote-empty-while-local-has-data
     /// preserves local; identical JSON is a no-op. Returns true when applied.
@@ -348,12 +383,44 @@ final class CollectionsStore: ObservableObject {
     /// blob). Same empty-preserve / no-op-on-identical rules as the JSON path.
     @discardableResult
     func applyRemote(collections remote: [NuvioCollection]) -> Bool {
-        if remote.isEmpty && !collections.isEmpty { return false }
-        guard remote != collections else { return false }
+        // Applies to the shared LIBRARY. Same guards as before: an empty remote
+        // while we hold data is a race, not a clear-all; identical is a no-op.
+        if remote.isEmpty && !library.isEmpty { return false }
+        guard remote != library else { return false }
         suppressChange = true
         defer { suppressChange = false }
-        collections = remote
+        library = remote
         save()
+        recomputeVisible()
+        return true
+    }
+
+    /// Merge a remote library into the shared one, de-duplicated by title with
+    /// the richer copy winning — the same rule the local migration uses. Used
+    /// when pulling the per-profile collection rows that predate the shared
+    /// library, so a pack that only ever lived on one profile is adopted
+    /// account-wide instead of being dropped.
+    @discardableResult
+    func mergeIntoLibrary(_ remote: [NuvioCollection]) -> Bool {
+        guard !remote.isEmpty else { return false }
+        var byTitle: [String: NuvioCollection] = [:]
+        var order: [String] = []
+        for c in library + remote {
+            let key = c.title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if let existing = byTitle[key] {
+                if Self.richness(c) > Self.richness(existing) { byTitle[key] = c }
+            } else {
+                byTitle[key] = c
+                order.append(key)
+            }
+        }
+        let merged = order.compactMap { byTitle[$0] }
+        guard merged != library else { return false }
+        suppressChange = true
+        defer { suppressChange = false }
+        library = merged
+        save()
+        recomputeVisible()
         return true
     }
 
@@ -364,21 +431,116 @@ final class CollectionsStore: ObservableObject {
         onLocalChange?()
     }
 
+    // MARK: Visibility (per profile)
+
+    func isVisible(_ id: String) -> Bool { !hiddenIDs.contains(id) }
+
+    /// Show/hide one collection on the ACTIVE profile. The collection stays in
+    /// the account-wide library either way.
+    func setVisible(_ visible: Bool, id: String) {
+        let changed = visible ? hiddenIDs.remove(id) != nil : hiddenIDs.insert(id).inserted
+        guard changed else { return }
+        saveHidden()
+        recomputeVisible()
+        guard !suppressChange else { return }
+        onVisibilityChange?()
+    }
+
+    /// Apply a pulled hidden-set for the active profile without echoing back.
+    func applyRemoteHidden(_ ids: Set<String>) {
+        guard ids != hiddenIDs else { return }
+        suppressChange = true
+        defer { suppressChange = false }
+        hiddenIDs = ids
+        saveHidden()
+        recomputeVisible()
+    }
+
+    private func recomputeVisible() {
+        collections = library.filter { !hiddenIDs.contains($0.id) }
+    }
+
+    // MARK: Persistence
+
     private func load() {
-        guard let data = UserDefaults.standard.data(forKey: storageKey),
-              let decoded = try? JSONDecoder().decode([NuvioCollection].self, from: data) else {
-            collections = []
+        // Account-wide library, else a one-time migration from the old
+        // per-profile stores.
+        if let data = UserDefaults.standard.data(forKey: Self.libraryKey),
+           let decoded = try? JSONDecoder().decode([NuvioCollection].self, from: data) {
+            library = decoded
+        } else {
+            library = Self.migrateLegacyProfileCollections()
+            if !library.isEmpty { saveLibrary() }
+        }
+        hiddenIDs = Set(UserDefaults.standard.stringArray(forKey: hiddenKey) ?? [])
+        recomputeVisible()
+    }
+
+    /// One-time union of the legacy per-profile collection stores into a single
+    /// account-wide library, de-duplicated by TITLE. Where two profiles hold a
+    /// same-named collection the RICHER one wins (more folders, then more
+    /// artwork: gifs / hero backdrops / hero video / logos) — profile 6's
+    /// "Streaming Services" carries GIFs and hero art that profile 1's does not.
+    private static func migrateLegacyProfileCollections() -> [NuvioCollection] {
+        var byTitle: [String: NuvioCollection] = [:]
+        var order: [String] = []
+        for pid in 1...12 {
+            let key = pid == 1 ? baseKey : "\(baseKey).p\(pid)"
+            guard let data = UserDefaults.standard.data(forKey: key),
+                  let decoded = try? JSONDecoder().decode([NuvioCollection].self, from: data)
+            else { continue }
+            for c in decoded {
+                let title = c.title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if let existing = byTitle[title] {
+                    if richness(c) > richness(existing) { byTitle[title] = c }
+                } else {
+                    byTitle[title] = c
+                    order.append(title)
+                }
+            }
+        }
+        let merged = order.compactMap { byTitle[$0] }
+        if !merged.isEmpty {
+            NSLog("[OrivioCollections] migrated %d per-profile collections into a shared library", merged.count)
+        }
+        return merged
+    }
+
+    /// How much presentation data a collection carries — the tie-break when the
+    /// same collection exists on two profiles.
+    private static func richness(_ c: NuvioCollection) -> Int {
+        var score = c.folders.count * 10
+        if c.backdropImageUrl?.isEmpty == false { score += 5 }
+        for f in c.folders {
+            if f.focusGifUrl?.isEmpty == false { score += 2 }
+            if f.heroBackdropUrl?.isEmpty == false { score += 2 }
+            if f.heroVideoUrl?.isEmpty == false { score += 2 }
+            if f.titleLogoUrl?.isEmpty == false { score += 1 }
+            if f.coverImageUrl?.isEmpty == false { score += 1 }
+            if f.coverEmoji?.isEmpty == false { score += 1 }
+        }
+        return score
+    }
+
+    private func saveLibrary() {
+        if library.isEmpty {
+            UserDefaults.standard.removeObject(forKey: Self.libraryKey)
             return
         }
-        collections = decoded
+        guard let data = try? JSONEncoder().encode(library) else { return }
+        UserDefaults.standard.set(data, forKey: Self.libraryKey)
+    }
+
+    private func saveHidden() {
+        if hiddenIDs.isEmpty {
+            UserDefaults.standard.removeObject(forKey: hiddenKey)
+            return
+        }
+        UserDefaults.standard.set(Array(hiddenIDs), forKey: hiddenKey)
     }
 
     private func save() {
-        if collections.isEmpty {
-            UserDefaults.standard.removeObject(forKey: storageKey)
-            return
-        }
-        guard let data = try? JSONEncoder().encode(collections) else { return }
-        UserDefaults.standard.set(data, forKey: storageKey)
+        saveLibrary()
+        saveHidden()
     }
 }

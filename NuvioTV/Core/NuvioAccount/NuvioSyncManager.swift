@@ -205,6 +205,14 @@ final class NuvioSyncManager: ObservableObject {
             // changes the catalog-settings payload.
             self?.scheduleHomeCatalogPush()
         }
+        // Per-profile show/hide: the shared library is untouched, so only the
+        // profile-scoped preferences blob needs pushing (NOT the collections
+        // blob — that would write this profile's visible subset over the shared
+        // library and delete other profiles' collections).
+        collectionsStore.onVisibilityChange = { [weak self] in
+            self?.scheduleAppPreferencesPush()
+            self?.scheduleHomeCatalogPush()
+        }
         homeCatalogSettings.onLocalChange = { [weak self] in self?.scheduleHomeCatalogPush() }
         streamBadges?.onLocalChange = { [weak self] in self?.scheduleBadgeSettingsPush() }
         streamBadges?.remoteSync = { [weak self] in
@@ -1031,11 +1039,28 @@ final class NuvioSyncManager: ObservableObject {
     }
 
     private func pullCollections() async throws {
-        guard account.accessToken != nil else { return }
-        let data = try await authedPost(RPC.url(RPC.pullCollections), body: ["p_profile_id": pid])
-        let rows = try JSONDecoder().decode([SupabaseCollectionsBlob].self, from: data)
-        guard let blob = rows.first else { return }   // no remote row: keep local
-        collectionsStore.applyRemote(json: blob.collectionsJSON)
+        guard let userID = account.currentUserID else { return }
+        // Collections are now an ACCOUNT-WIDE library. The backing table is
+        // still keyed per profile (and Android writes it that way), so read
+        // EVERY profile's row and merge them — that's what makes a pack added
+        // on one profile ("Kaptain's Collection" lives on profile 6) show up on
+        // all of them. Per-profile choice is visibility only, synced separately.
+        let path = "/rest/v1/collections?user_id=eq.\(userID)&select=profile_id,collections_json"
+        let data = try await authedGet(path)
+        let rows = try JSONDecoder().decode([SupabaseCollectionsRow].self, from: data)
+        var adopted: [NuvioCollection] = []
+        for row in rows.sorted(by: { $0.profileID < $1.profileID }) {
+            guard let json = row.collectionsJSON.data(using: .utf8),
+                  let lenient = try? JSONDecoder().decode([Lenient<NuvioCollection>].self, from: json)
+            else { continue }
+            adopted.append(contentsOf: lenient.compactMap(\.value))
+        }
+        NSLog("[OrivioCollections] pulled %d profile rows -> %d collections before merge",
+              rows.count, adopted.count)
+        guard !adopted.isEmpty else { return }
+        let changed = collectionsStore.mergeIntoLibrary(adopted)
+        NSLog("[OrivioCollections] shared library now %d collections (changed=%@)",
+              collectionsStore.library.count, changed ? "yes" : "no")
     }
 
     // MARK: - Home catalog settings
@@ -1319,6 +1344,10 @@ final class NuvioSyncManager: ObservableObject {
         /// tvOS-preferences feature the rest of the port-only data uses.
         /// Optional for backward-compat.
         var collections: [NuvioCollection]?
+        /// Collection ids THIS profile has switched off. The collections above
+        /// are the account-wide library; this is the per-profile opt-out, so a
+        /// newly added pack shows everywhere until a profile turns it off.
+        var hiddenCollectionIDs: [String]?
     }
 
     /// Set when a local app-pref-backed change (collections included) is waiting
@@ -1367,8 +1396,11 @@ final class NuvioSyncManager: ObservableObject {
         }
         if let torrent = snapshot.torrent { torrentSettings?.applyRemote(torrent) }
         if let collections = snapshot.collections {
-            collectionsStore.applyRemote(collections: collections)
+            // Merge rather than replace: another profile's blob may carry packs
+            // this one has never seen, and the library is account-wide.
+            collectionsStore.mergeIntoLibrary(collections)
         }
+        collectionsStore.applyRemoteHidden(Set(snapshot.hiddenCollectionIDs ?? []))
     }
 
     /// READ-MERGE-WRITE: fetch the blob, replace only our own feature key, push
@@ -1385,7 +1417,11 @@ final class NuvioSyncManager: ObservableObject {
             debrid: debridStore?.snapshot,
             plugins: pluginStore?.snapshot,
             torrent: torrentSettings?.settings,
-            collections: collectionsStore.collections
+            // The shared library (every profile's collections), plus THIS
+            // profile's opt-outs. Pushing the visible subset here would delete
+            // other profiles' collections from the account.
+            collections: collectionsStore.library,
+            hiddenCollectionIDs: collectionsStore.hiddenIDsForSync
         )
         guard let data = try? JSONEncoder().encode(snapshot),
               let json = String(data: data, encoding: .utf8) else { return }
