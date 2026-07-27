@@ -100,6 +100,20 @@ enum GIFDecoder {
         cache.removeAll(); bytes.removeAll(); order.removeAll()
     }
 
+    /// Decode ONLY the first frame, for "partial" quality. Same thumbnail and
+    /// budget rules; no animation, so a 240-frame GIF costs one still.
+    static func decodeFirstFrame(_ data: Data) -> (image: UIImage, cost: Int)? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        let opts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+        ]
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, opts as CFDictionary)
+        else { return nil }
+        return (UIImage(cgImage: cg), cg.width * cg.height * 4)
+    }
+
     /// Decode animated image data (GIF *or* animated WebP — the collections use
     /// both, and ImageIO reads each) into one `UIImage` carrying its frames,
     /// plus the decoded byte cost. Returns nil for non-animated or undecodable
@@ -185,6 +199,10 @@ struct AnimatedGIFView: UIViewRepresentable {
 
     let url: String
     var contentMode: UIView.ContentMode = .scaleAspectFit
+    /// "Partial" quality: decode ONE frame and show it as a still. Keeps the
+    /// art change on focus for a fraction of the cost — a single ~0.5 MB image
+    /// instead of dozens of frames.
+    var stillOnly: Bool = false
     /// Called once the GIF is ready (or fails), so the parent can decide whether
     /// to hide the still artwork behind it.
     var onLoaded: ((Bool) -> Void)?
@@ -239,8 +257,9 @@ struct AnimatedGIFView: UIViewRepresentable {
             }
             NSLog("[OrivioGIF] fetched %d bytes", data.count)
             // Decode off the main actor — a 100-frame GIF is real work.
+            let stillOnly = self.stillOnly
             let decoded = await Task.detached(priority: .userInitiated) {
-                GIFDecoder.decode(data)
+                stillOnly ? GIFDecoder.decodeFirstFrame(data) : GIFDecoder.decode(data)
             }.value
             await MainActor.run {
                 guard !Task.isCancelled, let decoded, let view else {

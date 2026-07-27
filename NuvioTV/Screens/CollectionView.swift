@@ -295,7 +295,7 @@ struct CollectionFolderCard: View {
     /// `focusGifEnabled` is nil on older/imported folders — treat a present URL
     /// as opt-in there, matching how the Android app behaves.
     private var focusGifURL: String? {
-        guard AnimatedGIFView.isSupported,
+        guard perf.settings.collectionGifQuality != .off,
               let url = folder?.focusGifUrl, !url.isEmpty,
               folder?.focusGifEnabled != false else { return nil }
         return url
@@ -339,7 +339,8 @@ struct CollectionFolderCard: View {
                 // while focused, so a 100-folder collection isn't animating a
                 // hundred GIFs at once, and it fades in over the still art.
                 if let gif = focusGifURL, isFocused {
-                    AnimatedGIFView(url: gif, contentMode: .scaleAspectFill) { ok in
+                    AnimatedGIFView(url: gif, contentMode: .scaleAspectFill,
+                                    stillOnly: perf.settings.collectionGifQuality == .partial) { ok in
                         withAnimation(.easeOut(duration: 0.22)) { gifPlaying = ok }
                     }
                     // Pin to the tile explicitly. Without a hard frame the
@@ -388,10 +389,64 @@ struct CollectionFolderCard: View {
 
 /// Full collection browser: folder tabs across the top (with an "All" tab when
 /// enabled) and a poster grid below — the APK's TABBED_GRID view mode.
+/// One-time notice, shown the first time collections are opened, explaining
+/// that focus animations are off on this hardware and where to change it.
+/// Collection packs carry hundreds of multi-megabyte focus GIFs and they were
+/// heavy enough to lock up a 4K gen 1, so the default is conservative — but the
+/// user should be told rather than left wondering why nothing animates.
+struct CollectionGifNotice: View {
+    @EnvironmentObject private var theme: ThemeManager
+    let quality: CollectionGifQuality
+    let onDismiss: () -> Void
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.75).ignoresSafeArea()
+            VStack(spacing: NuvioSpacing.lg) {
+                Image(systemName: "sparkles.tv")
+                    .font(.system(size: 64))
+                    .foregroundStyle(theme.palette.focusRing)
+                Text("Collection focus artwork")
+                    .font(.system(size: 40, weight: .bold))
+                    .foregroundStyle(theme.palette.textPrimary)
+                Text(message)
+                    .font(.system(size: 24))
+                    .foregroundStyle(theme.palette.textSecondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 900)
+                Text("Settings → Performance → Collection focus artwork")
+                    .font(.system(size: 22, weight: .medium))
+                    .foregroundStyle(theme.palette.textTertiary)
+                Button("Got it", action: onDismiss)
+                    .font(.system(size: 26, weight: .semibold))
+                    .padding(.top, NuvioSpacing.md)
+            }
+            .padding(NuvioSpacing.huge)
+            .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: NuvioRadius.lg, style: .continuous))
+            .padding(NuvioSpacing.huge)
+        }
+        .onExitCommand(perform: onDismiss)
+    }
+
+    private var message: String {
+        switch quality {
+        case .off:
+            return "These collections include animated artwork that plays when you focus a tile. It's off on \(PerformanceProfile.tierLabel) because it's demanding enough to affect playback and browsing. You can turn it on any time."
+        case .partial:
+            return "Focus artwork is set to still images on \(PerformanceProfile.tierLabel) — the art still changes when you focus a tile, without the cost of animation. You can switch to full animation any time."
+        case .full:
+            return "These collections include animated artwork that plays when you focus a tile. If browsing feels sluggish, you can switch it to still images or turn it off."
+        }
+    }
+}
+
 struct CollectionView: View {
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var addonManager: AddonManager
     @EnvironmentObject private var tmdbSettings: TMDBSettingsStore
+    @ObservedObject private var perfSettings = PerformanceSettingsStore.shared
+    @AppStorage("nuvio.collections.gifNoticeSeen.v1") private var gifNoticeSeen = false
+    @State private var showGifNotice = false
 
     let collection: NuvioCollection
     let onSelect: (MetaItem) -> Void
@@ -489,6 +544,27 @@ struct CollectionView: View {
     private var headerInset: CGFloat { (hasTabs ? 230 : 150) + 76 }
 
     var body: some View {
+        collectionBody
+            // First time a collection is opened, explain the focus-artwork
+            // setting — otherwise "why doesn't anything animate?" on a
+            // constrained box looks like a bug rather than a deliberate default.
+            .overlay {
+                if showGifNotice {
+                    CollectionGifNotice(quality: perfSettings.settings.collectionGifQuality) {
+                        gifNoticeSeen = true
+                        showGifNotice = false
+                    }
+                }
+            }
+            .task {
+                guard !gifNoticeSeen, collection.folders.contains(where: {
+                    !($0.focusGifUrl ?? "").isEmpty
+                }) else { return }
+                showGifNotice = true
+            }
+    }
+
+    private var collectionBody: some View {
         ZStack(alignment: .top) {
             theme.palette.background.ignoresSafeArea()
             // A real backdrop photo fills edge-to-edge like before; the logo

@@ -121,6 +121,24 @@ struct PerformanceSettingsDetail: View {
             }
 
             SettingsGroupCard(
+                title: "Collections",
+                subtitle: "Focus artwork on collection folder tiles"
+            ) {
+                NuvioDropdown(
+                    title: "Collection focus artwork",
+                    subtitle: store.settings.collectionGifQuality.summary,
+                    icon: "sparkles.tv",
+                    selection: store.settings.collectionGifQuality.rawValue,
+                    options: CollectionGifQuality.allCases.map {
+                        NuvioDropdownOption($0.rawValue, $0.displayName)
+                    }
+                ) { raw in
+                    store.settings.collectionGifQuality =
+                        CollectionGifQuality(rawValue: raw) ?? .deviceDefault
+                }
+            }
+
+            SettingsGroupCard(
                 title: "Developer",
                 subtitle: "Diagnostics — safe to leave off"
             ) {

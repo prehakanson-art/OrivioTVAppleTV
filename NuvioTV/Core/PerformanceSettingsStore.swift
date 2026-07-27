@@ -2,6 +2,51 @@ import Foundation
 import SwiftUI
 import UIKit
 
+/// How much motion collection folder tiles may use on focus.
+///
+/// Collection packs ship focus artwork per folder — often 3–4 MB GIFs of
+/// 120–240 frames. Decoding those is the single most expensive thing a tile can
+/// do, so this is a real performance dial, not a cosmetic one. It defaults to
+/// OFF on the 2 GB Apple TV HD and the 3 GB 4K gen 1, which is where the cost
+/// actually hurts.
+enum CollectionGifQuality: String, Codable, CaseIterable, Identifiable {
+    /// Animated, highest frame rate and resolution this device allows.
+    case full
+    /// Static focus artwork only — the hover image swaps in, nothing animates.
+    /// Costs one still image per tile instead of dozens of frames.
+    case partial
+    /// Nothing on focus; the cover art stays put. Cheapest.
+    case off
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .full:    return "Full — animated"
+        case .partial: return "Partial — still images"
+        case .off:     return "Off"
+        }
+    }
+
+    var summary: String {
+        switch self {
+        case .full:
+            return "Play the collection's focus GIFs. The richest look, and by far the heaviest — a single GIF can be 240 frames."
+        case .partial:
+            return "Swap in the focus artwork as a still image. Keeps the art change on focus at a fraction of the cost."
+        case .off:
+            return "Leave the cover art alone on focus. Recommended on older Apple TVs."
+        }
+    }
+
+    /// Default for this hardware. Deliberately OFF on both constrained tiers:
+    /// the 3 GB 4K gen 1 froze with GIFs enabled.
+    static var deviceDefault: CollectionGifQuality {
+        (PerformanceProfile.isLowPower || PerformanceProfile.isMidPower) ? .off : .full
+    }
+}
+
+
 /// User-tunable performance switches (Settings → Performance). On 4K gen-2+
 /// hardware everything defaults ON — the app's full look. Older boxes start
 /// with the costly effects OFF (see `tierDefaults()`); every switch remains
@@ -40,6 +85,9 @@ final class PerformanceSettingsStore: ObservableObject {
         /// Developer: live FPS counter overlaid on the app. Off by default,
         /// never set by the tier defaults — a diagnostic, not an effect.
         var showFPSOverlay = false
+        /// Motion allowed on collection folder tiles when focused. Defaults per
+        /// hardware tier (off on the 2 GB HD and the 3 GB 4K gen 1).
+        var collectionGifQuality: CollectionGifQuality = .deviceDefault
 
         init() {}
 
@@ -47,6 +95,7 @@ final class PerformanceSettingsStore: ObservableObject {
             case heroBackdrop, heroCrossfade, cardShadows, focusZoom, cardParallax
             case artworkPrefetch, artworkFadeIn
             case sidebarAnimation, buttonAnimations, showFPSOverlay
+            case collectionGifQuality
         }
 
         /// Lenient decode: a key missing from an older save keeps its default
@@ -64,6 +113,8 @@ final class PerformanceSettingsStore: ObservableObject {
             sidebarAnimation = (try? c.decode(Bool.self, forKey: .sidebarAnimation)) ?? true
             buttonAnimations = (try? c.decode(Bool.self, forKey: .buttonAnimations)) ?? true
             showFPSOverlay = (try? c.decode(Bool.self, forKey: .showFPSOverlay)) ?? false
+            collectionGifQuality = (try? c.decode(CollectionGifQuality.self, forKey: .collectionGifQuality))
+                ?? .deviceDefault
         }
     }
 
