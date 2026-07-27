@@ -1432,6 +1432,8 @@ final class NuvioSyncManager: ObservableObject {
         /// Folder ids switched off account-wide — the catalog default that all
         /// profiles inherit and can trim further.
         var globalHiddenFolderIDs: [String]?
+        /// Whole collections switched off account-wide.
+        var globalHiddenCollectionIDs: [String]?
     }
 
     /// Set when a local app-pref-backed change (collections included) is waiting
@@ -1490,6 +1492,9 @@ final class NuvioSyncManager: ObservableObject {
         // "empty" let the pull wipe a local choice before the push in the same
         // sync could upload it — which is exactly what made a folder hidden on
         // this device come back as visible.
+        if let globalCollections = snapshot.globalHiddenCollectionIDs {
+            collectionsStore.applyRemoteGlobalHidden(Set(globalCollections))
+        }
         if snapshot.hiddenFolderIDs != nil || snapshot.globalHiddenFolderIDs != nil {
             collectionsStore.applyRemoteHiddenFolders(
                 profile: Set(snapshot.hiddenFolderIDs ?? []),
@@ -1517,7 +1522,8 @@ final class NuvioSyncManager: ObservableObject {
             collections: collectionsStore.library,
             hiddenCollectionIDs: collectionsStore.hiddenIDsForSync,
             hiddenFolderIDs: collectionsStore.hiddenFolderIDsForSync,
-            globalHiddenFolderIDs: collectionsStore.globalHiddenFolderIDsForSync
+            globalHiddenFolderIDs: collectionsStore.globalHiddenFolderIDsForSync,
+            globalHiddenCollectionIDs: collectionsStore.globalHiddenCollectionIDsForSync
         )
         guard let data = try? JSONEncoder().encode(snapshot),
               let json = String(data: data, encoding: .utf8) else { return }

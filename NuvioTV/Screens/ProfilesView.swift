@@ -696,15 +696,21 @@ struct ProfileEditView: View {
                         .foregroundStyle(theme.palette.textSecondary)
 
                     ForEach(collections.library) { collection in
-                        Button { editingCollection = collection } label: {
+                        let globallyOff = !collections.isGloballyVisible(collection.id)
+                        Button {
+                            guard !globallyOff else { return }
+                            editingCollection = collection
+                        } label: {
                             ProfileCollectionRow(
                                 title: collection.title,
                                 detail: folderSummary(collection),
                                 shown: collections.isVisible(collection.id),
-                                showsChevron: true
+                                showsChevron: !globallyOff
                             )
                         }
                         .buttonStyle(PlainCardButtonStyle())
+                        .disabled(globallyOff)
+                        .opacity(globallyOff ? 0.45 : 1)
                     }
                 } else {
                     Text("Switch to “\(current.name)” to choose which of the \(collections.library.count) collections it shows.")
@@ -718,6 +724,9 @@ struct ProfileEditView: View {
 
     /// "3 of 19 folders" — so the row says what's on without opening it.
     private func folderSummary(_ collection: NuvioCollection) -> String {
+        guard collections.isGloballyVisible(collection.id) else {
+            return "Off for everyone — Settings → Collections"
+        }
         guard collections.isVisible(collection.id) else { return "Hidden on this profile" }
         let total = collection.folders.count
         let on = collection.folders.filter { collections.isFolderVisible($0.id) }.count

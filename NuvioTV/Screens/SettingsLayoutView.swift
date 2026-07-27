@@ -588,18 +588,36 @@ struct CollectionsSettingsDetail: View {
             }
             .buttonStyle(PlainCardButtonStyle())
 
-            ForEach(collections.collections) { collection in
-                Button { editing = collection } label: {
-                    SettingsActionRow(
-                        title: collection.title,
-                        subtitle: "\(collection.folders.count) folder\(collection.folders.count == 1 ? "" : "s")",
-                        leadingIcon: "rectangle.stack.fill"
-                    )
+            // The LIBRARY, not the visible subset — a collection switched off
+            // account-wide has to stay listed here or there'd be no way to turn
+            // it back on.
+            ForEach(collections.library) { collection in
+                let on = collections.isGloballyVisible(collection.id)
+                HStack(spacing: NuvioSpacing.md) {
+                    Button {
+                        collections.setGloballyVisible(!on, id: collection.id)
+                    } label: {
+                        Image(systemName: on ? "checkmark.circle.fill" : "circle")
+                            .font(.system(size: 30))
+                            .foregroundStyle(on ? theme.palette.focusRing : theme.palette.textTertiary)
+                    }
+                    .buttonStyle(PlainCardButtonStyle())
+
+                    Button { editing = collection } label: {
+                        SettingsActionRow(
+                            title: collection.title,
+                            subtitle: on
+                                ? "\(collection.folders.count) folder\(collection.folders.count == 1 ? "" : "s")"
+                                : "Off for all profiles · \(collection.folders.count) folder\(collection.folders.count == 1 ? "" : "s")",
+                            leadingIcon: "rectangle.stack.fill"
+                        )
+                    }
+                    .buttonStyle(PlainCardButtonStyle())
+                    .opacity(on ? 1 : 0.45)
                 }
-                .buttonStyle(PlainCardButtonStyle())
             }
 
-            if collections.collections.isEmpty {
+            if collections.library.isEmpty {
                 Text("No collections yet. A collection appears as its own home row of folder tiles — like \"Marvel\" with folders for each phase.")
                     .font(.system(size: 21))
                     .foregroundStyle(theme.palette.textSecondary)
