@@ -295,8 +295,38 @@ final class NuvioSyncManager: ObservableObject {
     @MainActor static var playbackActive = false
 
     /// Start (or restart) the periodic sync loop. Idempotent.
+    /// How many 30s ticks between FULL syncs (everything). In between, only the
+    /// hot data is pulled/pushed.
+    private static let fullSyncEveryNTicks = 10   // ≈ every 5 minutes
+
+    /// The subset that genuinely changes while you use the app: what you're
+    /// watching, your library, and watched state. Cheap enough to run every 30s.
+    private func syncHotDataOnly() async {
+        guard account.accessToken != nil, !isSyncing else { return }
+        isSyncing = true
+        defer { isSyncing = false }
+        let started = Date()
+        do {
+            await drainPendingDeletes()
+            try await pullWatchProgress()
+            try await pullLibrary()
+            await reconcileWatchedDeletesBeforePull()
+            try await pullWatchedItems()
+            try await pushWatchProgressAll()
+            try await pushLibrary()
+            try await pushWatchedItems()
+        } catch {
+            NSLog("[OrivioSync] hot-data tick failed: %@", String(describing: error))
+            return
+        }
+        NSLog("[OrivioSync] hot-data tick ok in %.1fs", Date().timeIntervalSince(started))
+    }
+
+    private var ticks = 0
+
     private func startAutoSync() {
         autoSyncTask?.cancel()
+        ticks = 0
         autoSyncTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: UInt64(Self.autoSyncInterval * 1_000_000_000))
@@ -309,7 +339,19 @@ final class NuvioSyncManager: ObservableObject {
                     NSLog("[OrivioSync] auto-sync tick skipped — playback active")
                     continue
                 }
-                await syncNow()
+                // A FULL sync takes ~8s on a real account (collections alone are
+                // ~700 KB / 493 folders, plus badges, prefs, plugins, profiles).
+                // Running that every 30s left an A10X doing heavy network+JSON
+                // work a quarter of the time, which is what made browsing choppy.
+                // The tick now syncs only what actually changes minute to minute;
+                // everything else rides the full sync on sign-in, on foreground,
+                // and on the manual "Sync Now" button.
+                ticks += 1
+                if ticks % Self.fullSyncEveryNTicks == 0 {
+                    await syncNow()
+                } else {
+                    await syncHotDataOnly()
+                }
             }
         }
     }
