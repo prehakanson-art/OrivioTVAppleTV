@@ -100,6 +100,20 @@ struct CollectionsRowSection: View {
         return pinned + rest
     }
 
+    /// Tallest tile in this row, plus room for the title line beneath it. Must
+    /// match CollectionTileCard.cardSize.
+    private var rowHeight: CGFloat {
+        let tallest = ordered.reduce(CGFloat(214)) { acc, c in
+            switch c.folders.first?.tileShape {
+            case "POSTER": return max(acc, 330)
+            case "LANDSCAPE": return max(acc, 214)
+            default: return max(acc, 260)
+            }
+        }
+        // + title line + the row's own vertical padding.
+        return tallest + 44 + NuvioSpacing.lg * 2
+    }
+
     var body: some View {
         ScrollViewReader { proxy in
         ScrollView(.horizontal) {
@@ -118,6 +132,12 @@ struct CollectionsRowSection: View {
             }
             .padding(.horizontal, NuvioSpacing.huge)
             .padding(.vertical, NuvioSpacing.lg)
+            // Reserve the TALLEST tile's height for the whole row. Collections
+            // mix shapes (a POSTER tile is 330pt, a LANDSCAPE one 214pt), and
+            // without a common height the row only sized to its own content —
+            // so a tall tile plus its title/focus glow spilled over whatever
+            // sat underneath.
+            .frame(height: rowHeight, alignment: .top)
         }
         .scrollClipDisabled()
         // Focus section so a sparse collections row is never skipped on vertical
@@ -195,6 +215,13 @@ struct CollectionTileCard: View {
         return CommunityCollections.decodeCoverStyles(coverStylesJSON)[id] ?? false
     }
 
+    /// SQUARE is the only shape that means "a logo mark on a branded card";
+    /// POSTER and LANDSCAPE are full-bleed artwork that should fill the tile.
+    private var isLogoMark: Bool {
+        let shape = firstFolder?.tileShape ?? "SQUARE"
+        return shape != "POSTER" && shape != "LANDSCAPE"
+    }
+
     /// Tile size follows the (editable) shape of the collection's first folder.
     private var cardSize: CGSize {
         switch firstFolder?.tileShape {
@@ -210,9 +237,12 @@ struct CollectionTileCard: View {
                 RoundedRectangle(cornerRadius: NuvioRadius.md)
                     .fill(isBright ? AnyShapeStyle(NuvioPrimitives.neutral100) : AnyShapeStyle(theme.palette.surface))
                 if let cover, !cover.isEmpty {
-                    // .fit keeps a logo intact; a full landscape picture still
-                    // reads well centered on the branded surface.
-                    RemoteImage(url: cover, contentMode: .fit)
+                    // POSTER / LANDSCAPE covers are full-bleed CARD ART (a
+                    // Netflix card, a director portrait), not logo marks — so
+                    // fill the tile edge to edge. Drawing them .fit with padding
+                    // left the grey `surface` fill showing as bars around every
+                    // tile. Only SQUARE is a logo mark that wants a margin.
+                    RemoteImage(url: cover, contentMode: isLogoMark ? .fit : .fill)
                         .padding(NuvioSpacing.sm)
                         .clipShape(RoundedRectangle(cornerRadius: NuvioRadius.md))
                 } else if let emoji, !emoji.isEmpty {
@@ -301,6 +331,13 @@ struct CollectionFolderCard: View {
         return url
     }
 
+    /// Same rule as CollectionCard: only SQUARE is a logo mark wanting a margin.
+    private var isLogoMark: Bool {
+        if forceLandscape { return false }
+        let shape = folder?.tileShape ?? "SQUARE"
+        return shape != "POSTER" && shape != "LANDSCAPE"
+    }
+
     private var isPoster: Bool { folder?.tileShape == "POSTER" }
     private var isLandscape: Bool { folder?.tileShape == "LANDSCAPE" }
 
@@ -316,11 +353,13 @@ struct CollectionFolderCard: View {
                 RoundedRectangle(cornerRadius: NuvioRadius.md)
                     .fill(isBright ? AnyShapeStyle(NuvioPrimitives.neutral100) : AnyShapeStyle(theme.palette.surface))
                 if let cover = folder?.coverImageUrl, !cover.isEmpty {
-                    // .fit (not .fill) so the whole logo shows, with a margin of
-                    // blank edge around it instead of a cropped, zoomed-in crop.
-                    // Full-res `original` so the logo is crisp on a TV.
-                    RemoteImage(url: TMDBService.originalSize(cover) ?? cover, contentMode: .fit)
-                        .padding(NuvioSpacing.xl)
+                    // Full-bleed for POSTER/LANDSCAPE card art; .fit + margin
+                    // only for SQUARE logo marks. See CollectionCard above —
+                    // padding full-bleed art inside the tile is what produced
+                    // the grey bars around every tile.
+                    RemoteImage(url: TMDBService.originalSize(cover) ?? cover,
+                                contentMode: isLogoMark ? .fit : .fill)
+                        .padding(isLogoMark ? NuvioSpacing.xl : 0)
                         .clipShape(RoundedRectangle(cornerRadius: NuvioRadius.md))
                         // Fade the still out only once the GIF is actually
                         // playing, so a slow/failed GIF never leaves a blank tile.

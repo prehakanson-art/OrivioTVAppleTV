@@ -556,12 +556,29 @@ private struct RenameRowView: View {
 struct CollectionsSettingsDetail: View {
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var collections: CollectionsStore
+    @ObservedObject private var perf = PerformanceSettingsStore.shared
 
     @State private var editing: NuvioCollection?
     @State private var creating = false
 
     var body: some View {
         DetailScaffold(title: "Collections", subtitle: "Group catalogs into custom home rows") {
+            // Focus artwork sits ABOVE the collection list — it applies to all
+            // of them, and it's the first thing to reach for when a collection
+            // pack feels heavy. (Also mirrored in Settings → Performance.)
+            NuvioDropdown(
+                title: "Focus artwork",
+                subtitle: perf.settings.collectionGifQuality.summary,
+                icon: "sparkles.tv",
+                selection: perf.settings.collectionGifQuality.rawValue,
+                options: CollectionGifQuality.allCases.map {
+                    NuvioDropdownOption($0.rawValue, $0.displayName)
+                }
+            ) { raw in
+                perf.settings.collectionGifQuality =
+                    CollectionGifQuality(rawValue: raw) ?? .deviceDefault
+            }
+
             Button { creating = true } label: {
                 SettingsActionRow(
                     title: "New Collection",
