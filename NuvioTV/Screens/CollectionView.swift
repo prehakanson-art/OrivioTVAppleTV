@@ -295,7 +295,8 @@ struct CollectionFolderCard: View {
     /// `focusGifEnabled` is nil on older/imported folders — treat a present URL
     /// as opt-in there, matching how the Android app behaves.
     private var focusGifURL: String? {
-        guard let url = folder?.focusGifUrl, !url.isEmpty,
+        guard AnimatedGIFView.isSupported,
+              let url = folder?.focusGifUrl, !url.isEmpty,
               folder?.focusGifEnabled != false else { return nil }
         return url
     }
@@ -341,6 +342,11 @@ struct CollectionFolderCard: View {
                     AnimatedGIFView(url: gif, contentMode: .scaleAspectFill) { ok in
                         withAnimation(.easeOut(duration: 0.22)) { gifPlaying = ok }
                     }
+                    // Pin to the tile explicitly. Without a hard frame the
+                    // UIImageView's intrinsic size won out and the GIF drew
+                    // outside the card.
+                    .frame(width: cardSize.width, height: cardSize.height)
+                    .clipped()
                     .clipShape(RoundedRectangle(cornerRadius: NuvioRadius.md))
                     .opacity(gifPlaying ? 1 : 0)
                     .allowsHitTesting(false)
