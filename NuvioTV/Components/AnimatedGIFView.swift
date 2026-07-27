@@ -191,19 +191,31 @@ struct AnimatedGIFView: UIViewRepresentable {
             return
         }
         context.coordinator.task?.cancel()
+        NSLog("[OrivioGIF] load start %@", url.suffix(40).description)
         context.coordinator.task = Task { [weak view] in
-            guard let remote = URL(string: url),
-                  let (data, _) = try? await URLSession.shared.data(from: remote),
-                  !Task.isCancelled
-            else { await MainActor.run { onLoaded?(false) }; return }
+            guard let remote = URL(string: url) else {
+                NSLog("[OrivioGIF] bad URL"); await MainActor.run { onLoaded?(false) }; return
+            }
+            guard let (data, _) = try? await URLSession.shared.data(from: remote), !Task.isCancelled
+            else {
+                NSLog("[OrivioGIF] fetch FAILED %@", url.suffix(40).description)
+                await MainActor.run { onLoaded?(false) }; return
+            }
+            NSLog("[OrivioGIF] fetched %d bytes", data.count)
             // Decode off the main actor — a 100-frame GIF is real work.
             let decoded = await Task.detached(priority: .userInitiated) {
                 GIFDecoder.decode(data)
             }.value
             await MainActor.run {
                 guard !Task.isCancelled, let decoded, let view else {
+                    NSLog("[OrivioGIF] decode FAILED (cancelled=%@ decoded=%@ view=%@)",
+                          Task.isCancelled ? "y" : "n", decoded == nil ? "nil" : "ok",
+                          view == nil ? "nil" : "ok")
                     onLoaded?(false); return
                 }
+                NSLog("[OrivioGIF] playing: %d frames, %.2fs, %.1f MB",
+                      decoded.image.images?.count ?? 0, decoded.image.duration,
+                      Double(decoded.cost) / 1_048_576)
                 GIFDecoder.store(decoded.image, cost: decoded.cost, for: url)
                 view.image = decoded.image
                 view.startAnimating()
