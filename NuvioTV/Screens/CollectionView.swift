@@ -493,6 +493,10 @@ struct CollectionView: View {
 
     @State private var selectedFolderID: String?   // nil = All
     @State private var itemsByFolder: [String: [MetaItem]] = [:]
+    /// Folders whose first pass has landed. The grid only shows an empty state
+    /// for a folder that has actually been fetched — an unfetched one is still
+    /// on its way, and saying "nothing here" about it would be a lie.
+    @State private var loadedFolders: Set<String> = []
     @State private var isLoading = true
     @State private var hasUnsupportedSources = false
 
@@ -511,6 +515,15 @@ struct CollectionView: View {
         // "All" preserves folder order and de-dupes across folders.
         var seen = Set<String>()
         return collection.folders.flatMap { itemsByFolder[$0.id] ?? [] }.filter { seen.insert($0.id).inserted }
+    }
+
+    /// False while the folder on screen is still queued. Folders now arrive one
+    /// chunk at a time, so tabbing to one that hasn't landed must show a
+    /// spinner — the empty state would wrongly claim the folder has no titles.
+    /// "All" is treated as resolved as soon as anything has landed.
+    private var selectedFolderResolved: Bool {
+        guard let selectedFolderID else { return !loadedFolders.isEmpty }
+        return loadedFolders.contains(selectedFolderID)
     }
 
     private var typeFilteredItems: [MetaItem] {
@@ -663,7 +676,7 @@ struct CollectionView: View {
 
     @ViewBuilder
     private var grid: some View {
-        if isLoading {
+        if isLoading || !selectedFolderResolved {
             NuvioLoadingView(label: "Loading collection")
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if visibleItems.isEmpty {
@@ -814,13 +827,53 @@ struct CollectionView: View {
             return results
         }
 
-        // Phase 1 — fast first paint: a few pages per folder so the grid shows
-        // in a couple of seconds instead of waiting on a big network's entire
-        // catalog (up to 500 TMDB pages) before anything appears.
-        let firstPassPages = 4
-        itemsByFolder = await resolveAll(folders: collection.folders, maxTmdbPages: firstPassPages)
+        // How many folders may be in flight at once during the background fill.
+        // Unbounded meant a 200-folder collection opened 200 folders × 4 pages =
+        // 800 simultaneous TMDB requests, which throttles and finishes SLOWER
+        // than a bounded queue as well as spiking memory on the small boxes.
+        let maxParallelFolders = 6
+        let firstPassPages = 3          // 3 TMDB pages ≈ 60 titles
+
+        /// Fetch `folders` a chunk at a time, publishing each chunk as it lands
+        /// so the grid keeps filling, and re-ordering before every chunk so the
+        /// folder the user is CURRENTLY looking at is fetched next rather than
+        /// whenever its turn happens to come up.
+        func fill(_ folders: [NuvioCollectionFolder], pages: Int) async {
+            var pending = folders
+            while !pending.isEmpty {
+                if Task.isCancelled { return }
+                if let i = pending.firstIndex(where: { $0.id == selectedFolderID }), i != 0 {
+                    pending.insert(pending.remove(at: i), at: 0)
+                }
+                let chunk = Array(pending.prefix(maxParallelFolders))
+                pending.removeFirst(chunk.count)
+                let batch = await resolveAll(folders: chunk, maxTmdbPages: pages)
+                if Task.isCancelled { return }
+                for folder in chunk {
+                    itemsByFolder[folder.id] = batch[folder.id] ?? []
+                    loadedFolders.insert(folder.id)
+                }
+            }
+        }
+
+        // Phase 1 — first paint. The screen shows ONE folder at a time, so it
+        // only needs that one folder to render; resolving the whole collection
+        // up front is why a big one sat on a spinner for 20-30 seconds. Fetch
+        // the folder actually on screen, paint, then fill the rest behind it.
+        let firstFolder = collection.folders.first { $0.id == selectedFolderID }
+            ?? collection.folders.first
+        if let firstFolder {
+            await fill([firstFolder], pages: firstPassPages)
+        }
         hasUnsupportedSources = unsupported
         isLoading = false
+
+        // The remaining folders stream in behind the visible grid. They're only
+        // needed when the user changes tab (or for the "All" tab), and the tab
+        // they pick jumps the queue.
+        await fill(collection.folders.filter { $0.id != firstFolder?.id },
+                   pages: firstPassPages)
+        if Task.isCancelled { return }
 
         // Phase 2 — the FULL catalog streams in behind the visible grid, but
         // ONLY for folders phase 1 could actually have truncated: a folder
@@ -843,9 +896,18 @@ struct CollectionView: View {
         var startPage = firstPassPages + 1
         while !possiblyTruncated.isEmpty, startPage <= 500 {
             if Task.isCancelled { return }
-            let window = await resolveAll(folders: possiblyTruncated,
-                                          maxTmdbPages: pagesPerWindow,
-                                          tmdbStartPage: startPage)
+            // Chunked for the same reason as the first pass: a wide collection
+            // would otherwise deepen every folder at once.
+            var window: [String: [MetaItem]] = [:]
+            for chunk in stride(from: 0, to: possiblyTruncated.count, by: maxParallelFolders) {
+                if Task.isCancelled { return }
+                let slice = Array(possiblyTruncated[chunk ..< min(chunk + maxParallelFolders,
+                                                                 possiblyTruncated.count)])
+                let part = await resolveAll(folders: slice,
+                                            maxTmdbPages: pagesPerWindow,
+                                            tmdbStartPage: startPage)
+                window.merge(part) { a, _ in a }
+            }
             if Task.isCancelled { return }
             var stillGoing: [NuvioCollectionFolder] = []
             for folder in possiblyTruncated {
