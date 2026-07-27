@@ -61,6 +61,20 @@ enum GIFDecoder {
     private static var order: [String] = []
     private static let lock = NSLock()
 
+    /// Repairs malformed focus-art URLs seen in real collection data.
+    ///
+    /// Some entries have the URL DOUBLED — "…Hover.pnghttps://…Hover.png".
+    /// i.ibb.co happens to ignore the trailing garbage and serve the right
+    /// bytes, so it works by luck; any stricter host would 404. Truncate at the
+    /// second scheme so it doesn't depend on that.
+    static func normalize(_ url: String) -> String {
+        let scheme = "https://"
+        if let second = url.range(of: scheme, range: url.index(url.startIndex, offsetBy: min(1, url.count))..<url.endIndex) {
+            return String(url[url.startIndex..<second.lowerBound])
+        }
+        return url
+    }
+
     static func cached(_ key: String) -> UIImage? {
         lock.lock(); defer { lock.unlock() }
         return cache[key]
@@ -93,7 +107,25 @@ enum GIFDecoder {
     static func decode(_ data: Data) -> (image: UIImage, cost: Int)? {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
         let count = CGImageSourceGetCount(source)
-        guard count > 1 else { return nil }   // not animated — RemoteImage handles it
+
+        // STILL focus art. A chunk of the real collection assets are static
+        // despite being named "*_Hover.gif" / "*-Hover.png": the github.com
+        // ones are JPEGs with a .gif name (rewriting them to
+        // raw.githubusercontent.com returns byte-identical JPEGs, so it is the
+        // asset that is static, not the URL that is wrong), and the i.ibb.co
+        // ones are PNGs. They are still FOCUS artwork — a different image meant
+        // to replace the cover while the tile is focused — so show them instead
+        // of discarding them, which is why those tiles previously did nothing.
+        if count == 1 {
+            let opts: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+            ]
+            guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, opts as CFDictionary)
+            else { return nil }
+            return (UIImage(cgImage: cg), cg.width * cg.height * 4)
+        }
 
         // Source runtime, so the rebuilt loop lasts as long as the original.
         var total: Double = 0
@@ -179,7 +211,11 @@ struct AnimatedGIFView: UIViewRepresentable {
     }
 
     func updateUIView(_ view: UIImageView, context: Context) {
-        // Already showing this GIF — don't restart it on every focus re-render.
+        // Normalize FIRST so the cache key, the coordinator's dedupe key and
+        // the fetch all agree — keying the cache on the raw URL while fetching
+        // the repaired one would miss on every focus.
+        let url = GIFDecoder.normalize(self.url)
+        // Already showing this one — don't restart it on every focus re-render.
         if context.coordinator.loadedURL == url, view.image != nil { return }
         context.coordinator.loadedURL = url
         view.image = nil
