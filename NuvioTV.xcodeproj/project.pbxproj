@@ -860,6 +860,7 @@
 				);
 				MARKETING_VERSION = 0.7.15;
 				PRODUCT_BUNDLE_IDENTIFIER = com.orivio.tv.appletv;
+				DEVELOPMENT_TEAM = CYCSPZ5MTR;
 				SDKROOT = appletvos;
 				SWIFT_VERSION = 5.9;
 				TARGETED_DEVICE_FAMILY = 3;
@@ -877,6 +878,7 @@
 					"@loader_path/Frameworks",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.orivio.tv.appletv.uitests;
+				DEVELOPMENT_TEAM = CYCSPZ5MTR;
 				SDKROOT = appletvos;
 				SWIFT_VERSION = 5.9;
 				TARGETED_DEVICE_FAMILY = 3;
@@ -951,6 +953,7 @@
 					"@loader_path/Frameworks",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.orivio.tv.appletv.uitests;
+				DEVELOPMENT_TEAM = CYCSPZ5MTR;
 				SDKROOT = appletvos;
 				SWIFT_VERSION = 5.9;
 				TARGETED_DEVICE_FAMILY = 3;
@@ -1039,6 +1042,7 @@
 				);
 				MARKETING_VERSION = 0.7.15;
 				PRODUCT_BUNDLE_IDENTIFIER = com.orivio.tv.appletv.dev;
+				DEVELOPMENT_TEAM = CYCSPZ5MTR;
 				SDKROOT = appletvos;
 				SWIFT_VERSION = 5.9;
 				TARGETED_DEVICE_FAMILY = 3;
