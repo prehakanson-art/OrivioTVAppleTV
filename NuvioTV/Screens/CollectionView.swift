@@ -484,6 +484,7 @@ struct CollectionView: View {
     @EnvironmentObject private var addonManager: AddonManager
     @EnvironmentObject private var tmdbSettings: TMDBSettingsStore
     @ObservedObject private var perfSettings = PerformanceSettingsStore.shared
+    @EnvironmentObject private var layoutSettings: HomeCatalogSettingsStore
     @AppStorage("nuvio.collections.gifNoticeSeen.v1") private var gifNoticeSeen = false
     @State private var showGifNotice = false
 
@@ -786,11 +787,13 @@ struct CollectionView: View {
         let tmdbLanguage = tmdbSettings.settings.language
         let addons = addonManager.addons
         let manager = addonManager
+        let hideUnreleased = layoutSettings.hideUnreleasedContent
         for folder in collection.folders where CollectionResolver.hasUnsupportedSources(folder, tmdbEnabled: tmdbEnabled) {
             unsupported = true
         }
 
-        func resolveAll(folders: [NuvioCollectionFolder], maxTmdbPages: Int) async -> [String: [MetaItem]] {
+        func resolveAll(folders: [NuvioCollectionFolder], maxTmdbPages: Int,
+                        tmdbStartPage: Int = 1) async -> [String: [MetaItem]] {
             var results: [String: [MetaItem]] = [:]
             await withTaskGroup(of: (String, [MetaItem]).self) { group in
                 for folder in folders {
@@ -798,7 +801,8 @@ struct CollectionView: View {
                         let items = await CollectionResolver.resolveFolder(
                             folder, addons: addons, addonManager: manager,
                             tmdbEnabled: tmdbEnabled, tmdbLanguage: tmdbLanguage,
-                            maxTmdbPages: maxTmdbPages
+                            maxTmdbPages: maxTmdbPages, tmdbStartPage: tmdbStartPage,
+                            hideUnreleased: hideUnreleased
                         )
                         return (folder.id, items)
                     }
@@ -824,15 +828,37 @@ struct CollectionView: View {
         // 20/page, minus dedup slack). Addon/Trakt-only and small-catalog
         // folders are already complete — re-fetching them just doubled every
         // network call on every visit. Leaving the screen cancels this task.
-        let possiblyTruncated = collection.folders.filter { folder in
+        var possiblyTruncated = collection.folders.filter { folder in
             let hasTmdb = folder.effectiveSources.contains { $0.provider.lowercased() == "tmdb" }
             return hasTmdb && (itemsByFolder[folder.id]?.count ?? 0) >= firstPassPages * 20 - 5
         }
         guard !possiblyTruncated.isEmpty else { return }
-        let full = await resolveAll(folders: possiblyTruncated, maxTmdbPages: Int.max)
-        guard !Task.isCancelled else { return }
-        for (folderID, items) in full where !items.isEmpty {
-            itemsByFolder[folderID] = items
+
+        // Phase 2 — STREAM the rest in. This used to fetch everything at once
+        // (maxTmdbPages: Int.max, up to 500 pages per folder) and only repaint
+        // when the whole thing landed, so a big catalog sat there looking stuck
+        // for a long time. Now it walks the catalog in windows and appends each
+        // one as it arrives, so titles keep filling in continuously.
+        let pagesPerWindow = 3                       // ~60 titles (TMDB pages are 20)
+        var startPage = firstPassPages + 1
+        while !possiblyTruncated.isEmpty, startPage <= 500 {
+            if Task.isCancelled { return }
+            let window = await resolveAll(folders: possiblyTruncated,
+                                          maxTmdbPages: pagesPerWindow,
+                                          tmdbStartPage: startPage)
+            if Task.isCancelled { return }
+            var stillGoing: [NuvioCollectionFolder] = []
+            for folder in possiblyTruncated {
+                let fresh = window[folder.id] ?? []
+                guard !fresh.isEmpty else { continue }   // exhausted → drop it
+                var existing = itemsByFolder[folder.id] ?? []
+                var seen = Set(existing.map(\.id))
+                for item in fresh where seen.insert(item.id).inserted { existing.append(item) }
+                itemsByFolder[folder.id] = existing      // published → grid grows
+                stillGoing.append(folder)
+            }
+            possiblyTruncated = stillGoing
+            startPage += pagesPerWindow
         }
     }
 }

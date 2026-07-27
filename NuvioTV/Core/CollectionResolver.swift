@@ -24,7 +24,13 @@ enum CollectionResolver {
         addonManager: AddonManager,
         tmdbEnabled: Bool,
         tmdbLanguage: String,
-        maxTmdbPages: Int = Int.max
+        maxTmdbPages: Int = Int.max,
+        /// First TMDB page of this window (see TMDBService.resolve). >1 means
+        /// "continue a streaming load", so addon/Trakt sources — which aren't
+        /// paged — are skipped to avoid re-returning what earlier windows
+        /// already delivered.
+        tmdbStartPage: Int = 1,
+        hideUnreleased: Bool = false
     ) async -> [MetaItem] {
         let tmdbSources = folder.effectiveSources.filter { $0.provider.lowercased() == "tmdb" }
         let traktSources = folder.effectiveSources.filter { $0.isTraktSource }
@@ -34,7 +40,8 @@ enum CollectionResolver {
 
         var items: [MetaItem] = []
         var seen = Set<String>()
-        for source in addonSources {
+        let isContinuation = tmdbStartPage > 1
+        for source in addonSources where !isContinuation {
             guard let addonID = source.addonId,
                   let type = source.type,
                   let catalogID = source.catalogId,
@@ -46,14 +53,15 @@ enum CollectionResolver {
             for item in fetched where seen.insert(item.id).inserted { items.append(item) }
         }
         for source in resolvableTmdb {
-            let fetched = await TMDBService.resolve(source: source, language: tmdbLanguage, maxPages: maxTmdbPages)
+            let fetched = await TMDBService.resolve(source: source, language: tmdbLanguage,
+                                                    maxPages: maxTmdbPages, startPage: tmdbStartPage)
             for item in fetched where seen.insert(item.id).inserted { items.append(item) }
         }
-        for source in traktSources {
+        for source in traktSources where !isContinuation {
             let fetched = await resolveTrakt(source: source, addonManager: addonManager)
             for item in fetched where seen.insert(item.id).inserted { items.append(item) }
         }
-        return items
+        return hideUnreleased ? items.filter { !$0.isUnreleased } : items
     }
 
     /// Trakt list items arrive with no artwork — enrich the first N via the

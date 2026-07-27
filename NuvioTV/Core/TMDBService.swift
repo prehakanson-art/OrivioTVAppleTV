@@ -309,7 +309,13 @@ enum TMDBService {
     /// BROWSE page wants the full catalog (default = unlimited), but Home rows
     /// only need ~one page of posters, so they pass maxPages: 1 to avoid firing
     /// hundreds of requests per folder on every Home load.
-    static func resolve(source: CollectionSourceDTO, language: String, maxPages: Int = Int.max) async -> [MetaItem] {
+    /// `startPage` lets a caller fetch a WINDOW of pages (startPage ..<
+    /// startPage+maxPages) instead of always starting at 1, so a big catalog
+    /// can be streamed into the grid in chunks rather than assembled in full
+    /// before anything appears. Only DISCOVER/COMPANY/NETWORK are paged; the
+    /// other source types return their whole (small) result on the first call.
+    static func resolve(source: CollectionSourceDTO, language: String, maxPages: Int = Int.max,
+                        startPage: Int = 1) async -> [MetaItem] {
         guard source.provider.lowercased() == "tmdb",
               let sourceType = source.tmdbSourceType?.uppercased() else { return [] }
         let mediaIsMovie = (source.mediaType ?? "movie").lowercased() != "tv"
@@ -317,13 +323,15 @@ enum TMDBService {
         do {
             switch sourceType {
             case "LIST":
-                raw = try await resolveList(id: source.tmdbId, language: language)
+                // Unpaged sources have already been returned in full by the
+                // first window; later windows must not repeat them.
+                raw = startPage > 1 ? [] : (try await resolveList(id: source.tmdbId, language: language))
             case "COLLECTION":
-                raw = try await resolveCollection(id: source.tmdbId, language: language)
+                raw = startPage > 1 ? [] : (try await resolveCollection(id: source.tmdbId, language: language))
             case "COMPANY", "NETWORK", "DISCOVER":
-                raw = try await resolveDiscover(source: source, sourceType: sourceType, isMovie: mediaIsMovie, language: language, maxPages: maxPages)
+                raw = try await resolveDiscover(source: source, sourceType: sourceType, isMovie: mediaIsMovie, language: language, maxPages: maxPages, startPage: startPage)
             case "PERSON", "DIRECTOR":
-                raw = try await resolvePerson(id: source.tmdbId, director: sourceType == "DIRECTOR", isMovie: mediaIsMovie, language: language)
+                raw = startPage > 1 ? [] : (try await resolvePerson(id: source.tmdbId, director: sourceType == "DIRECTOR", isMovie: mediaIsMovie, language: language))
             default:
                 raw = []
             }
@@ -440,7 +448,7 @@ enum TMDBService {
         }
     }
 
-    private static func resolveDiscover(source: CollectionSourceDTO, sourceType: String, isMovie: Bool, language: String, maxPages: Int = Int.max) async throws -> [TMDBRawItem] {
+    private static func resolveDiscover(source: CollectionSourceDTO, sourceType: String, isMovie: Bool, language: String, maxPages: Int = Int.max, startPage: Int = 1) async throws -> [TMDBRawItem] {
         let f = source.filters
         // NETWORK forces TV, because TMDB's with_networks filter is TV-only —
         // UNLESS a watch-provider override is present. Watch-provider data
@@ -534,10 +542,13 @@ enum TMDBService {
         // simultaneously — kinder to TMDB's rate limit and to the device.
         let tmdbPageCeiling = 500
         let batchSize = 20
-        guard let first = await fetchPage(1) else { return [] }
+        // Window: pages [startPage, startPage + maxPages).
+        guard let first = await fetchPage(startPage) else { return [] }
         var allResults = first.results ?? []
-        let totalPages = min(first.total_pages ?? 1, tmdbPageCeiling, max(1, maxPages))
-        var page = 2
+        let available = min(first.total_pages ?? 1, tmdbPageCeiling)
+        let totalPages = maxPages == Int.max ? available
+            : min(available, startPage + max(1, maxPages) - 1)
+        var page = startPage + 1
         while page <= totalPages {
             let upper = min(page + batchSize - 1, totalPages)
             await withTaskGroup(of: (Int, [Result]).self) { group in
