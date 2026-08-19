@@ -356,58 +356,16 @@ struct PlayerScreen: View {
         viewModel.commitScrub()
     }
 
-    /// Exit is SEQUENCED, not immediate. Leaving HDR/DV content makes the TV
-    /// mode-switch back to the home screen's format (on a Dolby Vision setup
-    /// the DV badge pops up) — and dismissing the fullScreenCover during that
-    /// HDMI switch wedged the transition: stuck grey screen, Back looping
-    /// through a half-dismissed player. So: release the display criteria
-    /// while the player still owns the screen (prepareForExit), wait for
-    /// `isDisplayModeSwitchInProgress` to clear (bounded), THEN dismiss with
-    /// animations disabled so there's no transition left to wedge. SDR /
-    /// Match-Content-off sessions never had criteria set, skip the wait, and
-    /// exit in ~0.15s.
+    /// Confirmed exit is immediate. The confirmation button remains the guard
+    /// against accidental Back presses; once the user chooses Exit, teardown
+    /// starts and the cover is dismissed without an extra display-mode wait.
     private func exitPlayer() {
         guard !viewModel.isExiting else { return }
         NSLog("[OrivioPlayer] exitPlayer() called — overlay=%@", String(describing: viewModel.overlay))
         viewModel.prepareForExit()
-        Task { @MainActor in
-            let manager = UIApplication.shared.ks_keyWindow?.avDisplayManager
-            // Did THIS session actually request a display switch? Keying off
-            // the match-content toggle alone missed native-DV sessions (they
-            // switch with the toggle OFF) — exiting DV then dismissed
-            // mid-switch-back: stuck green/black screen.
-            let switched = viewModel.displayCriteriaApplied
-                || viewModel.settings.matchContentDisplayMode
-            // Give the just-released criteria a beat to start the switch.
-            try? await Task.sleep(nanoseconds: 150_000_000)
-            if switched {
-                // The switch-back can LAG the criteria release (rate+range
-                // renegotiations start slowly) — if it hasn't begun yet, wait
-                // for it to actually START, or the completion loop below
-                // falls straight through and we dismiss mid-switch.
-                let waitStart = Date()
-                while manager?.isDisplayModeSwitchInProgress != true,
-                      Date().timeIntervalSince(waitStart) < 1.0 {
-                    try? await Task.sleep(nanoseconds: 100_000_000)
-                }
-            }
-            let started = Date()
-            while manager?.isDisplayModeSwitchInProgress == true,
-                  Date().timeIntervalSince(started) < 3 {
-                try? await Task.sleep(nanoseconds: 150_000_000)
-            }
-            // Trailing settle: even once tvOS reports the switch "done", the
-            // TV's HDMI receiver needs a moment to lock the new mode. Tearing
-            // the cover down the instant the flag clears can land mid-lock
-            // and leave the panel wedged. Only pay it when a switch was
-            // actually in play (otherwise exit stays snappy).
-            if switched {
-                try? await Task.sleep(nanoseconds: 500_000_000)
-            }
-            var transaction = Transaction()
-            transaction.disablesAnimations = true
-            withTransaction(transaction) { dismiss() }
-        }
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) { dismiss() }
     }
 
     private var remoteCatcher: some View {

@@ -99,6 +99,7 @@
 		9B3FA2260743150105A9D5B4 /* DeepLinkService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0CEDB85725047F73A8229A81 /* DeepLinkService.swift */; };
 		9B9E605EC0039FC1C05A6A1C /* VLCKitSPM in Frameworks */ = {isa = PBXBuildFile; productRef = 02A6139CD1D7A76A7D0AC3DC /* VLCKitSPM */; };
 		9C1E03CEEB0D8CED91DBB2FA /* MaxUI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 58966C984048950D4CC82520 /* MaxUI.swift */; };
+		9C364CBA90A9D6910DEE3E38 /* ScrubThumbnailer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1970D6E8918900E798318067 /* ScrubThumbnailer.swift */; };
 		9E84617B508432C86A202A4E /* SourceSelection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D4C53D8C6A8B8FC9F1C1216 /* SourceSelection.swift */; };
 		A055A49823153A5E7FF467CF /* CollectionSourcePickerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1F2F3D404F8090E645BED64F /* CollectionSourcePickerView.swift */; };
 		A0E0B1CA9C96B4892749E9AB /* PauseOverlayView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E2B5622602D0586649B04485 /* PauseOverlayView.swift */; };
@@ -107,6 +108,7 @@
 		AB5B766D183A7565977D32AE /* FusionTokens.swift in Sources */ = {isa = PBXBuildFile; fileRef = F6445656DB7DCAD1E90A05A4 /* FusionTokens.swift */; };
 		AE0CFA7CB5922AEB4625975A /* CollectionView.swift in Sources */ = {isa = PBXBuildFile; fileRef = EAE1265EE9F6B43BD02CCC9F /* CollectionView.swift */; };
 		AE8A26A212CF6A062EA2F0B7 /* StremioAccount.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2BFA3A5175DFB66B5ED3B94 /* StremioAccount.swift */; };
+		B42B9DB670CD96D2A46BF3C4 /* NuvioLocalBackupService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 918B41E012EC14B4B09F7155 /* NuvioLocalBackupService.swift */; };
 		B694AA4934DA1692E9FE5BE3 /* HuluSidebar.swift in Sources */ = {isa = PBXBuildFile; fileRef = F96730C97830E457BF3C64FE /* HuluSidebar.swift */; };
 		B93CF80ADD1404E1ED522216 /* AnimatedGIFView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0F6A4BAC8E2E8B139AFA4C3 /* AnimatedGIFView.swift */; };
 		B98A93E06913372E0DF322E3 /* MaxTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2984806852BDC134F255AC3A /* MaxTheme.swift */; };
@@ -118,6 +120,7 @@
 		C1E4CF340CEB3DCC7282754C /* TorrServerService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B849FFDB58E807B07C473367 /* TorrServerService.swift */; };
 		C4A89B31BA169E57A828C8A5 /* PlayerControlsOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = 57C4A723527A06C009FCB68A /* PlayerControlsOverlay.swift */; };
 		C5645FFFF564BFED04BDB619 /* StremioAddons.swift in Sources */ = {isa = PBXBuildFile; fileRef = 49ACEE6593ADFC9EDFE63DCD /* StremioAddons.swift */; };
+		C600249401D4B97C5E980D06 /* StremioSyncManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = E3460A9075F4147E89F4C69D /* StremioSyncManager.swift */; };
 		C7A329FA86460E8FE3DFCA59 /* DVRemuxer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 48D4225F2EA78DACA1350421 /* DVRemuxer.swift */; };
 		C876273DA65835A43BDBFFD9 /* PosterHoldMenu.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC411FD781EFBC41A09ECCFB /* PosterHoldMenu.swift */; };
 		CB4FE6DE4F4A2038847E8042 /* KSPlayer in Frameworks */ = {isa = PBXBuildFile; productRef = 6F247E3DA7201162C0D31072 /* KSPlayer */; };
@@ -128,6 +131,7 @@
 		D80260DF602808C85646CA6F /* ParentalGuideService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 27E6B87A80D6B01D3A58DD6B /* ParentalGuideService.swift */; };
 		D93146472B6B7BF5F92096A7 /* AnimeSkipService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 33630A3CF4A4B769A36A3404 /* AnimeSkipService.swift */; };
 		DDDEA206F0D4A9A48B5C421C /* FocusTour.swift in Sources */ = {isa = PBXBuildFile; fileRef = B453879DDCDBBC1441013D02 /* FocusTour.swift */; };
+		DE12BE6F70FBD7F478A5C1C9 /* NuvioSyncDiagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = A98645467AE5A622E980295E /* NuvioSyncDiagnostics.swift */; };
 		DE74561D221C4C25B60C7E41 /* CloudLibraryService.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB57AA419192D7276E5E56DC /* CloudLibraryService.swift */; };
 		E2CFF35E41DBA1ED383BD452 /* CommunityCollectionsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = EDFA7EC018CBBC0C2C165D94 /* CommunityCollectionsView.swift */; };
 		E373E2BFA1CA4BC70051A3AA /* ThemedDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B70422822F30616E5627F138 /* ThemedDetailView.swift */; };
@@ -170,6 +174,7 @@
 		164DA27F63B762F8EB81BBD6 /* libdovi.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = libdovi.xcframework; path = Vendor/libdovi.xcframework; sourceTree = "<group>"; };
 		16C3CC132C8AA81FEAD97A0F /* AddonCatalogService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AddonCatalogService.swift; sourceTree = "<group>"; };
 		17D137BCE0827FF5B9EBCA42 /* ExternalPlayers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExternalPlayers.swift; sourceTree = "<group>"; };
+		1970D6E8918900E798318067 /* ScrubThumbnailer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScrubThumbnailer.swift; sourceTree = "<group>"; };
 		1B2527E2D3E1D4A7BF571C36 /* ThemedProfileGates.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThemedProfileGates.swift; sourceTree = "<group>"; };
 		1C322F59EB939395E94A9A54 /* StremioSearchLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StremioSearchLibrary.swift; sourceTree = "<group>"; };
 		1D9B0235B6A7831146A9FD28 /* StremioTokens.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StremioTokens.swift; sourceTree = "<group>"; };
@@ -231,6 +236,7 @@
 		88808D61D06962DC1E8D8598 /* PlayerVideoView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerVideoView.swift; sourceTree = "<group>"; };
 		8DC2E0AB0F583B31661A3D9A /* CinemaTheme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CinemaTheme.swift; sourceTree = "<group>"; };
 		8E7D954FA6B8F52309A05490 /* StremioAPI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StremioAPI.swift; sourceTree = "<group>"; };
+		918B41E012EC14B4B09F7155 /* NuvioLocalBackupService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioLocalBackupService.swift; sourceTree = "<group>"; };
 		969D7289F1E624FC42108D86 /* NuvioSyncManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioSyncManager.swift; sourceTree = "<group>"; };
 		9B6486364A772D88D23EE575 /* SubtitleProbe.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubtitleProbe.swift; sourceTree = "<group>"; };
 		9BE091846427522F2BC04294 /* StremioBoard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StremioBoard.swift; sourceTree = "<group>"; };
@@ -238,6 +244,7 @@
 		A26744F92AC1D7E60BF3416E /* HomeCatalogSettingsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeCatalogSettingsStore.swift; sourceTree = "<group>"; };
 		A4EA353DABA76B77A9FCA728 /* TraktService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TraktService.swift; sourceTree = "<group>"; };
 		A5A01D5FF908F1F01CF6BA50 /* ATVTheme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ATVTheme.swift; sourceTree = "<group>"; };
+		A98645467AE5A622E980295E /* NuvioSyncDiagnostics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioSyncDiagnostics.swift; sourceTree = "<group>"; };
 		AD681267F7BC35D3CC1F797C /* RequestCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RequestCache.swift; sourceTree = "<group>"; };
 		ADBB2C0716736EF000BE1068 /* HomeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeView.swift; sourceTree = "<group>"; };
 		AE307D5699497B04FCA96EE9 /* MaxComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaxComponents.swift; sourceTree = "<group>"; };
@@ -270,6 +277,7 @@
 		E1B7D256E3B5029E76D7C03D /* ProfilesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfilesView.swift; sourceTree = "<group>"; };
 		E2B5622602D0586649B04485 /* PauseOverlayView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PauseOverlayView.swift; sourceTree = "<group>"; };
 		E2E52DF7CD06E99777E79CD5 /* LiveTVView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveTVView.swift; sourceTree = "<group>"; };
+		E3460A9075F4147E89F4C69D /* StremioSyncManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StremioSyncManager.swift; sourceTree = "<group>"; };
 		E3BA0288809B5DD6BEFC91DE /* TMDBService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TMDBService.swift; sourceTree = "<group>"; };
 		E565452F2EEBB3B76844EE38 /* TMDBBrowseView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TMDBBrowseView.swift; sourceTree = "<group>"; };
 		E5D7F61A348C43BA8601218A /* SearchView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchView.swift; sourceTree = "<group>"; };
@@ -369,6 +377,8 @@
 				E88E24392958CAE9EB4727EE /* NuvioAccountManager.swift */,
 				3DA2F1D1196039A07AE5F6E0 /* NuvioAuthModels.swift */,
 				EC76C716994706B4C8031E57 /* NuvioConfig.swift */,
+				918B41E012EC14B4B09F7155 /* NuvioLocalBackupService.swift */,
+				A98645467AE5A622E980295E /* NuvioSyncDiagnostics.swift */,
 				969D7289F1E624FC42108D86 /* NuvioSyncManager.swift */,
 				4E68E4D03BAF629A2694A011 /* NuvioSyncModels.swift */,
 				CB84CD5358005AFCBA81FA25 /* QRCode.swift */,
@@ -470,6 +480,7 @@
 				5780AD496BA8A2CFBBCD07CB /* StreamBadges.swift */,
 				B2BFA3A5175DFB66B5ED3B94 /* StremioAccount.swift */,
 				8E7D954FA6B8F52309A05490 /* StremioAPI.swift */,
+				E3460A9075F4147E89F4C69D /* StremioSyncManager.swift */,
 				E3BA0288809B5DD6BEFC91DE /* TMDBService.swift */,
 				F2F37340DE97CB402D9FE2DE /* TopShelfExporter.swift */,
 				39771A168193BE313C08DB26 /* TorrentSettingsStore.swift */,
@@ -537,6 +548,7 @@
 				824B17483732A7F2EBB5F81D /* PlayerViewModel.swift */,
 				33E98DE3FF2BD0DC102D80F4 /* RemoteInput.swift */,
 				E6F178D2C0DFC1696A87DB92 /* ScrubberViews.swift */,
+				1970D6E8918900E798318067 /* ScrubThumbnailer.swift */,
 				0AABBCDB9DAA6E74AB201B6E /* SidePanels.swift */,
 				9B6486364A772D88D23EE575 /* SubtitleProbe.swift */,
 				E07F3565C7E5BB417A83893E /* TrailerPlayer.swift */,
@@ -767,6 +779,8 @@
 				940EF9F55F7D3674E2E712FC /* NuvioAuthModels.swift in Sources */,
 				8EEF224B9573AA3722E84B1D /* NuvioConfig.swift in Sources */,
 				F016AB0B271739F9298BE959 /* NuvioDropdown.swift in Sources */,
+				B42B9DB670CD96D2A46BF3C4 /* NuvioLocalBackupService.swift in Sources */,
+				DE12BE6F70FBD7F478A5C1C9 /* NuvioSyncDiagnostics.swift in Sources */,
 				D5A546FAEA5DBF7EF868DBE3 /* NuvioSyncManager.swift in Sources */,
 				13920A373FF2E5D7BB06F939 /* NuvioSyncModels.swift in Sources */,
 				6866CA62BAB2D88C2968222B /* NuvioTVApp.swift in Sources */,
@@ -793,6 +807,7 @@
 				82F185106384988C38383B8D /* RatingsStore.swift in Sources */,
 				2F285C593B479C27A9A8069E /* RemoteInput.swift in Sources */,
 				4E54D704783E4680F2021062 /* RequestCache.swift in Sources */,
+				9C364CBA90A9D6910DEE3E38 /* ScrubThumbnailer.swift in Sources */,
 				A9F8E8B54CCF719E19974568 /* ScrubberViews.swift in Sources */,
 				EA3FAC10216300E9811CF19E /* SearchView.swift in Sources */,
 				276BD4FAF524DAD3A6C360DE /* Secrets.swift in Sources */,
@@ -818,6 +833,7 @@
 				93D9C17201FE340994DE008F /* StremioNav.swift in Sources */,
 				049078AC290F4AA9804A3747 /* StremioSearchLibrary.swift in Sources */,
 				1D5290072980FEA7079EEE83 /* StremioSettings.swift in Sources */,
+				C600249401D4B97C5E980D06 /* StremioSyncManager.swift in Sources */,
 				7663CBA85576AA0034F84B29 /* StremioTokens.swift in Sources */,
 				948DDDB74756ED1594B6D0FB /* SubtitleProbe.swift in Sources */,
 				3E75BF4F2B2008787D63DDDD /* TMDBBrowseView.swift in Sources */,
@@ -864,7 +880,6 @@
 				);
 				MARKETING_VERSION = 0.7.15;
 				PRODUCT_BUNDLE_IDENTIFIER = com.orivio.tv.appletv;
-				DEVELOPMENT_TEAM = CYCSPZ5MTR;
 				SDKROOT = appletvos;
 				SWIFT_VERSION = 5.9;
 				TARGETED_DEVICE_FAMILY = 3;
@@ -882,7 +897,6 @@
 					"@loader_path/Frameworks",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.orivio.tv.appletv.uitests;
-				DEVELOPMENT_TEAM = CYCSPZ5MTR;
 				SDKROOT = appletvos;
 				SWIFT_VERSION = 5.9;
 				TARGETED_DEVICE_FAMILY = 3;
@@ -957,7 +971,6 @@
 					"@loader_path/Frameworks",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.orivio.tv.appletv.uitests;
-				DEVELOPMENT_TEAM = CYCSPZ5MTR;
 				SDKROOT = appletvos;
 				SWIFT_VERSION = 5.9;
 				TARGETED_DEVICE_FAMILY = 3;
@@ -1046,7 +1059,6 @@
 				);
 				MARKETING_VERSION = 0.7.15;
 				PRODUCT_BUNDLE_IDENTIFIER = com.orivio.tv.appletv.dev;
-				DEVELOPMENT_TEAM = CYCSPZ5MTR;
 				SDKROOT = appletvos;
 				SWIFT_VERSION = 5.9;
 				TARGETED_DEVICE_FAMILY = 3;

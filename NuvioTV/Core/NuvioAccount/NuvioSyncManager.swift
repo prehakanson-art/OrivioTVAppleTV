@@ -1,3 +1,4 @@
+
 import Combine
 import Foundation
 
@@ -63,6 +64,22 @@ final class NuvioSyncManager: ObservableObject {
     /// failed — can't wipe that profile's account library. See pushLibrary.
     private var pulledLibraryProfiles: Set<Int> = []
 
+    struct PendingSyncCounts {
+        let progressDeletes: Int
+        let libraryDeletes: Int
+        let watchedDeletes: Int
+
+        var total: Int { progressDeletes + libraryDeletes + watchedDeletes }
+    }
+
+    var pendingSyncCounts: PendingSyncCounts {
+        PendingSyncCounts(
+            progressDeletes: loadPendingDeletes().count,
+            libraryDeletes: loadPendingLibraryDeletes().count,
+            watchedDeletes: loadPendingWatchedDeletes().count
+        )
+    }
+
     // MARK: - Seeded flags
     // "Has this profile ever had <kind> data on the account?" — persisted, set
     // after any non-empty pull or push. An EMPTY pull only reconciles (deletes
@@ -72,6 +89,8 @@ final class NuvioSyncManager: ObservableObject {
     private func seededKey(_ kind: String) -> String { "nuvio.sync.seeded.\(kind).p\(pid)" }
     private func isSeeded(_ kind: String) -> Bool { UserDefaults.standard.bool(forKey: seededKey(kind)) }
     private func setSeeded(_ kind: String) { UserDefaults.standard.set(true, forKey: seededKey(kind)) }
+    private func clearedWatchHistoryKey() -> String { "nuvio.sync.clearedWatchHistory.v1.p\(pid)" }
+    private func repairedWatchHistoryClearKey() -> String { "nuvio.sync.repairedWatchHistoryClear.v1.p\(pid)" }
 
     /// The active profile scopes all personal-data sync. Addons stay global
     /// (profile 1) so the same sources are available on every profile.
@@ -99,6 +118,7 @@ final class NuvioSyncManager: ObservableObject {
         static let pullWatchProgress = "sync_pull_watch_progress"
         static let deleteWatchProgress = "sync_delete_watch_progress"
         static let pushLibrary = "sync_push_library"
+        static let deleteLibraryItems = "sync_delete_library_items"
         static let pullLibrary = "sync_pull_library"
         static let pushWatchedItems = "sync_push_watched_items"
         static let pullWatchedItems = "sync_pull_watched_items"
@@ -190,6 +210,7 @@ final class NuvioSyncManager: ObservableObject {
         progressStore.onLocalUpdate = { [weak self] in self?.pushWatchProgress() }
         progressStore.onRemove = { [weak self] keys in self?.deleteWatchProgress(keys: keys) }
         libraryStore.onLocalChange = { [weak self] in self?.scheduleLibraryPush() }
+        libraryStore.onRemove = { [weak self] items in self?.queueLibraryDeletes(items) }
         watchedStore.onLocalChange = { [weak self] in self?.scheduleWatchedPush() }
         watchedStore.onRemove = { [weak self] items in self?.deleteWatchedItems(items) }
         profileStore.onLocalChange = { [weak self] in self?.scheduleProfilePush() }
@@ -263,15 +284,21 @@ final class NuvioSyncManager: ObservableObject {
               String(describing: state), wasSignedIn ? "true" : "false")
         switch state {
         case .signedIn:
+            guard account.currentUserID != nil else {
+                profileStore.accountAvailable = false
+                stopAutoSync()
+                wasSignedIn = false
+                NuvioSyncDiagnostics.record(.failure, area: "Orivio", "Sync skipped because the saved account session has no user id.")
+                return
+            }
             profileStore.accountAvailable = true
             startAutoSync()
             guard !wasSignedIn else { return }
             wasSignedIn = true
-            let previous = fullSyncTask
-            fullSyncTask = Task { [weak self] in
-                await previous?.value
-                await self?.syncNow()
-            }
+            // Do not run the heavyweight full sync during app construction. The
+            // 30-second auto-sync loop and manual controls still sync the account,
+            // but launch must stay responsive even with a large saved library.
+            NuvioSyncDiagnostics.record(.info, area: "Orivio", "Account sync will run after launch or when requested.")
         case .signedOut:
             wasSignedIn = false
             profileStore.accountAvailable = false
@@ -294,39 +321,8 @@ final class NuvioSyncManager: ObservableObject {
     /// after playback ends runs normally.
     @MainActor static var playbackActive = false
 
-    /// Start (or restart) the periodic sync loop. Idempotent.
-    /// How many 30s ticks between FULL syncs (everything). In between, only the
-    /// hot data is pulled/pushed.
-    private static let fullSyncEveryNTicks = 10   // ≈ every 5 minutes
-
-    /// The subset that genuinely changes while you use the app: what you're
-    /// watching, your library, and watched state. Cheap enough to run every 30s.
-    private func syncHotDataOnly() async {
-        guard account.accessToken != nil, !isSyncing else { return }
-        isSyncing = true
-        defer { isSyncing = false }
-        let started = Date()
-        do {
-            await drainPendingDeletes()
-            try await pullWatchProgress()
-            try await pullLibrary()
-            await reconcileWatchedDeletesBeforePull()
-            try await pullWatchedItems()
-            try await pushWatchProgressAll()
-            try await pushLibrary()
-            try await pushWatchedItems()
-        } catch {
-            NSLog("[OrivioSync] hot-data tick failed: %@", String(describing: error))
-            return
-        }
-        NSLog("[OrivioSync] hot-data tick ok in %.1fs", Date().timeIntervalSince(started))
-    }
-
-    private var ticks = 0
-
     private func startAutoSync() {
         autoSyncTask?.cancel()
-        ticks = 0
         autoSyncTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: UInt64(Self.autoSyncInterval * 1_000_000_000))
@@ -339,19 +335,7 @@ final class NuvioSyncManager: ObservableObject {
                     NSLog("[OrivioSync] auto-sync tick skipped — playback active")
                     continue
                 }
-                // A FULL sync takes ~8s on a real account (collections alone are
-                // ~700 KB / 493 folders, plus badges, prefs, plugins, profiles).
-                // Running that every 30s left an A10X doing heavy network+JSON
-                // work a quarter of the time, which is what made browsing choppy.
-                // The tick now syncs only what actually changes minute to minute;
-                // everything else rides the full sync on sign-in, on foreground,
-                // and on the manual "Sync Now" button.
-                ticks += 1
-                if ticks % Self.fullSyncEveryNTicks == 0 {
-                    await syncNow()
-                } else {
-                    await syncHotDataOnly()
-                }
+                await syncNow()
             }
         }
     }
@@ -366,7 +350,19 @@ final class NuvioSyncManager: ObservableObject {
             NSLog("[OrivioSync] syncNow skipped — no access token")
             return
         }
+        guard account.currentUserID != nil else {
+            NSLog("[OrivioSync] syncNow skipped — no user id")
+            lastSyncError = "Account session is missing a user id. Sign in again."
+            NuvioSyncDiagnostics.record(.failure, area: "Orivio", lastSyncError ?? "Sync skipped.")
+            return
+        }
+        guard !isSyncing else {
+            NSLog("[OrivioSync] syncNow skipped — sync already running")
+            NuvioSyncDiagnostics.record(.warning, area: "Orivio", "Sync skipped because another sync is already running.")
+            return
+        }
         NSLog("[OrivioSync] syncNow starting")
+        NuvioSyncDiagnostics.record(.info, area: "Orivio", "Full sync started for profile \(pid).")
         isSyncing = true
         lastSyncError = nil
         defer { isSyncing = false }
@@ -383,14 +379,24 @@ final class NuvioSyncManager: ObservableObject {
             // to the active profile before pulling its data.
             try await pullProfiles()
             applyActiveProfileScope()
-            // Pull first so remote wins on first login, then push the merged set.
+            repairAccidentalWatchHistoryClearState()
+            // Pull first so remote wins on first login, then push the merged
+            // set — but flush a pending add-on edit first. `addonsDirty` exists
+            // for exactly this ("dirty ⇒ push first"), yet only the manual
+            // "Sync Add-ons" button consulted it: a periodic full sync landing
+            // inside the 1.2s debounce would reconcile an add-on you had just
+            // removed back onto the device, and then push it up again.
+            if addonsDirty { try await pushAddons() }
             try await pullAddons()
+            // Flush local progress edits before pulling. The account pull is a
+            // full snapshot, so pulling first can interpret a just-watched row
+            // as remotely deleted before its upload lands.
+            if progressDirty { try await pushWatchProgressAll() }
             // Flush removals queued in a previous session before pulling, and
             // tombstone them, so a not-yet-deleted row can't come back here.
-            let pendingDel = loadPendingDeletes()
-            if !pendingDel.isEmpty { progressStore.tombstone(Array(pendingDel)) }
-            await drainPendingDeletes()
+            await reconcileProgressDeletesBeforePull()
             try await pullWatchProgress()
+            await reconcileLibraryDeletesBeforePull()
             try await pullLibrary()
             await reconcileWatchedDeletesBeforePull()
             try await pullWatchedItems()
@@ -402,6 +408,9 @@ final class NuvioSyncManager: ObservableObject {
             await pullBadgeSettings()   // best-effort; badge chips are cosmetic
             await pullAppPreferences()  // player/TMDB/theme prefs + collections
             await pullProviderCredentials()  // debrid keys + Trakt (Android table)
+            // Local repo edits go up before the reconciling pull, or a removal
+            // still inside its debounce is restored and then re-uploaded.
+            if pluginsDirty { try? await pushPlugins() }
             await pullPlugins()              // plugin repos (Android table)
             try await pushProfiles()
             try await pushAddons()
@@ -420,9 +429,21 @@ final class NuvioSyncManager: ObservableObject {
             // later pull/push in this run.
             NSLog("[OrivioSync] syncNow FAILED: %@", String(describing: error))
             lastSyncError = describe(error)
+            NuvioSyncDiagnostics.record(.failure, area: "Orivio", lastSyncError ?? "Sync failed.")
             return
         }
         NSLog("[OrivioSync] syncNow finished ok")
+        NuvioSyncDiagnostics.record(.success, area: "Orivio", "Full sync finished for profile \(pid).")
+    }
+
+    func pullAccountUpdates() async {
+        NuvioSyncDiagnostics.record(.info, area: "Orivio", "Pull updates requested; running full two-way sync for profile \(pid).")
+        await syncNow()
+    }
+
+    func pushThisDevice() async {
+        NuvioSyncDiagnostics.record(.info, area: "Orivio", "Device push requested; running full two-way sync for profile \(pid).")
+        await syncNow()
     }
 
     private func applyActiveProfileScope() {
@@ -470,7 +491,7 @@ final class NuvioSyncManager: ObservableObject {
             var obj: [String: Any] = [
                 "url": addon.manifestURL,
                 "sort_order": index,
-                "enabled": true
+                "enabled": addon.enabled
             ]
             if !addon.manifest.name.isEmpty { obj["name"] = addon.manifest.name }
             return obj
@@ -500,7 +521,9 @@ final class NuvioSyncManager: ObservableObject {
         let path = "/rest/v1/addons?user_id=eq.\(userID)&profile_id=eq.1&select=url,sort_order,enabled,name"
         let data = try await authedGet(path)
         let rows = try JSONDecoder().decode([SupabaseAddon].self, from: data)
-        let orderedURLs = rows.sorted { $0.sortOrder < $1.sortOrder }.map(\.url)
+        let orderedAddons = rows.sorted { $0.sortOrder < $1.sortOrder }.map {
+            AddonManager.RemoteAddonState(manifestURL: $0.url, enabled: $0.enabled)
+        }
         NSLog("[OrivioAddonSync] pullAddons: %d rows for user %@", rows.count, userID)
 
         // Same seeded policy library/watched use. Reconciling (deleting local
@@ -508,7 +531,7 @@ final class NuvioSyncManager: ObservableObject {
         // account genuinely represents this profile's add-ons — otherwise a
         // first sign-in against a fresh account would wipe the device.
         let seeded = isSeeded("addons")
-        if orderedURLs.isEmpty {
+        if orderedAddons.isEmpty {
             // Empty account list: only a real "removed everything elsewhere"
             // when seeded. Unseeded + empty = fresh account; keep local and let
             // the push upload it.
@@ -516,13 +539,16 @@ final class NuvioSyncManager: ObservableObject {
             await addonManager.applyRemote(urls: [], reconcile: true)
             return
         }
-        await addonManager.applyRemote(urls: orderedURLs, reconcile: seeded)
+        await addonManager.applyRemote(addons: orderedAddons, reconcile: seeded)
         setSeeded("addons")
     }
 
     // MARK: - Watch progress
 
+    private var progressDirty = false
+
     private func pushWatchProgress() {
+        progressDirty = true
         Task { [weak self] in try? await self?.pushWatchProgressAll() }
     }
 
@@ -535,10 +561,10 @@ final class NuvioSyncManager: ObservableObject {
             guard let self else { return }
             // Reassert not-yet-confirmed removals so the pull can't resurrect
             // them, push the deletes to the server, THEN pull the snapshot.
-            let pending = self.loadPendingDeletes()
-            if !pending.isEmpty { self.progressStore.tombstone(Array(pending)) }
-            await self.drainPendingDeletes()
+            await self.reconcileProgressDeletesBeforePull()
+            guard self.loadPendingDeletes().isEmpty else { return }
             try? await self.pullWatchProgress()
+            await self.reconcileLibraryDeletesBeforePull()
             try? await self.pullLibrary()
         }
     }
@@ -570,6 +596,18 @@ final class NuvioSyncManager: ObservableObject {
         Task { [weak self] in await self?.drainPendingDeletes() }
     }
 
+    /// Reassert tombstones for Continue Watching removals the server hasn't
+    /// confirmed, THEN flush them — so a full-snapshot pull can't resurrect a
+    /// card whose delete is still retrying. The in-memory tombstone expires
+    /// after 3 minutes while the persisted queue does not, so a delete that
+    /// keeps failing would otherwise let the row reappear once the grace ran
+    /// out. Must run before every progress pull.
+    private func reconcileProgressDeletesBeforePull() async {
+        let pending = loadPendingDeletes()
+        if !pending.isEmpty { progressStore.tombstone(Array(pending)) }
+        await drainPendingDeletes()
+    }
+
     /// Send every queued removal to the account, clearing only what the server
     /// confirmed. Anything left (a failure, or added mid-flight) retries on the
     /// next drain — foreground, the 30s Home poll, or full sync.
@@ -591,12 +629,63 @@ final class NuvioSyncManager: ObservableObject {
         }
     }
 
+    private func repairAccidentalWatchHistoryClearState() {
+        let hadClearState = UserDefaults.standard.bool(forKey: clearedWatchHistoryKey())
+            || WatchHistoryClearState.clearedAt != nil
+        guard hadClearState,
+              !UserDefaults.standard.bool(forKey: repairedWatchHistoryClearKey()) else { return }
+
+        UserDefaults.standard.removeObject(forKey: clearedWatchHistoryKey())
+        savePendingDeletes([])
+        savePendingWatchedDeletes([])
+        UserDefaults.standard.set(true, forKey: repairedWatchHistoryClearKey())
+        NuvioSyncDiagnostics.record(
+            .warning,
+            area: "Orivio",
+            "Cleared stale watch-history delete queues so account Continue Watching can pull again."
+        )
+    }
+
+    private func clearWatchHistoryIfNeeded() async throws -> Bool {
+        guard account.accessToken != nil else { return false }
+        guard !UserDefaults.standard.bool(forKey: clearedWatchHistoryKey()) else { return false }
+
+        NuvioSyncDiagnostics.record(.warning, area: "Orivio", "Clearing watch history for profile \(pid).")
+
+        await reconcileProgressDeletesBeforePull()
+        try await pullWatchProgress()
+        await reconcileWatchedDeletesBeforePull()
+        try await pullWatchedItems()
+
+        WatchHistoryClearState.markClearedNow()
+        let progressKeys = progressStore.clearAllProgress(notify: false)
+        let watchedItems = watchedStore.clearAll(notify: false)
+
+        if !progressKeys.isEmpty {
+            deleteWatchProgress(keys: progressKeys)
+            await drainPendingDeletes()
+        }
+        if !watchedItems.isEmpty {
+            deleteWatchedItems(watchedItems)
+            await drainPendingWatchedDeletes()
+        }
+
+        if loadPendingDeletes().isEmpty && loadPendingWatchedDeletes().isEmpty {
+            UserDefaults.standard.set(true, forKey: clearedWatchHistoryKey())
+            NuvioSyncDiagnostics.record(.success, area: "Orivio", "Watch history cleared for profile \(pid).")
+        } else {
+            NuvioSyncDiagnostics.record(.warning, area: "Orivio", "Watch history clear is queued and will retry while deletes are pending.")
+        }
+
+        return true
+    }
+
     private func pushWatchProgressAll() async throws {
         guard account.accessToken != nil else { return }
         // Serialize OFF the main actor: this runs on every periodic progress
         // save during playback, and building dictionaries + JSON for the whole
         // history on main was a measurable playback hiccup.
-        let snapshot = progressStore.allForSync()
+        let snapshot = progressStore.serviceBackedForSync()
         let profileID = pid
         let client = clientID
         let payload = await Task.detached(priority: .utility) {
@@ -604,20 +693,40 @@ final class NuvioSyncManager: ObservableObject {
         }.value
         guard let payload else { return }
         _ = try await send(endpoint: RPC.url(RPC.pushWatchProgress), method: "POST", body: payload)
+        progressDirty = false
+        if !snapshot.isEmpty { setSeeded("progress") }
+    }
+
+    private nonisolated static func boundedInt(_ value: Double) -> Int? {
+        let jsonSafeIntegerLimit = 9_000_000_000_000_000.0
+        guard value.isFinite,
+              abs(value) <= jsonSafeIntegerLimit else { return nil }
+        return Int(value)
+    }
+
+    private nonisolated static func milliseconds(_ seconds: Double) -> Int? {
+        boundedInt((seconds * 1000).rounded())
+    }
+
+    private nonisolated static func epochMilliseconds(_ date: Date) -> Int? {
+        boundedInt((date.timeIntervalSince1970 * 1000).rounded())
     }
 
     private nonisolated static func encodeWatchProgressBody(
         _ items: [WatchProgress], pid: Int, clientID: String
     ) -> Data? {
         let entries: [[String: Any]] = items.compactMap { wp in
-            guard wp.durationSeconds > 0 else { return nil }
+            guard wp.durationSeconds > 0,
+                  let position = milliseconds(wp.positionSeconds),
+                  let duration = milliseconds(wp.durationSeconds),
+                  let lastWatched = epochMilliseconds(wp.updatedAt) else { return nil }
             var obj: [String: Any] = [
                 "content_id": wp.metaID,
                 "content_type": wp.type,
                 "video_id": wp.id,
-                "position": Int((wp.positionSeconds * 1000).rounded()),
-                "duration": Int((wp.durationSeconds * 1000).rounded()),
-                "last_watched": Int(wp.updatedAt.timeIntervalSince1970 * 1000),
+                "position": position,
+                "duration": duration,
+                "last_watched": lastWatched,
                 "progress_key": wp.id
             ]
             if let season = wp.season { obj["season"] = season }
@@ -637,9 +746,15 @@ final class NuvioSyncManager: ObservableObject {
         guard account.accessToken != nil else { return }
         let data = try await authedPost(RPC.url(RPC.pullWatchProgress), body: ["p_profile_id": pid])
         let rows = try JSONDecoder().decode([SupabaseWatchProgress].self, from: data)
-        // NB: no early return on an empty result — this is a full snapshot, so
-        // an empty (but successful) pull must still reach mergeRemote to
-        // reconcile deletions, e.g. when the last item was removed elsewhere.
+        let seeded = isSeeded("progress")
+        if rows.isEmpty && !seeded {
+            // Fresh account: keep local app/Stremio/Trakt rows and let the
+            // following push upload them instead of treating empty as deletion.
+            return
+        }
+        // NB: after the first successful non-empty sync, an empty result is a
+        // full snapshot and must reconcile deletions, e.g. when the last item
+        // was removed elsewhere.
 
         var pulled: [WatchProgress] = rows.map { row in
             WatchProgress(
@@ -656,25 +771,47 @@ final class NuvioSyncManager: ObservableObject {
                 positionSeconds: Double(row.position) / 1000.0,
                 durationSeconds: Double(row.duration) / 1000.0,
                 streamURL: nil,
-                updatedAt: Date(timeIntervalSince1970: Double(row.lastWatched) / 1000.0)
+                updatedAt: Date(timeIntervalSince1970: Double(row.lastWatched) / 1000.0),
+                syncSource: "nuvio"
             )
         }
         pulled = await enrichMetadata(pulled)
         let before = progressStore.continueWatching(sortMode: .recentlyWatched).count
-        progressStore.mergeRemote(pulled)
+        progressStore.replaceWithNuvioSnapshot(pulled, preserveLocalAdditions: !seeded)
+        if !pulled.isEmpty { setSeeded("progress") }
+        // Catch-all: any Continue Watching card still labelled with its raw
+        // "tt…" id — from THIS pull or any other source — resolves now, so a
+        // synced row is never shown as its IMDb id.
+        await enrichRawContinueWatchingTitles()
         let after = progressStore.continueWatching(sortMode: .recentlyWatched).count
         NSLog("[OrivioCWSync] pullWatchProgress: %d rows from account, continue-watching %d -> %d",
               rows.count, before, after)
+    }
+
+    /// Resolve real titles/art for any Continue Watching row still showing a
+    /// raw "tt…" id and write them back to the store (presentation only — no
+    /// push, no position change). Bounded by `enrichMetadata`'s own cap.
+    private func enrichRawContinueWatchingTitles() async {
+        let raw = progressStore.continueWatching(sortMode: .recentlyWatched)
+            .filter { isRawSyncTitle($0.name, id: $0.metaID) }
+        guard !raw.isEmpty else { return }
+        let enriched = await enrichMetadata(raw)
+            .filter { !isRawSyncTitle($0.name, id: $0.metaID) }
+        guard !enriched.isEmpty else { return }
+        progressStore.applyEnrichedMetadata(enriched)
     }
 
     /// The backend stores no titles/artwork with progress, so pulled Continue
     /// Watching rows arrive bare. Fill them in from a meta addon (Cinemeta) so
     /// the cards render, best-effort and capped.
     private func enrichMetadata(_ entries: [WatchProgress]) async -> [WatchProgress] {
-        // Gated by the "Enrich Continue Watching" setting: when off, synced
-        // rows keep whatever title/art they arrived with (leaner, no extra
-        // meta-addon calls). Locally-watched rows already carry name + art.
-        guard enrichContinueWatchingEnabled?() ?? true else { return entries }
+        // The "Enrich Continue Watching" setting gates ONLY the optional artwork
+        // backfill for rows that already have a real title (leaner: fewer
+        // meta-addon calls). A raw "tt…" id is never an acceptable card title,
+        // so rows still showing their IMDb id ALWAYS resolve — otherwise a row
+        // synced from another device (which arrives with no title) renders as
+        // "tt1234567". Locally-watched rows already carry name + art.
+        let enrichArtwork = enrichContinueWatchingEnabled?() ?? true
         // Match ProgressStore.continueWatching: any started, unfinished item is
         // visible (no lower bound), so all of them need title/artwork.
         let visible = entries.filter { $0.fraction < 0.95 }
@@ -682,21 +819,33 @@ final class NuvioSyncManager: ObservableObject {
         // 30s Home poll must not re-hit meta addons for cards already on
         // screen; only genuinely new rows (added on another device) enrich.
         // Their name/art then flows through mergeRemote's local-field coalesce.
-        let localNamed = Set(progressStore.items.values.filter { !$0.name.isEmpty }.map(\.metaID))
-        let ids = Array(Set(visible.map { ($0.metaID, $0.type) }
-            .filter { !localNamed.contains($0.0) }
-            .map { "\($0.0)|\($0.1)" })).prefix(30)
+        let localNamed = Set(progressStore.items.values
+            .filter { !isRawSyncTitle($0.name, id: $0.metaID) }
+            .map(\.metaID))
+        // Raw-title rows resolve unconditionally so no card shows a bare "tt…".
+        let rawTitleTokens = visible
+            .filter { isRawSyncTitle($0.name, id: $0.metaID) }
+            .map { "\($0.metaID)|\($0.type)" }
+        // Artwork-only backfill for already-titled rows is what the setting gates.
+        let missingLocalTokens = enrichArtwork
+            ? visible
+                .filter { !localNamed.contains($0.metaID) }
+                .map { "\($0.metaID)|\($0.type)" }
+            : []
+        let ids = Array(NSOrderedSet(array: rawTitleTokens + missingLocalTokens).compactMap { $0 as? String }).prefix(30)
         var metaByID: [String: MetaItem] = [:]
         for token in ids {
             let parts = token.split(separator: "|", maxSplits: 1).map(String.init)
-            guard parts.count == 2, let addon = addonManager.metaAddon(for: parts[1], id: parts[0]) else { continue }
-            if let meta = try? await StremioAPI.meta(addon: addon, type: parts[1], id: parts[0]) {
+            guard parts.count == 2 else { continue }
+            if let meta = await resolveSyncMetadata(id: parts[0], type: parts[1]) {
                 metaByID[parts[0]] = meta
             }
         }
         guard !metaByID.isEmpty else { return entries }
         return entries.map { wp in
             guard let meta = metaByID[wp.metaID] else { return wp }
+            let video = meta.videos?.first { $0.id == wp.id }
+                ?? meta.videos?.first { $0.season == wp.season && $0.episode == wp.episode }
             return WatchProgress(
                 id: wp.id,
                 metaID: wp.metaID,
@@ -707,11 +856,15 @@ final class NuvioSyncManager: ObservableObject {
                 logo: meta.logo,
                 season: wp.season,
                 episode: wp.episode,
-                episodeTitle: wp.episodeTitle,
+                episodeTitle: video?.title ?? wp.episodeTitle,
+                episodeThumbnail: video?.thumbnail ?? wp.episodeThumbnail,
                 positionSeconds: wp.positionSeconds,
                 durationSeconds: wp.durationSeconds,
                 streamURL: wp.streamURL,
-                updatedAt: wp.updatedAt
+                streamSignature: wp.streamSignature,
+                updatedAt: wp.updatedAt,
+                syncSource: wp.syncSource,
+                hasNewEpisode: wp.hasNewEpisode
             )
         }
     }
@@ -719,6 +872,7 @@ final class NuvioSyncManager: ObservableObject {
     // MARK: - Library
 
     private func scheduleLibraryPush() {
+        libraryDirty = true
         pushLibraryTask?.cancel()
         pushLibraryTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 1_200_000_000)
@@ -727,22 +881,184 @@ final class NuvioSyncManager: ObservableObject {
         }
     }
 
+    /// Set on any local library edit, cleared only once a push actually lands.
+    /// Dirty ⇒ push BEFORE pulling: the library push is full-replace and the
+    /// pull reconciles, so a pull that ran first would restore whatever the
+    /// debounced push hadn't uploaded yet — and the following push would then
+    /// re-upload the row the user had just removed (the remove/re-add
+    /// ping-pong). Addons and profiles already work this way.
+    private var libraryDirty = false
+
+    // The library push is upsert-with-replace and has no per-item delete RPC,
+    // so a removal only reaches the account as an ABSENCE from the next push.
+    // That made removals the most fragile thing in the whole sync: if the app
+    // was killed inside the 1.2s debounce, or the push failed once (offline,
+    // token refresh), nothing anywhere remembered the deletion — the in-memory
+    // tombstone died with the process and the next pull re-added the item
+    // permanently. Queue removals to a PERSISTED per-profile set, exactly like
+    // Continue Watching and watched items, and keep them until a push confirms.
+    private func pendingLibraryDeletesKey() -> String {
+        "nuvio.sync.pendingLibraryDeletes.p\(pid)"
+    }
+
+    private func loadPendingLibraryDeletes() -> Set<String> {
+        Set(UserDefaults.standard.stringArray(forKey: pendingLibraryDeletesKey()) ?? [])
+    }
+
+    private func savePendingLibraryDeletes(_ set: Set<String>) {
+        if set.isEmpty { UserDefaults.standard.removeObject(forKey: pendingLibraryDeletesKey()) }
+        else { UserDefaults.standard.set(Array(set), forKey: pendingLibraryDeletesKey()) }
+    }
+
+    private func queueLibraryDeletes(_ items: [SavedLibraryItem]) {
+        var keys = Set(items.map(\.key))
+        for item in items where item.id.hasPrefix("tt") {
+            let alternateType = item.type == "series" ? "movie" : "series"
+            keys.insert("\(alternateType)|\(item.id)")
+        }
+        guard !keys.isEmpty else { return }
+        var pending = loadPendingLibraryDeletes()
+        pending.formUnion(keys)
+        savePendingLibraryDeletes(pending)
+    }
+
+    private func libraryDeletePayload(from keys: Set<String>) -> [[String: String]] {
+        keys.compactMap { key in
+            let parts = key.split(separator: "|", maxSplits: 1).map(String.init)
+            guard parts.count == 2 else { return nil }
+            return ["content_id": parts[1], "content_type": parts[0]]
+        }
+    }
+
+    private func ignoresMissingRPC(_ error: Error) -> Bool {
+        guard case NuvioAuthError.http(let status, let body) = error else { return false }
+        return [400, 404].contains(status)
+            && (body.localizedCaseInsensitiveContains("could not find the function")
+                || body.localizedCaseInsensitiveContains("pgrst202")
+                || body.localizedCaseInsensitiveContains("schema cache"))
+    }
+
+    private func staleAlternateLibraryDeleteKeys(for items: [SavedLibraryItem]) -> Set<String> {
+        var keys: Set<String> = []
+        for item in items where item.id.hasPrefix("tt") {
+            let alternateType = item.type == "series" ? "movie" : "series"
+            keys.insert("\(alternateType)|\(item.id)")
+        }
+        return keys
+    }
+
+    private func deleteLibraryItems(keys: Set<String>) async throws {
+        let payload = libraryDeletePayload(from: keys)
+        guard !payload.isEmpty else { return }
+        do {
+            _ = try await authedPost(
+                RPC.url(RPC.deleteLibraryItems),
+                body: [
+                    "p_keys": payload,
+                    "p_profile_id": pid,
+                    "p_origin_client_id": clientID
+                ]
+            )
+        } catch {
+            guard ignoresMissingRPC(error) else { throw error }
+        }
+    }
+
+    /// Reassert tombstones for removals the account hasn't confirmed, then flush
+    /// the pending push — so a pull can neither resurrect them locally nor feed
+    /// them back into the next upload.
+    private func reconcileLibraryDeletesBeforePull() async {
+        let pending = loadPendingLibraryDeletes()
+        if !pending.isEmpty { libraryStore.tombstone(Array(pending)) }
+        if libraryDirty || !pending.isEmpty {
+            try? await pushLibrary()
+        }
+    }
+
+    private func metadataTypes(for type: String, id: String) -> [String] {
+        let normalized = type.lowercased()
+        let preferred = ["series", "tv", "show", "tvshow"].contains(normalized) ? "series" : "movie"
+        guard id.hasPrefix("tt") else { return [preferred] }
+        return preferred == "series" ? ["series", "movie"] : ["movie", "series"]
+    }
+
+    private func isRawSyncTitle(_ title: String, id: String) -> Bool {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return true }
+        if trimmed == id { return true }
+        if trimmed.hasPrefix("tt") && trimmed.dropFirst(2).allSatisfy(\.isNumber) { return true }
+        return false
+    }
+
+    private func isUsefulMetadata(_ meta: MetaItem, for id: String) -> Bool {
+        (!meta.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && meta.name != id)
+        || meta.poster != nil
+        || meta.background != nil
+    }
+
+    private func resolveSyncMetadata(id: String, type: String) async -> MetaItem? {
+        let cinemeta = AddonManager.bundledCinemeta()
+        for lookupType in metadataTypes(for: type, id: id) {
+            if let meta = try? await StremioAPI.meta(addon: cinemeta, type: lookupType, id: id),
+               isUsefulMetadata(meta, for: id) {
+                return meta
+            }
+        }
+        return nil
+    }
+
+    private func enrichLibraryMetadata(_ items: [SavedLibraryItem]) async -> [SavedLibraryItem] {
+        let rawTitleItems = items.filter { isRawSyncTitle($0.name, id: $0.id) }
+        let rawTitleKeys = Set(rawTitleItems.map(\.key))
+        let artworkItems = items.filter { item in
+            !rawTitleKeys.contains(item.key) && (item.poster == nil || item.background == nil)
+        }
+        let candidates = rawTitleItems + Array(artworkItems.prefix(30))
+        guard !candidates.isEmpty else { return items }
+
+        var metaByKey: [String: MetaItem] = [:]
+        for item in candidates {
+            guard metaByKey[item.key] == nil else { continue }
+            if let meta = await resolveSyncMetadata(id: item.id, type: item.type) {
+                metaByKey[item.key] = meta
+            }
+        }
+        guard !metaByKey.isEmpty else { return items }
+        return items.map { item in
+            guard let meta = metaByKey[item.key] else { return item }
+            return item.withFallbackMetadata(meta)
+        }
+    }
+
     private func pushLibrary() async throws {
         guard account.accessToken != nil else { return }
-        let items = libraryStore.allForSync()
+        let rawItems = libraryStore.allForSync()
+        let items = await enrichLibraryMetadata(rawItems)
+        if items != rawItems { libraryStore.mergeRemote(items, reconcile: false) }
+        let pendingDeletes = loadPendingLibraryDeletes()
         // `sync_push_library` is replace-semantics (like the addon push), so an
         // empty push is how "removed my last saved item" reaches the account.
         // But only send empty AFTER a successful pull this session — otherwise a
         // cold start (local empty, not yet reconciled) could wipe the account.
-        guard !items.isEmpty || pulledLibraryProfiles.contains(pid) else { return }
-        let entries: [[String: Any]] = items.map { item in
+        //
+        // …OR when this device has a QUEUED REMOVAL. `pulledLibraryProfiles` is
+        // in-memory, so removing your last saved item before the session's first
+        // pull skipped the push entirely and left nothing to retry — the item
+        // came straight back. A pending delete is positive proof the user
+        // removed it here, which is exactly the evidence the cold-start guard
+        // was missing.
+        guard !items.isEmpty || pulledLibraryProfiles.contains(pid) || !pendingDeletes.isEmpty
+        else { return }
+        let entries: [[String: Any]] = items.compactMap { item in
+            guard let addedAt = Self.epochMilliseconds(item.addedAt) else { return nil }
             var obj: [String: Any] = [
                 "content_id": item.id,
                 "content_type": item.type,
                 "name": item.name,
+                "title": item.name,
                 "poster_shape": item.posterShape,
                 "genres": item.genres,
-                "added_at": Int(item.addedAt.timeIntervalSince1970 * 1000)
+                "added_at": addedAt
             ]
             if let poster = item.poster { obj["poster"] = poster }
             if let background = item.background { obj["background"] = background }
@@ -758,6 +1074,20 @@ final class NuvioSyncManager: ObservableObject {
             "p_origin_client_id": clientID
         ]
         _ = try await authedPost(RPC.url(RPC.pushLibrary), body: body)
+        let accountDeleteKeys = pendingDeletes.union(staleAlternateLibraryDeleteKeys(for: items))
+        try await deleteLibraryItems(keys: accountDeleteKeys)
+        // The push landed, so the account now holds exactly `items` — every
+        // queued removal it doesn't contain is done. (Replace semantics mean an
+        // absence IS the delete.) Subtract only the snapshot we captured above,
+        // so a removal made while this call was in flight still retries.
+        if !pendingDeletes.isEmpty {
+            var latest = loadPendingLibraryDeletes()
+            latest.subtract(pendingDeletes)
+            savePendingLibraryDeletes(latest)
+        }
+        // Only now is the account known to hold this device's list, so a later
+        // pull may safely reconcile against it.
+        libraryDirty = false
         if !items.isEmpty { setSeeded("library") }
     }
 
@@ -772,7 +1102,7 @@ final class NuvioSyncManager: ObservableObject {
                 body: ["p_profile_id": pid, "p_limit": pageSize, "p_offset": offset]
             )
             let page = try JSONDecoder().decode([SupabaseLibraryItem].self, from: data)
-            collected.append(contentsOf: page.map { row in
+            let pageItems = page.map { row in
                 SavedLibraryItem(
                     id: row.contentID,
                     type: row.contentType,
@@ -787,7 +1117,8 @@ final class NuvioSyncManager: ObservableObject {
                     addonBaseURL: row.addonBaseURL,
                     addedAt: Date(timeIntervalSince1970: Double(row.addedAt) / 1000.0)
                 )
-            })
+            }
+            collected.append(contentsOf: await enrichLibraryMetadata(pageItems))
             if page.count < pageSize { break }
             offset += pageSize
         }
@@ -905,12 +1236,13 @@ final class NuvioSyncManager: ObservableObject {
         guard account.accessToken != nil else { return }
         let items = watchedStore.allForSync()
         guard !items.isEmpty else { return }
-        let entries: [[String: Any]] = items.map { item in
+        let entries: [[String: Any]] = items.compactMap { item in
+            guard let watchedAt = Self.epochMilliseconds(item.watchedAt) else { return nil }
             var obj: [String: Any] = [
                 "content_id": item.contentID,
                 "content_type": item.contentType,
                 "title": item.title,
-                "watched_at": Int(item.watchedAt.timeIntervalSince1970 * 1000),
+                "watched_at": watchedAt,
                 "season": item.season as Any,
                 "episode": item.episode as Any
             ]
@@ -1375,8 +1707,7 @@ final class NuvioSyncManager: ObservableObject {
             RPC.url(RPC.pullProfileSettingsBlob),
             body: ["p_profile_id": pid, "p_platform": Self.settingsBlobPlatform]
         ),
-            let rows = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
-            let existing = rows.first?["settings_json"] as? [String: Any] {
+           let existing = Self.settingsBlob(from: data) {
             blob = existing
         }
         var features = blob["features"] as? [String: Any] ?? [:]
@@ -1533,8 +1864,7 @@ final class NuvioSyncManager: ObservableObject {
             RPC.url(RPC.pullProfileSettingsBlob),
             body: ["p_profile_id": pid, "p_platform": Self.settingsBlobPlatform]
         ),
-            let rows = try? JSONSerialization.jsonObject(with: existingData) as? [[String: Any]],
-            let existing = rows.first?["settings_json"] as? [String: Any] {
+           let existing = Self.settingsBlob(from: existingData) {
             blob = existing
         }
         var features = blob["features"] as? [String: Any] ?? [:]
@@ -1673,7 +2003,13 @@ final class NuvioSyncManager: ObservableObject {
 
     // MARK: - Plugins — Android table
 
+    /// Set on any local plugin-repo edit, cleared once a push lands. Same role
+    /// as `addonsDirty`: dirty ⇒ push before pulling, so a reconcile can't
+    /// restore a repo the user just removed.
+    private var pluginsDirty = false
+
     private func schedulePluginsPush() {
+        pluginsDirty = true
         pushPluginsTask?.cancel()
         pushPluginsTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 1_500_000_000)
@@ -1696,7 +2032,12 @@ final class NuvioSyncManager: ObservableObject {
     private func pushPlugins() async throws {
         guard account.accessToken != nil, let pluginStore else { return }
         let repos = pluginStore.repositories
-        guard !repos.isEmpty else { return }
+        // An empty push is how "I removed my last repo" reaches the account —
+        // but only when this device actually made that edit (`pluginsDirty`).
+        // Blanket-skipping empty meant removing the last repo never synced and
+        // the next pull put it straight back; blanket-allowing it would let a
+        // fresh device wipe the account before its first pull.
+        guard !repos.isEmpty || pluginsDirty else { return }
         let entries: [[String: Any]] = repos.enumerated().map { index, repo in
             [
                 "url": repo.url,
@@ -1712,6 +2053,8 @@ final class NuvioSyncManager: ObservableObject {
             "p_origin_client_id": clientID
         ]
         _ = try await authedPost(RPC.url(RPC.pushPlugins), body: body)
+        pluginsDirty = false
+        if !repos.isEmpty { setSeeded("plugins") }
     }
 
     /// Pull plugin repos via a PostgREST table select (there's no dedicated pull

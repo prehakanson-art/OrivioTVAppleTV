@@ -1,11 +1,12 @@
 import SwiftUI
 
-/// Account → Stremio: QR ("Stremio Link") sign-in and a one-way pull of your
-/// Stremio library into Orivio's Library / Continue Watching / Watched. Opened
-/// full-screen from the Account settings pane. Mirrors the Trakt flow.
+/// Account → Stremio: QR ("Stremio Link") sign-in plus Stremio library,
+/// Continue Watching, watched, and add-on sync. Opened full-screen from the
+/// Account settings pane. Mirrors the Trakt flow.
 struct StremioAccountView: View {
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var stremio: StremioAccountStore
+    @EnvironmentObject private var addonManager: AddonManager
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var progress: ProgressStore
     @EnvironmentObject private var watched: WatchedStore
@@ -16,10 +17,11 @@ struct StremioAccountView: View {
     @State private var showConnect = false
     @State private var pollTask: Task<Void, Never>?
     @State private var status: String?
+    @State private var connectStatus = "Starting sign-in..."
 
     var body: some View {
         DetailScaffold(title: "Stremio",
-                       subtitle: "Sync your Stremio library, Continue Watching and Watched") {
+                       subtitle: "Sync your Stremio add-ons, library, Continue Watching and Watched") {
             if stremio.isSignedIn { signedIn } else { signedOut }
         }
         .onDisappear { pollTask?.cancel() }
@@ -28,7 +30,7 @@ struct StremioAccountView: View {
             ZStack {
                 theme.palette.background.ignoresSafeArea()
                 if let code = linkCode {
-                    StremioConnectPage(code: code).id(code.code)
+                    StremioConnectPage(code: code, status: connectStatus).id(code.code)
                 }
             }
             .environmentObject(theme)
@@ -60,7 +62,7 @@ struct StremioAccountView: View {
                     title: "Sync now",
                     subtitle: stremio.isSyncing
                         ? "Syncing…"
-                        : (stremio.lastSyncStatus ?? "Pull your library, Continue Watching and Watched from Stremio"),
+                        : (stremio.lastSyncStatus ?? "Sync add-ons, library, Continue Watching and Watched with Stremio"),
                     leadingIcon: "arrow.triangle.2.circlepath"
                 )
             }
@@ -103,6 +105,7 @@ struct StremioAccountView: View {
     // MARK: Actions
 
     private func startLogin() {
+        connectStatus = "Starting sign-in..."
         showConnect = true
         Task { await loadCode() }
     }
@@ -112,6 +115,7 @@ struct StremioAccountView: View {
         do {
             let code = try await StremioAccountService.createLink()
             linkCode = code
+            connectStatus = "Waiting for authorization..."
             beginPolling(code)
         } catch {
             status = "Couldn't start Stremio login."
@@ -130,12 +134,22 @@ struct StremioAccountView: View {
         pollTask = Task {
             let deadline = Date().addingTimeInterval(300)   // codes are short-lived
             while !Task.isCancelled && Date() < deadline {
-                if case .authorized(let authKey) = await StremioAccountService.readLink(code: code.code) {
+                switch await StremioAccountService.readLink(code: code.code) {
+                case .pending:
+                    connectStatus = "Waiting for authorization..."
+                case .authorized(let authKey):
+                    connectStatus = "Authorized. Syncing your library..."
                     let user = await StremioAccountService.getUser(authKey: authKey)
                     stremio.signIn(authKey: authKey, user: user)
                     linkCode = nil
                     showConnect = false
                     await syncNow()
+                    return
+                case .failed(let message):
+                    status = message
+                    connectStatus = message
+                    linkCode = nil
+                    showConnect = false
                     return
                 }
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
@@ -146,10 +160,21 @@ struct StremioAccountView: View {
     }
 
     private func syncNow() async {
+        if let manager = StremioSyncManager.shared {
+            manager.syncNow(reason: "Manual Stremio sync")
+            return
+        }
+
         guard let key = stremio.authKey else { return }
         stremio.setSyncing(true)
-        stremio.setStatus("Syncing…")
-        let result = await StremioSync.pull(authKey: key, library: library, progress: progress, watched: watched)
+        stremio.setStatus("Syncing...")
+        let result = await StremioSync.pull(
+            authKey: key,
+            addonManager: addonManager,
+            library: library,
+            progress: progress,
+            watched: watched
+        )
         stremio.setStatus(result)
         stremio.setSyncing(false)
     }
@@ -159,6 +184,7 @@ struct StremioAccountView: View {
 struct StremioConnectPage: View {
     @EnvironmentObject private var theme: ThemeManager
     let code: StremioLinkCode
+    let status: String
 
     var body: some View {
         VStack(spacing: NuvioSpacing.xl) {
@@ -183,7 +209,7 @@ struct StremioConnectPage: View {
 
             HStack(spacing: NuvioSpacing.sm) {
                 ProgressView().tint(theme.palette.secondary)
-                Text("Waiting for authorization…")
+                Text(status)
                     .font(.system(size: 22))
                     .foregroundStyle(theme.palette.textTertiary)
             }

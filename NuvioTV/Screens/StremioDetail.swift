@@ -176,8 +176,11 @@ struct StremioDetailView: View {
         } else if let info = meta.releaseInfo {
             values.append(info)
         }
+        if let contentRating = viewModel.contentRating {
+            values.append(contentRating)
+        }
         if meta.isSeries {
-            let count = meta.seasons.count
+            let count = meta.regularSeasons.count
             if count > 0 { values.append(count == 1 ? "1 season" : "\(count) seasons") }
         } else if let runtime = meta.runtimeFormatted {
             values.append(runtime)
@@ -283,7 +286,7 @@ struct StremioDetailView: View {
     }
 
     private var seriesPlayTarget: MetaVideo? {
-        let all = meta.seasons.flatMap { meta.episodes(season: $0) }
+        let all = meta.playbackSeasons.flatMap { meta.episodesIncludingLinkedSpecials(season: $0) }
         guard !all.isEmpty else { return nil }
         if let inProgress = all.first(where: { ep in
             if let p = progressStore.progress(for: ep.id) { return p.fraction > 0.02 && p.fraction < 0.95 }
@@ -325,17 +328,19 @@ struct StremioDetailView: View {
             if let season = viewModel.selectedSeason {
                 ScrollView(.horizontal) {
                     LazyHStack(alignment: .top, spacing: 26) {
-                        ForEach(meta.episodes(season: season)) { episode in
+                        ForEach(meta.episodesIncludingLinkedSpecials(season: season)) { episode in
                             let extra = episode.episode.flatMap { viewModel.episodeExtras[season]?[$0] }
                             Button { onPlay(meta, episode) } label: {
                                 StremioEpisodeCard(
                                     episode: episode,
                                     stillURL: episode.thumbnail ?? extra?.still ?? meta.background,
                                     progress: progressStore.progress(for: episode.id)?.fraction,
-                                    watched: watched.isWatched(contentID: meta.id, season: season, episode: episode.episode)
+                                    watched: watched.isWatched(contentID: meta.id, season: season, episode: episode.episode),
+                                    castLine: episodeCastLine(viewModel.episodeCasts[episode.id])
                                 )
                             }
                             .buttonStyle(PlainCardButtonStyle())
+                            .task { await viewModel.loadCast(for: episode) }
                         }
                     }
                     .padding(.vertical, 12)
@@ -351,6 +356,11 @@ struct StremioDetailView: View {
     }
 
     // MARK: More like this
+
+    private func episodeCastLine(_ cast: [TMDBService.CastMember]?) -> String? {
+        guard let names = cast?.prefix(3).map(\.name), !names.isEmpty else { return nil }
+        return "Cast: \(names.joined(separator: ", "))"
+    }
 
     @ViewBuilder
     private var moreLikeThis: some View {
@@ -479,6 +489,7 @@ private struct StremioEpisodeCard: View {
     let stillURL: String?
     let progress: Double?
     let watched: Bool
+    let castLine: String?
 
     private let width: CGFloat = 420
     private let height: CGFloat = 236
@@ -520,11 +531,24 @@ private struct StremioEpisodeCard: View {
             .shadow(color: .black.opacity(isFocused ? 0.55 : 0), radius: 20, y: 9)
             .scaleEffect(isFocused ? StremioFocus.landscapeScale : 1)
 
-            Text(titleLine)
-                .font(StremioFont.medium(22))
-                .foregroundStyle(isFocused ? .white : StremioSurfaces.textSecondary)
-                .lineLimit(2)
-                .frame(width: width, alignment: .leading)
+            VStack(alignment: .leading, spacing: 5) {
+                Text(titleLine)
+                    .font(StremioFont.medium(22))
+                    .foregroundStyle(isFocused ? .white : StremioSurfaces.textSecondary)
+                    .lineLimit(2)
+                    .frame(width: width, alignment: .leading)
+
+                if let castLine, !castLine.isEmpty {
+                    Text(castLine)
+                        .font(StremioFont.regular(16))
+                        .foregroundStyle(StremioSurfaces.textTertiary)
+                        .lineLimit(1)
+                        .frame(width: width, alignment: .leading)
+                        .opacity(isFocused ? 1 : 0)
+                }
+            }
+            .frame(width: width, height: castLine?.isEmpty == false ? 68 : 54, alignment: .topLeading)
+            .clipped()
         }
         .animation(StremioFocus.entry, value: isFocused)
     }

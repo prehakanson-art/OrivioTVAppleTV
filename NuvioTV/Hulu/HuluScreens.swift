@@ -34,7 +34,9 @@ struct HuluHomeView: View {
                             LazyHStack(spacing: 26) {
                                 ForEach(continueItems) { cw in
                                     HuluProgressCard(title: cw, label: "Continue Watching",
-                                                     subtitle: cw.episodeLine.isEmpty ? cw.name : cw.episodeLine,
+                                                     subtitle: [cw.episodeLine.isEmpty ? cw.name : cw.episodeLine, cw.remainingText]
+                                                        .compactMap { $0 }
+                                                        .joined(separator: " · "),
                                                      progress: cw.progress ?? 0.35) { onResume(cw) }
                                 }
                             }

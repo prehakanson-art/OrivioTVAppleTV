@@ -943,19 +943,21 @@ struct AccountSettingsDetail: View {
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var progressStore: ProgressStore
     @EnvironmentObject private var watchedStore: WatchedStore
+    @EnvironmentObject private var trakt: TraktStore
+    @EnvironmentObject private var debrid: DebridStore
+    @EnvironmentObject private var plugins: PluginStore
     @State private var showAccount = false
     @State private var showProfiles = false
-    @State private var showStremio = false
 
     var body: some View {
         DetailScaffold(title: SettingsCategory.account.title, subtitle: SettingsCategory.account.subtitle) {
             SettingsGroupCard(title: "") {
                 Button { showAccount = true } label: {
                     SettingsValueCard(
-                        title: account.authState.isSignedIn ? "Orivio Account" : "Sign in to Orivio",
+                        title: "Accounts",
                         subtitle: account.authState.isSignedIn
-                            ? "Sync your addons, library, progress and profiles"
-                            : "Sign in to sync your addons, library, progress and profiles",
+                            ? "Manage Orivio, Stremio, sync status and backups"
+                            : "Sign in to Orivio, Stremio, or both",
                         value: accountStatus
                     )
                 }
@@ -971,26 +973,7 @@ struct AccountSettingsDetail: View {
                 }
                 .buttonStyle(PlainCardButtonStyle())
 
-                Button { showStremio = true } label: {
-                    SettingsValueCard(
-                        title: "Stremio",
-                        subtitle: "Sign in with QR to sync your Stremio library, Continue Watching and Watched",
-                        value: stremio.isSignedIn ? (stremio.email ?? "Connected") : ""
-                    )
-                }
-                .buttonStyle(PlainCardButtonStyle())
             }
-        }
-        .fullScreenCover(isPresented: $showStremio) {
-            ZStack {
-                theme.palette.background.ignoresSafeArea()
-                StremioAccountView(onClose: { showStremio = false })
-            }
-            .environmentObject(theme)
-            .environmentObject(stremio)
-            .environmentObject(library)
-            .environmentObject(progressStore)
-            .environmentObject(watchedStore)
         }
         .fullScreenCover(isPresented: $showAccount) {
             ZStack {
@@ -1000,9 +983,14 @@ struct AccountSettingsDetail: View {
             .environmentObject(theme)
             .environmentObject(account)
             .environmentObject(profiles)
-            .onChange(of: account.authState) { _, newState in
-                if case .signedIn = newState { showAccount = false }
-            }
+            .environmentObject(addonManager)
+            .environmentObject(library)
+            .environmentObject(progressStore)
+            .environmentObject(watchedStore)
+            .environmentObject(stremio)
+            .environmentObject(trakt)
+            .environmentObject(debrid)
+            .environmentObject(plugins)
             .onExitCommand { showAccount = false }
         }
         .fullScreenCover(isPresented: $showProfiles) {
@@ -1015,9 +1003,10 @@ struct AccountSettingsDetail: View {
 
     private var accountStatus: String {
         switch account.authState {
-        case .signedIn(_, let email): return email.isEmpty ? "Signed in" : email
-        case .loading: return "…"
-        case .signedOut: return ""
+        case .signedIn(_, let email): return email.isEmpty ? "Orivio connected" : email
+        case .loading: return "..."
+        case .signedOut:
+            return stremio.isSignedIn ? (stremio.email ?? "Stremio connected") : ""
         }
     }
 }
@@ -1223,6 +1212,8 @@ private struct AddonsManagementView: View {
     @State private var showCommunityCollections = false
     @State private var refreshing = false
     @State private var showExport = false
+    @State private var showImport = false
+    @State private var showHealth = false
     @State private var pendingRemoval: InstalledAddon?
 
     private static let refreshIdle = "Two-way sync with your account — uploads your changes, pulls others' and removes add-ons deleted elsewhere"
@@ -1320,6 +1311,15 @@ private struct AddonsManagementView: View {
             .buttonStyle(PlainCardButtonStyle())
             .disabled(refreshing)
 
+            Button { showHealth = true } label: {
+                SettingsActionRow(
+                    title: "Add-on Health",
+                    subtitle: "Measure manifest response time and find slow or dead providers",
+                    leadingIcon: "waveform.path.ecg"
+                )
+            }
+            .buttonStyle(PlainCardButtonStyle())
+
             // Export Setup: QR with every installed manifest URL — scan with a
             // phone to keep your addon list for a fresh install.
             Button { showExport = true } label: {
@@ -1327,6 +1327,15 @@ private struct AddonsManagementView: View {
                     title: "Export Add-on Setup",
                     subtitle: "Show a QR code containing every installed manifest URL",
                     leadingIcon: "qrcode"
+                )
+            }
+            .buttonStyle(PlainCardButtonStyle())
+
+            Button { showImport = true } label: {
+                SettingsActionRow(
+                    title: "Import Add-on Setup",
+                    subtitle: "Paste exported manifest URLs to restore a setup",
+                    leadingIcon: "square.and.arrow.down"
                 )
             }
             .buttonStyle(PlainCardButtonStyle())
@@ -1398,6 +1407,16 @@ private struct AddonsManagementView: View {
                 onDone: { showExport = false }
             )
             .environmentObject(theme)
+        }
+        .fullScreenCover(isPresented: $showImport) {
+            AddonImportView(onDone: { showImport = false })
+                .environmentObject(theme)
+                .environmentObject(addonManager)
+        }
+        .fullScreenCover(isPresented: $showHealth) {
+            AddonHealthView(onDone: { showHealth = false })
+                .environmentObject(theme)
+                .environmentObject(addonManager)
         }
     }
 
@@ -1691,6 +1710,239 @@ private struct AboutInfoView: View {
             }
         }
         .onExitCommand { dismiss() }
+    }
+}
+
+private struct AddonImportView: View {
+    @EnvironmentObject private var theme: ThemeManager
+    @EnvironmentObject private var addonManager: AddonManager
+    let onDone: () -> Void
+
+    @State private var input = ""
+    @State private var importing = false
+    @State private var message: String?
+
+    var body: some View {
+        ZStack {
+            theme.palette.background.ignoresSafeArea()
+            DetailScaffold(title: "Import Add-ons", subtitle: "Paste manifest URLs from an exported setup") {
+                SettingsGroupCard(title: "Manifest URLs", subtitle: "One URL per line, or paste the full text from an export") {
+                    TextField("https://.../manifest.json", text: $input, axis: .vertical)
+                        .font(.system(size: 22))
+                        .lineLimit(5...10)
+                        .padding(NuvioSpacing.lg)
+                        .background(theme.palette.field, in: RoundedRectangle(cornerRadius: NuvioRadius.md, style: .continuous))
+
+                    HStack(spacing: NuvioSpacing.md) {
+                        Button {
+                            importAddons()
+                        } label: {
+                            if importing {
+                                ProgressView().tint(theme.palette.onSecondary)
+                            } else {
+                                Text("Import").font(.system(size: 23, weight: .semibold))
+                            }
+                        }
+                        .disabled(importing || input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                        Button("Done", action: onDone)
+                            .font(.system(size: 23, weight: .semibold))
+                    }
+
+                    if let message {
+                        Text(message)
+                            .font(.system(size: 20, weight: .medium))
+                            .foregroundStyle(message.hasPrefix("Imported") ? NuvioPrimitives.success : NuvioPrimitives.error)
+                    }
+                }
+            }
+        }
+        .onExitCommand(perform: onDone)
+    }
+
+    private func importAddons() {
+        guard !importing else { return }
+        importing = true
+        message = nil
+        Task {
+            let result = await addonManager.importManifestURLs(from: input)
+            importing = false
+            if result.installed == 0 && result.failed == 0 {
+                message = "No manifest URLs found."
+            } else {
+                message = "Imported \(result.installed), failed \(result.failed)."
+                if result.installed > 0 { input = "" }
+            }
+        }
+    }
+}
+
+private struct AddonHealthView: View {
+    @EnvironmentObject private var theme: ThemeManager
+    @EnvironmentObject private var addonManager: AddonManager
+    let onDone: () -> Void
+
+    @State private var scanning = false
+    @State private var results: [AddonManager.HealthResult] = []
+
+    var body: some View {
+        ZStack {
+            theme.palette.background.ignoresSafeArea()
+            DetailScaffold(title: "Add-on Health", subtitle: "Manifest response times for installed providers") {
+                SettingsGroupCard(title: "Scan", subtitle: summary) {
+                    Button { scan() } label: {
+                        SettingsActionRow(
+                            title: scanning ? "Scanning..." : "Run Health Check",
+                            subtitle: "Checks installed manifest URLs without changing your setup",
+                            value: scanning ? "..." : nil,
+                            leadingIcon: "waveform.path.ecg"
+                        )
+                    }
+                    .buttonStyle(PlainCardButtonStyle())
+                    .disabled(scanning)
+                }
+
+                if !results.isEmpty {
+                    SettingsGroupCard(title: "Results") {
+                        ForEach(results) { result in
+                            AddonHealthRow(
+                                result: result,
+                                onDisable: { disable(result) }
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        .task {
+            if results.isEmpty { scan() }
+        }
+        .onExitCommand(perform: onDone)
+    }
+
+    private var summary: String {
+        guard !results.isEmpty else {
+            return scanning ? "Checking installed add-ons..." : "No scan has run yet"
+        }
+        let failed = results.filter {
+            if case .failed = $0.status { return true }
+            return false
+        }.count
+        let slow = results.filter { $0.status == .slow }.count
+        if failed > 0 || slow > 0 {
+            return "\(failed) failed, \(slow) slow, \(results.count) checked"
+        }
+        return "All \(results.count) installed add-ons responded normally"
+    }
+
+    private func scan() {
+        guard !scanning else { return }
+        scanning = true
+        Task {
+            results = await addonManager.healthCheck().sorted { lhs, rhs in
+                rank(lhs.status) < rank(rhs.status)
+            }
+            scanning = false
+        }
+    }
+
+    private func rank(_ status: AddonManager.HealthResult.Status) -> Int {
+        switch status {
+        case .failed: return 0
+        case .slow: return 1
+        case .ok: return 2
+        case .disabled: return 3
+        }
+    }
+
+    private func disable(_ result: AddonManager.HealthResult) {
+        guard let addon = addonManager.addons.first(where: { $0.id == result.id }) else { return }
+        addonManager.setEnabled(addon, false)
+        scan()
+    }
+}
+
+private struct AddonHealthRow: View {
+    @EnvironmentObject private var theme: ThemeManager
+    let result: AddonManager.HealthResult
+    let onDisable: () -> Void
+
+    var body: some View {
+        HStack(spacing: NuvioSpacing.md) {
+            Image(systemName: icon)
+                .font(.system(size: 28, weight: .semibold))
+                .foregroundStyle(color)
+                .frame(width: 56, height: 56)
+                .background(Circle().fill(color.opacity(0.16)))
+
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: NuvioSpacing.sm) {
+                    Text(result.name)
+                        .font(.system(size: 24, weight: .semibold))
+                        .foregroundStyle(theme.palette.textPrimary)
+                    Text(result.status.label)
+                        .font(.system(size: 16, weight: .bold))
+                        .foregroundStyle(color)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 3)
+                        .background(Capsule().fill(color.opacity(0.16)))
+                }
+                Text(detail)
+                    .font(.system(size: 18))
+                    .foregroundStyle(theme.palette.textSecondary)
+                    .lineLimit(2)
+                Text(result.manifestURL)
+                    .font(.system(size: 16).monospaced())
+                    .foregroundStyle(theme.palette.textTertiary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+
+            Spacer()
+
+            if canDisable {
+                Button("Disable", action: onDisable)
+                    .font(.system(size: 21, weight: .semibold))
+            }
+        }
+        .padding(.horizontal, NuvioSpacing.lg)
+        .padding(.vertical, NuvioSpacing.sm)
+        .background(theme.palette.backgroundCard.opacity(0.5), in: RoundedRectangle(cornerRadius: NuvioRadius.md, style: .continuous))
+    }
+
+    private var detail: String {
+        let timing = result.elapsedMS.map { "\($0) ms" } ?? "not checked"
+        switch result.status {
+        case .failed(let reason):
+            return "\(result.capabilities) · \(timing) · \(reason)"
+        default:
+            return "\(result.capabilities) · \(timing)"
+        }
+    }
+
+    private var canDisable: Bool {
+        switch result.status {
+        case .failed, .slow: return true
+        case .ok, .disabled: return false
+        }
+    }
+
+    private var icon: String {
+        switch result.status {
+        case .ok: return "checkmark.circle.fill"
+        case .slow: return "speedometer"
+        case .disabled: return "pause.circle.fill"
+        case .failed: return "exclamationmark.triangle.fill"
+        }
+    }
+
+    private var color: Color {
+        switch result.status {
+        case .ok: return NuvioPrimitives.success
+        case .slow: return theme.palette.secondary
+        case .disabled: return theme.palette.textTertiary
+        case .failed: return NuvioPrimitives.error
+        }
     }
 }
 

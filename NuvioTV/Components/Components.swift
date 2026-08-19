@@ -27,7 +27,7 @@ final class ImageCache: @unchecked Sendable {
     /// shared session.
     static let downloadSession: URLSession = {
         let config = URLSessionConfiguration.default
-        config.httpMaximumConnectionsPerHost = 12
+        config.httpMaximumConnectionsPerHost = PerformanceProfile.isLowPower ? 6 : (PerformanceProfile.isMidPower ? 8 : 12)
         config.timeoutIntervalForRequest = 25
         config.urlCache = URLCache(memoryCapacity: 16 << 20, diskCapacity: 128 << 20)
         return URLSession(configuration: config)
@@ -161,8 +161,12 @@ final class ImageCache: @unchecked Sendable {
     /// 100+ posters) before being evicted, for zero display benefit. The display
     /// path decodes from this disk cache at its own tight per-card budget.
     func prefetch(urls: [String]) {
+        var seen = Set<String>()
+        let unique = urls.filter { seen.insert($0).inserted }
+        let limit = PerformanceProfile.isLowPower ? 36 : (PerformanceProfile.isMidPower ? 60 : unique.count)
+        let candidates = Array(unique.prefix(limit))
         Task.detached(priority: .utility) { [weak self] in
-            for urlString in urls {
+            for urlString in candidates {
                 guard let self, let url = URL(string: urlString) else { continue }
                 let fileURL = self.fileURL(for: urlString)
                 if self.fm.fileExists(atPath: fileURL.path) { continue }
@@ -380,7 +384,11 @@ struct BlurredRemoteImage: View {
     }
 
     private func load(_ value: String?) async {
-        guard let value else { return }
+        guard let value else {
+            shownKey = nil
+            image = nil
+            return
+        }
         if value == shownKey { return }
         guard let blurred = await ImageCache.shared.blurredImage(
             for: value, screenBlurRadius: screenBlurRadius
@@ -444,6 +452,7 @@ private struct ActiveMarquee: View {
     @State private var textWidth: CGFloat = 0
     @State private var boxWidth: CGFloat = 0
     @State private var offset: CGFloat = 0
+    @State private var marqueeTask: Task<Void, Never>?
 
     /// Gap between the looping copies, and scroll speed in pt/s.
     private let gap: CGFloat = 60
@@ -470,6 +479,7 @@ private struct ActiveMarquee: View {
         )
         .onChange(of: textWidth) { _, _ in startIfNeeded() }
         .onChange(of: boxWidth) { _, _ in startIfNeeded() }
+        .onDisappear { marqueeTask?.cancel() }
     }
 
     private var measuredText: some View {
@@ -483,12 +493,13 @@ private struct ActiveMarquee: View {
     }
 
     private func startIfNeeded() {
+        marqueeTask?.cancel()
         guard overflows, offset == 0 else { return }
         let distance = textWidth + gap
         // Brief hold so the title is readable before it starts moving.
-        Task { @MainActor in
+        marqueeTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 700_000_000)
-            guard overflows, offset == 0 else { return }
+            guard !Task.isCancelled, overflows, offset == 0 else { return }
             withAnimation(.linear(duration: distance / speed)
                 .delay(0.4)
                 .repeatForever(autoreverses: false)) {
@@ -638,6 +649,11 @@ struct ProgressStrip: View {
     }
 }
 
+enum LandscapeSubtitleBehavior: Equatable {
+    case compact
+    case readableOnFocus
+}
+
 /// Landscape card used for Continue Watching and episode thumbnails.
 struct LandscapeCard: View {
     @EnvironmentObject private var theme: ThemeManager
@@ -654,6 +670,15 @@ struct LandscapeCard: View {
     var watched: Bool = false
     var rating: String? = nil
     var width: CGFloat = 380
+    var subtitleBehavior: LandscapeSubtitleBehavior = .compact
+    var detailLine: String? = nil
+    var remainingText: String? = nil
+    var hasNewEpisode: Bool = false
+    /// Flip to false to revert episode cards to the compact caption if the taller
+    /// focused description treatment does not feel right on-device.
+    private static let expandedEpisodeDescriptionsEnabled = true
+    /// Flip to false to hide per-episode cast captions without removing the fetch/cache path.
+    private static let episodeCastLineEnabled = true
     /// Spoiler-blur the still until the card is focused (then it reveals).
     var blurImage: Bool = false
     /// When false, the title/subtitle caption is omitted — the Apple TV theme
@@ -687,7 +712,18 @@ struct LandscapeCard: View {
                 if let rating { RatingBadge(rating: rating).padding(10) }
             }
             .overlay(alignment: .topTrailing) {
-                if watched { WatchedBadge().padding(10) }
+                if hasNewEpisode {
+                    NewEpisodeBadge().padding(10)
+                } else if watched {
+                    WatchedBadge().padding(10)
+                }
+            }
+            .overlay(alignment: .bottomTrailing) {
+                if let remainingText {
+                    RemainingTimeBadge(text: remainingText)
+                        .padding(.trailing, 12)
+                        .padding(.bottom, progress == nil ? 12 : 24)
+                }
             }
             .overlay(
                 RoundedRectangle(cornerRadius: cardRadius, style: .continuous)
@@ -711,23 +747,7 @@ struct LandscapeCard: View {
                     radius: stremio && isFocused ? 26 : 0, y: 6)
 
             if showsCaption {
-                VStack(alignment: .leading, spacing: 2) {
-                    MarqueeText(
-                        text: title,
-                        font: .system(size: 22, weight: .medium),
-                        color: isFocused ? theme.palette.textPrimary : theme.palette.textSecondary,
-                        active: isFocused
-                    )
-                    if let subtitle, !subtitle.isEmpty {
-                        MarqueeText(
-                            text: subtitle,
-                            font: .system(size: 19),
-                            color: theme.palette.textTertiary,
-                            active: isFocused
-                        )
-                    }
-                }
-                .frame(width: width, alignment: .leading)
+                caption
             }
         }
         .scaleEffect(landscapeScale)
@@ -735,9 +755,96 @@ struct LandscapeCard: View {
                    : .spring(response: 0.32, dampingFraction: 0.82), value: isFocused)
     }
 
+    private var caption: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            MarqueeText(
+                text: title,
+                font: .system(size: 22, weight: .medium),
+                color: isFocused ? theme.palette.textPrimary : theme.palette.textSecondary,
+                active: isFocused
+            )
+            .frame(width: width, alignment: .leading)
+            .clipped()
+
+            if let subtitle, !subtitle.isEmpty {
+                subtitleText(subtitle)
+            }
+
+            if let detailLine, !detailLine.isEmpty, Self.episodeCastLineEnabled {
+                Text(detailLine)
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(theme.palette.textTertiary)
+                    .lineLimit(1)
+                    .frame(width: width, alignment: .leading)
+                    .opacity(isFocused ? 1 : 0)
+                    .offset(y: isFocused ? 0 : 4)
+            }
+        }
+        .frame(width: width, height: captionHeight, alignment: .topLeading)
+        .clipped()
+    }
+
+    @ViewBuilder
+    private func subtitleText(_ subtitle: String) -> some View {
+        if subtitleBehavior == .readableOnFocus && Self.expandedEpisodeDescriptionsEnabled {
+            ZStack(alignment: .topLeading) {
+                episodeSubtitle(subtitle, lines: 2, color: theme.palette.textTertiary)
+                    .opacity(isFocused ? 0 : 1)
+                    .offset(y: isFocused ? -4 : 0)
+                episodeSubtitle(subtitle, lines: 5, color: theme.palette.textSecondary)
+                    .opacity(isFocused ? 1 : 0)
+                    .offset(y: isFocused ? 0 : 6)
+            }
+            .frame(width: width, height: 98, alignment: .topLeading)
+            .clipped()
+            .animation(.easeInOut(duration: 0.18), value: isFocused)
+        } else {
+            episodeSubtitle(subtitle, lines: 2, color: theme.palette.textTertiary)
+        }
+    }
+
+    private func episodeSubtitle(_ subtitle: String, lines: Int, color: Color) -> some View {
+        Text(subtitle)
+            .font(.system(size: 18))
+            .foregroundStyle(color)
+            .lineSpacing(2)
+            .lineLimit(lines)
+            .frame(width: width, alignment: .leading)
+            .clipped()
+    }
+
+    private var captionHeight: CGFloat {
+        let expanded = subtitleBehavior == .readableOnFocus && Self.expandedEpisodeDescriptionsEnabled
+        return expanded ? (Self.episodeCastLineEnabled && detailLine?.isEmpty == false ? 156 : 132) : 72
+    }
+
     private var landscapeScale: CGFloat {
         guard perf.focusZoomEffective && isFocused && !theme.isAppleTVTheme else { return 1.0 }
         return stremio ? StremioFocus.landscapeScale : 1.06
+    }
+}
+
+private struct RemainingTimeBadge: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 18, weight: .semibold))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(.black.opacity(0.68), in: Capsule())
+    }
+}
+
+private struct NewEpisodeBadge: View {
+    var body: some View {
+        Image(systemName: "plus")
+            .font(.system(size: 18, weight: .bold))
+            .foregroundStyle(.black)
+            .frame(width: 34, height: 34)
+            .background(.white, in: Circle())
+            .shadow(color: .black.opacity(0.35), radius: 8, y: 3)
     }
 }
 
@@ -980,6 +1087,23 @@ struct MetaLine: View {
                 ImdbBadge(rating: imdbRating)
             }
         }
+    }
+}
+
+struct ContentRatingBadge: View {
+    let rating: String
+
+    var body: some View {
+        Text(rating)
+            .font(.system(size: 18, weight: .heavy))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 5)
+            .background(.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .strokeBorder(.white.opacity(0.5), lineWidth: 1)
+            )
     }
 }
 

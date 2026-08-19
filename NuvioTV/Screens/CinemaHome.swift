@@ -29,6 +29,7 @@ struct CinemaHomeView: View {
     }
     private var continueItems: [WatchProgress] {
         progressStore.continueWatching(sortMode: homeCatalogSettings.continueWatchingSortMode)
+            .map(progressWithCatalogArt)
     }
     private var heroItem: MetaItem? { focused ?? viewModel.initialHero ?? catalogRows.first?.items.first }
 
@@ -113,6 +114,14 @@ struct CinemaHomeView: View {
         return MetaItem(id: p.metaID, type: p.type, name: p.name,
                         poster: p.poster, background: p.background, logo: p.logo)
     }
+
+    private func progressWithCatalogArt(_ progress: WatchProgress) -> WatchProgress {
+        guard (progress.poster == nil || progress.background == nil || progress.name.isEmpty),
+              let meta = catalogRows.lazy.flatMap(\.items).first(where: { $0.id == progress.metaID }) else {
+            return progress
+        }
+        return progress.withFallbackMetadata(meta)
+    }
 }
 
 // MARK: - Hero
@@ -122,6 +131,7 @@ private struct CinemaHero: View {
     @ObservedObject private var perf = PerformanceSettingsStore.shared
     let item: MetaItem?
     let onPlay: () -> Void
+    @State private var contentRating: String?
 
     var body: some View {
         ZStack(alignment: .bottomLeading) {
@@ -176,12 +186,23 @@ private struct CinemaHero: View {
             .padding(.leading, 60)
             .padding(.bottom, 24)
         }
+        .task(id: item?.id) { await loadContentRating() }
+    }
+
+    private func loadContentRating() async {
+        guard let item, item.type != "collection" else {
+            contentRating = nil
+            return
+        }
+        let rating = await TMDBService.contentRating(imdbID: item.id, type: item.type)
+        if self.item?.id == item.id { contentRating = rating }
     }
 
     private var metaLine: String? {
         guard let item else { return nil }
         var parts: [String] = []
         if let r = item.imdbRating { parts.append("★ \(r)") }
+        if let contentRating { parts.append(contentRating) }
         if let y = item.releaseInfo { parts.append(y) }
         if let g = item.genres?.first { parts.append(g) }
         if let rt = item.runtime { parts.append(rt) }
@@ -343,14 +364,36 @@ private struct CinemaContinueArt: View {
                         contentMode: .fill, maxDimension: width)
                 .frame(width: width, height: width * 9 / 16)
                 .clipShape(RoundedRectangle(cornerRadius: CinemaFocus.cardRadius, style: .continuous))
-            GeometryReader { geo in
-                ZStack(alignment: .leading) {
-                    Capsule().fill(Color.white.opacity(0.3)).frame(height: 5)
-                    Capsule().fill(theme.palette.secondary)
-                        .frame(width: geo.size.width * CGFloat(min(max(progress.fraction, 0.02), 1)), height: 5)
-                }
+            if progress.hasNewEpisode == true {
+                Image(systemName: "plus")
+                    .font(.system(size: 18, weight: .bold))
+                    .foregroundStyle(.black)
+                    .frame(width: 34, height: 34)
+                    .background(.white, in: Circle())
+                    .padding(12)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
             }
-            .frame(height: 5).padding(.horizontal, 10).padding(.bottom, 10)
+            if let remaining = progress.remainingTimeText {
+                Text(remaining)
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(.black.opacity(0.68), in: Capsule())
+                    .padding(.trailing, 12)
+                    .padding(.bottom, 24)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+            }
+            if progress.fraction > 0 {
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(Color.white.opacity(0.3)).frame(height: 5)
+                        Capsule().fill(theme.palette.secondary)
+                            .frame(width: geo.size.width * CGFloat(min(max(progress.fraction, 0.02), 1)), height: 5)
+                    }
+                }
+                .frame(height: 5).padding(.horizontal, 10).padding(.bottom, 10)
+            }
         }
         .frame(width: width, height: width * 9 / 16)
         .overlay(

@@ -44,6 +44,7 @@ struct HuluRootView: View {
     }
     private var continueList: [WatchProgress] {
         progressStore.continueWatching(sortMode: homeCatalogSettings.continueWatchingSortMode)
+            .map(progressWithCatalogArt)
     }
     private var homeRows: [HuluRail] {
         var out: [HuluRail] = []
@@ -80,6 +81,14 @@ struct HuluRootView: View {
     }
     private var myStuffItems: [HuluTitle] { library.sorted.map { HuluTitle($0.metaItem) } }
     private var suggestions: [HuluTitle] { Array(pool.prefix(20)).map(HuluTitle.init) }
+
+    private func progressWithCatalogArt(_ progress: WatchProgress) -> WatchProgress {
+        guard (progress.poster == nil || progress.background == nil || progress.name.isEmpty),
+              let meta = pool.first(where: { $0.id == progress.metaID }) else {
+            return progress
+        }
+        return progress.withFallbackMetadata(meta)
+    }
 
     // MARK: Body
 

@@ -26,6 +26,11 @@ struct AutoLinkPreferences: Codable, Hashable {
 
     init() {}
 
+    static func sanitizedMaxSizeGB(_ value: Double) -> Double {
+        guard value.isFinite, value >= 0 else { return 0 }
+        return min(value.rounded(), 60)
+    }
+
     // Tolerant decode so prefs saved before a field existed still load (a
     // missing key falls back to the default instead of failing the whole
     // profile decode).
@@ -35,7 +40,8 @@ struct AutoLinkPreferences: Codable, Hashable {
         preferredAddon = (try? c.decode(String.self, forKey: .preferredAddon)) ?? ""
         secondaryAddon = (try? c.decode(String.self, forKey: .secondaryAddon)) ?? ""
         minResolution = (try? c.decode(String.self, forKey: .minResolution)) ?? ""
-        maxSizeGB = (try? c.decode(Double.self, forKey: .maxSizeGB)) ?? 0
+        let decodedMaxSize = (try? c.decode(Double.self, forKey: .maxSizeGB)) ?? 0
+        maxSizeGB = Self.sanitizedMaxSizeGB(decodedMaxSize)
         cachedOnly = (try? c.decode(Bool.self, forKey: .cachedOnly)) ?? false
         avoidDolbyVision = (try? c.decode(Bool.self, forKey: .avoidDolbyVision)) ?? true
     }
@@ -228,7 +234,9 @@ final class ProfileStore: ObservableObject {
 
     func setAutoLink(id: Int, _ prefs: AutoLinkPreferences) {
         guard let idx = profiles.firstIndex(where: { $0.id == id }) else { return }
-        profiles[idx].autoLink = prefs
+        var sanitized = prefs
+        sanitized.maxSizeGB = AutoLinkPreferences.sanitizedMaxSizeGB(sanitized.maxSizeGB)
+        profiles[idx].autoLink = sanitized
         saveList()
         notifyChange()
     }

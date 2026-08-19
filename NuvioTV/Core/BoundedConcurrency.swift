@@ -50,16 +50,28 @@ func boundedConcurrentMap<Item: Sendable, Result: Sendable>(
 enum AddonSweepLimits {
     /// Manifest fetches (login pull, launch refresh). Small responses, but one
     /// per installed addon.
-    static let manifests = 6
+    static var manifests: Int {
+        PerformanceProfile.isLowPower ? 4 : 6
+    }
     /// Home catalog rows. The heaviest payloads in the app (a catalog page is
     /// easily 100s of KB) and every result is retained for the whole load.
-    static let catalogs = 6
+    static var catalogs: Int {
+        if PerformanceProfile.isLowPower { return 3 }
+        if PerformanceProfile.isMidPower { return 4 }
+        return 6
+    }
     /// Per-title stream sweeps. Higher than the others because the user is
     /// actively waiting on this one and responses are small.
-    static let streams = 8
+    static var streams: Int {
+        PerformanceProfile.isLowPower ? 5 : 8
+    }
     /// Plugin scrapers. Lowest of the lot: each concurrent run stands up its own
     /// JSContext, which costs orders of magnitude more than an HTTP request.
-    static let plugins = 4
+    static var plugins: Int {
+        if PerformanceProfile.isLowPower { return 2 }
+        if PerformanceProfile.isMidPower { return 3 }
+        return 4
+    }
     /// Hard ceiling on Home rows regardless of how many catalogs the installed
     /// addons declare. Row layouts build their rows EAGERLY (a non-lazy VStack,
     /// so the LazyHStacks inside keep their scroll position), so an account
@@ -67,5 +79,7 @@ enum AddonSweepLimits {
     /// the focus engine down with it. Rows past the cap are still reachable
     /// from Discover / See All; the user can also reorder Home in
     /// Settings → Layout to pull a specific catalog into the visible set.
-    static let maxHomeRows = 60
+    static var maxHomeRows: Int {
+        PerformanceProfile.isLowPower ? 42 : 60
+    }
 }

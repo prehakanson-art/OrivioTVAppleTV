@@ -774,7 +774,7 @@ struct ProfileEditView: View {
                 )
                 NuvioDropdown(
                     title: "Maximum size",
-                    selection: String(Int(current.autoLinkPrefs.maxSizeGB)),
+                    selection: String(Int(AutoLinkPreferences.sanitizedMaxSizeGB(current.autoLinkPrefs.maxSizeGB))),
                     options: [
                         .init("0", "No limit"),
                         .init("5", "5 GB"),

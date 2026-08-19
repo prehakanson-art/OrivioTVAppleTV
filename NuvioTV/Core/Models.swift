@@ -375,8 +375,16 @@ struct MetaItem: Codable, Identifiable, Hashable {
     }
 
     var seasons: [Int] {
-        let numbers = Set((videos ?? []).compactMap { $0.season }.filter { $0 > 0 })
+        let numbers = Set((videos ?? []).compactMap { $0.season }.filter { $0 >= 0 })
         return numbers.sorted()
+    }
+
+    var regularSeasons: [Int] {
+        seasons.filter { $0 > 0 }
+    }
+
+    var playbackSeasons: [Int] {
+        regularSeasons.isEmpty ? seasons : regularSeasons
     }
 
     func episodes(season: Int) -> [MetaVideo] {
@@ -384,6 +392,10 @@ struct MetaItem: Codable, Identifiable, Hashable {
             .filter { $0.season == season }
             .sorted { ($0.episode ?? 0) < ($1.episode ?? 0) }
             .deduplicatedByID()
+    }
+
+    func episodesIncludingLinkedSpecials(season: Int) -> [MetaVideo] {
+        episodes(season: season)
     }
 }
 
@@ -419,9 +431,12 @@ struct MetaVideo: Codable, Identifiable, Hashable {
     let thumbnail: String?
     let overview: String?
     let released: String?
+    let originalSeason: Int?
+    let originalEpisode: Int?
 
     private enum CodingKeys: String, CodingKey {
         case id, title, name, season, episode, number, thumbnail, overview, released
+        case originalSeason, originalEpisode
     }
 
     init(from decoder: Decoder) throws {
@@ -435,6 +450,8 @@ struct MetaVideo: Codable, Identifiable, Hashable {
         thumbnail = try? c.decode(String.self, forKey: .thumbnail)
         overview = try? c.decode(String.self, forKey: .overview)
         released = try? c.decode(String.self, forKey: .released)
+        originalSeason = try? c.decode(Int.self, forKey: .originalSeason)
+        originalEpisode = try? c.decode(Int.self, forKey: .originalEpisode)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -446,11 +463,14 @@ struct MetaVideo: Codable, Identifiable, Hashable {
         try c.encodeIfPresent(thumbnail, forKey: .thumbnail)
         try c.encodeIfPresent(overview, forKey: .overview)
         try c.encodeIfPresent(released, forKey: .released)
+        try c.encodeIfPresent(originalSeason, forKey: .originalSeason)
+        try c.encodeIfPresent(originalEpisode, forKey: .originalEpisode)
     }
 
     init(
         id: String, title: String?, season: Int?, episode: Int?,
-        thumbnail: String? = nil, overview: String? = nil, released: String? = nil
+        thumbnail: String? = nil, overview: String? = nil, released: String? = nil,
+        originalSeason: Int? = nil, originalEpisode: Int? = nil
     ) {
         self.id = id
         self.title = title
@@ -459,6 +479,8 @@ struct MetaVideo: Codable, Identifiable, Hashable {
         self.thumbnail = thumbnail
         self.overview = overview
         self.released = released
+        self.originalSeason = originalSeason
+        self.originalEpisode = originalEpisode
     }
 
     var hasAired: Bool {
@@ -474,6 +496,34 @@ struct MetaVideo: Codable, Identifiable, Hashable {
     var seasonEpisodeCode: String {
         guard let season, let episode else { return "" }
         return "S\(season):E\(episode)"
+    }
+
+    var airedDate: Date? {
+        guard let released, !released.isEmpty else { return nil }
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = iso.date(from: released) { return date }
+        iso.formatOptions = [.withInternetDateTime]
+        if let date = iso.date(from: released) { return date }
+        let ymd = DateFormatter()
+        ymd.locale = Locale(identifier: "en_US_POSIX")
+        ymd.timeZone = TimeZone(secondsFromGMT: 0)
+        ymd.dateFormat = "yyyy-MM-dd"
+        return ymd.date(from: String(released.prefix(10)))
+    }
+
+    func withDisplaySeason(_ season: Int, episode: Int) -> MetaVideo {
+        MetaVideo(
+            id: id,
+            title: title,
+            season: season,
+            episode: episode,
+            thumbnail: thumbnail,
+            overview: overview,
+            released: released,
+            originalSeason: originalSeason ?? self.season,
+            originalEpisode: originalEpisode ?? self.episode
+        )
     }
 
     /// Air date formatted for display ("Jun 25, 2021"), or nil if unknown.

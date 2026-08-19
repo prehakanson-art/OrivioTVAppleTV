@@ -182,6 +182,28 @@ struct HuluProgressCard: View {
                                 .clipShape(RoundedRectangle(cornerRadius: 5)).padding(10)
                         }
                     }
+                    .overlay(alignment: .topTrailing) {
+                        if title.hasNewEpisode {
+                            Image(systemName: "plus")
+                                .font(.system(size: 16, weight: .bold))
+                                .foregroundStyle(.black)
+                                .frame(width: 32, height: 32)
+                                .background(.white, in: Circle())
+                                .padding(10)
+                        }
+                    }
+                    .overlay(alignment: .bottomTrailing) {
+                        if let remaining = title.remainingText {
+                            Text(remaining)
+                                .font(.system(size: 16, weight: .semibold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 5)
+                                .background(.black.opacity(0.72), in: Capsule())
+                                .padding(.trailing, 10)
+                                .padding(.bottom, progress > 0 ? 20 : 10)
+                        }
+                    }
                     .overlay(alignment: .bottom) {
                         if progress > 0 {
                             GeometryReader { geo in
@@ -333,6 +355,7 @@ struct HuluFeaturedHero: View {
 
     @State private var index = 0
     @State private var lastManual = Date.distantPast
+    @State private var contentRating: String?
     private let timer = Timer.publish(every: 8, on: .main, in: .common).autoconnect()
 
     private var current: HuluTitle? { items.indices.contains(index) ? items[index] : nil }
@@ -354,6 +377,18 @@ struct HuluFeaturedHero: View {
                             .font(HuluStyle.semibold(22)).tracking(1).foregroundStyle(.white)
 
                         HuluTitleArt(title: t, maxHeight: 150)
+
+                        HStack(spacing: 14) {
+                            if let contentRating {
+                                Text(contentRating)
+                            } else {
+                                Text(t.maturity)
+                            }
+                            if !t.genreName.isEmpty { Text(t.genreName) }
+                            if !t.year.isEmpty { Text(t.year) }
+                        }
+                        .font(HuluStyle.semibold(22))
+                        .foregroundStyle(.white.opacity(0.72))
 
                         if t.isSeries && !t.episodeLine.isEmpty {
                             Text(t.episodeLine).font(HuluStyle.semibold(26))
@@ -388,6 +423,16 @@ struct HuluFeaturedHero: View {
             guard items.count > 1, Date().timeIntervalSince(lastManual) > 10 else { return }
             withAnimation(.easeInOut(duration: 0.6)) { index = (index + 1) % items.count }
         }
+        .task(id: current?.id) { await loadContentRating() }
+    }
+
+    private func loadContentRating() async {
+        guard let meta = current?.meta else {
+            contentRating = nil
+            return
+        }
+        let rating = await TMDBService.contentRating(imdbID: meta.id, type: meta.type)
+        if current?.id == meta.id { contentRating = rating }
     }
 }
 

@@ -137,9 +137,40 @@ final class WatchedStore: ObservableObject {
         }
     }
 
+    @discardableResult
+    func clearAll(notify: Bool = true) -> [WatchedItem] {
+        let removedItems = Array(items.values)
+        guard !removedItems.isEmpty else { return [] }
+        let now = Date()
+        for item in removedItems { tombstones[item.key] = now }
+        items.removeAll()
+        save()
+        if notify && !suppressChange {
+            onRemove?(removedItems)
+            onTraktRemove?(removedItems)
+            onLocalChange?()
+        }
+        return removedItems
+    }
+
     // MARK: - Sync bridge
 
     func allForSync() -> [WatchedItem] { Array(items.values) }
+
+    func importItems(_ imported: [WatchedItem]) {
+        guard !imported.isEmpty else { return }
+        var changed = false
+        for item in imported {
+            if let local = items[item.key], local.watchedAt >= item.watchedAt { continue }
+            tombstones.removeValue(forKey: item.key)
+            items[item.key] = item
+            changed = true
+        }
+        if changed {
+            save()
+            if !suppressChange { onLocalChange?() }
+        }
+    }
 
     /// Merge a FULL remote snapshot. Two-way, mirroring ProgressStore: newer
     /// remote rows are added AND (when `reconcile`) local rows the server no

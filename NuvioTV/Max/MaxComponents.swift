@@ -478,6 +478,7 @@ struct MaxFeaturedHero: View {
 
     @State private var index = 0
     @State private var lastManual = Date.distantPast
+    @State private var contentRating: String?
     private let timer = Timer.publish(every: 8, on: .main, in: .common).autoconnect()
     private let contentInset: CGFloat = MaxLayout.railInset
 
@@ -515,7 +516,7 @@ struct MaxFeaturedHero: View {
                             .font(MaxStyle.semibold(24)).foregroundStyle(.white)
 
                         HStack(spacing: 16) {
-                            Text(t.maturity)
+                            Text(contentRating ?? t.maturity)
                             if t.isSeries { if !t.seasonsText.isEmpty { Text(t.seasonsText) } }
                             else { Text(t.year) }
                         }
@@ -550,6 +551,16 @@ struct MaxFeaturedHero: View {
             guard items.count > 1, Date().timeIntervalSince(lastManual) > 10 else { return }
             withAnimation(.easeInOut(duration: 0.6)) { index = (index + 1) % items.count }
         }
+        .task(id: current?.id) { await loadContentRating() }
+    }
+
+    private func loadContentRating() async {
+        guard let meta = current?.meta else {
+            contentRating = nil
+            return
+        }
+        let rating = await TMDBService.contentRating(imdbID: meta.id, type: meta.type)
+        if current?.id == meta.id { contentRating = rating }
     }
 }
 

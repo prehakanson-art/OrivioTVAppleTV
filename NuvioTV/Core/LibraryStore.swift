@@ -58,6 +58,31 @@ struct SavedLibraryItem: Codable, Identifiable, Hashable {
         )
     }
 
+    static func shouldReplaceTitle(_ title: String, id: String) -> Bool {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return true }
+        if trimmed == id { return true }
+        if trimmed.hasPrefix("tt") && trimmed.dropFirst(2).allSatisfy(\.isNumber) { return true }
+        return false
+    }
+
+    func withFallbackMetadata(_ meta: MetaItem) -> SavedLibraryItem {
+        SavedLibraryItem(
+            id: id,
+            type: type,
+            name: Self.shouldReplaceTitle(name, id: id) ? meta.name : name,
+            poster: poster ?? meta.poster,
+            posterShape: posterShape,
+            background: background ?? meta.background,
+            description: description ?? meta.description,
+            releaseInfo: releaseInfo ?? meta.releaseInfo,
+            imdbRating: imdbRating ?? meta.imdbRating.flatMap { Double($0) },
+            genres: genres.isEmpty ? (meta.genres ?? []) : genres,
+            addonBaseURL: addonBaseURL,
+            addedAt: addedAt
+        )
+    }
+
     /// Reconstruct a `MetaItem` good enough to open the detail page.
     var metaItem: MetaItem {
         MetaItem(
@@ -77,6 +102,13 @@ final class LibraryStore: ObservableObject {
     /// Called after a local change so account sync can push. Suppressed while
     /// merging remote data.
     var onLocalChange: (() -> Void)?
+    /// Fired with the items the user explicitly removed, so account sync can
+    /// record the removal DURABLY (a persisted pending-delete queue) instead of
+    /// relying on the debounced replace-push landing before the next pull.
+    /// Mirrors ProgressStore.onRemove / WatchedStore.onRemove — without it a
+    /// removal lost to a killed app, an offline moment or an expired token was
+    /// never represented anywhere, and the next pull re-added the item for good.
+    var onRemove: (([SavedLibraryItem]) -> Void)?
     /// Trakt watchlist hooks (separate owner from account-sync): fired on a
     /// genuine local add / remove so the Trakt manager can push to the watchlist.
     var onTraktAdd: ((SavedLibraryItem) -> Void)?
@@ -97,6 +129,17 @@ final class LibraryStore: ObservableObject {
     private func pruneTombstones() {
         let cutoff = Date().addingTimeInterval(-Self.tombstoneGrace)
         tombstones = tombstones.filter { $0.value >= cutoff }
+    }
+
+    /// Reassert tombstones from outside — the sync manager calls this before a
+    /// pull for removals whose replace-push hasn't landed yet, so a full
+    /// snapshot can't resurrect them while the deletion is still outstanding.
+    /// Renewing the timestamp keeps them protected for as long as that takes
+    /// (the in-memory grace alone expires after 3 minutes, and is lost outright
+    /// when the app restarts — which is how removals used to come back).
+    func tombstone(_ keys: [String]) {
+        let now = Date()
+        for key in keys { tombstones[key] = now }
     }
 
     private var profileID = 1
@@ -153,6 +196,7 @@ final class LibraryStore: ObservableObject {
         tombstones[key] = Date()
         save()
         if !suppressChange {
+            onRemove?([removed])
             onTraktRemove?(removed)
             onLocalChange?()
         }
@@ -190,7 +234,7 @@ final class LibraryStore: ObservableObject {
             }
         }
 
-        for item in remote where items[item.key] == nil {
+        for item in remote {
             if let tomb = tombstones[item.key] {
                 if item.addedAt > tomb {
                     tombstones.removeValue(forKey: item.key)   // re-saved elsewhere
@@ -198,7 +242,17 @@ final class LibraryStore: ObservableObject {
                     continue
                 }
             }
-            items[item.key] = item
+            if let local = items[item.key] {
+                let merged = local.withFallbackMetadata(item.metaItem)
+                guard merged != local else { continue }
+                items.removeValue(forKey: item.key)
+                items[merged.key] = merged
+            } else {
+                for key in Array(items.keys) where key != item.key && items[key]?.id == item.id {
+                    items.removeValue(forKey: key)
+                }
+                items[item.key] = item
+            }
             changed = true
         }
         if changed { save() }

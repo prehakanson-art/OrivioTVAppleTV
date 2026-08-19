@@ -156,7 +156,8 @@ final class StreamsViewModel: ObservableObject {
     func autoLinkPick(_ prefs: AutoLinkPreferences) -> StreamEntry? {
         let minTier = prefs.minResolution.isEmpty ? nil
             : ResolutionTier.from(resolutionLabel: prefs.minResolution)
-        let maxBytes = prefs.maxSizeGB > 0 ? Int64(prefs.maxSizeGB * 1_073_741_824) : nil
+        let maxSizeGB = AutoLinkPreferences.sanitizedMaxSizeGB(prefs.maxSizeGB)
+        let maxBytes = maxSizeGB > 0 ? Int64(maxSizeGB * 1_073_741_824) : nil
         let pool = allEntries.filter { entry in
             if prefs.cachedOnly && !entry.stream.isCached { return false }
             if prefs.avoidDolbyVision && entry.stream.isDolbyVision { return false }
@@ -508,6 +509,7 @@ struct StreamsView: View {
                         tmdbID: String(tmdbID), mediaType: isMovie ? "movie" : "tv",
                         season: viewModel.video?.season, episode: viewModel.video?.episode
                     )
+                    guard !Task.isCancelled, !isGone else { return }
                     viewModel.addPluginStreams(entries)
                 }
             }

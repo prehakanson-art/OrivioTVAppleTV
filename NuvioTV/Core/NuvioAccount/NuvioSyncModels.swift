@@ -199,7 +199,7 @@ struct SupabaseLibraryItem: Decodable {
     private enum CodingKeys: String, CodingKey {
         case contentID = "content_id"
         case contentType = "content_type"
-        case name, poster
+        case name, title, poster
         case posterShape = "poster_shape"
         case background, description
         case releaseInfo = "release_info"
@@ -213,7 +213,9 @@ struct SupabaseLibraryItem: Decodable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         contentID = try c.decode(String.self, forKey: .contentID)
         contentType = (try? c.decode(String.self, forKey: .contentType)) ?? "movie"
-        name = (try? c.decode(String.self, forKey: .name)) ?? ""
+        name = (try? c.decode(String.self, forKey: .name))
+            ?? (try? c.decode(String.self, forKey: .title))
+            ?? ""
         poster = try? c.decode(String.self, forKey: .poster)
         posterShape = (try? c.decode(String.self, forKey: .posterShape)) ?? "POSTER"
         background = try? c.decode(String.self, forKey: .background)

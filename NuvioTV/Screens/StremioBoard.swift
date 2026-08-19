@@ -31,6 +31,7 @@ struct StremioBoardView: View {
 
     private var continueItems: [WatchProgress] {
         progressStore.continueWatching(sortMode: homeCatalogSettings.continueWatchingSortMode)
+            .map(progressWithCatalogArt)
     }
 
     private var catalogRows: [HomeRow] {
@@ -45,6 +46,14 @@ struct StremioBoardView: View {
         return catalogRows.flatMap(\.items).filter { seen.insert($0.id).inserted }
     }
     private func enrich(_ m: MetaItem) -> MetaItem { pool.first { $0.id == m.id } ?? m }
+
+    private func progressWithCatalogArt(_ progress: WatchProgress) -> WatchProgress {
+        guard (progress.poster == nil || progress.background == nil || progress.name.isEmpty),
+              let meta = pool.first(where: { $0.id == progress.metaID }) else {
+            return progress
+        }
+        return progress.withFallbackMetadata(meta)
+    }
 
     /// Set the hero to a focused item, then fetch its FULL meta (runtime / cast /
     /// synopsis) in the background — catalog items carry only light metadata, but
@@ -556,16 +565,40 @@ private struct StremioContinueCard: View {
                 .overlay { if isFocused { gloss } }
                 .clipShape(RoundedRectangle(cornerRadius: StremioFocus.cardRadius, style: .continuous))
                 .overlay(alignment: .topLeading) { StremioCheckBadge() }
-            GeometryReader { geo in
-                ZStack(alignment: .leading) {
-                    Capsule().fill(Color.black.opacity(0.55))
-                    Capsule().fill(StremioSurfaces.accentBright)
-                        .frame(width: geo.size.width * CGFloat(min(max(progress.fraction, 0.03), 1)))
+                .overlay(alignment: .topTrailing) {
+                    if progress.hasNewEpisode == true {
+                        Image(systemName: "plus")
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundStyle(.black)
+                            .frame(width: 28, height: 28)
+                            .background(.white, in: Circle())
+                            .padding(8)
+                    }
                 }
+                .overlay(alignment: .bottomTrailing) {
+                    if let remaining = progress.remainingTimeText {
+                        Text(remaining)
+                            .font(StremioFont.bold(14))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(.black.opacity(0.72), in: Capsule())
+                            .padding(.trailing, 8)
+                            .padding(.bottom, 20)
+                    }
+                }
+            if progress.fraction > 0 {
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(Color.black.opacity(0.55))
+                        Capsule().fill(StremioSurfaces.accentBright)
+                            .frame(width: geo.size.width * CGFloat(min(max(progress.fraction, 0.03), 1)))
+                    }
+                }
+                .frame(height: 5)
+                .padding(.horizontal, 8)
+                .padding(.bottom, 8)
             }
-            .frame(height: 5)
-            .padding(.horizontal, 8)
-            .padding(.bottom, 8)
         }
         .frame(width: width, height: height)
         .scaleEffect(perf.focusScale(StremioFocus.posterScale, !parallax && isFocused))

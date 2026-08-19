@@ -103,6 +103,9 @@ enum TMDBService {
     // Swift Dictionary is not thread-safe (concurrent mutation → EXC_BAD_ACCESS).
     private static let cacheLock = NSLock()
     private static var imdbCache: [String: String] = [:]
+    private static var contentRatingCache: [String: String] = [:]
+    private static var seasonEpisodeCache: [String: [Int: EpisodeExtra]] = [:]
+    private static var episodeCastCache: [String: [CastMember]] = [:]
 
     private static func cachedIMDB(_ key: String) -> String? {
         cacheLock.lock(); defer { cacheLock.unlock() }
@@ -111,6 +114,30 @@ enum TMDBService {
     private static func storeIMDB(_ value: String, for key: String) {
         cacheLock.lock(); defer { cacheLock.unlock() }
         imdbCache[key] = value
+    }
+    private static func cachedContentRating(_ key: String) -> String? {
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        return contentRatingCache[key]
+    }
+    private static func storeContentRating(_ value: String?, for key: String) {
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        contentRatingCache[key] = value ?? ""
+    }
+    private static func cachedSeasonEpisodes(_ key: String) -> [Int: EpisodeExtra]? {
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        return seasonEpisodeCache[key]
+    }
+    private static func storeSeasonEpisodes(_ value: [Int: EpisodeExtra], for key: String) {
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        seasonEpisodeCache[key] = value
+    }
+    private static func cachedEpisodeCast(_ key: String) -> [CastMember]? {
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        return episodeCastCache[key]
+    }
+    private static func storeEpisodeCast(_ value: [CastMember], for key: String) {
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        episodeCastCache[key] = value
     }
     private static func cachedFind(_ key: String) -> (Int, Bool)? {
         cacheLock.lock(); defer { cacheLock.unlock() }
@@ -181,6 +208,84 @@ enum TMDBService {
         let imdb = (try? await get(path) as ExternalIDs)?.imdb_id
         storeIMDB(imdb ?? "", for: cacheKey)
         return imdb?.isEmpty == false ? imdb : nil
+    }
+
+    /// Resolve an IMDb `tt…` id through TMDB. This is a fallback for newer or
+    /// upcoming titles that Cinemeta can miss, preventing saved/synced rows from
+    /// displaying only the raw IMDb id.
+    static func metaItem(imdbID: String, type: String) async -> MetaItem? {
+        guard imdbID.hasPrefix("tt") else { return nil }
+        struct FindResponse: Decodable {
+            struct Movie: Decodable {
+                let id: Int
+                let title: String?
+                let poster_path: String?
+                let backdrop_path: String?
+                let overview: String?
+                let release_date: String?
+                let vote_average: Double?
+            }
+            struct TV: Decodable {
+                let id: Int
+                let name: String?
+                let poster_path: String?
+                let backdrop_path: String?
+                let overview: String?
+                let first_air_date: String?
+                let vote_average: Double?
+            }
+            let movie_results: [Movie]?
+            let tv_results: [TV]?
+        }
+        guard let body: FindResponse = try? await get(
+            "/find/\(imdbID)",
+            query: ["external_source": "imdb_id"]
+        ) else { return nil }
+
+        let preferredType = type.lowercased()
+        if ["series", "tv", "show", "tvshow"].contains(preferredType), let show = body.tv_results?.first, let name = show.name, !name.isEmpty {
+            return MetaItem(
+                id: imdbID,
+                type: "series",
+                name: name,
+                poster: imageURL(show.poster_path, size: "w500") ?? imageURL(show.backdrop_path, size: "w780"),
+                background: imageURL(show.backdrop_path, size: "w1280"),
+                logo: nil,
+                description: show.overview,
+                releaseInfo: show.first_air_date.map { String($0.prefix(4)) },
+                imdbRating: show.vote_average.map { String(format: "%.1f", $0) },
+                genres: nil
+            )
+        }
+        if let movie = body.movie_results?.first, let title = movie.title, !title.isEmpty {
+            return MetaItem(
+                id: imdbID,
+                type: "movie",
+                name: title,
+                poster: imageURL(movie.poster_path, size: "w500") ?? imageURL(movie.backdrop_path, size: "w780"),
+                background: imageURL(movie.backdrop_path, size: "w1280"),
+                logo: nil,
+                description: movie.overview,
+                releaseInfo: movie.release_date.map { String($0.prefix(4)) },
+                imdbRating: movie.vote_average.map { String(format: "%.1f", $0) },
+                genres: nil
+            )
+        }
+        if let show = body.tv_results?.first, let name = show.name, !name.isEmpty {
+            return MetaItem(
+                id: imdbID,
+                type: "series",
+                name: name,
+                poster: imageURL(show.poster_path, size: "w500") ?? imageURL(show.backdrop_path, size: "w780"),
+                background: imageURL(show.backdrop_path, size: "w1280"),
+                logo: nil,
+                description: show.overview,
+                releaseInfo: show.first_air_date.map { String($0.prefix(4)) },
+                imdbRating: show.vote_average.map { String(format: "%.1f", $0) },
+                genres: nil
+            )
+        }
+        return nil
     }
 
     // MARK: - Collection source discovery (editor: search / id lookup)
@@ -660,6 +765,7 @@ enum TMDBService {
         var country: String?             // primary production country name
         var language: String?            // spoken/original language, uppercased ISO (e.g. "EN")
         var releaseDate: String?         // ISO date for the localized full-date meta line
+        var contentRating: String?        // US certification/rating, e.g. PG-13, R, TV-MA
     }
 
     // Cache imdb→(tmdbID,isMovie) resolutions from /find.
@@ -718,6 +824,11 @@ enum TMDBService {
                 let id: String; let key: String; let name: String
                 let site: String?; let type: String?; let official: Bool?
             }
+            struct ReleaseDates: Decodable { let results: [ReleaseCountry]? }
+            struct ReleaseCountry: Decodable { let iso_3166_1: String?; let release_dates: [ReleaseInfo]? }
+            struct ReleaseInfo: Decodable { let certification: String?; let type: Int? }
+            struct ContentRatings: Decodable { let results: [TVRating]? }
+            struct TVRating: Decodable { let iso_3166_1: String?; let rating: String? }
             let credits: Credits?
             let recommendations: RecoResponse?
             let similar: RecoResponse?
@@ -728,11 +839,40 @@ enum TMDBService {
             let release_date: String?
             let first_air_date: String?
             let videos: Videos?
+            let release_dates: ReleaseDates?
+            let content_ratings: ContentRatings?
         }
         let path = isMovie ? "/movie/\(tmdbID)" : "/tv/\(tmdbID)"
+        let appended = isMovie
+            ? "credits,recommendations,similar,videos,release_dates"
+            : "credits,recommendations,similar,videos,content_ratings"
         guard let body: DetailResponse = try? await get(
-            path, query: ["language": language, "append_to_response": "credits,recommendations,similar,videos"]
+            path, query: ["language": language, "append_to_response": appended]
         ) else { return nil }
+
+        func movieCertification(_ dates: DetailResponse.ReleaseDates?) -> String? {
+            let countries = dates?.results ?? []
+            let preferred = countries.first { $0.iso_3166_1 == "US" } ?? countries.first
+            let releases = preferred?.release_dates ?? []
+            let rankedTypes = [3, 2, 4, 5, 1, 6]
+            for type in rankedTypes {
+                if let cert = releases.first(where: { $0.type == type })?.certification,
+                   !cert.trimmingCharacters(in: .whitespaces).isEmpty {
+                    return cert
+                }
+            }
+            return releases.compactMap { cert in
+                let value = cert.certification?.trimmingCharacters(in: .whitespaces)
+                return value?.isEmpty == false ? value : nil
+            }.first
+        }
+
+        func tvContentRating(_ ratings: DetailResponse.ContentRatings?) -> String? {
+            let rows = ratings?.results ?? []
+            let preferred = rows.first { $0.iso_3166_1 == "US" } ?? rows.first
+            let rating = preferred?.rating?.trimmingCharacters(in: .whitespaces)
+            return rating?.isEmpty == false ? rating : nil
+        }
 
         var detail = Detail()
         detail.cast = (body.credits?.cast ?? []).prefix(24).map {
@@ -752,6 +892,9 @@ enum TMDBService {
         detail.country = body.production_countries?.first?.name
         detail.language = body.original_language?.uppercased()
         detail.releaseDate = body.release_date ?? body.first_air_date
+        detail.contentRating = isMovie
+            ? movieCertification(body.release_dates)
+            : tvContentRating(body.content_ratings)
         let recoResults = (body.recommendations?.results?.isEmpty == false)
             ? body.recommendations?.results
             : body.similar?.results
@@ -790,10 +933,55 @@ enum TMDBService {
         return detail
     }
 
+    static func contentRating(imdbID: String, type: String) async -> String? {
+        let cacheKey = "\(type):\(imdbID)"
+        if let cached = cachedContentRating(cacheKey) {
+            return cached.isEmpty ? nil : cached
+        }
+        guard let (tmdbID, isMovie) = await resolveTMDBID(from: imdbID, type: type) else {
+            storeContentRating(nil, for: cacheKey)
+            return nil
+        }
+
+        let rating: String?
+        if isMovie {
+            struct ReleaseDates: Decodable { let results: [ReleaseCountry]? }
+            struct ReleaseCountry: Decodable { let iso_3166_1: String?; let release_dates: [ReleaseInfo]? }
+            struct ReleaseInfo: Decodable { let certification: String?; let type: Int? }
+            guard let body: ReleaseDates = try? await get("/movie/\(tmdbID)/release_dates") else {
+                storeContentRating(nil, for: cacheKey)
+                return nil
+            }
+            let countries = body.results ?? []
+            let releases = (countries.first { $0.iso_3166_1 == "US" } ?? countries.first)?.release_dates ?? []
+            rating = [3, 2, 4, 5, 1, 6].compactMap { releaseType in
+                releases.first(where: { $0.type == releaseType })?.certification?.trimmingCharacters(in: .whitespaces)
+            }.first { !$0.isEmpty }
+                ?? releases.compactMap { $0.certification?.trimmingCharacters(in: .whitespaces) }.first { !$0.isEmpty }
+        } else {
+            struct ContentRatings: Decodable { let results: [TVRating]? }
+            struct TVRating: Decodable { let iso_3166_1: String?; let rating: String? }
+            guard let body: ContentRatings = try? await get("/tv/\(tmdbID)/content_ratings") else {
+                storeContentRating(nil, for: cacheKey)
+                return nil
+            }
+            let rows = body.results ?? []
+            let value = (rows.first { $0.iso_3166_1 == "US" } ?? rows.first)?.rating?.trimmingCharacters(in: .whitespaces)
+            rating = value?.isEmpty == false ? value : nil
+        }
+        storeContentRating(rating, for: cacheKey)
+        return rating
+    }
+
     /// Per-episode extras for a season, keyed by episode number. Used to show
     /// ratings + air dates on the Detail episode row. Best-effort.
     static func seasonEpisodes(imdbID: String, type: String, season: Int) async -> [Int: EpisodeExtra] {
-        guard let (tmdbID, _) = await resolveTMDBID(from: imdbID, type: type) else { return [:] }
+        let cacheKey = "\(type):\(imdbID):s\(season)"
+        if let cached = cachedSeasonEpisodes(cacheKey) { return cached }
+        guard let (tmdbID, _) = await resolveTMDBID(from: imdbID, type: type) else {
+            storeSeasonEpisodes([:], for: cacheKey)
+            return [:]
+        }
         struct SeasonResponse: Decodable {
             struct Episode: Decodable {
                 let episode_number: Int?
@@ -803,7 +991,10 @@ enum TMDBService {
             }
             let episodes: [Episode]?
         }
-        guard let body: SeasonResponse = try? await get("/tv/\(tmdbID)/season/\(season)") else { return [:] }
+        guard let body: SeasonResponse = try? await get("/tv/\(tmdbID)/season/\(season)") else {
+            storeSeasonEpisodes([:], for: cacheKey)
+            return [:]
+        }
         var map: [Int: EpisodeExtra] = [:]
         for ep in body.episodes ?? [] {
             guard let n = ep.episode_number else { continue }
@@ -813,7 +1004,44 @@ enum TMDBService {
                 still: imageURL(ep.still_path, size: "w300")
             )
         }
+        storeSeasonEpisodes(map, for: cacheKey)
         return map
+    }
+
+    static func episodeCast(imdbID: String, type: String, episode: MetaVideo) async -> [CastMember] {
+        guard let season = episode.originalSeason ?? episode.season,
+              let number = episode.originalEpisode ?? episode.episode else { return [] }
+        let cacheKey = "\(type):\(imdbID):s\(season):e\(number)"
+        if let cached = cachedEpisodeCast(cacheKey) { return cached }
+        guard let (tmdbID, isMovie) = await resolveTMDBID(from: imdbID, type: type), !isMovie else {
+            storeEpisodeCast([], for: cacheKey)
+            return []
+        }
+        struct CreditsResponse: Decodable {
+            struct CastDTO: Decodable {
+                let id: Int
+                let name: String
+                let character: String?
+                let profile_path: String?
+            }
+            let cast: [CastDTO]?
+        }
+        guard let body: CreditsResponse = try? await get(
+            "/tv/\(tmdbID)/season/\(season)/episode/\(number)/credits"
+        ) else {
+            storeEpisodeCast([], for: cacheKey)
+            return []
+        }
+        let cast = (body.cast ?? []).prefix(12).map {
+            CastMember(
+                id: $0.id,
+                name: $0.name,
+                character: $0.character,
+                profileURL: imageURL($0.profile_path, size: "w300")
+            )
+        }
+        storeEpisodeCast(cast, for: cacheKey)
+        return cast
     }
 
     /// The parts of a TMDB collection as MetaItems (for the "belongs to" row).

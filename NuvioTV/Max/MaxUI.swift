@@ -66,7 +66,7 @@ struct MaxTitle: Identifiable, Hashable {
     init(_ m: MetaItem) {
         let series = m.isSeries
         let rating = Double(m.imdbRating ?? "") ?? 0
-        let seasons = m.seasons.count
+        let seasons = m.regularSeasons.count
         self.init(
             id: m.id, name: m.name, overview: m.description ?? "",
             posterURL: m.poster, backdropURL: m.background,

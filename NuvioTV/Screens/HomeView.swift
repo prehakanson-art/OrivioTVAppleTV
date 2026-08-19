@@ -9,6 +9,13 @@ struct HomeRow: Identifiable {
     var catalog: ManifestCatalog?
 }
 
+private extension Sequence where Element == WatchedItem {
+    func deduplicatedByContentID() -> [WatchedItem] {
+        var seen = Set<String>()
+        return filter { seen.insert($0.contentID).inserted }
+    }
+}
+
 /// A home screen row: either a catalog of posters or a collection of folders.
 enum HomeEntry: Identifiable {
     case catalog(HomeRow)
@@ -555,6 +562,7 @@ struct HomeView: View {
     // Owned via @State (NOT @StateObject) so HomeView does NOT observe it —
     // hero changes must re-render only the billboard subviews, never the rows.
     @State private var hero = HeroFocus()
+    @State private var nextUpContinueItems: [WatchProgress] = []
 
     /// Drives the Apple TV hero's spotlight rotation. Ticks every 2s; the hero
     /// only advances when it's been idle for a few seconds (see rotateIfIdle).
@@ -620,6 +628,7 @@ struct HomeView: View {
         .onChange(of: homeCatalogSettings.orderKeys) { _, _ in Task { await reload() } }
         .onChange(of: homeCatalogSettings.disabledKeys) { _, _ in Task { await reload() } }
         .onChange(of: homeCatalogSettings.customTitles) { _, _ in Task { await reload() } }
+        .task(id: nextUpRefreshKey) { await refreshNextUpContinueItems() }
     }
 
     @ViewBuilder
@@ -685,6 +694,15 @@ struct HomeView: View {
     }
 
     private func reload() async {
+        // Let the root enable focus/sidebar input after the first frame instead
+        // of waiting for every Home catalog request to finish. Slow or broken
+        // add-ons should leave Home loading, not make the whole app feel frozen.
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            guard !Task.isCancelled else { return }
+            onContentReady()
+        }
+
         await viewModel.loadIfNeeded(
             addonManager: addonManager,
             collections: collections,
@@ -750,7 +768,7 @@ struct HomeView: View {
 
     @ViewBuilder
     private var rowsList: some View {
-        let continueItems = progressStore.continueWatching(sortMode: homeCatalogSettings.continueWatchingSortMode)
+        let continueItems = mergedContinueItems()
         if !continueItems.isEmpty {
             continueRow(continueItems)
         }
@@ -895,6 +913,81 @@ struct HomeView: View {
         )
     }
 
+    private var nextUpRefreshKey: String {
+        let watchedKey = watched.items.keys.sorted().joined(separator: "|")
+        let progressKey = progressStore.continueWatching(sortMode: homeCatalogSettings.continueWatchingSortMode)
+            .map(\.id)
+            .sorted()
+            .joined(separator: "|")
+        return "\(watchedKey)#\(progressKey)#\(homeCatalogSettings.showUnairedNextUp)"
+    }
+
+    private func mergedContinueItems() -> [WatchProgress] {
+        let active = progressStore.continueWatching(sortMode: homeCatalogSettings.continueWatchingSortMode)
+        let activeMetaIDs = Set(active.map(\.metaID))
+        let additions = nextUpContinueItems.filter { !activeMetaIDs.contains($0.metaID) }
+        return active + additions
+    }
+
+    private func refreshNextUpContinueItems() async {
+        let activeMetaIDs = Set(progressStore.continueWatching(sortMode: homeCatalogSettings.continueWatchingSortMode).map(\.metaID))
+        let watchedSeries = watched.items.values
+            .filter { ($0.contentType == "series" || $0.contentType == "tv") && $0.season != nil && $0.episode != nil }
+            .sorted { $0.watchedAt > $1.watchedAt }
+            .deduplicatedByContentID()
+            .filter { !activeMetaIDs.contains($0.contentID) }
+            .prefix(20)
+
+        var rows: [WatchProgress] = []
+        for item in watchedSeries {
+            guard let addon = addonManager.metaAddon(for: item.contentType, id: item.contentID),
+                  let meta = try? await StremioAPI.meta(addon: addon, type: item.contentType, id: item.contentID),
+                  let next = nextUpEpisode(in: meta) else { continue }
+            rows.append(nextUpProgress(meta: meta, episode: next, lastWatchedAt: item.watchedAt))
+        }
+        if !Task.isCancelled {
+            nextUpContinueItems = rows
+        }
+    }
+
+    private func nextUpEpisode(in meta: MetaItem) -> MetaVideo? {
+        let all = meta.playbackSeasons.flatMap { meta.episodesIncludingLinkedSpecials(season: $0) }
+        guard !all.isEmpty else { return nil }
+
+        func isWatched(_ episode: MetaVideo) -> Bool {
+            watched.isWatched(contentID: meta.id, season: episode.season ?? 0, episode: episode.episode)
+        }
+
+        if homeCatalogSettings.nextUpFromFurthestEpisode,
+           let furthestIndex = all.lastIndex(where: isWatched),
+           furthestIndex + 1 < all.endIndex {
+            return all[(furthestIndex + 1)...].first
+        }
+
+        return all.first { !isWatched($0) }
+    }
+
+    private func nextUpProgress(meta: MetaItem, episode: MetaVideo, lastWatchedAt: Date) -> WatchProgress {
+        WatchProgress(
+            id: episode.id,
+            metaID: meta.id,
+            type: meta.type,
+            name: meta.name,
+            poster: meta.poster,
+            background: meta.background,
+            logo: meta.logo,
+            season: episode.season,
+            episode: episode.episode,
+            episodeTitle: episode.title,
+            episodeThumbnail: episode.thumbnail,
+            positionSeconds: 0,
+            durationSeconds: 1,
+            streamURL: nil,
+            updatedAt: lastWatchedAt,
+            hasNewEpisode: episode.hasAired
+        )
+    }
+
     // MARK: Rows
 
     /// Row header with a focusable "See All" affordance when the catalog can
@@ -992,7 +1085,8 @@ struct HomeView: View {
             id: progress.id,
             title: progress.episodeTitle,
             season: progress.season,
-            episode: progress.episode
+            episode: progress.episode,
+            thumbnail: progress.episodeThumbnail
         )
     }
 
@@ -1011,23 +1105,28 @@ struct HomeView: View {
         if homeCatalogSettings.useEpisodeThumbnailsInCw, let thumb = progress.episodeThumbnail, !thumb.isEmpty {
             return thumb
         }
-        return progress.background ?? progress.poster
+        return progress.background ?? progress.poster ?? catalogMeta(for: progress.metaID)?.background ?? catalogMeta(for: progress.metaID)?.poster
     }
 
     /// A hero-bar item for a Continue Watching entry. Progress rows only carry
     /// name/art, so prefer the full MetaItem when the title is also in a
     /// loaded catalog row (description, genres, rating…).
     private func heroItem(from progress: WatchProgress) -> MetaItem {
-        for entry in viewModel.entries {
-            if case .catalog(let row) = entry,
-               let match = row.items.first(where: { $0.id == progress.metaID }) {
-                return match
-            }
-        }
+        if let match = catalogMeta(for: progress.metaID) { return match }
         return MetaItem(
             id: progress.metaID, type: progress.type, name: progress.name,
             poster: progress.poster, background: progress.background, logo: progress.logo
         )
+    }
+
+    private func catalogMeta(for id: String) -> MetaItem? {
+        for entry in viewModel.entries {
+            if case .catalog(let row) = entry,
+               let match = row.items.first(where: { $0.id == id }) {
+                return match
+            }
+        }
+        return nil
     }
 }
 
@@ -1321,12 +1420,14 @@ private struct ContinueWatchingCell: View, Equatable {
             Button {
                 onResume(progress)
             } label: {
-                LandscapeCard(
-                    imageURL: imageURL,
-                    title: progress.name,
-                    subtitle: subtitle,
-                    progress: progress.fraction,
-                    blurImage: blur,
+                        LandscapeCard(
+                            imageURL: imageURL,
+                            title: progress.name,
+                            subtitle: subtitle,
+                            progress: progress.fraction,
+                            remainingText: progress.remainingTimeText,
+                            hasNewEpisode: progress.hasNewEpisode == true,
+                            blurImage: blur,
                     // ATV: caption goes BELOW the platter (see below) so it
                     // isn't bridged to the still by the slab.
                     showsCaption: !theme.isAppleTVTheme
@@ -1684,6 +1785,7 @@ private struct HeroInfoView: View {
     /// Light appearance (ATV theme): title-treatment logos are usually white
     /// art and float unanchored on a light backdrop without a shadow.
     @Environment(\.colorScheme) private var scheme
+    @State private var contentRating: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: NuvioSpacing.md) {
@@ -1706,6 +1808,16 @@ private struct HeroInfoView: View {
             }
         }
         .frame(height: 330, alignment: .bottomLeading)
+        .task(id: hero.item?.id) { await loadContentRating() }
+    }
+
+    private func loadContentRating() async {
+        guard let item = hero.item, item.type != "collection" else {
+            contentRating = nil
+            return
+        }
+        let rating = await TMDBService.contentRating(imdbID: item.id, type: item.type)
+        if hero.item?.id == item.id { contentRating = rating }
     }
 
     @ViewBuilder
@@ -1737,9 +1849,12 @@ private struct HeroInfoView: View {
                 .lineLimit(2)
         }
 
-        // APK meta order: Type • Genre • Runtime • Year • IMDb badge + rating.
+        // APK meta order: Type • Rating • Genre • Runtime • Year • IMDb badge + rating.
         HStack(spacing: NuvioSpacing.sm) {
             MetaDotText(item.typeLabel)
+            if let contentRating {
+                MetaDot(); MetaDotText(contentRating)
+            }
             if let genre = item.genres?.first {
                 MetaDot(); MetaDotText(genre)
             }
@@ -1838,6 +1953,7 @@ private struct ATVHeroInfoView: View {
     @Environment(\.colorScheme) private var scheme
     @ObservedObject var hero: HeroFocus
     let onPlay: (MetaItem) -> Void
+    @State private var contentRating: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: NuvioSpacing.md) {
@@ -1851,6 +1967,16 @@ private struct ATVHeroInfoView: View {
         .padding(.top, 40)
         .padding(.leading, NuvioSpacing.huge)
         .padding(.bottom, NuvioSpacing.md)
+        .task(id: hero.item?.id) { await loadContentRating() }
+    }
+
+    private func loadContentRating() async {
+        guard let item = hero.item, item.type != "collection" else {
+            contentRating = nil
+            return
+        }
+        let rating = await TMDBService.contentRating(imdbID: item.id, type: item.type)
+        if hero.item?.id == item.id { contentRating = rating }
     }
 
     @ViewBuilder
@@ -1930,7 +2056,7 @@ private struct ATVHeroInfoView: View {
     /// Rating (green, TV-app style) then a dot-separated Year • Genre • Runtime.
     @ViewBuilder
     private func metaLine(_ item: MetaItem) -> some View {
-        let segments = [item.year, item.genres?.first, item.runtimeFormatted].compactMap { $0 }
+        let segments = [contentRating, item.year, item.genres?.first, item.runtimeFormatted].compactMap { $0 }
         HStack(spacing: NuvioSpacing.sm) {
             if let rating = item.imdbRating {
                 HStack(spacing: 6) {

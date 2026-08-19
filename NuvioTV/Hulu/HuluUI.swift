@@ -22,6 +22,8 @@ struct HuluTitle: Identifiable, Hashable {
     var progress: Double? = nil
     var episodeLine: String = ""
     var tagline: String = ""
+    var remainingText: String? = nil
+    var hasNewEpisode: Bool = false
     var isPlaceholder: Bool = false
     var meta: MetaItem? = nil
 
@@ -39,13 +41,15 @@ struct HuluTitle: Identifiable, Hashable {
     init(id: String, name: String, overview: String, posterURL: String?, backdropURL: String?,
          cardURL: String?, logoURL: String?, isSeries: Bool, year: String, genres: [String],
          maturity: String = "TV-14", progress: Double? = nil, episodeLine: String = "",
-         tagline: String = "", isPlaceholder: Bool = false, meta: MetaItem? = nil) {
+         tagline: String = "", remainingText: String? = nil, hasNewEpisode: Bool = false,
+         isPlaceholder: Bool = false, meta: MetaItem? = nil) {
         self.id = id; self.name = name; self.overview = overview
         self.posterURL = posterURL; self.backdropURL = backdropURL
         self.cardURL = cardURL; self.logoURL = logoURL
         self.isSeries = isSeries; self.year = year; self.genres = genres
         self.maturity = maturity; self.progress = progress; self.episodeLine = episodeLine
-        self.tagline = tagline; self.isPlaceholder = isPlaceholder; self.meta = meta
+        self.tagline = tagline; self.remainingText = remainingText; self.hasNewEpisode = hasNewEpisode
+        self.isPlaceholder = isPlaceholder; self.meta = meta
     }
 
     init(_ m: MetaItem) {
@@ -74,7 +78,10 @@ struct HuluTitle: Identifiable, Hashable {
             posterURL: p.poster, backdropURL: p.background,
             cardURL: p.episodeThumbnail ?? p.background ?? p.poster, logoURL: p.logo,
             isSeries: series, year: "", genres: [],
-            progress: p.fraction, episodeLine: epLine, meta: nil
+            progress: p.fraction, episodeLine: epLine,
+            remainingText: p.remainingTimeText,
+            hasNewEpisode: p.hasNewEpisode == true,
+            meta: nil
         )
     }
 }

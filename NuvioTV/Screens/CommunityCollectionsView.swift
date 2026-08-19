@@ -369,16 +369,19 @@ enum CommunityCollections {
         }
     }
 
-    /// Runs every one-time consolidation/fix pass. Called from BOTH the app's
-    /// launch sequence (so an already-installed category picks up a fix — a
-    /// corrected Marvel/DC query, a Top Rated quality filter, etc. — the very
-    /// next time the app opens, not only if the user happens to revisit the
-    /// Community Collections screen) and from that screen itself (so it's
-    /// also current if the app was already running when a fix shipped).
+    /// Runs only local, cheap fixes that are safe to execute near launch.
     @MainActor
-    static func runStartupMigrations(collections: CollectionsStore) async {
+    static func runLaunchMigrations(collections: CollectionsStore) {
         consolidateIndividualCollections(collections: collections)
         resyncPresetSources(collections: collections)
+    }
+
+    /// Runs every one-time consolidation/fix pass. The logo pass can download
+    /// every installed community logo and query TMDB, so keep it off the app
+    /// launch path and run it only when this screen is opened.
+    @MainActor
+    static func runStartupMigrations(collections: CollectionsStore) async {
+        runLaunchMigrations(collections: collections)
         await remeasureInstalledLogos(collections: collections)
     }
 }

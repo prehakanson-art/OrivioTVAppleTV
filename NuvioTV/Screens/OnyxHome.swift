@@ -71,9 +71,18 @@ struct OnyxHomeView: View {
     }
     private var continueItems: [WatchProgress] {
         progressStore.continueWatching(sortMode: homeCatalogSettings.continueWatchingSortMode)
+            .map(progressWithCatalogArt)
     }
     private var heroItem: MetaItem? {
         focused ?? viewModel.initialHero ?? catalogRows.first?.items.first
+    }
+
+    private func progressWithCatalogArt(_ progress: WatchProgress) -> WatchProgress {
+        guard (progress.poster == nil || progress.background == nil || progress.name.isEmpty),
+              let meta = catalogRows.lazy.flatMap(\.items).first(where: { $0.id == progress.metaID }) else {
+            return progress
+        }
+        return progress.withFallbackMetadata(meta)
     }
 
     var body: some View {
@@ -236,6 +245,7 @@ private struct OnyxGradients: View {
 private struct OnyxHero: View {
     let item: MetaItem?
     let progress: WatchProgress?
+    @State private var contentRating: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -276,6 +286,16 @@ private struct OnyxHero: View {
         .padding(.top, 140)
         .padding(.bottom, 12)
         .frame(maxWidth: .infinity, alignment: .bottomLeading)
+        .task(id: item?.id) { await loadContentRating() }
+    }
+
+    private func loadContentRating() async {
+        guard let item else {
+            contentRating = nil
+            return
+        }
+        let rating = await TMDBService.contentRating(imdbID: item.id, type: item.type)
+        if self.item?.id == item.id { contentRating = rating }
     }
 
     private var metaLine: String? {
@@ -283,6 +303,7 @@ private struct OnyxHero: View {
         var parts: [String] = []
         if let e = progress.map(OnyxFormat.episodeLine), let e { parts.append(e) }
         else { parts.append(item.type == "series" ? "Series" : "Movie") }
+        if let contentRating { parts.append(contentRating) }
         if let g = item.genres?.first { parts.append(g) }
         if let rt = item.runtime, progress == nil { parts.append(rt) }
         if let y = item.releaseInfo { parts.append(y) }
@@ -528,10 +549,16 @@ private struct OnyxContinueLabel: View {
                     .frame(width: OnyxLayout.posterW, height: OnyxLayout.posterH)
                     .clipShape(RoundedRectangle(cornerRadius: OnyxLayout.cardRadius, style: .continuous))
                     .overlay(alignment: .topTrailing) {
-                        OnyxRemainingBadge(text: OnyxFormat.badge(progress))
+                        if progress.hasNewEpisode == true {
+                            OnyxPlusBadge()
+                        } else {
+                            OnyxRemainingBadge(text: OnyxFormat.badge(progress))
+                        }
                     }
                     .overlay(alignment: .bottom) {
-                        OnyxProgressBar(fraction: progress.fraction)
+                        if progress.fraction > 0 {
+                            OnyxProgressBar(fraction: progress.fraction)
+                        }
                     }
                     .shadow(color: .black.opacity(0.12), radius: 4)
                     .transition(.opacity)
@@ -586,7 +613,9 @@ private struct OnyxLandscapeCard: View {
         // Progress bar spans the card bottom (width tied to the card, not the
         // left-aligned summary — the old placement overflowed off the art).
         .overlay(alignment: .bottom) {
-            if let progressFraction { OnyxProgressBar(fraction: progressFraction) }
+            if let progressFraction, progressFraction > 0 {
+                OnyxProgressBar(fraction: progressFraction)
+            }
         }
         .overlay(
             RoundedRectangle(cornerRadius: OnyxLayout.cardRadius, style: .continuous)
@@ -656,6 +685,17 @@ private struct OnyxRemainingBadge: View {
     }
 }
 
+private struct OnyxPlusBadge: View {
+    var body: some View {
+        Image(systemName: "plus")
+            .font(.system(size: 16, weight: .bold))
+            .foregroundStyle(.black)
+            .frame(width: 32, height: 32)
+            .background(.white, in: Circle())
+            .padding(8)
+    }
+}
+
 private struct OnyxWatchedBadge: View {
     var body: some View {
         Image(systemName: "checkmark")
@@ -680,11 +720,7 @@ enum OnyxFormat {
     }
 
     static func remaining(_ p: WatchProgress) -> String {
-        let left = max(0, p.durationSeconds - p.positionSeconds)
-        guard left > 0 else { return "" }
-        let mins = Int(left / 60)
-        if mins >= 60 { return "\(mins / 60)h \(mins % 60)m left" }
-        return "\(max(1, mins))m left"
+        p.remainingTimeText.map { "\($0) left" } ?? ""
     }
 
     /// Compact CW badge: "S1 E3 • 24m left" (or just remaining for movies).

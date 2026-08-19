@@ -429,7 +429,8 @@ private struct DebridConnectPage: View {
                     }
 
                     TimelineView(.periodic(from: .now, by: 1)) { ctx in
-                        let remaining = max(0, Int(expiresAt.timeIntervalSince(ctx.date)))
+                        let seconds = expiresAt.timeIntervalSince(ctx.date)
+                        let remaining = seconds.isFinite ? Int(min(max(seconds, 0), 86_400)) : 0
                         Text(remaining > 0
                              ? "Code expires in \(remaining / 60):\(String(format: "%02d", remaining % 60))"
                              : "Refreshing code…")

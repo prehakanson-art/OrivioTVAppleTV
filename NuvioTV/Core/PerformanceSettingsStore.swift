@@ -200,10 +200,11 @@ final class PerformanceSettingsStore: ObservableObject {
     static func tierDefaults() -> Settings {
         var s = Settings()
         if PerformanceProfile.isLowPower {
-            // Apple TV HD (A8 / 2 GB): keep the core feel (hero backdrop,
-            // focus zoom) but drop every recurring animation/composite cost.
+            // Apple TV HD (A8 / 2 GB): keep the core artwork, but drop recurring
+            // animation/composite cost. Focus is still clear via rings/borders.
             s.cardShadows = false
             s.heroCrossfade = false
+            s.focusZoom = false
             s.artworkFadeIn = false
             s.sidebarAnimation = false
             s.buttonAnimations = false

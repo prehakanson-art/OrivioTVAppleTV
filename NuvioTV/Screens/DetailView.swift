@@ -19,9 +19,12 @@ final class DetailViewModel: ObservableObject {
     @Published var country: String?
     @Published var language: String?
     @Published var releaseDate: String?
+    @Published var contentRating: String?
     @Published var parentalGuide: [ParentalGuideEntry] = []
     /// Per-season episode extras (rating / air date), keyed season → episode.
     @Published var episodeExtras: [Int: [Int: TMDBService.EpisodeExtra]] = [:]
+    @Published var episodeCasts: [String: [TMDBService.CastMember]] = [:]
+    private var loadingEpisodeCast = Set<String>()
 
     init(item: MetaItem) {
         meta = item
@@ -54,7 +57,7 @@ final class DetailViewModel: ObservableObject {
             meta = full
         }
         if selectedSeason == nil {
-            selectedSeason = meta.seasons.first
+            selectedSeason = meta.regularSeasons.first ?? meta.seasons.first
         }
         if let season = selectedSeason { await loadSeason(season) }
         // Episodes are ready now — stop blocking the episode section (gated on
@@ -77,6 +80,7 @@ final class DetailViewModel: ObservableObject {
                 country = detail.country
                 language = detail.language
             }
+            contentRating = detail.contentRating
             if tmdb.useReleaseDates { releaseDate = detail.releaseDate }
             if tmdb.useMoreLikeThis { moreLikeThis = detail.moreLikeThis.deduplicatedByID() }
             if tmdb.useProductions { companies = detail.companies }
@@ -122,6 +126,14 @@ final class DetailViewModel: ObservableObject {
         guard useEpisodeExtras, episodeExtras[season] == nil, meta.isSeries else { return }
         let extras = await TMDBService.seasonEpisodes(imdbID: meta.id, type: meta.type, season: season)
         if !extras.isEmpty { episodeExtras[season] = extras }
+    }
+
+    func loadCast(for episode: MetaVideo) async {
+        guard meta.isSeries, episodeCasts[episode.id] == nil, !loadingEpisodeCast.contains(episode.id) else { return }
+        loadingEpisodeCast.insert(episode.id)
+        defer { loadingEpisodeCast.remove(episode.id) }
+        let cast = await TMDBService.episodeCast(imdbID: meta.id, type: meta.type, episode: episode)
+        if !cast.isEmpty { episodeCasts[episode.id] = cast }
     }
 }
 
@@ -347,6 +359,10 @@ struct DetailView: View {
                 MetaLine(segments: secondaryMetaSegments)
             }
 
+            if let contentRating = viewModel.contentRating {
+                ContentRatingBadge(rating: contentRating)
+            }
+
             if let mdbRatings = viewModel.mdbRatings {
                 let entries = mdbRatings.entries(settings: mdblist.settings)
                 if !entries.isEmpty {
@@ -445,6 +461,9 @@ struct DetailView: View {
         if let genres = viewModel.meta.genres, !genres.isEmpty {
             segments.append(genres.prefix(3).joined(separator: " • "))
         }
+        if let contentRating = viewModel.contentRating {
+            segments.append(contentRating)
+        }
         if let full = DateFormat.releaseDate(viewModel.releaseDate) ?? viewModel.meta.releaseInfo {
             if layout.showFullReleaseDate {
                 segments.append(full)
@@ -492,7 +511,7 @@ struct DetailView: View {
     /// For a series, the episode the Play button should start: an in-progress
     /// episode, else the next-up episode, else the very first — like the APK.
     private var seriesPlayTarget: MetaVideo? {
-        let all = viewModel.meta.seasons.flatMap { viewModel.meta.episodes(season: $0) }
+        let all = viewModel.meta.playbackSeasons.flatMap { viewModel.meta.episodesIncludingLinkedSpecials(season: $0) }
         guard !all.isEmpty else { return nil }
         if let inProgress = all.first(where: { ep in
             if let p = progressStore.progress(for: ep.id) { return p.fraction > 0.02 && p.fraction < 0.95 }
@@ -554,11 +573,11 @@ struct DetailView: View {
 
             if let season = viewModel.selectedSeason {
                 HStack(alignment: .firstTextBaseline) {
-                    RowHeader(title: "Season \(season)")
+                    RowHeader(title: season == 0 ? "Specials" : "Season \(season)")
                     Spacer()
                     // Mark/unmark the whole season in one press.
                     Button {
-                        let episodes = viewModel.meta.episodes(season: season)
+                        let episodes = viewModel.meta.episodesIncludingLinkedSpecials(season: season)
                         for episode in episodes where !watched.isWatched(
                             contentID: viewModel.meta.id, season: episode.season ?? season, episode: episode.episode
                         ) {
@@ -572,7 +591,7 @@ struct DetailView: View {
                 }
                 ScrollView(.horizontal) {
                     LazyHStack(alignment: .top, spacing: NuvioSpacing.lg) {
-                        ForEach(viewModel.meta.episodes(season: season)) { episode in
+                        ForEach(viewModel.meta.episodesIncludingLinkedSpecials(season: season)) { episode in
                             let extra = episode.episode.flatMap { viewModel.episodeExtras[season]?[$0] }
                             Button {
                                 onPlay(viewModel.meta, episode)
@@ -588,10 +607,14 @@ struct DetailView: View {
                                         episode: episode.episode
                                     ),
                                     rating: extra?.rating.map { String(format: "%.1f", $0) },
+                                    width: 400,
+                                    subtitleBehavior: .readableOnFocus,
+                                    detailLine: episodeCastLine(viewModel.episodeCasts[episode.id]),
                                     blurImage: shouldBlurEpisode(episode, season: season)
                                 )
                             }
                             .buttonStyle(PlainCardButtonStyle())
+                            .task { await viewModel.loadCast(for: episode) }
                         }
                     }
                     .padding(.horizontal, NuvioSpacing.huge)
@@ -619,6 +642,11 @@ struct DetailView: View {
         var label = ""
         if let number = episode.episode { label = "\(number). " }
         return label + (episode.title ?? "Episode")
+    }
+
+    private func episodeCastLine(_ cast: [TMDBService.CastMember]?) -> String? {
+        guard let names = cast?.prefix(3).map(\.name), !names.isEmpty else { return nil }
+        return "Cast: \(names.joined(separator: ", "))"
     }
 
     // MARK: - Cast
@@ -1023,7 +1051,7 @@ struct SeasonChip: View {
     let selected: Bool
 
     var body: some View {
-        Text("Season \(season)")
+        Text(season == 0 ? "Specials" : "Season \(season)")
             .font(.system(size: 23, weight: .semibold))
             .foregroundStyle(selected || isFocused ? theme.palette.textPrimary : theme.palette.textSecondary)
             .padding(.horizontal, NuvioSpacing.lg)

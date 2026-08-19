@@ -106,7 +106,11 @@ final class TraktSyncManager: ObservableObject {
     /// items Trakt doesn't have. Returns the count pulled.
     private func syncWatchHistory(token: String) async -> Int {
         let remote = await TraktService.watchedHistory(accessToken: token)
-        let remoteItems = remote.compactMap(watchedItem(from:))
+        let clearedAt = WatchHistoryClearState.clearedAt
+        let remoteItems = remote.compactMap(watchedItem(from:)).filter { item in
+            guard let clearedAt else { return true }
+            return item.watchedAt > clearedAt
+        }
         // Add Trakt items missing locally (additive — never delete local
         // history from a partial Trakt response).
         if !remoteItems.isEmpty { watched.mergeRemote(remoteItems, reconcile: false) }
@@ -131,7 +135,13 @@ final class TraktSyncManager: ObservableObject {
         // player's own auto-clear threshold. nil = the fetch FAILED — bail out
         // entirely rather than mistaking an outage for an empty list.
         guard let remote = await TraktService.playbackProgress(accessToken: token) else { return 0 }
-        let items = remote.filter { ($0.progress ?? 0) > 0 && ($0.progress ?? 0) < 95 }
+        let clearedAt = WatchHistoryClearState.clearedAt
+        let items = remote.filter { item in
+            let progress = item.progress ?? 0
+            guard progress > 0, progress < 95 else { return false }
+            guard let clearedAt else { return true }
+            return (item.watchedAt ?? .distantPast) > clearedAt
+        }
         var rows: [WatchProgress] = []
         var enriched = 0
         for s in items {
@@ -160,7 +170,7 @@ final class TraktSyncManager: ObservableObject {
                 poster: poster, background: background, logo: nil,
                 season: s.season, episode: s.episode, episodeTitle: nil,
                 positionSeconds: pos, durationSeconds: dur, streamURL: nil,
-                updatedAt: s.watchedAt ?? Date()))
+                updatedAt: s.watchedAt ?? Date(), syncSource: "trakt"))
         }
         progress.mergeExternal(rows)
 
@@ -186,7 +196,7 @@ final class TraktSyncManager: ObservableObject {
                 }
             }
         }
-        let localOnly = progress.allForSync()
+        let localOnly = progress.serviceBackedForSync()
             .filter { $0.metaID.hasPrefix("tt") && !remoteKeys.contains($0.id) }
             .filter { !progress.wasExternallyMerged($0.id) }
             .filter { $0.durationSeconds > 0 }
@@ -273,39 +283,57 @@ final class TraktSyncManager: ObservableObject {
     // MARK: - Immediate push (watchlist / ratings)
 
     private func pushWatchlistAdd(_ item: SavedLibraryItem) {
-        guard trakt.isSignedIn, trakt.syncWatchlist, let token = trakt.accessToken,
+        guard trakt.isSignedIn, trakt.syncWatchlist,
               let s = syncItem(fromLibrary: item) else { return }
-        Task { _ = await TraktService.addToWatchlist([s], accessToken: token) }
+        Task { [weak self] in
+            guard let self, let token = await self.validToken() else { return }
+            _ = await TraktService.addToWatchlist([s], accessToken: token)
+        }
     }
     private func pushWatchlistRemove(_ item: SavedLibraryItem) {
-        guard trakt.isSignedIn, trakt.syncWatchlist, let token = trakt.accessToken,
+        guard trakt.isSignedIn, trakt.syncWatchlist,
               let s = syncItem(fromLibrary: item) else { return }
-        Task { _ = await TraktService.removeFromWatchlist([s], accessToken: token) }
+        Task { [weak self] in
+            guard let self, let token = await self.validToken() else { return }
+            _ = await TraktService.removeFromWatchlist([s], accessToken: token)
+        }
     }
     private func pushRating(_ metaID: String, _ type: String, _ rating: Int) {
-        guard trakt.isSignedIn, trakt.syncRatings, let token = trakt.accessToken,
+        guard trakt.isSignedIn, trakt.syncRatings,
               let s = syncItem(metaID: metaID, type: type, rating: rating) else { return }
-        Task { _ = await TraktService.addRatings([s], accessToken: token) }
+        Task { [weak self] in
+            guard let self, let token = await self.validToken() else { return }
+            _ = await TraktService.addRatings([s], accessToken: token)
+        }
     }
     private func pushUnrate(_ metaID: String, _ type: String) {
-        guard trakt.isSignedIn, trakt.syncRatings, let token = trakt.accessToken,
+        guard trakt.isSignedIn, trakt.syncRatings,
               let s = syncItem(metaID: metaID, type: type, rating: nil) else { return }
-        Task { _ = await TraktService.removeRatings([s], accessToken: token) }
+        Task { [weak self] in
+            guard let self, let token = await self.validToken() else { return }
+            _ = await TraktService.removeRatings([s], accessToken: token)
+        }
     }
 
     // MARK: - Immediate mark/un-mark push
 
     private func pushMark(_ item: WatchedItem) {
-        guard trakt.isSignedIn, trakt.syncWatchHistory, let token = trakt.accessToken,
+        guard trakt.isSignedIn, trakt.syncWatchHistory,
               let s = syncItem(from: item) else { return }
-        Task { _ = await TraktService.addToHistory([s], accessToken: token) }
+        Task { [weak self] in
+            guard let self, let token = await self.validToken() else { return }
+            _ = await TraktService.addToHistory([s], accessToken: token)
+        }
     }
 
     private func pushRemove(_ items: [WatchedItem]) {
-        guard trakt.isSignedIn, trakt.syncWatchHistory, let token = trakt.accessToken else { return }
+        guard trakt.isSignedIn, trakt.syncWatchHistory else { return }
         let syncItems = items.compactMap(syncItem(from:))
         guard !syncItems.isEmpty else { return }
-        Task { _ = await TraktService.removeFromHistory(syncItems, accessToken: token) }
+        Task { [weak self] in
+            guard let self, let token = await self.validToken() else { return }
+            _ = await TraktService.removeFromHistory(syncItems, accessToken: token)
+        }
     }
 
     // MARK: - Token health

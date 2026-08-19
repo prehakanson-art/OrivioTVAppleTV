@@ -86,6 +86,7 @@ struct RootView: View {
     @EnvironmentObject private var collections: CollectionsStore
     @EnvironmentObject private var homeCatalogSettings: HomeCatalogSettingsStore
     @EnvironmentObject private var trakt: TraktStore
+    @EnvironmentObject private var stremioAccount: StremioAccountStore
     @EnvironmentObject private var playerSettings: PlayerSettingsStore
     @EnvironmentObject private var streamBadges: StreamBadgeStore
     @EnvironmentObject private var tmdbSettings: TMDBSettingsStore
@@ -120,6 +121,7 @@ struct RootView: View {
     @State private var pendingAutoPlayPop = false
     @State private var sync: NuvioSyncManager?
     @State private var traktSync: TraktSyncManager?
+    @State private var stremioSync: StremioSyncManager?
     @State private var showProfileGate = false
     @State private var selectedTab = 0
     /// Polls the account every 30s while Home is up so Continue Watching stays
@@ -157,6 +159,7 @@ struct RootView: View {
                 NSLog("[OrivioPlayer] RootView content onAppear")
                 startPlayerDemoIfRequested()
                 startDetailDemoIfRequested()
+                ScrubThumbnailer.runSelfTestIfRequested()
             }
             .task {
                 if sync == nil {
@@ -164,7 +167,7 @@ struct RootView: View {
                     progressStore.onFinished = { [weak watched] meta, video in
                         watched?.mark(meta: meta, video: video)
                     }
-                    sync = NuvioSyncManager(
+                    let nuvioSync = NuvioSyncManager(
                         account: account,
                         addonManager: addonManager,
                         progressStore: progressStore,
@@ -182,7 +185,8 @@ struct RootView: View {
                         torrentSettings: torrent,
                         traktStore: trakt
                     )
-                    sync?.enrichContinueWatchingEnabled = { [tmdbSettings] in
+                    sync = nuvioSync
+                    nuvioSync.enrichContinueWatchingEnabled = { [tmdbSettings] in
                         tmdbSettings.settings.enrichContinueWatching
                     }
                     // Trakt two-way sync (history / watched badges + Continue
@@ -191,22 +195,27 @@ struct RootView: View {
                         trakt: trakt, watched: watched, progress: progressStore,
                         library: library, ratings: ratings, addonManager: addonManager
                     )
-                    // Fix up any already-installed Community Collections
-                    // categories (a corrected Marvel/DC query, a Top Rated
-                    // quality filter, ...) at launch — not only if the user
-                    // happens to reopen the Community Collections screen,
-                    // which could otherwise leave a fix installed in code but
-                    // never actually reaching a category the user already
-                    // has (that was the actual bug: Marvel/DC's query was
-                    // correct, but a stale, already-installed folder just
-                    // never got told to use it). The data-correctness parts
-                    // are synchronous/local — run them NOW, before the user
-                    // could possibly navigate into a collection this launch.
-                    // Only the network-bound logo re-measurement (cosmetic,
-                    // not correctness) is backgrounded.
-                    CommunityCollections.consolidateIndividualCollections(collections: collections)
-                    CommunityCollections.resyncPresetSources(collections: collections)
-                    Task { await CommunityCollections.remeasureInstalledLogos(collections: collections) }
+                    let stremioManager = StremioSyncManager(
+                        stremio: stremioAccount,
+                        addonManager: addonManager,
+                        library: library,
+                        progress: progressStore,
+                        watched: watched
+                    )
+                    stremioManager.onMergedFromStremio = { [weak nuvioSync, account] in
+                        guard account.authState.isSignedIn else { return }
+                        await nuvioSync?.pushThisDevice()
+                    }
+                    stremioSync = stremioManager
+                    // Fix up any already-installed Community Collections after
+                    // launch has yielded. Keep network-backed logo migration
+                    // out of app-open startup; that runs when the collection
+                    // screen is opened.
+                    Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 3_000_000_000)
+                        guard !Task.isCancelled else { return }
+                        CommunityCollections.runLaunchMigrations(collections: collections)
+                    }
                     // "Who's watching?" gate on cold launch when 2+ profiles.
                     // Skipped in the demo modes so the screen isn't covered.
                     let args = ProcessInfo.processInfo.arguments
@@ -254,6 +263,7 @@ struct RootView: View {
                 if phase == .active {
                     sync?.refreshContinueWatching()
                     traktSync?.syncNow()
+                    stremioSync?.syncNow(reason: "Foreground Stremio sync")
                 }
             }
             // Keep Continue Watching live while browsing Home (tab 0), app

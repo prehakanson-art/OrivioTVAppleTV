@@ -1,5 +1,23 @@
 import Foundation
 
+enum WatchHistoryClearState {
+    private static let clearedAtKey = "nuvio.watchHistoryClearedAt.v1"
+
+    static var clearedAt: Date? {
+        let timestamp = UserDefaults.standard.double(forKey: clearedAtKey)
+        guard timestamp > 0 else { return nil }
+        return Date(timeIntervalSince1970: timestamp)
+    }
+
+    @discardableResult
+    static func markClearedNow() -> Date {
+        if let clearedAt { return clearedAt }
+        let date = Date()
+        UserDefaults.standard.set(date.timeIntervalSince1970, forKey: clearedAtKey)
+        return date
+    }
+}
+
 struct WatchProgress: Codable, Identifiable, Hashable {
     let id: String
     let metaID: String
@@ -22,10 +40,58 @@ struct WatchProgress: Codable, Identifiable, Hashable {
     /// backend has no field for it); optional so old saves + synced rows decode.
     var streamSignature: StreamSignature? = nil
     var updatedAt: Date
+    var syncSource: String? = nil
+    var hasNewEpisode: Bool? = nil
 
     var fraction: Double {
         guard durationSeconds > 0 else { return 0 }
         return min(max(positionSeconds / durationSeconds, 0), 1)
+    }
+
+    var remainingTimeText: String? {
+        guard durationSeconds.isFinite,
+              positionSeconds.isFinite,
+              durationSeconds > positionSeconds,
+              fraction > 0,
+              fraction < 0.95 else { return nil }
+        let minutes = max(1, Int(((durationSeconds - positionSeconds) / 60).rounded(.up)))
+        if minutes >= 60 {
+            let hours = minutes / 60
+            let remainder = minutes % 60
+            return remainder > 0 ? "\(hours)h \(remainder)m" : "\(hours)h"
+        }
+        return "\(minutes)m"
+    }
+
+    static func shouldReplaceTitle(_ title: String, id: String) -> Bool {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return true }
+        if trimmed == id { return true }
+        if trimmed.hasPrefix("tt") && trimmed.dropFirst(2).allSatisfy(\.isNumber) { return true }
+        return false
+    }
+
+    func withFallbackMetadata(_ meta: MetaItem) -> WatchProgress {
+        WatchProgress(
+            id: id,
+            metaID: metaID,
+            type: type,
+            name: Self.shouldReplaceTitle(name, id: metaID) ? meta.name : name,
+            poster: poster ?? meta.poster,
+            background: background ?? meta.background,
+            logo: logo ?? meta.logo,
+            season: season,
+            episode: episode,
+            episodeTitle: episodeTitle,
+            episodeThumbnail: episodeThumbnail,
+            positionSeconds: positionSeconds,
+            durationSeconds: durationSeconds,
+            streamURL: streamURL,
+            streamSignature: streamSignature,
+            updatedAt: updatedAt,
+            syncSource: syncSource,
+            hasNewEpisode: hasNewEpisode
+        )
     }
 }
 
@@ -100,6 +166,20 @@ final class ProgressStore: ObservableObject {
         profileID == 1 ? "nuvio.progress.v1" : "nuvio.progress.v1.p\(profileID)"
     }
 
+    private static let maxProgressSeconds: Double = 30 * 24 * 60 * 60
+
+    private static func sanitized(_ entry: WatchProgress) -> WatchProgress? {
+        guard entry.positionSeconds.isFinite,
+              entry.durationSeconds.isFinite,
+              entry.updatedAt.timeIntervalSince1970.isFinite,
+              entry.durationSeconds > 60,
+              entry.durationSeconds <= maxProgressSeconds,
+              entry.positionSeconds >= 0 else { return nil }
+        var sanitized = entry
+        sanitized.positionSeconds = min(entry.positionSeconds, entry.durationSeconds)
+        return sanitized
+    }
+
     init() {
         load()
     }
@@ -118,6 +198,31 @@ final class ProgressStore: ObservableObject {
     /// All entries, for a full push to the account backend.
     func allForSync() -> [WatchProgress] { Array(items.values) }
 
+    private static let serviceSyncSources: Set<String> = ["local", "nuvio", "stremio", "trakt"]
+
+    func serviceBackedForSync() -> [WatchProgress] {
+        items.values.filter { item in
+            guard let source = item.syncSource else { return false }
+            return Self.serviceSyncSources.contains(source)
+        }
+    }
+
+    func importEntries(_ entries: [WatchProgress]) {
+        guard !entries.isEmpty else { return }
+        var changed = false
+        for entry in entries {
+            guard let entry = Self.sanitized(entry) else { continue }
+            if let local = items[entry.id], local.updatedAt >= entry.updatedAt { continue }
+            tombstones.removeValue(forKey: entry.id)
+            items[entry.id] = entry
+            changed = true
+        }
+        if changed {
+            save()
+            if !suppressChange { onLocalUpdate?() }
+        }
+    }
+
     /// Merges entries pulled from the account, keeping whichever side was
     /// updated more recently. Never triggers a push back.
     /// Grace window protecting a just-created local row from deletion
@@ -126,6 +231,33 @@ final class ProgressStore: ObservableObject {
     /// push arrived, the row is legitimately absent from `remote` yet must NOT
     /// be treated as deleted. Anything older than this is safe to reconcile.
     private static let deletionGrace: TimeInterval = 120
+
+    private func coalesced(remote entry: WatchProgress, local: WatchProgress) -> WatchProgress {
+        WatchProgress(
+            id: entry.id,
+            metaID: entry.metaID,
+            type: entry.type,
+            name: WatchProgress.shouldReplaceTitle(entry.name, id: entry.metaID) ? local.name : entry.name,
+            poster: entry.poster ?? local.poster,
+            background: entry.background ?? local.background,
+            logo: entry.logo ?? local.logo,
+            season: entry.season,
+            episode: entry.episode,
+            episodeTitle: entry.episodeTitle
+                ?? (local.season == entry.season && local.episode == entry.episode ? local.episodeTitle : nil),
+            episodeThumbnail: entry.episodeThumbnail
+                ?? (local.season == entry.season && local.episode == entry.episode ? local.episodeThumbnail : nil),
+            positionSeconds: entry.positionSeconds,
+            durationSeconds: entry.durationSeconds,
+            streamURL: entry.streamURL
+                ?? (local.season == entry.season && local.episode == entry.episode ? local.streamURL : nil),
+            streamSignature: local.season == entry.season && local.episode == entry.episode
+                ? local.streamSignature : nil,
+            updatedAt: entry.updatedAt,
+            syncSource: entry.syncSource,
+            hasNewEpisode: entry.hasNewEpisode ?? local.hasNewEpisode
+        )
+    }
 
     /// Merge a FULL remote snapshot for the profile. Two-way: newer remote rows
     /// are upserted, AND local rows the server no longer has are removed — so a
@@ -157,7 +289,8 @@ final class ProgressStore: ObservableObject {
             changed = true
         }
 
-        for entry in remote {
+        for rawEntry in remote {
+            guard let entry = Self.sanitized(rawEntry) else { continue }
             // A just-removed item may still be in the server snapshot (its
             // delete is slower than the poll). Don't resurrect it — unless the
             // remote row is NEWER than our removal, which means it was
@@ -176,33 +309,101 @@ final class ProgressStore: ObservableObject {
             // entry already has instead of blanking the card. The remembered
             // stream URL carries over only for the same episode, so instant
             // resume keeps working after a pull.
-            var merged = entry
-            if let local = items[entry.id] {
-                merged = WatchProgress(
-                    id: entry.id,
-                    metaID: entry.metaID,
-                    type: entry.type,
-                    name: entry.name.isEmpty ? local.name : entry.name,
-                    poster: entry.poster ?? local.poster,
-                    background: entry.background ?? local.background,
-                    logo: entry.logo ?? local.logo,
-                    season: entry.season,
-                    episode: entry.episode,
-                    episodeTitle: entry.episodeTitle
-                        ?? (local.season == entry.season && local.episode == entry.episode ? local.episodeTitle : nil),
-                    episodeThumbnail: entry.episodeThumbnail
-                        ?? (local.season == entry.season && local.episode == entry.episode ? local.episodeThumbnail : nil),
-                    positionSeconds: entry.positionSeconds,
-                    durationSeconds: entry.durationSeconds,
-                    streamURL: entry.streamURL
-                        ?? (local.season == entry.season && local.episode == entry.episode ? local.streamURL : nil),
-                    streamSignature: local.season == entry.season && local.episode == entry.episode
-                        ? local.streamSignature : nil,
-                    updatedAt: entry.updatedAt
-                )
-            }
+            let merged = items[entry.id].map { coalesced(remote: entry, local: $0) } ?? entry
             items[entry.id] = merged
             changed = true
+        }
+        if changed { save() }
+    }
+
+    func removeLocalOnlyProgress() {
+        let next = items.filter { _, item in
+            guard let source = item.syncSource else { return false }
+            return Self.serviceSyncSources.contains(source)
+        }
+        guard next.count != items.count else { return }
+        items = next
+        awaitingServerAck.formIntersection(Set(items.keys))
+        externallyMerged.formIntersection(Set(items.keys))
+        save()
+    }
+
+    /// Replace local Continue Watching with the Nuvio account snapshot, keeping
+    /// only external rows that were just merged from Stremio/Trakt and have not
+    /// been acknowledged by Nuvio yet. This removes stale device-local Orivio
+    /// progress that otherwise bloats Continue Watching forever.
+    func replaceWithNuvioSnapshot(_ remote: [WatchProgress], preserveLocalAdditions: Bool = false) {
+        suppressChange = true
+        defer { suppressChange = false }
+
+        let sanitizedRemote = remote.compactMap(Self.sanitized)
+        let remoteIDs = Set(sanitizedRemote.map(\.id))
+        awaitingServerAck.subtract(remoteIDs)
+
+        var next: [String: WatchProgress] = [:]
+        for entry in sanitizedRemote {
+            if let local = items[entry.id] {
+                next[entry.id] = coalesced(remote: entry, local: local)
+            } else {
+                next[entry.id] = entry
+            }
+        }
+        for id in awaitingServerAck {
+            if let local = items[id], Self.sanitized(local) != nil {
+                next[id] = local
+            }
+        }
+        if preserveLocalAdditions {
+            for (id, local) in items where next[id] == nil {
+                guard Self.sanitized(local) != nil,
+                      let source = local.syncSource,
+                      Self.serviceSyncSources.contains(source) else { continue }
+                next[id] = local
+            }
+        }
+
+        guard next != items else { return }
+        items = next
+        save()
+    }
+
+    /// Backfill resolved title/artwork onto existing rows (matched by id),
+    /// WITHOUT touching playback position, timestamps, or triggering a push —
+    /// used by sync to replace a raw "tt…" id with the real title once a meta
+    /// addon has been consulted. A real title is never regressed to an id, and
+    /// existing artwork is kept. No-op for ids not currently present.
+    func applyEnrichedMetadata(_ enriched: [WatchProgress]) {
+        suppressChange = true
+        defer { suppressChange = false }
+        var changed = false
+        for row in enriched {
+            guard let existing = items[row.id] else { continue }
+            let keepTitle = !WatchProgress.shouldReplaceTitle(existing.name, id: existing.metaID)
+                || WatchProgress.shouldReplaceTitle(row.name, id: row.metaID)
+            let merged = WatchProgress(
+                id: existing.id,
+                metaID: existing.metaID,
+                type: existing.type,
+                name: keepTitle ? existing.name : row.name,
+                poster: existing.poster ?? row.poster,
+                background: existing.background ?? row.background,
+                logo: existing.logo ?? row.logo,
+                season: existing.season,
+                episode: existing.episode,
+                episodeTitle: existing.episodeTitle ?? row.episodeTitle,
+                episodeThumbnail: existing.episodeThumbnail ?? row.episodeThumbnail,
+                positionSeconds: existing.positionSeconds,
+                durationSeconds: existing.durationSeconds,
+                streamURL: existing.streamURL,
+                streamSignature: existing.streamSignature,
+                updatedAt: existing.updatedAt,
+                syncSource: existing.syncSource,
+                hasNewEpisode: existing.hasNewEpisode
+            )
+            if merged != existing {
+                items[row.id] = merged
+                changed = true
+            }
         }
         if changed { save() }
     }
@@ -214,7 +415,8 @@ final class ProgressStore: ObservableObject {
     func mergeExternal(_ remote: [WatchProgress]) {
         suppressChange = true
         var changed = false
-        for entry in remote {
+        for rawEntry in remote {
+            guard let entry = Self.sanitized(rawEntry) else { continue }
             if let local = items[entry.id] {
                 // Only advance position if external is further and MEANINGFULLY
                 // newer (60s slack). External positions are rebuilt from a
@@ -303,11 +505,19 @@ final class ProgressStore: ObservableObject {
         duration: Double,
         signature: StreamSignature? = nil
     ) {
-        guard duration > 60, position > 0 else { return }
+        guard duration.isFinite,
+              position.isFinite,
+              duration > 60,
+              duration <= Self.maxProgressSeconds,
+              position > 0 else { return }
         let key = Self.key(metaID: meta.id, video: video)
         if position / duration >= 0.95 {
-            items.removeValue(forKey: key)
-            if !suppressChange { onFinished?(meta, video) }
+            let removed = items.removeValue(forKey: key) != nil
+            if removed { tombstones[key] = Date() }
+            if !suppressChange {
+                if removed { onRemove?([key]) }
+                onFinished?(meta, video)
+            }
         } else {
             // Re-watching something you'd removed clears its tombstone so the
             // fresh entry syncs normally.
@@ -328,7 +538,8 @@ final class ProgressStore: ObservableObject {
                 durationSeconds: duration,
                 streamURL: streamURL,
                 streamSignature: signature ?? items[key]?.streamSignature,
-                updatedAt: Date()
+                updatedAt: Date(),
+                syncSource: "nuvio"
             )
         }
         save()
@@ -348,7 +559,12 @@ final class ProgressStore: ObservableObject {
         duration: Double,
         signature: StreamSignature? = nil
     ) {
-        guard duration > 60, position > 0, position / duration < 0.95 else { return }
+        guard duration.isFinite,
+              position.isFinite,
+              duration > 60,
+              duration <= Self.maxProgressSeconds,
+              position > 0,
+              position / duration < 0.95 else { return }
         let key = Self.key(metaID: meta.id, video: video)
         var snapshot = items
         snapshot[key] = WatchProgress(
@@ -367,7 +583,8 @@ final class ProgressStore: ObservableObject {
             durationSeconds: duration,
             streamURL: streamURL,
             streamSignature: signature ?? items[key]?.streamSignature,
-            updatedAt: Date()
+            updatedAt: Date(),
+            syncSource: "nuvio"
         )
         let storage = storageKey
         Task.detached(priority: .utility) {
@@ -386,6 +603,27 @@ final class ProgressStore: ObservableObject {
         }
     }
 
+    @discardableResult
+    func clearAllProgress(notify: Bool = true) -> [String] {
+        let removedKeys = Array(items.keys)
+        guard !removedKeys.isEmpty else { return [] }
+        let now = Date()
+        for key in removedKeys { tombstones[key] = now }
+        items.removeAll()
+        externallyMerged.removeAll()
+        awaitingServerAck.removeAll()
+        rebuildContinueFractions()
+        UserDefaults.standard.removeObject(forKey: storageKey)
+        Task.detached(priority: .utility) {
+            TopShelfExporter.write([])
+        }
+        if notify && !suppressChange {
+            onRemove?(removedKeys)
+            onLocalUpdate?()
+        }
+        return removedKeys
+    }
+
     /// Rewrite a progress entry's identifiers to their canonical IMDb (`tt`)
     /// form, preserving position/timestamps. Used when resuming a TMDB-sourced
     /// item whose stored `tmdb:` key can't be served by Cinemeta/Torrentio —
@@ -402,7 +640,8 @@ final class ProgressStore: ObservableObject {
             season: existing.season, episode: existing.episode, episodeTitle: existing.episodeTitle,
             positionSeconds: existing.positionSeconds, durationSeconds: existing.durationSeconds,
             streamURL: existing.streamURL, streamSignature: existing.streamSignature,
-            updatedAt: existing.updatedAt
+            updatedAt: existing.updatedAt,
+            syncSource: existing.syncSource
         )
         save()
         if !suppressChange {
@@ -465,7 +704,9 @@ final class ProgressStore: ObservableObject {
             items = [:]
             return
         }
-        items = decoded
+        let sanitized = decoded.compactMapValues { Self.sanitized($0) }
+        items = sanitized.filter { _, item in item.syncSource != nil }
+        if items.count != decoded.count { save() }
     }
 
     private func save() {

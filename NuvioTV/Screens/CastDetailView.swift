@@ -5,6 +5,8 @@ final class CastDetailViewModel: ObservableObject {
     @Published var items: [MetaItem] = []
     @Published var isLoading = true
 
+    private var hasLoaded = false
+
     let personID: Int
     let personName: String
 
@@ -14,6 +16,8 @@ final class CastDetailViewModel: ObservableObject {
     }
 
     func load() async {
+        guard !hasLoaded else { return }
+        hasLoaded = true
         defer { isLoading = false }
         items = await TMDBService.personFilmography(personID: personID)
     }

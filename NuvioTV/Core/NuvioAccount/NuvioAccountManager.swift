@@ -54,10 +54,18 @@ final class NuvioAccountManager: ObservableObject {
     }
 
     private func applySignedIn(from accessToken: String) {
-        let claims = JWT.decode(accessToken)
+        guard let claims = JWT.decode(accessToken),
+              let userID = claims.sub,
+              !userID.isEmpty else {
+            session = nil
+            NuvioSession.clear()
+            authState = .signedOut
+            errorMessage = "Your saved sign-in could not be restored. Please sign in again."
+            return
+        }
         authState = .signedIn(
-            userID: claims?.sub ?? "unknown",
-            email: claims?.email ?? "Signed in"
+            userID: userID,
+            email: claims.email ?? "Signed in"
         )
     }
 

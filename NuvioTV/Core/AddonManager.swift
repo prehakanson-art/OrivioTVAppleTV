@@ -18,6 +18,11 @@ final class AddonManager: ObservableObject {
     private static let storageKey = "nuvio.addons.v1"
     static let cinemetaURL = "https://v3-cinemeta.strem.io/manifest.json"
 
+    struct RemoteAddonState {
+        let manifestURL: String
+        let enabled: Bool
+    }
+
     private func notifyLocalChange() {
         guard !suppressChange else { return }
         onLocalChange?()
@@ -53,30 +58,48 @@ final class AddonManager: ObservableObject {
     /// Does not fire `onLocalChange` (no echo back). Returns the number added.
     @discardableResult
     func applyRemote(urls: [String], reconcile: Bool = false) async -> Int {
+        await applyRemote(
+            addons: urls.map { RemoteAddonState(manifestURL: $0, enabled: true) },
+            reconcile: reconcile
+        )
+    }
+
+    /// Applies the account's addon list, including each addon's enabled state.
+    /// Does not fire `onLocalChange` (no echo back). Returns the number added.
+    @discardableResult
+    func applyRemote(addons remoteAddons: [RemoteAddonState], reconcile: Bool = false) async -> Int {
         suppressChange = true
         defer { suppressChange = false }
+        let normalizedStates = remoteAddons.map { state in
+            let manifestURL = Self.normalizeManifestURL(state.manifestURL)
+            let baseURL = manifestURL.hasSuffix("/manifest.json")
+                ? String(manifestURL.dropLast("/manifest.json".count)) : manifestURL
+            return (manifestURL: manifestURL, baseURL: baseURL, enabled: state.enabled)
+        }
         let existing = Set(addons.map { $0.baseURL })
         // Keep only genuinely-new addons, in their incoming order.
-        let toInstall: [String] = urls.map(Self.normalizeManifestURL).filter { normalized in
-            let base = normalized.hasSuffix("/manifest.json")
-                ? String(normalized.dropLast("/manifest.json".count)) : normalized
-            return !existing.contains(base)
-        }
+        let toInstall = normalizedStates.filter { !existing.contains($0.baseURL) }
         // Removals first, so the count logged below reflects the real delta.
         var removed = 0
         if reconcile {
-            let remoteBases = Set(urls.map { u -> String in
-                let n = Self.normalizeManifestURL(u)
-                return n.hasSuffix("/manifest.json")
-                    ? String(n.dropLast("/manifest.json".count)) : n
-            })
+            let remoteBases = Set(normalizedStates.map(\.baseURL))
             let before = addons.count
             addons.removeAll { !remoteBases.contains($0.baseURL) }
             removed = before - addons.count
             if removed > 0 { save() }
         }
+
+        var updatedEnabled = 0
+        for state in normalizedStates {
+            guard let index = addons.firstIndex(where: { $0.baseURL == state.baseURL }),
+                  addons[index].enabled != state.enabled else { continue }
+            addons[index].enabled = state.enabled
+            updatedEnabled += 1
+        }
+        if updatedEnabled > 0 { save() }
+
         NSLog("[OrivioAddonSync] pull: %d from account, %d already installed, %d to add, %d removed (reconcile=%@)",
-              urls.count, urls.count - toInstall.count, toInstall.count, removed,
+              normalizedStates.count, normalizedStates.count - toInstall.count, toInstall.count, removed,
               reconcile ? "yes" : "no")
         guard !toInstall.isEmpty else { return 0 }
 
@@ -87,16 +110,16 @@ final class AddonManager: ObservableObject {
         // The window matters here: this runs during the first-login sync, when
         // an account with dozens of addons would otherwise fire every manifest
         // request at once while Home is also loading.
-        let fetched = await boundedConcurrentMap(toInstall, limit: AddonSweepLimits.manifests) { manifestURL in
-            let manifest = (try? await StremioAPI.manifest(url: manifestURL))
-                ?? AddonManifest.placeholder(manifestURL: manifestURL)
-            return (manifestURL, manifest)
+        let fetched = await boundedConcurrentMap(toInstall, limit: AddonSweepLimits.manifests) { state in
+            let manifest = (try? await StremioAPI.manifest(url: state.manifestURL))
+                ?? AddonManifest.placeholder(manifestURL: state.manifestURL)
+            return (state, manifest)
         }
 
         var added = 0
-        for (manifestURL, manifest) in fetched {
-            let addon = InstalledAddon(manifestURL: manifestURL, manifest: manifest)
-            if let existing = addons.firstIndex(where: { $0.manifestURL == manifestURL }) {
+        for (state, manifest) in fetched {
+            let addon = InstalledAddon(manifestURL: state.manifestURL, manifest: manifest, enabled: state.enabled)
+            if let existing = addons.firstIndex(where: { $0.manifestURL == state.manifestURL }) {
                 addons[existing] = addon
             } else {
                 addons.append(addon)
@@ -143,7 +166,11 @@ final class AddonManager: ObservableObject {
         // The manual "Refresh Add-ons" button always forces it.
         let last = UserDefaults.standard.double(forKey: Self.lastRefreshKey)
         if Date().timeIntervalSince1970 - last > 3600 {
-            Task { await refreshManifests() }
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                guard !Task.isCancelled else { return }
+                await refreshManifests()
+            }
         }
     }
 
@@ -213,6 +240,115 @@ final class AddonManager: ObservableObject {
         notifyLocalChange()
     }
 
+    /// Install every manifest URL in an exported setup blob. Accepts one URL per
+    /// line, comma-separated lists, and pasted text that contains manifest URLs.
+    @discardableResult
+    func importManifestURLs(from text: String) async -> (installed: Int, failed: Int) {
+        let urls = Self.extractManifestURLs(from: text)
+        guard !urls.isEmpty else { return (0, 0) }
+
+        var installed = 0
+        var failed = 0
+        for url in urls {
+            do {
+                try await install(manifestURL: url)
+                installed += 1
+            } catch {
+                failed += 1
+            }
+        }
+        return (installed, failed)
+    }
+
+    var exportedManifestList: String {
+        addons.map(\.manifestURL).joined(separator: "\n")
+    }
+
+    private static func extractManifestURLs(from text: String) -> [String] {
+        let pattern = #"https?://[^\s,;]+(?:manifest\.json)?"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        let matches = regex.matches(in: text, range: range)
+        var seen = Set<String>()
+        return matches.compactMap { match in
+            guard let r = Range(match.range, in: text) else { return nil }
+            let normalized = normalizeManifestURL(String(text[r]))
+            guard !seen.contains(normalized) else { return nil }
+            seen.insert(normalized)
+            return normalized
+        }
+    }
+
+    struct HealthResult: Identifiable, Equatable {
+        enum Status: Equatable {
+            case ok
+            case slow
+            case disabled
+            case failed(String)
+
+            var label: String {
+                switch self {
+                case .ok: return "OK"
+                case .slow: return "Slow"
+                case .disabled: return "Off"
+                case .failed: return "Failed"
+                }
+            }
+        }
+
+        let id: String
+        let name: String
+        let manifestURL: String
+        let elapsedMS: Int?
+        let status: Status
+        let capabilities: String
+    }
+
+    /// Measures manifest responsiveness for every installed addon. This is a
+    /// lightweight provider health check for users with many addons enabled:
+    /// slow or dead manifests usually explain long home/source loading.
+    func healthCheck() async -> [HealthResult] {
+        let snapshot = addons
+        guard !snapshot.isEmpty else { return [] }
+
+        return await boundedConcurrentMap(snapshot, limit: AddonSweepLimits.manifests) { addon in
+            let capabilities = Self.capabilitySummary(for: addon.manifest)
+            guard addon.enabled else {
+                return HealthResult(
+                    id: addon.id, name: addon.manifest.name, manifestURL: addon.manifestURL,
+                    elapsedMS: nil, status: .disabled, capabilities: capabilities
+                )
+            }
+
+            let started = Date()
+            do {
+                _ = try await StremioAPI.manifest(url: addon.manifestURL)
+                let elapsed = Int(Date().timeIntervalSince(started) * 1000)
+                return HealthResult(
+                    id: addon.id, name: addon.manifest.name, manifestURL: addon.manifestURL,
+                    elapsedMS: elapsed, status: elapsed > 2500 ? .slow : .ok,
+                    capabilities: capabilities
+                )
+            } catch {
+                let elapsed = Int(Date().timeIntervalSince(started) * 1000)
+                return HealthResult(
+                    id: addon.id, name: addon.manifest.name, manifestURL: addon.manifestURL,
+                    elapsedMS: elapsed, status: .failed(Self.shortReason(error)),
+                    capabilities: capabilities
+                )
+            }
+        }
+    }
+
+    nonisolated private static func capabilitySummary(for manifest: AddonManifest) -> String {
+        var parts: [String] = []
+        if manifest.providesCatalogs { parts.append("Catalogs") }
+        if manifest.providesStreams { parts.append("Streams") }
+        if manifest.providesMeta { parts.append("Meta") }
+        if manifest.providesSubtitles { parts.append("Subtitles") }
+        return parts.isEmpty ? "No active resources" : parts.joined(separator: " · ")
+    }
+
     /// Re-fetch every installed addon's manifest (the APK's "Refresh Add-ons")
     /// AND sync with the account: pull addons added on other devices, then push
     /// the merged list back.
@@ -273,7 +409,7 @@ final class AddonManager: ObservableObject {
             ? .changed(added: added, removed: removed) : .alreadyUpToDate
     }
 
-    private static func shortReason(_ error: Error) -> String {
+    nonisolated private static func shortReason(_ error: Error) -> String {
         if let urlError = error as? URLError {
             return urlError.code == .notConnectedToInternet ? "no internet" : "network error"
         }
@@ -315,7 +451,7 @@ final class AddonManager: ObservableObject {
 
     /// Seed manifest so the home screen has content before the first network
     /// round-trip; replaced by the live manifest on launch.
-    private static func bundledCinemeta() -> InstalledAddon {
+    static func bundledCinemeta() -> InstalledAddon {
         let manifest = AddonManifest(
             id: "com.linvo.cinemeta",
             name: "Cinemeta",

@@ -32,6 +32,7 @@ struct FusionHeroBar: View {
     /// the bar stays mounted there, and rotating unseen means decoding a fresh
     /// wide backdrop every 9s during playback on the 2–3 GB boxes.
     @State private var isVisible = true
+    @State private var contentRating: String?
 
     /// Seconds each hero title stays up before auto-advancing.
     private let dwellSeconds: TimeInterval = 9
@@ -55,6 +56,16 @@ struct FusionHeroBar: View {
         .onAppear { isVisible = true }
         .onDisappear { isVisible = false }
         .onReceive(tick) { _ in rotateIfIdle() }
+        .task(id: current?.id) { await loadContentRating() }
+    }
+
+    private func loadContentRating() async {
+        guard let item = current, item.type != "collection" else {
+            contentRating = nil
+            return
+        }
+        let rating = await TMDBService.contentRating(imdbID: item.id, type: item.type)
+        if current?.id == item.id { contentRating = rating }
     }
 
     @ViewBuilder
@@ -177,7 +188,7 @@ struct FusionHeroBar: View {
 
     @ViewBuilder
     private func metaLine(_ item: MetaItem) -> some View {
-        let segments = [item.year, item.genres?.first, item.runtimeFormatted].compactMap { $0 }
+        let segments = [contentRating, item.year, item.genres?.first, item.runtimeFormatted].compactMap { $0 }
         HStack(spacing: NuvioSpacing.sm) {
             if let rating = item.imdbRating {
                 HStack(spacing: 5) {

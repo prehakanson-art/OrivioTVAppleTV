@@ -5,6 +5,8 @@ final class TMDBBrowseViewModel: ObservableObject {
     @Published var items: [MetaItem] = []
     @Published var isLoading = true
 
+    private var hasLoaded = false
+
     let companyID: Int
     let title: String
 
@@ -14,6 +16,8 @@ final class TMDBBrowseViewModel: ObservableObject {
     }
 
     func load() async {
+        guard !hasLoaded else { return }
+        hasLoaded = true
         defer { isLoading = false }
         items = await TMDBService.browseCompany(id: companyID)
     }

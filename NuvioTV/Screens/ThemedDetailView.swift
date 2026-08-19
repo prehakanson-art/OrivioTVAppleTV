@@ -37,8 +37,10 @@ struct ThemedDetailView: View {
     private var side: CGFloat { 130 }
 
     private var seasonEpisodes: [MetaVideo] {
-        guard let s = viewModel.selectedSeason else { return meta.episodes(season: meta.seasons.first ?? 1) }
-        return meta.episodes(season: s)
+        guard let s = viewModel.selectedSeason else {
+            return meta.episodesIncludingLinkedSpecials(season: meta.regularSeasons.first ?? meta.seasons.first ?? 1)
+        }
+        return meta.episodesIncludingLinkedSpecials(season: s)
     }
     /// The episode Play acts on for a series (first of the selected season).
     private var playVideo: MetaVideo? { meta.isSeries ? seasonEpisodes.first : nil }
@@ -82,13 +84,14 @@ struct ThemedDetailView: View {
                         .foregroundStyle(.white).lineLimit(2).frame(maxWidth: 760, alignment: .leading)
                 }
 
-                if meta.isSeries, variant == .streamline {
-                    Text("\(meta.seasons.count) Season\(meta.seasons.count == 1 ? "" : "s")")
+                if meta.isSeries, variant == .streamline, !meta.regularSeasons.isEmpty {
+                    Text("\(meta.regularSeasons.count) Season\(meta.regularSeasons.count == 1 ? "" : "s")")
                         .font(.system(size: 26, weight: .semibold)).foregroundStyle(accent)
                 }
 
                 HStack(spacing: 16) {
                     if let r = meta.imdbRating { Text("IMDb \(r)") }
+                    if let contentRating = viewModel.contentRating { Text(contentRating) }
                     if let g = meta.genres?.first { Text(g) }
                     if let y = meta.year { Text(y) }
                     if let rt = meta.runtimeFormatted { Text(rt) }
@@ -139,7 +142,7 @@ struct ThemedDetailView: View {
                 Text("Episodes").font(.system(size: 30, weight: .bold)).foregroundStyle(.white)
                 ForEach(meta.seasons, id: \.self) { s in
                     Button { viewModel.selectedSeason = s; Task { await viewModel.loadSeason(s) } } label: {
-                        Text("S\(s)")
+                        Text(s == 0 ? "Specials" : "S\(s)")
                             .font(.system(size: 24, weight: .semibold))
                             .foregroundStyle(viewModel.selectedSeason == s ? .white : .white.opacity(0.5))
                             .padding(.horizontal, 16).padding(.vertical, 8)
@@ -156,17 +159,24 @@ struct ThemedDetailView: View {
                     ForEach(seasonEpisodes) { ep in
                         ThemedEpisodeCard(
                             episode: ep, fallback: meta.background, accent: accent,
+                            castLine: episodeCastLine(viewModel.episodeCasts[ep.id]),
                             isWatched: watched.isWatched(contentID: meta.id,
                                                          season: ep.season ?? 0, episode: ep.episode)
                         ) {
                             onPlay(meta, ep)
                         }
+                        .task { await viewModel.loadCast(for: ep) }
                     }
                 }
                 .padding(.horizontal, side)
             }
             .scrollClipDisabled()
         }
+    }
+
+    private func episodeCastLine(_ cast: [TMDBService.CastMember]?) -> String? {
+        guard let names = cast?.prefix(3).map(\.name), !names.isEmpty else { return nil }
+        return "Cast: \(names.joined(separator: ", "))"
     }
 
     // MARK: More like this
@@ -245,6 +255,7 @@ private struct ThemedEpisodeCard: View {
     let episode: MetaVideo
     let fallback: String?
     let accent: Color
+    let castLine: String?
     var isWatched: Bool = false
     let action: () -> Void
     @FocusState private var focused: Bool
@@ -262,10 +273,24 @@ private struct ThemedEpisodeCard: View {
                     }
                     .overlay(alignment: .topTrailing) { if isWatched { WatchedTickBadge() } }
                     .overlay(RoundedRectangle(cornerRadius: 8).stroke(accent, lineWidth: focused ? 5 : 0))
-                Text("\(episode.episode ?? 0). \(episode.title ?? "Episode")")
-                    .font(.system(size: 22, weight: .semibold))
-                    .foregroundStyle(focused ? .white : .white.opacity(isWatched ? 0.5 : 0.7))
-                    .lineLimit(1).frame(width: 420, alignment: .leading)
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("\(episode.episode ?? 0). \(episode.title ?? "Episode")")
+                        .font(.system(size: 22, weight: .semibold))
+                        .foregroundStyle(focused ? .white : .white.opacity(isWatched ? 0.5 : 0.7))
+                        .lineLimit(1)
+                        .frame(width: 420, alignment: .leading)
+
+                    if let castLine, !castLine.isEmpty {
+                        Text(castLine)
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.52))
+                            .lineLimit(1)
+                            .frame(width: 420, alignment: .leading)
+                            .opacity(focused ? 1 : 0)
+                    }
+                }
+                .frame(width: 420, height: castLine?.isEmpty == false ? 50 : 28, alignment: .topLeading)
+                .clipped()
             }
         }
         .buttonStyle(.huluFlat)

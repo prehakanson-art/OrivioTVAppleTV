@@ -659,9 +659,12 @@ final class PlayerViewModel: ObservableObject {
     // Scrub preview thumbnails, generated in the background over a separate
     // FFmpeg context once playback is underway (Infuse builds its previews the
     // same way). Sorted by time; the scrub HUD picks the nearest frame.
-    @Published private(set) var scrubThumbnails: [FFThumbnail] = []
+    @Published private(set) var scrubThumbnails: [ScrubThumbnail] = []
     private var thumbnailTask: Task<Void, Never>?
     private var thumbnailsStarted = false
+    /// The running grabber, so cancelling actually aborts its FFmpeg session —
+    /// `thumbnailTask?.cancel()` alone cannot interrupt a blocking network read.
+    private var thumbnailer: ScrubThumbnailer?
 
     // Initial-load phases shown on the loading backdrop: "Loading" while the
     // stream opens, then "Caching" while a deep forward buffer is built with
@@ -910,7 +913,7 @@ final class PlayerViewModel: ObservableObject {
         didResignActive = true
         guard isPlaying else { return }
         enginePause()
-        pausedAt = Date()
+        markPaused()
         // Land on the pause overlay so returning shows a clean "paused here"
         // state, not a frozen bare frame.
         if overlay == .none { overlay = .pauseInfo }
@@ -921,7 +924,7 @@ final class PlayerViewModel: ObservableObject {
         guard hasStartedPlayback, !isExiting else { return }
         didBackground = true
         enginePause()
-        pausedAt = Date()
+        markPaused()
         // Land the viewer on the pause overlay so returning shows a clean
         // "paused here" state, not a frozen bare frame.
         if overlay == .none { overlay = .pauseInfo }
@@ -982,7 +985,7 @@ final class PlayerViewModel: ObservableObject {
         position = target
         clock.position = target
         isPlaying = false
-        pausedAt = Date()
+        markPaused()
     }
 
     /// Clear the black resync cover once — the earliest scheduled clear wins,
@@ -1252,6 +1255,8 @@ final class PlayerViewModel: ObservableObject {
         currentURL = url
         startLoadWatchdog()
         thumbnailTask?.cancel()
+        thumbnailer?.cancel()   // aborts its FFmpeg session, even mid-read
+        thumbnailer = nil
         thumbnailsStarted = false
         scrubThumbnails = []
         cacheTask?.cancel()
@@ -1275,6 +1280,25 @@ final class PlayerViewModel: ObservableObject {
 
         if let playerLayer {
             playerLayer.set(url: url, options: options)
+            // MUST follow every set(url:) on a REUSED layer.
+            //
+            // KSPlayerLayer.pause() clears its internal `isAutoPlay`, and
+            // `set(url:)` only opens the new stream `if isAutoPlay` — both of
+            // its branches (`player.replace(url:)` and the swap to a different
+            // engine class) gate `prepareToPlay()` on that flag, and neither
+            // `stop()` nor `replace()` ever opens a stream by itself. So any
+            // load that follows a pause — an episode switch or Up Next advance
+            // (play(episode:) pauses first), picking a different source/engine
+            // while paused, a failover armed while backgrounded — swapped the
+            // URL in and then never opened it. The picture never returned, the
+            // 30s watchdog fired, and every failover candidate died exactly the
+            // same silent way until "every available source was tried".
+            //
+            // play() re-arms autoplay and, because set(url:) leaves the layer
+            // in `.initialized` via its own stop(), performs the prepareToPlay
+            // that actually opens the stream. It is a no-op on the already
+            // -preparing path, so the normal (still-playing) case is unchanged.
+            playerLayer.play()
         } else {
             playerLayer = KSPlayerLayer(url: url, options: options, delegate: self)
         }
@@ -1294,9 +1318,19 @@ final class PlayerViewModel: ObservableObject {
     /// the native AVPlayer path manages its own buffer. `currentOptions` is
     /// read live by KSPlayer, so updating it here takes effect immediately.
     private func applyBufferSizeTarget(player: some MediaPlayerProtocol) {
-        guard let target = settings.bufferProfile.targetBytes,
-              let options = currentOptions,
-              player is KSMEPlayer else { return }
+        guard let options = currentOptions, player is KSMEPlayer else { return }
+        // The DEFAULT (Auto) profile has no byte target, and this method used to
+        // return immediately for it — which meant `PerformanceProfile
+        // .maxBufferBytes`, documented as the "hard ceiling … an oversized one
+        // jetsams the app", was in practice never enforced on the profile
+        // virtually everyone runs. The only limit was maxBufferDuration, a
+        // count of SECONDS, which is bitrate-blind: the tier defaults
+        // (90s small / 36s unknown / 24s large) are a few tens of MB on an
+        // ordinary stream and hundreds of MB on a high-bitrate 4K or 1080p one.
+        // A missing `videoSize` hint (very common — Continue Watching resumes
+        // carry none) lands such a stream on the 36s "unknown" tier. Treat the
+        // device ceiling as the target when the user hasn't picked one.
+        let target = settings.bufferProfile.targetBytes ?? PerformanceProfile.maxBufferBytes
 
         // Bitrate (bits/s): prefer file size ÷ duration; fall back to the sum
         // of the track bitrates. Guard against unknowns so we never divide by
@@ -1324,7 +1358,15 @@ final class PlayerViewModel: ObservableObject {
         // above the stall-resume gate (preferredForwardBufferDuration), never a
         // runaway (30 min is plenty even for a very low-bitrate stream).
         let floor = Double(KSOptions.preferredForwardBufferDuration) + 2
-        let clamped = min(max(seconds, floor), 1800)
+        var clamped = min(max(seconds, floor), 1800)
+        // On Auto the byte budget is only a CEILING: it must be able to shrink
+        // the tier's seconds cap for a high-bitrate stream, never to inflate it
+        // (a low-bitrate file would otherwise be handed 30 minutes of buffer).
+        // An explicitly chosen size profile stays authoritative in both
+        // directions — that is what the user asked for.
+        if settings.bufferProfile.targetBytes == nil {
+            clamped = max(min(clamped, options.maxBufferDuration), floor)
+        }
         options.maxBufferDuration = clamped
         NSLog("[OrivioBuffer] size target %d MB @ %.1f Mbps → %.0fs cache (cap %d MB)",
               target / (1 << 20), bitsPerSecond / 1_000_000, clamped,
@@ -1364,6 +1406,8 @@ final class PlayerViewModel: ObservableObject {
         loadStartedAt = Date()
         startLoadWatchdog()
         thumbnailTask?.cancel()
+        thumbnailer?.cancel()   // aborts its FFmpeg session, even mid-read
+        thumbnailer = nil
         thumbnailsStarted = false
         scrubThumbnails = []
         cacheTask?.cancel()
@@ -1379,6 +1423,16 @@ final class PlayerViewModel: ObservableObject {
             loadPhase = .loading   // VLC never enters the .caching hold
             cacheProgress = 0
         }
+
+        // VLC never touches KSPlayer, and KSPlayer is what normally puts the
+        // audio session into .playback/.moviePlayback (KSAVPlayer/KSMEPlayer
+        // both call KSOptions.setAudioSession on init). A VLC-only session
+        // therefore ran on tvOS's default .soloAmbient category — the wrong
+        // ducking, interruption and route policy for long-form video.
+        try? AVAudioSession.sharedInstance().setCategory(
+            .playback, mode: .moviePlayback, policy: .longFormAudio
+        )
+        try? AVAudioSession.sharedInstance().setActive(true)
 
         let engine = vlcEngine ?? VLCEngine()
         vlcEngine = engine
@@ -1671,11 +1725,32 @@ final class PlayerViewModel: ObservableObject {
     /// the idle socket, so a plain play() drains the buffer and then freezes
     /// mid-scene (the "have to rewind 10 seconds to get it going" bug).
     private var pausedAt: Date?
-    /// Pause longer than this → resume via an in-place seek. A seek flushes
-    /// the demuxer and re-opens the HTTP connection (range request), which is
-    /// exactly what the manual rewind-10s workaround did. Cheap: the FFmpeg
-    /// restart gate is 3s of buffer.
-    private let staleResumeAfter: TimeInterval = 30
+
+    /// Stamp the pause clock, KEEPING THE OLDEST time. `pausedAt` answers "how
+    /// long has this connection been idle?", so every later event that pauses an
+    /// already-paused player (backgrounding, the app switcher, the post-
+    /// background resync, entering a scan preview) must not restamp it — that
+    /// resets the staleness clock to zero and the resume then takes the plain
+    /// play() path on a socket the CDN dropped long ago, which is the freeze the
+    /// reconnect-by-seek exists to prevent. Cleared only when playback really
+    /// moves again (the `.buffering` / `.bufferFinished` states).
+    private func markPaused() {
+        if pausedAt == nil { pausedAt = Date() }
+    }
+
+    /// Resume via a tiny in-place rewind whenever the stream can seek. That
+    /// flushes stale decoder/network state and avoids the pause-resume freeze
+    /// where audio continues but the picture needs a manual rewind to move.
+    private let resumeRewindSeconds: Double = 1
+
+    /// Beyond this idle time a paused stream's connection is treated as likely
+    /// dropped (debrid CDNs reap idle sockets), so the resume flushes it with
+    /// the reconnect-rewind. Under it the network cache and decoder are still
+    /// warm, so a plain play() resumes instantly IN PLACE — no rewind and no
+    /// refilling the 6–20s VLC network cache, which was the "takes forever to
+    /// load on resume". A quick pause keeps the second before the playhead
+    /// buffered, so nothing has to reload.
+    private let staleResumeThreshold: TimeInterval = 12
 
     func togglePlayPause() {
         // Ignore input while exiting, or during the sub-second post-background
@@ -1692,29 +1767,40 @@ final class PlayerViewModel: ObservableObject {
             // Only reconnect-by-seek when the stream can actually seek — a live
             // / non-seekable source would stash the seek and never play, so the
             // press would do nothing.
-            let canReconnectBySeek = usingVLC || (playerLayer?.player.seekable ?? false)
-            if let pausedAt, canReconnectBySeek,
-               Date().timeIntervalSince(pausedAt) > staleResumeAfter {
-                // Long pause: reconnect in place instead of trusting the idle
-                // socket. Nudge back a second so the seek lands on content
-                // that's certainly still valid keyframe-wise.
-                //
-                // The seek AUTOPLAYS on completion — do not also call
-                // enginePlay(). Same trap as the resume path in `.readyToPlay`:
-                // a synchronous play() lands inside the seek and stomps
-                // KSMEPlayer's `.seeking` back to `.playing`, restarting both
-                // outputs mid-flush. The seek then flushes audio only, so audio
-                // re-primes at the new position while the video output keeps
-                // stale frames — picture freezes, sound carries on. FFmpeg
-                // engine only (AVPlayer has no such state).
-                engineSeek(to: max(position - 1, 0), autoPlay: true)
-            } else {
-                enginePlay()
-            }
+            resumePlayback()
             if overlay == .pauseInfo {
                 overlay = .none
             }
             restartHideTimer()
+        }
+    }
+
+    /// Leave pause. Seekable streams resume through a tiny rewind instead of a
+    /// plain play(). The seek flushes stale decoder/network state and autoplays
+    /// on completion, matching the manual workaround of nudging back a second.
+    ///
+    /// Non-seekable/live sources still use plain play: asking them to seek could
+    /// stash a target that never resolves, making the Play press look ignored.
+    ///
+    /// The seek AUTOPLAYS on completion — never also call enginePlay(). Same
+    /// trap as the resume path in `.readyToPlay`: a synchronous play() lands
+    /// inside the seek and stomps KSMEPlayer's `.seeking` back to `.playing`,
+    /// restarting both outputs mid-flush. The seek then flushes audio only, so
+    /// audio re-primes at the new position while the video output keeps stale
+    /// frames — picture freezes, sound carries on. FFmpeg engine only (AVPlayer
+    /// has no such state).
+    private func resumePlayback() {
+        // Only a long idle risks the dropped-socket / stale-decoder freeze the
+        // reconnect-rewind exists to fix. A short pause left everything warm, so
+        // play in place — instant, and it never re-fills the network cache
+        // (the resume that "takes forever to load").
+        let idleSeconds = pausedAt.map { Date().timeIntervalSince($0) } ?? 0
+        let connectionLikelyStale = idleSeconds >= staleResumeThreshold
+        let canReconnectBySeek = usingVLC || (playerLayer?.player.seekable ?? false)
+        if connectionLikelyStale, canReconnectBySeek {
+            engineSeek(to: max(position - resumeRewindSeconds, 0), autoPlay: true)
+        } else {
+            enginePlay()
         }
     }
 
@@ -2187,11 +2273,30 @@ final class PlayerViewModel: ObservableObject {
     func requestExitConfirm() {
         saveProgress()
         hideControlsTask?.cancel()
+        // A DEAD-END overlay (playback error, finished title, still-watching
+        // gate) is the only thing standing between the viewer and a black
+        // screen — remember it so "Keep Watching" puts it back. Dropping
+        // straight to `.controls` left them looking at a transport bar over a
+        // stream that had failed or ended, with no way to reach the error text
+        // or the Replay / Other Sources buttons again.
+        switch overlay {
+        case .error, .postPlay, .stillWatching: overlayBeforeExitConfirm = overlay
+        default: overlayBeforeExitConfirm = nil
+        }
         overlay = .exitConfirm
     }
 
+    /// The dead-end overlay the exit confirmation was raised over, restored if
+    /// the viewer chooses to keep watching.
+    private var overlayBeforeExitConfirm: PlayerOverlay?
+
     /// Dismiss the exit confirmation and return to the main player controls.
     func cancelExitConfirm() {
+        if let previous = overlayBeforeExitConfirm {
+            overlayBeforeExitConfirm = nil
+            overlay = previous
+            return
+        }
         guard hasStartedPlayback else {
             overlay = .none
             return
@@ -2247,6 +2352,10 @@ final class PlayerViewModel: ObservableObject {
         guard scanPreview == nil else { return }
         wasPlayingBeforeScan = isPlaying
         enginePause()
+        // Stamp the pause clock ourselves: the engine's `.paused` callback does
+        // it for a normal pause, but a scan preview must be timed too so a long
+        // sweep resumes through the stale-socket reconnect (see resumePlayback).
+        markPaused()
         scanPreview = position
     }
 
@@ -2304,8 +2413,16 @@ final class PlayerViewModel: ObservableObject {
         scanRate = 0
         scanTask?.cancel(); scanTask = nil
         scanPreview = nil
+        // The seek AUTOPLAYS on completion — do NOT also call enginePlay().
+        // A synchronous play() lands INSIDE the seek and stomps KSMEPlayer's
+        // `.seeking` back to `.playing`, restarting both outputs mid-flush; the
+        // seek then flushes audio only, so audio re-primes at the new position
+        // while the video output keeps stale frames — picture freezes, sound
+        // carries on. (Same trap documented in `.readyToPlay` and the
+        // stale-socket resume in togglePlayPause.) If the engine can't seek
+        // yet, KSPlayerLayer stashes the target WITH autoplay armed, so
+        // playback still starts.
         seek(to: target)        // loads the new position here
-        enginePlay()
         showControls()
     }
 
@@ -2315,7 +2432,11 @@ final class PlayerViewModel: ObservableObject {
         scanRate = 0
         scanTask?.cancel(); scanTask = nil
         scanPreview = nil
-        if wasPlayingBeforeScan { enginePlay() }
+        // The preview PAUSED the engine, and a sweep can sit there for minutes
+        // — long enough for the CDN to drop the idle socket. Resume through the
+        // same stale-connection path as the pause overlay rather than a bare
+        // play() that would drain the buffer and freeze.
+        if wasPlayingBeforeScan { resumePlayback() }
         showControls()
     }
 
@@ -2787,6 +2908,11 @@ final class PlayerViewModel: ObservableObject {
                 }
                 next = StreamEntry(addonName: next.addonName, stream: resolved)
             }
+            // The scrape / debrid re-resolve above can take many seconds. If the
+            // viewer exited during it, stop here — `load()` would otherwise open
+            // a fresh stream behind the dismissed player (the same orphaned
+            // playback `player(layer:finish:)` guards against up front).
+            guard !self.isExiting else { return }
             self.showToast("Source failed — trying \(next.addonName)")
             self.currentEntry = next
             self.pendingResume = resumeAt > 10 ? resumeAt : nil
@@ -2849,6 +2975,10 @@ final class PlayerViewModel: ObservableObject {
                     self.showToast("Couldn't resolve this source — try another")
                     return
                 }
+                // Debrid resolution takes seconds; the viewer may have left in
+                // the meantime. Loading now would strand a playing layer behind
+                // the dismissed player.
+                guard !self.isExiting else { return }
                 let direct = StreamEntry(addonName: entry.addonName, stream: resolved)
                 self.currentEntry = direct
                 self.countdownTask?.cancel()
@@ -3018,8 +3148,10 @@ final class PlayerViewModel: ObservableObject {
         upNextEpisode = nil
         autoAdvanceArmed = false
         consecutiveAutoAdvances = 0
+        // Seek only — it autoplays on completion. A second, synchronous play()
+        // here ran inside the seek's flush and left the picture frozen with the
+        // audio running (see scanCommit / `.readyToPlay` for the full story).
         seek(to: 0)
-        playerLayer?.play()
     }
 
     /// End-of-content handling: queue the next episode (the Up Next card
@@ -3039,6 +3171,11 @@ final class PlayerViewModel: ObservableObject {
     /// the episode's links are loaded (the "Choose Source" long-press action),
     /// so the viewer can pick a link instead of taking the auto-selected one.
     func play(episode: MetaVideo, autoAdvance: Bool = false, presentSources: Bool = false) {
+        // The player is closing (or gone): never start a new stream. Its
+        // source fetch takes seconds, so a countdown that fires — or an
+        // Episodes-panel tap — as the viewer exits used to land a load() on a
+        // dismissed player: a fresh layer playing audio with no UI to stop it.
+        guard !isExiting else { return }
         overlay = .none
         countdownTask?.cancel()
         upNextCountdown = nil
@@ -3119,6 +3256,9 @@ final class PlayerViewModel: ObservableObject {
                 preferred = playable.first
             }
 
+            // Re-check after the awaits above: the viewer may have exited while
+            // the episode's sources were being fetched.
+            guard !isExiting else { return }
             currentVideo = episode
             allEntries = panelEntries
             pendingResume = progressStore.progress(for: episode.id)?.positionSeconds
@@ -3192,20 +3332,17 @@ final class PlayerViewModel: ObservableObject {
     private(set) var displayCriteriaApplied = false
 
     /// Called when the exit sequence starts. Persists progress, halts
-    /// playback, and — crucially — releases the HDR display criteria NOW,
-    /// while the player still owns the screen. On a Dolby Vision home-screen
-    /// setup, leaving HDR content makes the TV mode-switch back into DV (the
-    /// badge in the corner); if the fullScreenCover dismisses DURING that
-    /// switch, the transition wedges and the app is left on a stuck grey
-    /// screen. PlayerScreen waits for `isDisplayModeSwitchInProgress` to
-    /// clear before dismissing (see exitPlayer). Engine teardown still runs
-    /// in `teardown()` (onDisappear) — resetting criteria twice is a no-op.
+    /// playback, and releases HDR display criteria before teardown. Confirmed
+    /// exits dismiss immediately after this; engine teardown still runs in
+    /// `teardown()` (onDisappear), so resetting criteria twice is a no-op.
     func prepareForExit() {
         guard !isExiting else { return }
         isExiting = true
         saveProgress()
         cacheTask?.cancel()
         thumbnailTask?.cancel()
+        thumbnailer?.cancel()   // aborts its FFmpeg session, even mid-read
+        thumbnailer = nil
         countdownTask?.cancel()
         dvRemuxer?.cancel()   // stop the DV remux's network reads immediately
         enginePause()
@@ -3226,12 +3363,22 @@ final class PlayerViewModel: ObservableObject {
         saveProgress()
         cacheTask?.cancel()
         thumbnailTask?.cancel()
+        thumbnailer?.cancel()   // aborts its FFmpeg session, even mid-read
+        thumbnailer = nil
         countdownTask?.cancel()
         scanTask?.cancel()
         resyncClearTask?.cancel()
         loadWatchdogTask?.cancel()
         stallWatchdogTask?.cancel()
         UIApplication.shared.isIdleTimerDisabled = false
+        // Release the Siri-remote trackpad stream. `configureWheelTracking()`
+        // installs this handler on the SHARED GCController, which outlives the
+        // player — left in place it keeps firing (and keeps owning the pad's
+        // absolute-value reporting) for the rest of the app's life, once per
+        // playback session.
+        for controller in GCController.controllers() {
+            controller.microGamepad?.dpad.valueChangedHandler = nil
+        }
         playerLayer?.pause()
         playerLayer?.stop()
         // KSMEPlayer.shutdown() (called by stop()) does NOT stop its
@@ -3378,13 +3525,23 @@ final class PlayerViewModel: ObservableObject {
                 guard let self else { return }
                 let ahead = self.buffered - self.position
                 if self.hasStartedPlayback && ahead >= gate { break }
+                // VLC exposes no ahead-buffer at all (`buffered` is pinned to
+                // 0 on that path), so the cache gate above can NEVER pass —
+                // every VLC session fell through to the 120s timeout and then
+                // ran the decode pass against live playback, which is the exact
+                // thing the gate exists to prevent. Give it a fixed settle.
+                if self.usingVLC, self.hasStartedPlayback,
+                   Date().timeIntervalSince(waitStart) > 20 { break }
                 if Date().timeIntervalSince(waitStart) > 120 { break }
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
             guard !Task.isCancelled else { return }
-            let controller = ThumbnailController(thumbnailCount: 36)
-            guard let thumbs = try? await controller.generateThumbnail(for: url, thumbWidth: 256),
-                  !Task.isCancelled else { return }
+            let thumbnailer = ScrubThumbnailer(url: url)
+            self?.thumbnailer = thumbnailer
+            let thumbs = await thumbnailer.generate()
+            guard !Task.isCancelled, self?.thumbnailer === thumbnailer else { return }
+            self?.thumbnailer = nil
+            guard !thumbs.isEmpty else { return }
             self?.scrubThumbnails = thumbs.sorted { $0.time < $1.time }
             NSLog("[OrivioPlayer] scrub previews ready: %d frames", thumbs.count)
         }
@@ -3769,13 +3926,18 @@ extension PlayerViewModel: KSPlayerLayerDelegate {
             // Some engines (notably the FFmpeg path) go straight to playing
             // without a `.readyToPlay`, so dismiss the loading backdrop here
             // too — unless the initial pre-cache is still holding playback.
+            // Disarm the load watchdog for the same reason: it is armed by
+            // `load()` and only ever disarmed in `.readyToPlay`, so a stream
+            // that reached "buffer finished" without one would be declared
+            // dead and failed over 30s into perfectly good playback.
+            markLoadStarted()
             if loadPhase != .caching { hasStartedPlayback = true }
         case .paused:
             isPlaying = false
             isBuffering = false
             // First transition into pause stamps the clock for the
             // stale-connection recovery; later delegate re-fires keep it.
-            if pausedAt == nil { pausedAt = Date() }
+            markPaused()
         case .playedToTheEnd:
             isPlaying = false
             // Post-play: queue next episode or show the end overlay instead of
@@ -3801,6 +3963,10 @@ extension PlayerViewModel: KSPlayerLayerDelegate {
             hasStartedPlayback = true
             loadPhase = nil
         }
+        // A clock that is advancing is proof the load is alive, whatever states
+        // the engine did or didn't report — never let the 30s load watchdog
+        // fail over a stream that is visibly playing.
+        if currentTime > 0 { markLoadStarted() }
         if currentTime.isFinite { markPlaybackProgressed(currentTime: currentTime) }
         if currentTime.isFinite { position = currentTime }
         if totalTime.isFinite, totalTime > 0, !usingNativeDV { duration = totalTime }

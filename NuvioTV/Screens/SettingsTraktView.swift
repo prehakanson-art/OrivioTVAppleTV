@@ -280,7 +280,8 @@ struct TraktConnectPage: View {
 
             // Live countdown; a new code is fetched automatically when it hits 0.
             TimelineView(.periodic(from: .now, by: 1)) { context in
-                let remaining = max(0, Int(expiresAt.timeIntervalSince(context.date)))
+                let seconds = expiresAt.timeIntervalSince(context.date)
+                let remaining = seconds.isFinite ? Int(min(max(seconds, 0), 86_400)) : 0
                 Text(remaining > 0
                      ? "Code expires in \(remaining / 60):\(String(format: "%02d", remaining % 60))"
                      : "Refreshing code…")
