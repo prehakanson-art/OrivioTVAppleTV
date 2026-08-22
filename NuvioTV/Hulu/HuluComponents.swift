@@ -384,6 +384,10 @@ struct HuluFeaturedHero: View {
     @State private var index = 0
     @State private var lastManual = Date.distantPast
     @State private var contentRating: String?
+    /// False while this hero is off screen, so its timer can't rotate (and
+    /// repaint a full-screen backdrop) for a section nobody is looking at.
+    @State private var isVisible = false
+    @ObservedObject private var perf = PerformanceSettingsStore.shared
     private let timer = Timer.publish(every: 8, on: .main, in: .common).autoconnect()
 
     private var current: HuluTitle? { items.indices.contains(index) ? items[index] : nil }
@@ -447,9 +451,21 @@ struct HuluFeaturedHero: View {
                 Color.clear.frame(height: 780).frame(maxWidth: .infinity)
             }
         }
+        .onAppear { isVisible = true }
+        .onDisappear { isVisible = false }
         .onReceive(timer) { _ in
-            guard items.count > 1, Date().timeIntervalSince(lastManual) > 10 else { return }
-            withAnimation(.easeInOut(duration: 0.6)) { index = (index + 1) % items.count }
+            // Gated like the Fusion hero: an auto-rotation crossfades a
+            // FULL-SCREEN backdrop, so it must not run while this hero is off
+            // screen (another tab/section is showing), and Reduce Motion turns
+            // automatic rotation off entirely (§55). The fade itself follows the
+            // hero-crossfade setting, which is off by default on the A8 and the
+            // 3 GB 4K — there it swaps without recompositing a fade.
+            guard isVisible, !perf.reduceMotion, items.count > 1,
+                  Date().timeIntervalSince(lastManual) > 10 else { return }
+            let fade = perf.heroCrossfadeEffective
+            withAnimation(fade ? .easeInOut(duration: 0.6) : nil) {
+                index = (index + 1) % items.count
+            }
         }
         .contentRating(for: current?.meta, into: $contentRating)
     }

@@ -21,7 +21,11 @@ struct HuluHomeView: View {
 
     var body: some View {
         ScrollView(.vertical, showsIndicators: false) {
-            VStack(alignment: .leading, spacing: 34) {
+            // LAZY: these rows are built per collection/catalog and each
+            // instantiates its own horizontal strip of cards. Eager, the whole
+            // screen's artwork was constructed before the first frame — the
+            // cost that made these themes crawl on the older boxes.
+            LazyVStack(alignment: .leading, spacing: 34) {
                 HuluFeaturedHero(items: featured.isEmpty ? [.placeholder] : featured,
                                  onPlay: onPlay, onDetails: onSelect, playFocus: playFocus)
                     .padding(.bottom, 6)
@@ -99,7 +103,11 @@ struct HuluHubsView: View {
 
     var body: some View {
         ScrollView(.vertical, showsIndicators: false) {
-            VStack(alignment: .leading, spacing: 40) {
+            // LAZY: these rows are built per collection/catalog and each
+            // instantiates its own horizontal strip of cards. Eager, the whole
+            // screen's artwork was constructed before the first frame — the
+            // cost that made these themes crawl on the older boxes.
+            LazyVStack(alignment: .leading, spacing: 40) {
                 Text("HUBS").font(HuluStyle.hero(52)).foregroundStyle(.white)
                     .padding(.leading, side).padding(.top, 40)
 

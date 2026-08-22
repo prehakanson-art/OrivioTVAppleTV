@@ -606,7 +606,6 @@ struct HomeView: View {
     @EnvironmentObject private var progressStore: ProgressStore
     @EnvironmentObject private var collections: CollectionsStore
     @EnvironmentObject private var homeCatalogSettings: HomeCatalogSettingsStore
-    @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var watched: WatchedStore
     // Owned by RootView so it PERSISTS across tab switches. If it were a local
     // @StateObject, switching away and back would rebuild HomeView with a fresh

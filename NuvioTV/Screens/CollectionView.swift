@@ -374,8 +374,15 @@ struct CollectionFolderCard: View, Equatable {
                     // only for SQUARE logo marks. See CollectionCard above —
                     // padding full-bleed art inside the tile is what produced
                     // the grey bars around every tile.
+                    // Decode capped to the tile, NOT the original. This asked
+                    // TMDB for `originalSize` and then handed it to RemoteImage
+                    // uncapped, so a 260-330pt tile decoded full-resolution
+                    // artwork — in a strip that can hold 100-200 of them (this
+                    // library has Actors at 100 and Film Collections at 200),
+                    // on the box least able to afford it.
                     RemoteImage(url: TMDBService.originalSize(cover) ?? cover,
-                                contentMode: isLogoMark ? .fit : .fill)
+                                contentMode: isLogoMark ? .fit : .fill,
+                                maxDimension: max(cardSize.width, cardSize.height))
                         .padding(isLogoMark ? NuvioSpacing.xl : 0)
                         .clipShape(RoundedRectangle(cornerRadius: NuvioRadius.md))
                         // Fade the still out only once the GIF is actually

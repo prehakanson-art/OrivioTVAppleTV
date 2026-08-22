@@ -104,9 +104,11 @@ struct MaxPosterRail: View {
 /// focus visuals and store changes invalidate through their own dependencies,
 /// which bypass ==.
 struct MaxPosterCard: View, Equatable {
+    // NOTE: no LibraryStore here — the hold menu (MaxCardMenu) owns that
+    // subscription. Declaring it on the card subscribed every card's body to
+    // the store, so they all rebuilt on any library change, for nothing.
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.title == rhs.title }
 
-    @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var watched: WatchedStore
     let title: MaxTitle
     var externalFocus: FocusState<Bool>.Binding? = nil
@@ -231,12 +233,13 @@ private struct MaxLandscapeArt: View {
 /// Used in grids (Search / My Stuff / Categories) and behind the Top 10 numerals.
 /// Equatable for the same reason as MaxPosterCard.
 struct MaxPortraitCard: View, Equatable {
+    // No store subscriptions: this card reads neither, and holding them made
+    // every instance rebuild whenever either store published (every sync pull,
+    // every playback save). MaxCardMenu owns them where they are used.
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.title == rhs.title && lhs.width == rhs.width
     }
 
-    @EnvironmentObject private var library: LibraryStore
-    @EnvironmentObject private var watched: WatchedStore
     @ObservedObject private var perf = PerformanceSettingsStore.shared
     let title: MaxTitle
     var width: CGFloat = 210
@@ -277,10 +280,11 @@ struct MaxPortraitCard: View, Equatable {
 /// Used in every grid (Search / My Stuff / Categories / hub genre lists).
 /// Equatable for the same reason as MaxPosterCard.
 struct MaxGridCard: View, Equatable {
+    // No store subscriptions: this card reads neither, and holding them made
+    // every instance rebuild whenever either store published (every sync pull,
+    // every playback save). MaxCardMenu owns them where they are used.
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.title == rhs.title }
 
-    @EnvironmentObject private var library: LibraryStore
-    @EnvironmentObject private var watched: WatchedStore
     let title: MaxTitle
     var focus: FocusState<Bool>.Binding? = nil
     let action: () -> Void
@@ -494,6 +498,10 @@ struct MaxFeaturedHero: View {
     @State private var index = 0
     @State private var lastManual = Date.distantPast
     @State private var contentRating: String?
+    /// False while this hero is off screen, so its timer can't rotate (and
+    /// repaint a full-screen backdrop) for a section nobody is looking at.
+    @State private var isVisible = false
+    @ObservedObject private var perf = PerformanceSettingsStore.shared
     private let timer = Timer.publish(every: 8, on: .main, in: .common).autoconnect()
     private let contentInset: CGFloat = MaxLayout.railInset
 
@@ -562,9 +570,21 @@ struct MaxFeaturedHero: View {
                 Color.black.frame(height: MaxLayout.heroHeight).frame(maxWidth: .infinity)
             }
         }
+        .onAppear { isVisible = true }
+        .onDisappear { isVisible = false }
         .onReceive(timer) { _ in
-            guard items.count > 1, Date().timeIntervalSince(lastManual) > 10 else { return }
-            withAnimation(.easeInOut(duration: 0.6)) { index = (index + 1) % items.count }
+            // Gated like the Fusion hero: an auto-rotation crossfades a
+            // FULL-SCREEN backdrop, so it must not run while this hero is off
+            // screen (another tab/section is showing), and Reduce Motion turns
+            // automatic rotation off entirely (§55). The fade itself follows the
+            // hero-crossfade setting, which is off by default on the A8 and the
+            // 3 GB 4K — there it swaps without recompositing a fade.
+            guard isVisible, !perf.reduceMotion, items.count > 1,
+                  Date().timeIntervalSince(lastManual) > 10 else { return }
+            let fade = perf.heroCrossfadeEffective
+            withAnimation(fade ? .easeInOut(duration: 0.6) : nil) {
+                index = (index + 1) % items.count
+            }
         }
         .contentRating(for: current?.meta, into: $contentRating)
     }

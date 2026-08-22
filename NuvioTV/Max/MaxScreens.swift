@@ -29,7 +29,11 @@ struct MaxHomeView: View {
 
     var body: some View {
         ScrollView(.vertical, showsIndicators: false) {
-            VStack(alignment: .leading, spacing: 30) {
+            // LAZY: these rows are built per collection/catalog and each
+            // instantiates its own horizontal strip of cards. Eager, the whole
+            // screen's artwork was constructed before the first frame — the
+            // cost that made these themes crawl on the older boxes.
+            LazyVStack(alignment: .leading, spacing: 30) {
                 MaxFeaturedHero(items: featured.isEmpty ? [.placeholder] : featured,
                                 onPlay: onSelect,
                                 defaultFocusNS: defaultFocusNS, playFocus: playFocus,
@@ -193,7 +197,11 @@ struct MaxCategoriesView: View {
 
     var body: some View {
         ScrollView(.vertical, showsIndicators: false) {
-            VStack(alignment: .leading, spacing: 40) {
+            // LAZY: these rows are built per collection/catalog and each
+            // instantiates its own horizontal strip of cards. Eager, the whole
+            // screen's artwork was constructed before the first frame — the
+            // cost that made these themes crawl on the older boxes.
+            LazyVStack(alignment: .leading, spacing: 40) {
                 Text("Categories")
                     .font(MaxStyle.hero(52)).foregroundStyle(.white)
                     .padding(.leading, side).padding(.top, 40)
