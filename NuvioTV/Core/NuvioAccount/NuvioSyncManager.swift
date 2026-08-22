@@ -452,6 +452,9 @@ final class NuvioSyncManager: ObservableObject {
         watchedStore.setProfile(pid)
         collectionsStore.setProfile(pid)
         homeCatalogSettings.setProfile(pid)
+        // Only rescopes when per-profile Trakt accounts are on; otherwise the
+        // login stays device-wide.
+        traktStore?.setProfile(pid)
     }
 
     // MARK: - Addons
@@ -1432,6 +1435,7 @@ final class NuvioSyncManager: ObservableObject {
         watchedStore.setProfile(id)
         collectionsStore.setProfile(id)
         homeCatalogSettings.setProfile(id)
+        traktStore?.setProfile(id)
         guard account.accessToken != nil else { return }
         // Serialize behind any in-flight full sync (e.g. picking a profile at
         // the gate while the sign-in sync is still running) so two cycles can't

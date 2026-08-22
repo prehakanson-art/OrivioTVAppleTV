@@ -53,6 +53,11 @@ final class TraktStore: ObservableObject {
 
     private static let tokenKey = "nuvio.trakt.tokens.v1"
     private static let userKey = "nuvio.trakt.user.v1"
+    private static let perProfileKey = "nuvio.trakt.perProfileAccounts.v1"
+    /// Same key ProfileStore uses, read directly so the scope is right from
+    /// launch even when signed out of the Orivio account (the sync manager,
+    /// which scopes the other stores, only runs while signed in).
+    private static let activeProfileKey = "nuvio.profiles.active"
     private static let scrobbleKey = "nuvio.trakt.scrobble.v1"
     private static let secretKey = "nuvio.trakt.secret.v1"
     private static let histKey = "nuvio.trakt.synchistory.v1"
@@ -69,12 +74,79 @@ final class TraktStore: ObservableObject {
         syncWatchlist = UserDefaults.standard.object(forKey: Self.watchlistKey) as? Bool ?? true
         syncRatings = UserDefaults.standard.object(forKey: Self.ratingsKey) as? Bool ?? true
         clientSecret = UserDefaults.standard.string(forKey: Self.secretKey) ?? ""
-        username = UserDefaults.standard.string(forKey: Self.userKey)
-        if let data = UserDefaults.standard.data(forKey: Self.tokenKey),
+        perProfileAccounts = UserDefaults.standard.bool(forKey: Self.perProfileKey)
+        profileID = UserDefaults.standard.object(forKey: Self.activeProfileKey) as? Int ?? 1
+        let suffix = perProfileAccounts ? ".p\(profileID)" : ""
+        username = UserDefaults.standard.string(forKey: Self.userKey + suffix)
+        if let data = UserDefaults.standard.data(forKey: Self.tokenKey + suffix),
            let tokens = try? JSONDecoder().decode(Tokens.self, from: data) {
             accessToken = tokens.access
             refreshToken = tokens.refresh
         }
+    }
+
+    /// Give every PROFILE its own Trakt account instead of sharing one across
+    /// the device. Off = the login is device-wide, as it has always been.
+    ///
+    /// Only the ACCOUNT (tokens + username) is scoped. The sync switches and
+    /// the client secret stay device-wide: the secret is an app credential
+    /// rather than a person's login, and scoping the switches would silently
+    /// reset them per profile.
+    ///
+    /// The account backend already stores these per profile — the credentials
+    /// push sends `p_profile_id` — so this aligns local storage with what sync
+    /// was doing anyway.
+    @Published var perProfileAccounts: Bool {
+        didSet {
+            guard perProfileAccounts != oldValue else { return }
+            UserDefaults.standard.set(perProfileAccounts, forKey: Self.perProfileKey)
+            if perProfileAccounts {
+                // Turning it ON: whoever is using the app now keeps the login
+                // that was already set up, and the other profiles start empty.
+                // The device-wide copy is left untouched, so turning it back
+                // off restores the shared account exactly as it was.
+                if UserDefaults.standard.data(forKey: scopedTokenKey) == nil,
+                   let shared = UserDefaults.standard.data(forKey: Self.tokenKey) {
+                    UserDefaults.standard.set(shared, forKey: scopedTokenKey)
+                    UserDefaults.standard.set(UserDefaults.standard.string(forKey: Self.userKey),
+                                              forKey: scopedUserKey)
+                }
+            }
+            reloadAccount()
+        }
+    }
+
+    /// The profile whose Trakt account is currently loaded.
+    private(set) var profileID: Int
+
+    private var scopeSuffix: String { perProfileAccounts ? ".p\(profileID)" : "" }
+    private var scopedTokenKey: String { Self.tokenKey + scopeSuffix }
+    private var scopedUserKey: String { Self.userKey + scopeSuffix }
+
+    /// Point the store at a profile. No-op unless per-profile accounts are on,
+    /// in which case the previous profile's login is swapped out for this
+    /// one's — which may be none at all, and that is the intended outcome.
+    func setProfile(_ id: Int) {
+        guard id != profileID else { return }
+        profileID = id
+        guard perProfileAccounts else { return }
+        reloadAccount()
+    }
+
+    /// Load tokens + username from whichever scope is active now.
+    private func reloadAccount() {
+        applyingRemote = true
+        defer { applyingRemote = false }
+        username = UserDefaults.standard.string(forKey: scopedUserKey)
+        if let data = UserDefaults.standard.data(forKey: scopedTokenKey),
+           let tokens = try? JSONDecoder().decode(Tokens.self, from: data) {
+            accessToken = tokens.access
+            refreshToken = tokens.refresh
+        } else {
+            accessToken = nil
+            refreshToken = nil
+        }
+        lastSyncStatus = nil
     }
 
     var isSignedIn: Bool { accessToken != nil }
@@ -90,14 +162,14 @@ final class TraktStore: ObservableObject {
         accessToken = access
         refreshToken = refresh
         if let data = try? JSONEncoder().encode(Tokens(access: access, refresh: refresh)) {
-            UserDefaults.standard.set(data, forKey: Self.tokenKey)
+            UserDefaults.standard.set(data, forKey: scopedTokenKey)
         }
         if !applyingRemote { onLocalChange?() }
     }
 
     func setUsername(_ name: String?) {
         username = name
-        UserDefaults.standard.set(name, forKey: Self.userKey)
+        UserDefaults.standard.set(name, forKey: scopedUserKey)
         if !applyingRemote { onLocalChange?() }
     }
 
@@ -105,8 +177,8 @@ final class TraktStore: ObservableObject {
         accessToken = nil
         refreshToken = nil
         username = nil
-        UserDefaults.standard.removeObject(forKey: Self.tokenKey)
-        UserDefaults.standard.removeObject(forKey: Self.userKey)
+        UserDefaults.standard.removeObject(forKey: scopedTokenKey)
+        UserDefaults.standard.removeObject(forKey: scopedUserKey)
         if !applyingRemote { onLocalChange?() }
     }
 

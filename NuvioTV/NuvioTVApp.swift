@@ -191,6 +191,10 @@ struct RootView: View {
                     }
                     // Trakt two-way sync (history / watched badges + Continue
                     // Watching). Separate opt-in destination from the account.
+                    // Trakt scoping must survive being signed out of Orivio:
+                    // the sync manager owns profile scoping for every other
+                    // store, but it only runs while signed in.
+                    profiles.onSwitchLocal = { [weak trakt] id in trakt?.setProfile(id) }
                     traktSync = TraktSyncManager(
                         trakt: trakt, watched: watched, progress: progressStore,
                         library: library, ratings: ratings, addonManager: addonManager
@@ -235,6 +239,14 @@ struct RootView: View {
                     if args.contains("-discoverDemo") {
                         selectedTab = 1
                         searchPath.append(Route.discover)
+                    }
+                    // Dev: flip per-profile Trakt and/or switch profile, the
+                    // same calls Settings and the profile gate make.
+                    if args.contains("-traktPerProfile") { trakt.perProfileAccounts = true }
+                    if args.contains("-traktShared") { trakt.perProfileAccounts = false }
+                    if let p = args.first(where: { $0.hasPrefix("-profile:") })?
+                        .replacingOccurrences(of: "-profile:", with: ""), let id = Int(p) {
+                        profiles.setActive(id)
                     }
                     // Dev: pick a theme exactly as Settings does (persisted AND
                     // marked as an explicit choice), so the "does my pick

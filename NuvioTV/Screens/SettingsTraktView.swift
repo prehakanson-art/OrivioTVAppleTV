@@ -4,6 +4,7 @@ import SwiftUI
 struct TraktDetail: View {
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var trakt: TraktStore
+    @EnvironmentObject private var profiles: ProfileStore
 
     @State private var deviceCode: TraktDeviceCode?
     @State private var polling = false
@@ -15,6 +16,21 @@ struct TraktDetail: View {
 
     var body: some View {
         DetailScaffold(title: SettingsCategory.trakt.title, subtitle: SettingsCategory.trakt.subtitle) {
+            // Shown above BOTH states: a profile that hasn't connected Trakt
+            // sees the signed-out view, and this is how someone turns the
+            // per-profile behaviour on (or back off) from there. Only worth
+            // showing once there is more than one profile.
+            if profiles.profiles.count > 1 {
+                SettingsToggleCard(
+                    title: "Separate Trakt per profile",
+                    subtitle: "Each profile connects its own Trakt account here. Profiles that haven't connected one simply have no Trakt — nothing is shared between them. Off: one Trakt account for the whole device.",
+                    isOn: Binding(
+                        get: { trakt.perProfileAccounts },
+                        set: { trakt.perProfileAccounts = $0 }
+                    )
+                )
+                .padding(.bottom, NuvioSpacing.sm)
+            }
             if trakt.isSignedIn {
                 signedInView
             } else {

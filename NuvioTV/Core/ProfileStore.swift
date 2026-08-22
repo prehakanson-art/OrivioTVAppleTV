@@ -208,11 +208,16 @@ final class ProfileStore: ObservableObject {
         notifyChange()
     }
 
+    /// A second switch hook, for state that must rescope even when signed out
+    /// of the account (the sync manager's `onSwitch` only runs while signed in).
+    var onSwitchLocal: ((Int) -> Void)?
+
     func setActive(_ id: Int) {
         guard profiles.contains(where: { $0.id == id }) else { return }
         guard id != activeProfileID else { return }
         activeProfileID = id
         UserDefaults.standard.set(id, forKey: Self.activeKey)
+        onSwitchLocal?(id)
         onSwitch?(id)
     }
 
