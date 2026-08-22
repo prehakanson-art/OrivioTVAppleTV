@@ -240,6 +240,13 @@ struct RootView: View {
                         selectedTab = 1
                         searchPath.append(Route.discover)
                     }
+                    // Dev: remove a title from Continue Watching through the
+                    // same call the hold menu makes, so the fan-out to Orivio,
+                    // Trakt and Stremio can be exercised without the tvOS UI.
+                    if let meta = args.first(where: { $0.hasPrefix("-removeCW:") })?
+                        .replacingOccurrences(of: "-removeCW:", with: ""), !meta.isEmpty {
+                        progressStore.removeShow(metaID: meta, notifyTrakt: true)
+                    }
                     // Dev: flip per-profile Trakt and/or switch profile, the
                     // same calls Settings and the profile gate make.
                     if args.contains("-traktPerProfile") { trakt.perProfileAccounts = true }

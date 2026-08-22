@@ -412,6 +412,15 @@ final class NuvioSyncManager: ObservableObject {
             await pullBadgeSettings()   // best-effort; badge chips are cosmetic
             await pullAppPreferences()  // player/TMDB/theme prefs + collections
             await pullProviderCredentials()  // debrid keys + Trakt (Android table)
+            // Trakt and the player key the same episode differently; collapse
+            // any pair that already exists so the hub holds ONE row per episode.
+            let collapsed = progressStore.collapseDuplicateEpisodes()
+            if !collapsed.isEmpty {
+                NuvioSyncDiagnostics.record(
+                    .info, area: "Orivio",
+                    "Collapsed \(collapsed.count) duplicate Continue Watching row(s) keyed differently by another source."
+                )
+            }
             // Local repo edits go up before the reconciling pull, or a removal
             // still inside its debounce is restored and then re-uploaded.
             if pluginsDirty { try? await pushPlugins() }

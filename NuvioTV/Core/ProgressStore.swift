@@ -142,6 +142,12 @@ final class ProgressStore: ObservableObject {
     /// Not fired for internal migrations (recanonicalize) — the title is still
     /// being watched, its key just changed.
     var onTraktRemove: ((String) -> Void)?
+    /// Fired with the metaID when a title leaves Continue Watching, so the
+    /// Stremio sync can clear it THERE too. Stremio's continue watching is
+    /// derived from each library item's playback state, and the push only
+    /// carries rows that still exist locally — so without this a removal was
+    /// invisible to Stremio and the card simply came back on the next pull.
+    var onStremioClearProgress: ((String) -> Void)?
     private var suppressChange = false
 
     /// Recently-removed progress keys → removal time. A pull's server snapshot
@@ -440,12 +446,79 @@ final class ProgressStore: ObservableObject {
     /// row only when the key is absent, or updates position when the external
     /// one is clearly further AND the local row is older. Never deletes, so it
     /// can't fight the Nuvio full-snapshot reconcile.
+    /// The key an incoming row should land on: its own if we already hold that
+    /// key, otherwise any existing row for the SAME title and episode.
+    ///
+    /// Sources disagree on how to key an episode — Trakt builds
+    /// `tt1234:1:1` while the player uses the addon's own video id, which can
+    /// be `tt1234_s1e1`. Keyed literally, the same episode lands twice and the
+    /// two copies never merge: two rows, two positions, and whichever sorts
+    /// first wins the card. Matching on identity instead is what makes the
+    /// account a real hub rather than three parallel lists.
+    private func mergeKey(for entry: WatchProgress, index: [String: String]) -> String {
+        if items[entry.id] != nil { return entry.id }
+        return index[Self.identity(of: entry)] ?? entry.id
+    }
+
+    /// metaID + season + episode — the same episode however it was keyed.
+    private static func identity(of item: WatchProgress) -> String {
+        "\(item.metaID)|\(item.season.map(String.init) ?? "-")|\(item.episode.map(String.init) ?? "-")"
+    }
+
+    private func identityIndex() -> [String: String] {
+        var index: [String: String] = [:]
+        for (key, item) in items where index[Self.identity(of: item)] == nil {
+            index[Self.identity(of: item)] = key
+        }
+        return index
+    }
+
+    /// Collapse rows that are the same episode under different keys, keeping
+    /// one and deleting the rest from the account too.
+    ///
+    /// Merging by identity (see mergeKey) stops new duplicates, but installs
+    /// that already synced a Trakt-keyed copy alongside the player's own hold
+    /// both. The survivor is the most recently updated row; on a tie the one
+    /// the player itself writes (anything not sourced from Trakt) wins, since
+    /// that is the key future playback will keep updating.
+    @discardableResult
+    func collapseDuplicateEpisodes() -> [String] {
+        var best: [String: String] = [:]      // identity -> winning key
+        var losers: [String] = []
+        for (key, item) in items.sorted(by: { $0.key < $1.key }) {
+            let id = Self.identity(of: item)
+            guard let current = best[id], let held = items[current] else {
+                best[id] = key
+                continue
+            }
+            let heldWins: Bool
+            if held.updatedAt != item.updatedAt {
+                heldWins = held.updatedAt > item.updatedAt
+            } else {
+                heldWins = held.syncSource != "trakt" || item.syncSource == "trakt"
+            }
+            if heldWins { losers.append(key) } else { best[id] = key; losers.append(current) }
+        }
+        guard !losers.isEmpty else { return [] }
+        for key in losers { items.removeValue(forKey: key) }
+        save()
+        if !suppressChange {
+            // Delete the dropped keys from the account as well, or the next
+            // pull hands the duplicate straight back.
+            onRemove?(losers)
+            onLocalUpdate?()
+        }
+        return losers
+    }
+
     func mergeExternal(_ remote: [WatchProgress]) {
         suppressChange = true
         var changed = false
+        let index = identityIndex()
         for rawEntry in remote {
             guard let entry = Self.sanitized(rawEntry) else { continue }
-            if let local = items[entry.id] {
+            let key = mergeKey(for: entry, index: index)
+            if let local = items[key] {
                 // Only advance position if external is further and MEANINGFULLY
                 // newer (60s slack). External positions are rebuilt from a
                 // percentage × a guessed runtime, so they're approximate — the
@@ -460,9 +533,9 @@ final class ProgressStore: ObservableObject {
                     merged.positionSeconds = entry.positionSeconds
                     if entry.durationSeconds > 0 { merged.durationSeconds = entry.durationSeconds }
                     merged.updatedAt = entry.updatedAt
-                    items[entry.id] = merged
-                    externallyMerged.insert(entry.id)
-                    awaitingServerAck.insert(entry.id)
+                    items[key] = merged
+                    externallyMerged.insert(key)
+                    awaitingServerAck.insert(key)
                     changed = true
                 }
             } else if tombstones[entry.id] == nil {
@@ -715,6 +788,7 @@ final class ProgressStore: ObservableObject {
         if !suppressChange {
             onRemove?(removedKeys)
             if notifyTrakt { onTraktRemove?(metaID) }
+            onStremioClearProgress?(metaID)
             onLocalUpdate?()
         }
     }

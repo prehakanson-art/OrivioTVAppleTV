@@ -446,7 +446,8 @@ enum StremioSync {
                              addonManager: AddonManager,
                              library: LibraryStore,
                              progress: ProgressStore,
-                             watched: WatchedStore) async -> String {
+                             watched: WatchedStore,
+                             clearedProgressIDs: Set<String> = []) async -> String {
         var warnings: [String] = []
 
         do {
@@ -462,7 +463,8 @@ enum StremioSync {
         let items = makeLibraryPutPayload(
             library: savedLibrary,
             progress: serviceProgress,
-            watched: watched.allForSync()
+            watched: watched.allForSync(),
+            clearedProgressIDs: clearedProgressIDs
         )
         do {
             try await StremioAccountService.putLibrary(authKey: authKey, items: items)
@@ -539,7 +541,8 @@ enum StremioSync {
     private static func makeLibraryPutPayload(
         library: [SavedLibraryItem],
         progress: [WatchProgress],
-        watched: [WatchedItem]
+        watched: [WatchedItem],
+        clearedProgressIDs: Set<String> = []
     ) -> [[String: Any]] {
         var rows: [String: [String: Any]] = [:]
 
@@ -578,6 +581,31 @@ enum StremioSync {
             if let poster = wp.poster { row["poster"] = poster }
             row["_mtime"] = isoString(wp.updatedAt)
             row["state"] = stremioState(progress: wp, watched: nil)
+            rows[id] = row
+        }
+
+        // Titles removed from Continue Watching here: zero their playback
+        // state so Stremio drops them from ITS continue watching. Library
+        // membership is untouched — this clears the resume point, it does not
+        // unsave the title. Applied before the watched pass, which may then
+        // legitimately overwrite the state with a "watched" marker.
+        for id in clearedProgressIDs {
+            var row = rows[id] ?? [
+                "_id": id,
+                "_ctime": isoString(Date()),
+                "id": id,
+                "type": "movie",
+                "removed": false,
+                "temp": true
+            ]
+            row["_mtime"] = isoString(Date())
+            row["state"] = [
+                "time_offset": 0,
+                "time_watched": 0,
+                "overall_time_watched": 0,
+                "flagged_watched": 0,
+                "last_watched": isoString(Date())
+            ]
             rows[id] = row
         }
 

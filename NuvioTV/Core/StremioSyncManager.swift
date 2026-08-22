@@ -39,12 +39,32 @@ final class StremioSyncManager: ObservableObject {
             }
             .store(in: &cancellables)
 
+        // Removals here must reach Stremio too — the hub fans OUT, not just in.
+        progress.onStremioClearProgress = { [weak self] metaID in
+            self?.queueProgressClear(metaID)
+        }
+
         handleAuthKey(stremio.authKey)
     }
 
     deinit {
         syncTask?.cancel()
         autoSyncTask?.cancel()
+    }
+
+    /// Titles removed from Continue Watching that Stremio hasn't been told
+    /// about yet. Persisted, so a removal survives a failed push or a relaunch
+    /// instead of silently coming back on the next pull.
+    private static let pendingClearKey = "orivio.stremio.pendingProgressClears.v1"
+
+    private var pendingProgressClears: Set<String> {
+        get { Set(UserDefaults.standard.stringArray(forKey: Self.pendingClearKey) ?? []) }
+        set { UserDefaults.standard.set(Array(newValue).sorted(), forKey: Self.pendingClearKey) }
+    }
+
+    private func queueProgressClear(_ metaID: String) {
+        guard !metaID.isEmpty else { return }
+        pendingProgressClears.insert(metaID)
     }
 
     func syncNow(reason: String = "Manual Stremio sync") {
@@ -121,13 +141,20 @@ final class StremioSyncManager: ObservableObject {
                 progress.removeLocalOnlyProgress()
                 await onMergedFromStremio?()
                 progress.removeLocalOnlyProgress()
+                let clears = pendingProgressClears
                 let pushResult = await StremioSync.pushCombined(
                     authKey: key,
                     addonManager: addonManager,
                     library: library,
                     progress: progress,
-                    watched: watched
+                    watched: watched,
+                    clearedProgressIDs: clears
                 )
+                // Only drop the queue once the push actually reported success;
+                // a failure keeps them for the next run.
+                if !clears.isEmpty, !pushResult.hasPrefix("Couldn't") {
+                    pendingProgressClears.subtract(clears)
+                }
                 finalResult = "\(pullResult) · \(pushResult)"
             }
             stremio.setStatus(finalResult)
