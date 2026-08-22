@@ -1906,16 +1906,7 @@ private struct HeroInfoView: View {
             }
         }
         .frame(height: 330, alignment: .bottomLeading)
-        .task(id: hero.item?.id) { await loadContentRating() }
-    }
-
-    private func loadContentRating() async {
-        guard let item = hero.item, item.type != "collection" else {
-            contentRating = nil
-            return
-        }
-        let rating = await TMDBService.contentRating(imdbID: item.id, type: item.type)
-        if hero.item?.id == item.id { contentRating = rating }
+        .contentRating(for: hero.item, into: $contentRating)
     }
 
     @ViewBuilder
@@ -2065,16 +2056,7 @@ private struct ATVHeroInfoView: View {
         .padding(.top, 40)
         .padding(.leading, NuvioSpacing.huge)
         .padding(.bottom, NuvioSpacing.md)
-        .task(id: hero.item?.id) { await loadContentRating() }
-    }
-
-    private func loadContentRating() async {
-        guard let item = hero.item, item.type != "collection" else {
-            contentRating = nil
-            return
-        }
-        let rating = await TMDBService.contentRating(imdbID: item.id, type: item.type)
-        if hero.item?.id == item.id { contentRating = rating }
+        .contentRating(for: hero.item, into: $contentRating)
     }
 
     @ViewBuilder

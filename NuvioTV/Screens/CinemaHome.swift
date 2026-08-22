@@ -206,16 +206,7 @@ private struct CinemaHero: View {
             .padding(.leading, 60)
             .padding(.bottom, 24)
         }
-        .task(id: item?.id) { await loadContentRating() }
-    }
-
-    private func loadContentRating() async {
-        guard let item, item.type != "collection" else {
-            contentRating = nil
-            return
-        }
-        let rating = await TMDBService.contentRating(imdbID: item.id, type: item.type)
-        if self.item?.id == item.id { contentRating = rating }
+        .contentRating(for: item, into: $contentRating)
     }
 
     private var metaLine: String? {

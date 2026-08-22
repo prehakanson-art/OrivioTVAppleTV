@@ -56,16 +56,7 @@ struct FusionHeroBar: View {
         .onAppear { isVisible = true }
         .onDisappear { isVisible = false }
         .onReceive(tick) { _ in rotateIfIdle() }
-        .task(id: current?.id) { await loadContentRating() }
-    }
-
-    private func loadContentRating() async {
-        guard let item = current, item.type != "collection" else {
-            contentRating = nil
-            return
-        }
-        let rating = await TMDBService.contentRating(imdbID: item.id, type: item.type)
-        if current?.id == item.id { contentRating = rating }
+        .contentRating(for: current, into: $contentRating)
     }
 
     @ViewBuilder

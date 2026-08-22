@@ -451,16 +451,7 @@ struct HuluFeaturedHero: View {
             guard items.count > 1, Date().timeIntervalSince(lastManual) > 10 else { return }
             withAnimation(.easeInOut(duration: 0.6)) { index = (index + 1) % items.count }
         }
-        .task(id: current?.id) { await loadContentRating() }
-    }
-
-    private func loadContentRating() async {
-        guard let meta = current?.meta else {
-            contentRating = nil
-            return
-        }
-        let rating = await TMDBService.contentRating(imdbID: meta.id, type: meta.type)
-        if current?.id == meta.id { contentRating = rating }
+        .contentRating(for: current?.meta, into: $contentRating)
     }
 }
 

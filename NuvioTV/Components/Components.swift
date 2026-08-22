@@ -1512,3 +1512,30 @@ where Element.ID == String {
         .onChange(of: focusedID) { _, id in onFocusedIDChange?(id) }
     }
 }
+
+// MARK: - Shared content-rating lookup
+
+extension View {
+    /// Keep `rating` in sync with the TMDB certification ("TV-MA", "PG-13") for
+    /// the item a hero is showing.
+    ///
+    /// Every hero in the app needed this and each carried its own copy of the
+    /// same `loadContentRating()` — seven of them, differing only in how they
+    /// reached the item. The staleness guard each one hand-rolled ("is this
+    /// still the item I fetched for?") is what `.task(id:)` already does: it
+    /// cancels the in-flight fetch when the id changes, so a slow lookup can't
+    /// land on the next title.
+    ///
+    /// Collections have no certification and are skipped.
+    func contentRating(for item: MetaItem?, into rating: Binding<String?>) -> some View {
+        task(id: item?.id) {
+            guard let item, item.type != "collection" else {
+                rating.wrappedValue = nil
+                return
+            }
+            let value = await TMDBService.contentRating(imdbID: item.id, type: item.type)
+            guard !Task.isCancelled else { return }
+            rating.wrappedValue = value
+        }
+    }
+}

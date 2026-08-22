@@ -280,16 +280,7 @@ private struct OnyxHero: View {
         .padding(.top, 140)
         .padding(.bottom, 12)
         .frame(maxWidth: .infinity, alignment: .bottomLeading)
-        .task(id: item?.id) { await loadContentRating() }
-    }
-
-    private func loadContentRating() async {
-        guard let item else {
-            contentRating = nil
-            return
-        }
-        let rating = await TMDBService.contentRating(imdbID: item.id, type: item.type)
-        if self.item?.id == item.id { contentRating = rating }
+        .contentRating(for: item, into: $contentRating)
     }
 
     private var metaLine: String? {
