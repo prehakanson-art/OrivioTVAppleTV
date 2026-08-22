@@ -238,6 +238,11 @@ struct PlayerSettings: Codable, Equatable {
     /// Fetch a preferred-language subtitle from your subtitle addons and hand
     /// it to the external player (Infuse/VLC/VidHub `sub=` parameter).
     var externalPlayerForwardSubtitles: Bool = false
+    /// Hand the REST of the season over too, as a playlist, when the external
+    /// player supports one (Infuse takes repeated url/filename/position
+    /// groups). Lets next-episode work over there instead of stopping dead
+    /// after one episode.
+    var externalPlayerSendPlaylist: Bool = true
     /// LEGACY (pre-audioOutputMode): the old force-renderer toggle. Kept only
     /// so existing saves migrate — read once in the decoder, never in the UI.
     var audioRendererEnabled: Bool = false
@@ -446,6 +451,7 @@ struct PlayerSettings: Codable, Equatable {
         bufferProfile = (try? c.decode(BufferProfile.self, forKey: .bufferProfile)) ?? d.bufferProfile
         externalPlayerID = (try? c.decode(String.self, forKey: .externalPlayerID)) ?? d.externalPlayerID
         externalPlayerForwardSubtitles = (try? c.decode(Bool.self, forKey: .externalPlayerForwardSubtitles)) ?? d.externalPlayerForwardSubtitles
+        externalPlayerSendPlaylist = (try? c.decode(Bool.self, forKey: .externalPlayerSendPlaylist)) ?? d.externalPlayerSendPlaylist
         audioRendererEnabled = (try? c.decode(Bool.self, forKey: .audioRendererEnabled)) ?? d.audioRendererEnabled
         // Migration: saves from before audioOutputMode existed carry only the
         // old force-renderer bool — honor it as an explicit "renderer".

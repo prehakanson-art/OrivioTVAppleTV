@@ -412,6 +412,29 @@ struct MetaItem: Codable, Identifiable, Hashable {
         return "\(total)m"
     }
 
+    /// Runtime in SECONDS from the addon's free-text field ("109 min",
+    /// "1h 49m", "2 hr 15 min"). A duration of last resort: an external
+    /// player's callback reports a position but no duration, and a position
+    /// means nothing without something to measure it against.
+    var runtimeSeconds: Double? {
+        guard let runtime = runtime?.lowercased() else { return nil }
+        var hours = 0.0, minutes = 0.0
+        var digits = ""
+        var value: Double?
+        for character in runtime {
+            if character.isNumber { digits.append(character); continue }
+            if !digits.isEmpty { value = Double(digits); digits = "" }
+            guard let number = value else { continue }
+            if character == "h" { hours += number; value = nil }
+            else if character == "m" { minutes += number; value = nil }
+        }
+        if !digits.isEmpty { value = Double(digits) }
+        // A bare number with no unit ("109") is minutes — Cinemeta's usual form.
+        if let leftover = value, hours == 0, minutes == 0 { minutes = leftover }
+        let total = hours * 3600 + minutes * 60
+        return total > 0 ? total : nil
+    }
+
     var seasons: [Int] {
         let numbers = Set((videos ?? []).compactMap { $0.season }.filter { $0 >= 0 })
         return numbers.sorted()

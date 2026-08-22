@@ -1396,10 +1396,10 @@ struct RootView: View {
                     // Fetch a preferred-language subtitle, then hand off (async).
                     Task {
                         let sub = await externalSubtitleURL(for: request)
-                        target.open(streamURL: urlString, subtitleURL: sub)
+                        handOff(request, to: target, streamURL: urlString, subtitleURL: sub)
                     }
                 } else {
-                    target.open(streamURL: urlString)
+                    handOff(request, to: target, streamURL: urlString)
                 }
                 return
             }
@@ -1427,6 +1427,212 @@ struct RootView: View {
         return firstAny
     }
 
+    /// Hand a playback to an external app with everything its scheme accepts,
+    /// and remember it so the return trip can land back in Continue Watching.
+    private func handOff(
+        _ request: PlaybackRequest, to player: ExternalPlayer,
+        streamURL: String, subtitleURL: String? = nil
+    ) {
+        let duration = externalDuration(meta: request.meta, video: request.video)
+        let resume = request.resumePosition
+            ?? progressStore.progress(for: ProgressStore.key(metaID: request.meta.id, video: request.video))?.positionSeconds
+
+        var item = ExternalPlayerHandoff.Item(streamURL: streamURL)
+        item.subtitleURL = subtitleURL
+        item.filename = externalFilename(meta: request.meta, video: request.video, streamURL: streamURL)
+        if player.acceptsResume, let resume, resume >= 1 { item.resumeSeconds = resume }
+
+        let session = ExternalPlaybackSession.Item(
+            meta: request.meta, video: request.video,
+            streamURL: streamURL, durationSeconds: duration
+        )
+
+        // Optimistic Continue Watching entry, for the players that can't report
+        // anything back: without it, watching in another app leaves no trace at
+        // all here. A player that DOES report (Infuse) overwrites this with the
+        // real position on return — or removes the row outright if it finished.
+        if let duration, duration > 60 {
+            progressStore.update(
+                meta: request.meta, video: request.video, streamURL: streamURL,
+                position: max(resume ?? 0, 1), duration: duration,
+                signature: request.entry.stream.signature(addonName: request.entry.addonName)
+            )
+        }
+
+        guard player.supportsPlaylist,
+              playerSettings.settings.externalPlayerSendPlaylist,
+              request.video != nil
+        else {
+            send([item], sessions: [session], to: player)
+            return
+        }
+        // Resolve the rest of the season in the background and hand the whole
+        // run over as one playlist. Bounded by a deadline: a slow addon sweep
+        // must not hold up the episode the viewer actually pressed play on.
+        Task {
+            let upcoming = await upcomingExternalEpisodes(after: request)
+            send([item] + upcoming.map(\.item),
+                 sessions: [session] + upcoming.map(\.session), to: player)
+        }
+    }
+
+    private func send(
+        _ items: [ExternalPlayerHandoff.Item],
+        sessions: [ExternalPlaybackSession.Item],
+        to player: ExternalPlayer
+    ) {
+        var handoff = ExternalPlayerHandoff(items: items)
+        if player.reportsPosition {
+            // Bare scheme + host: the player APPENDS its own result query.
+            handoff.successURL = "nuvio://external-return"
+            handoff.errorURL = "nuvio://external-error"
+        }
+        ExternalPlaybackSession.begin(ExternalPlaybackSession.Pending(
+            items: sessions, playerID: player.id, playerName: player.name,
+            startedAt: Date()
+        ))
+        player.open(handoff)
+    }
+
+    /// The next few aired, unwatched episodes after the one being handed off,
+    /// each with a playable link picked the way the in-player "next episode"
+    /// picks one (same addon / binge group as the current source first).
+    ///
+    /// Capped hard: every episode costs a full stream sweep across the addons,
+    /// and the whole lot rides in ONE url that the other app has to parse.
+    private func upcomingExternalEpisodes(
+        after request: PlaybackRequest
+    ) async -> [(item: ExternalPlayerHandoff.Item, session: ExternalPlaybackSession.Item)] {
+        guard let current = request.video,
+              let season = current.season, let number = current.episode else { return [] }
+        let episodes = (request.meta.videos ?? [])
+            .filter { video in
+                guard let s = video.season, let e = video.episode else { return false }
+                return video.hasAired && (s > season || (s == season && e > number))
+            }
+            .sorted { ($0.season ?? 0, $0.episode ?? 0) < ($1.season ?? 0, $1.episode ?? 0) }
+            .prefix(Self.externalPlaylistLimit)
+        guard !episodes.isEmpty else { return [] }
+
+        let deadline = Date().addingTimeInterval(Self.externalPlaylistDeadline)
+        var out: [(item: ExternalPlayerHandoff.Item, session: ExternalPlaybackSession.Item)] = []
+        for episode in episodes {
+            guard Date() < deadline else { break }
+            // Stop at the first gap: a playlist that silently skips an episode
+            // is worse than a shorter one.
+            guard let stream = await externalNextEpisodeStream(
+                meta: request.meta, episode: episode, like: request.entry
+            ), let url = stream.stream.url else { break }
+            var item = ExternalPlayerHandoff.Item(streamURL: url)
+            item.filename = externalFilename(meta: request.meta, video: episode, streamURL: url)
+            out.append((
+                item,
+                ExternalPlaybackSession.Item(
+                    meta: request.meta, video: episode, streamURL: url,
+                    durationSeconds: externalDuration(meta: request.meta, video: episode)
+                )
+            ))
+        }
+        return out
+    }
+
+    private static let externalPlaylistLimit = 5
+    private static let externalPlaylistDeadline: TimeInterval = 8
+
+    /// One playable link for `episode`, chosen like PlayerViewModel's
+    /// next-episode auto-pick: prefer the same binge group, then the same
+    /// addon, then simply the best-ranked playable link. Torrents are skipped
+    /// outright — no external player can take a magnet.
+    private func externalNextEpisodeStream(
+        meta: MetaItem, episode: MetaVideo, like current: StreamEntry
+    ) async -> StreamEntry? {
+        var showID = meta.id
+        if showID.hasPrefix("tmdb:"), let n = Int(showID.dropFirst("tmdb:".count)),
+           let tt = await TMDBService.imdbID(tmdbID: n, isMovie: meta.type != "series") {
+            showID = tt
+        }
+        let streamID: String
+        if showID.hasPrefix("tt"), let season = episode.season, let number = episode.episode {
+            streamID = "\(showID):\(season):\(number)"
+        } else {
+            streamID = episode.id
+        }
+        let addons = addonManager.streamAddons.filter { $0.handles(id: streamID) }
+        guard !addons.isEmpty else { return nil }
+        var entries: [StreamEntry] = []
+        await withTaskGroup(of: [StreamEntry].self) { group in
+            for addon in addons {
+                group.addTask {
+                    let streams = (try? await StremioAPI.streams(addon: addon, type: meta.type, id: streamID)) ?? []
+                    return streams.filter(\.isPlayable)
+                        .map { StreamEntry(addonName: addon.manifest.name, stream: $0) }
+                }
+            }
+            for await batch in group { entries.append(contentsOf: batch) }
+        }
+        guard !entries.isEmpty else { return nil }
+        let curated = SourceSelection.select(entries, perTier: playerSettings.settings.sourcesPerSizeTier)
+        let playable = (curated.isEmpty ? entries : curated).filter(\.stream.isPlayable)
+        let group = current.stream.behaviorHints?.bingeGroup
+        return playable.first { $0.stream.behaviorHints?.bingeGroup == group && group != nil }
+            ?? playable.first { $0.addonName == current.addonName }
+            ?? playable.first
+    }
+
+    /// Duration for an external handoff: what we already recorded for this
+    /// title, else the addon's runtime. Without one, a returned position can't
+    /// be turned into progress at all (and never into "watched").
+    private func externalDuration(meta: MetaItem, video: MetaVideo?) -> Double? {
+        progressStore.progress(for: ProgressStore.key(metaID: meta.id, video: video))?.durationSeconds
+            ?? meta.runtimeSeconds
+    }
+
+    /// A media-style filename for the handoff ("Show.Name.S01E02.mkv"). Infuse
+    /// matches metadata off this, so a title arrives with real artwork instead
+    /// of a raw CDN URL.
+    private func externalFilename(meta: MetaItem, video: MetaVideo?, streamURL: String) -> String? {
+        let name = meta.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return nil }
+        var base = name.replacingOccurrences(of: " ", with: ".")
+        if let video, let season = video.season, let episode = video.episode {
+            base += String(format: ".S%02dE%02d", season, episode)
+        } else if let year = meta.releaseInfo?.prefix(4), Int(year) != nil {
+            base += ".\(year)"
+        }
+        // Keep the real container so the other app doesn't guess wrong.
+        let ext = URL(string: streamURL)?.pathExtension ?? ""
+        return ext.isEmpty ? base : "\(base).\(ext)"
+    }
+
+    /// An external player reported back (x-success). Write the position it
+    /// returned into Continue Watching through the SAME path in-app playback
+    /// uses, so watched-state, Trakt scrobbling and sync all behave identically.
+    private func finishExternalPlayback(streamURL: String?, position: Double?) {
+        guard let pending = ExternalPlaybackSession.pending,
+              let (stopped, completed) = ExternalPlaybackSession.resolveReturn(pending, returnedURL: streamURL)
+        else { return }
+        ExternalPlaybackSession.clear()
+        // Everything ahead of the stopping point played through to the end.
+        for item in completed {
+            guard let duration = item.durationSeconds ?? storedDuration(item), duration > 60 else { continue }
+            progressStore.update(
+                meta: item.meta, video: item.video, streamURL: item.streamURL,
+                position: duration, duration: duration
+            )
+        }
+        guard let position, position > 0,
+              let duration = stopped.durationSeconds ?? storedDuration(stopped), duration > 60
+        else { return }
+        progressStore.update(
+            meta: stopped.meta, video: stopped.video, streamURL: stopped.streamURL,
+            position: position, duration: duration
+        )
+    }
+
+    private func storedDuration(_ item: ExternalPlaybackSession.Item) -> Double? {
+        progressStore.progress(for: ProgressStore.key(metaID: item.meta.id, video: item.video))?.durationSeconds
+    }
+
     /// Route an incoming `nuvio://` / `stremio://` deep link.
     private func handleDeepLink(_ url: URL) {
         guard let link = DeepLinkService.parse(url) else { return }
@@ -1439,6 +1645,17 @@ struct RootView: View {
             homePath.append(Route.detail(meta))
         case .addonInstall(let manifestURL):
             Task { try? await addonManager.install(manifestURL: manifestURL) }
+        case .externalPlaybackFinished(let streamURL, let position):
+            finishExternalPlayback(streamURL: streamURL, position: position)
+        case .externalPlaybackFailed(let message):
+            // The stream never played over there, so drop the optimistic
+            // Continue Watching row we wrote at handoff — it would otherwise
+            // sit at 0% forever.
+            if let first = ExternalPlaybackSession.pending?.items.first {
+                progressStore.remove(id: ProgressStore.key(metaID: first.meta.id, video: first.video))
+            }
+            ExternalPlaybackSession.clear()
+            NSLog("[OrivioPlayer] external player error: %@", message ?? "(none)")
         }
     }
 

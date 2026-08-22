@@ -226,6 +226,18 @@ struct PlaybackSettingsDetail: View {
                             subtitle: "Fetch a subtitle in your preferred language from your subtitle addons and pass it to the external player (Infuse / VLC / VidHub)",
                             isOn: s.externalPlayerForwardSubtitles
                         )
+
+                        // Only Infuse takes a playlist; the row would be a lie
+                        // for the players whose scheme carries one url.
+                        if (ExternalPlayers.player(id: store.settings.externalPlayerID)
+                            ?? installed.first)?.supportsPlaylist == true {
+                            PlaybackToggleRow(
+                                icon: "list.and.film",
+                                title: "Send the rest of the season",
+                                subtitle: "Hand the next few episodes over as a playlist so next-episode keeps working in the other app. Their links are resolved before the handoff, which adds a moment to starting a show; the episode you pressed play on always goes first.",
+                                isOn: s.externalPlayerSendPlaylist
+                            )
+                        }
                     }
                 }
 

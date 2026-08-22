@@ -7,6 +7,12 @@ enum DeepLink: Equatable {
     case meta(type: String, id: String)
     /// Install a Stremio/Nuvio addon from its manifest URL.
     case addonInstall(url: String)
+    /// An external player finished and handed playback back to us
+    /// (x-callback-url `x-success`). Infuse returns the url it stopped on and
+    /// the position in seconds; that's what updates Continue Watching.
+    case externalPlaybackFinished(streamURL: String?, position: Double?)
+    /// An external player refused the stream (x-callback-url `x-error`).
+    case externalPlaybackFailed(message: String?)
 }
 
 enum DeepLinkService {
@@ -30,6 +36,16 @@ enum DeepLinkService {
 
         let query = queryParams(url)
         switch host {
+        // x-callback returns from an external player. Matched BEFORE the
+        // catch-all below, which would otherwise try to read them as addon
+        // hosts.
+        case "external-return", "externalreturn", "external-success":
+            return .externalPlaybackFinished(
+                streamURL: firstParam(query, "lastplayedurl", "url"),
+                position: firstParam(query, "position").flatMap(Double.init)
+            )
+        case "external-error", "externalerror":
+            return .externalPlaybackFailed(message: firstParam(query, "errormessage", "message"))
         case "meta":
             if let type = firstParam(query, "type", "mediatype", "media_type"),
                let id = metaID(query) {
