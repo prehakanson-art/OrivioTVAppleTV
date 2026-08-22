@@ -271,6 +271,16 @@ struct RootView: View {
                             NSLog("[OrivioSync] -restoreProgress: imported %d rows", stamped.count)
                         }
                     }
+                    // Dev/recovery: clear Trakt's continue-watching list on
+                    // launch (same path as the Settings → Trakt button).
+                    if args.contains("-clearTraktPlayback") {
+                        Task { @MainActor [weak traktSyncRef = traktSync] in
+                            try? await Task.sleep(nanoseconds: 6_000_000_000)
+                            let removed = await traktSyncRef?.clearTraktContinueWatching()
+                            NSLog("[OrivioTrakt] -clearTraktPlayback removed=%@",
+                                  removed.map(String.init) ?? "nil (fetch failed)")
+                        }
+                    }
                     if args.contains("-clearWatchHistory") {
                         Task { @MainActor [weak nuvioSync] in
                             try? await Task.sleep(nanoseconds: 8_000_000_000)

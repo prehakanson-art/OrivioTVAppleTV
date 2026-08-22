@@ -39,6 +39,9 @@ final class TraktSyncManager: ObservableObject {
         progress.onTraktRemove = { [weak self] metaID in self?.pushPlaybackRemove(metaID) }
         // Toggling a Trakt sync setting on kicks a full sync.
         trakt.onTraktSettingChange = { [weak self] in self?.syncNow(force: true) }
+        trakt.onClearContinueWatching = { [weak self] in
+            Task { @MainActor in await self?.clearTraktContinueWatching() }
+        }
 
         // Sync the moment we become signed in (device-code login completes, or
         // tokens arrive from account sync) — and once now if already signed in.
@@ -216,6 +219,28 @@ final class TraktSyncManager: ObservableObject {
 
     /// The user removed a title from Continue Watching — delete its playback
     /// rows (movie, or every episode of the show) on Trakt too.
+    /// Delete EVERY row from Trakt's playback list — their "continue
+    /// watching". Deliberately NOT the watched history: this clears only the
+    /// partially-watched rows, which is what re-imports into Continue Watching
+    /// here. Also advances the local clear horizon so the rows can't be pulled
+    /// straight back in before Trakt's own list settles. Returns the number
+    /// removed, or nil if the list couldn't be fetched (an outage must not be
+    /// reported as "nothing to clear").
+    @discardableResult
+    func clearTraktContinueWatching() async -> Int? {
+        guard let token = await validToken() else { return nil }
+        guard let rows = await TraktService.playbackProgress(accessToken: token) else { return nil }
+        var removed = 0
+        for row in rows {
+            guard let playbackID = row.playbackID else { continue }
+            if await TraktService.removePlayback(playbackID: playbackID, accessToken: token) { removed += 1 }
+        }
+        WatchHistoryClearState.markClearedNow()
+        NSLog("[OrivioTrakt] cleared %d of %d playback rows", removed, rows.count)
+        trakt.setSyncStatus("Cleared \(removed) Trakt continue-watching rows")
+        return removed
+    }
+
     private func pushPlaybackRemove(_ metaID: String) {
         guard trakt.isSignedIn, trakt.syncPlayback else { return }
         Task { [weak self] in

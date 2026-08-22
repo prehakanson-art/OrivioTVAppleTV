@@ -35,6 +35,9 @@ final class TraktStore: ObservableObject {
     @Published private(set) var lastSyncStatus: String?
     /// Fired when a Trakt sync-related setting changes, so the manager can react.
     var onTraktSettingChange: (() -> Void)?
+    /// Fired when the user confirms clearing Trakt's continue-watching list.
+    /// Wired to TraktSyncManager, which owns the token and the API calls.
+    var onClearContinueWatching: (() -> Void)?
     func setSyncStatus(_ s: String?) { lastSyncStatus = s }
     /// User-supplied client secret (empty until recovered).
     @Published var clientSecret: String {

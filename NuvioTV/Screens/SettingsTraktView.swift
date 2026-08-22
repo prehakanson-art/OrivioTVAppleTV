@@ -10,6 +10,7 @@ struct TraktDetail: View {
     @State private var statusMessage: String?
     @State private var pollTask: Task<Void, Never>?
     @State private var showConnect = false
+    @State private var confirmClearPlayback = false
     @State private var codeExpiresAt: Date?
 
     var body: some View {
@@ -106,6 +107,24 @@ struct TraktDetail: View {
                 )
             }
             .buttonStyle(PlainCardButtonStyle())
+
+            Button { confirmClearPlayback = true } label: {
+                SettingsActionRow(
+                    title: "Clear Trakt Continue Watching",
+                    subtitle: "Empties Trakt's in-progress list — the source of re-imported Continue Watching rows. Your watched history is NOT touched.",
+                    leadingIcon: "trash"
+                )
+            }
+            .buttonStyle(PlainCardButtonStyle())
+            .alert("Clear Trakt Continue Watching?", isPresented: $confirmClearPlayback) {
+                Button("Clear", role: .destructive) {
+                    trakt.setSyncStatus("Clearing Trakt continue watching…")
+                    trakt.onClearContinueWatching?()
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Removes every partially-watched row from Trakt's continue-watching list, on Trakt itself. Your Trakt watched history stays exactly as it is. This cannot be undone.")
+            }
 
             Button { trakt.signOut() } label: {
                 DestructivePillLabel(title: "Sign Out")
