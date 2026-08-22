@@ -44,12 +44,28 @@ enum CollectionResolver {
         for source in addonSources where !isContinuation {
             guard let addonID = source.addonId,
                   let type = source.type,
-                  let catalogID = source.catalogId,
-                  let addon = addons.first(where: { $0.manifest.id == addonID }),
-                  let catalog = (addon.manifest.catalogs ?? [])
-                    .first(where: { $0.type == type && $0.id == catalogID })
+                  let catalogID = source.catalogId
             else { continue }
-            let fetched = (try? await StremioAPI.catalog(addon: addon, catalog: catalog)) ?? []
+            // A source names its addon by MANIFEST ID, but the same id can be
+            // installed twice (two configured instances of one addon). Take the
+            // first install of that id that actually declares this catalog
+            // instead of the first install outright — otherwise a folder bound
+            // to the second instance's catalog resolved against the first one
+            // and came back empty.
+            var resolved: (InstalledAddon, ManifestCatalog)?
+            for addon in addons where addon.manifest.id == addonID {
+                guard let catalog = (addon.manifest.catalogs ?? [])
+                    .first(where: { $0.type == type && $0.id == catalogID }) else { continue }
+                resolved = (addon, catalog)
+                break
+            }
+            guard let (addon, catalog) = resolved else { continue }
+            // Honour the source's saved genre filter (the phone lets you pin a
+            // folder to one genre of a catalog); it was being dropped here, so
+            // those folders showed the unfiltered catalog.
+            let fetched = (try? await StremioAPI.catalog(
+                addon: addon, catalog: catalog, genre: source.genre
+            )) ?? []
             for item in fetched where seen.insert(item.id).inserted { items.append(item) }
         }
         for source in resolvableTmdb {

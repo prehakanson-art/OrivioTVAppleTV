@@ -75,8 +75,10 @@ enum AddonSweepLimits {
     /// Hard ceiling on Home rows regardless of how many catalogs the installed
     /// addons declare. Row layouts build their rows EAGERLY (a non-lazy VStack,
     /// so the LazyHStacks inside keep their scroll position), so an account
-    /// with 50 addons would otherwise materialize 300 rows up front and take
-    /// the focus engine down with it. Rows past the cap are still reachable
+    /// with 50 addons would otherwise materialize hundreds of rows up front and
+    /// take the focus engine down with it. This is the ONLY cap on Home rows —
+    /// it replaced a per-addon "first 6 catalogs" cut that hid catalogs the
+    /// rest of the app (Settings → Layout, Discover, sync) still listed. Rows past the cap are still reachable
     /// from Discover / See All; the user can also reorder Home in
     /// Settings → Layout to pull a specific catalog into the visible set.
     static var maxHomeRows: Int {

@@ -182,6 +182,38 @@ final class AddonManager: ObservableObject {
         addons.filter { $0.enabled && $0.manifest.providesCatalogs }
     }
 
+    /// manifestURL → the id to build Home-catalog keys with (see
+    /// `HomeCatalogSettingsStore.catalogKey(addon:catalog:namespaces:)`).
+    ///
+    /// The FIRST install of a given manifest id keeps the bare id, so every key
+    /// already saved on disk or synced from the phone still matches and no
+    /// existing layout, custom title or hidden-row choice is disturbed. Any
+    /// FURTHER install of that same id — a second configured instance of the
+    /// same addon — gets a suffix derived from its manifest URL, which is what
+    /// stops its catalogs from colliding with the first one's and vanishing.
+    /// Derived from the FULL install list (not `catalogAddons`) so that
+    /// enabling or disabling an addon never renumbers anyone else.
+    var catalogKeyNamespaces: [String: String] {
+        var namespaces: [String: String] = [:]
+        var claimed = Set<String>()
+        for addon in addons {
+            let id = addon.manifest.id
+            namespaces[addon.manifestURL] = claimed.insert(id).inserted
+                ? id
+                : "\(id)#\(Self.stableSuffix(addon.manifestURL))"
+        }
+        return namespaces
+    }
+
+    /// Short, deterministic tag for a manifest URL. Deliberately NOT
+    /// `hashValue`: Swift seeds that per process, so the key would change on
+    /// every launch and take the saved layout with it.
+    private static func stableSuffix(_ text: String) -> String {
+        var hash: UInt64 = 5381
+        for byte in text.utf8 { hash = (hash &* 33) &+ UInt64(byte) }
+        return String(hash % 0xFFFF, radix: 36)
+    }
+
     var subtitleAddons: [InstalledAddon] {
         addons.filter { $0.enabled && $0.manifest.providesSubtitles }
     }

@@ -211,10 +211,11 @@ struct CatalogOrderSection: View {
     private var catalogKeys: [String] {
         var keys: [String] = []
         var seen = Set<String>()
+        let namespaces = addonManager.catalogKeyNamespaces
         for addon in addonManager.catalogAddons {
             for catalog in (addon.manifest.catalogs ?? []) where !catalog.requiresExtra {
                 let key = HomeCatalogSettingsStore.catalogKey(
-                    addonID: addon.manifest.id, type: catalog.type, catalogID: catalog.id)
+                    addon: addon, catalog: catalog, namespaces: namespaces)
                 if seen.insert(key).inserted { keys.append(key) }
             }
         }
@@ -229,10 +230,11 @@ struct CatalogOrderSection: View {
     /// fold into it), positioned where the collections block sits.
     private var rows: [LayoutRowInfo] {
         var byKey: [String: LayoutRowInfo] = [:]
+        let namespaces = addonManager.catalogKeyNamespaces
         for addon in addonManager.catalogAddons {
             for catalog in (addon.manifest.catalogs ?? []) where !catalog.requiresExtra {
                 let key = HomeCatalogSettingsStore.catalogKey(
-                    addonID: addon.manifest.id, type: catalog.type, catalogID: catalog.id)
+                    addon: addon, catalog: catalog, namespaces: namespaces)
                 if byKey[key] == nil {
                     byKey[key] = LayoutRowInfo(key: key, defaultTitle: catalog.displayName,
                                                subtitle: addon.manifest.name, isCollection: false)
@@ -899,7 +901,7 @@ private struct FolderEditorView: View {
     }
 
     private var choices: [CatalogChoice] {
-        addonManager.catalogAddons.flatMap { addon in
+        let all = addonManager.catalogAddons.flatMap { addon in
             (addon.manifest.catalogs ?? [])
                 .filter { !$0.requiresExtra }
                 .map { catalog in
@@ -914,6 +916,12 @@ private struct FolderEditorView: View {
                     )
                 }
         }
+        // A source is identified by manifest id + type + catalog id (the shared
+        // wire format), so two installs of the same addon yield the SAME id
+        // twice. Rendered as-is that's duplicate ids in a ForEach — the tvOS
+        // focus-engine crash — and one row's selection would toggle both.
+        var seen = Set<String>()
+        return all.filter { seen.insert($0.id).inserted }
     }
 
     var body: some View {
