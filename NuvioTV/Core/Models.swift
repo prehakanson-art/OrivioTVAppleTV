@@ -919,6 +919,50 @@ struct StreamBehaviorHints: Codable, Hashable {
     /// Exact video size in bytes (Stremio SDK field, set by Torrentio etc.).
     let videoSize: Int64?
     let filename: String?
+    /// Headers the addon wants sent WITH the media request (Stremio's
+    /// `behaviorHints.proxyHeaders`). Scraper addons hand back a CDN link that
+    /// only answers with the right `Referer`/`User-Agent` — without them the
+    /// host returns 403 and the source looks broken. Only `request` is
+    /// actionable for us; `response` is a browser-player concern.
+    let proxyHeaders: StreamProxyHeaders?
+
+    private enum CodingKeys: String, CodingKey {
+        case bingeGroup, notWebReady, videoSize, filename, proxyHeaders
+    }
+
+    /// Tolerant decode, same policy as `Stream`: one malformed hint (a string
+    /// `videoSize`, a proxyHeaders map with non-string values) must not blank
+    /// the whole hints object and take the good fields down with it.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        bingeGroup = (try? c.decodeIfPresent(String.self, forKey: .bingeGroup)) ?? nil
+        notWebReady = (try? c.decodeIfPresent(Bool.self, forKey: .notWebReady)) ?? nil
+        var decodedSize: Int64? = (try? c.decodeIfPresent(Int64.self, forKey: .videoSize)) ?? nil
+        if decodedSize == nil, let string = (try? c.decodeIfPresent(String.self, forKey: .videoSize)) ?? nil {
+            decodedSize = Int64(string)
+        }
+        videoSize = decodedSize
+        filename = (try? c.decodeIfPresent(String.self, forKey: .filename)) ?? nil
+        proxyHeaders = (try? c.decodeIfPresent(StreamProxyHeaders.self, forKey: .proxyHeaders)) ?? nil
+    }
+}
+
+struct StreamProxyHeaders: Codable, Hashable {
+    /// Header name → value, applied to the outgoing media request.
+    let request: [String: String]?
+
+    private enum CodingKeys: String, CodingKey { case request }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        request = (try? c.decodeIfPresent([String: String].self, forKey: .request)) ?? nil
+    }
+
+    /// Non-empty header map, or nil — the form every caller actually wants.
+    var requestHeaders: [String: String]? {
+        guard let request, !request.isEmpty else { return nil }
+        return request
+    }
 }
 
 /// A stream tagged with the addon it came from, used across the stream

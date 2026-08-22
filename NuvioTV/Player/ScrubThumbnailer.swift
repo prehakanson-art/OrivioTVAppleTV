@@ -95,14 +95,22 @@ final class ScrubThumbnailer: @unchecked Sendable {
     /// Overall budget. A slow remote source must not hold a second connection
     /// and decoder open for the whole movie.
     private let budgetSeconds: TimeInterval
+    /// Addon-declared request headers (behaviorHints.proxyHeaders). Same
+    /// requirement as playback: the sources that need a Referer answer this
+    /// second connection with a 403 without one.
+    private let headers: [String: String]?
 
     @Atomic private var cancelled = false
 
-    init(url: URL, count: Int = 36, thumbWidth: Int32 = 256, budgetSeconds: TimeInterval = 60) {
+    init(
+        url: URL, count: Int = 36, thumbWidth: Int32 = 256,
+        budgetSeconds: TimeInterval = 60, headers: [String: String]? = nil
+    ) {
         self.url = url
         self.count = count
         self.thumbWidth = thumbWidth
         self.budgetSeconds = budgetSeconds
+        self.headers = headers
     }
 
     /// Aborts promptly even from a blocked network read (the interrupt callback
@@ -153,6 +161,10 @@ final class ScrubThumbnailer: @unchecked Sendable {
         // Keep the probe cheap — we only need the video stream's parameters.
         av_dict_set(&openOpts, "probesize", String(2 << 20), 0)
         av_dict_set(&openOpts, "analyzeduration", "1000000", 0)
+        if let headers, !headers.isEmpty {
+            let joined = headers.map { "\($0.key):\($0.value)\r\n" }.joined()
+            av_dict_set(&openOpts, "headers", joined, 0)
+        }
         let path = url.isFileURL ? url.path : url.absoluteString
         let opened = avformat_open_input(&formatCtx, path, nil, &openOpts)
         av_dict_free(&openOpts)

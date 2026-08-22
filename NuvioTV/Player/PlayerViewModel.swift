@@ -1036,6 +1036,23 @@ final class PlayerViewModel: ObservableObject {
         vlcEngine = nil
 
         let options = NuvioPlayerOptions()
+        // Addon-declared request headers (behaviorHints.proxyHeaders). Scraper
+        // addons (KhmerDub and friends) return a CDN link that 403s without the
+        // exact Referer/User-Agent of the page it was scraped from — dropping
+        // them made every one of those sources "fail to play". appendHeader
+        // feeds BOTH engines: AVURLAssetHTTPHeaderFieldsKey for the native
+        // path, FFmpeg's `headers` option for the FFmpeg one.
+        if let headers = entry.stream.behaviorHints?.proxyHeaders?.requestHeaders {
+            options.appendHeader(headers)
+            // KSOptions ALSO carries a standalone `user_agent` FFmpeg option
+            // (default "KSPlayer"). Left alone it would go out alongside the
+            // one appendHeader just wrote — two User-Agent lines on the same
+            // request, which some of these CDNs reject outright. Point it at
+            // the addon's value so the two agree.
+            if let agent = headers.first(where: { $0.key.lowercased() == "user-agent" })?.value {
+                options.userAgent = agent
+            }
+        }
         // Sticky per-session record that a display-mode switch really was
         // requested (survives options replacement on failover/DV swap) — the
         // exit path waits out the switch-back only when one could be pending.
@@ -1451,7 +1468,10 @@ final class PlayerViewModel: ObservableObject {
         case .medium, .unknown: cachingMs = 12000
         case .large: cachingMs = 20000
         }
-        engine.load(url: url, networkCachingMs: cachingMs)
+        engine.load(
+            url: url, networkCachingMs: cachingMs,
+            headers: currentEntry.stream.behaviorHints?.proxyHeaders?.requestHeaders
+        )
         engine.play()
         NSLog("[OrivioPlayer] load start engine=VLC url-host=%@", url.host ?? "?")
         videoRefreshID = UUID()
@@ -3506,8 +3526,9 @@ final class PlayerViewModel: ObservableObject {
             // missing (Continue Watching resumes carry none), which previously
             // let 16 GB+ files slip through this gate and stutter playback:
             // VERIFY the size with a HEAD request and skip when big or unknown.
+            let headers = self?.currentEntry.stream.behaviorHints?.proxyHeaders?.requestHeaders
             var bytes = self?.currentEntry.stream.behaviorHints?.videoSize
-            if bytes == nil { bytes = await Self.remoteContentLength(url) }
+            if bytes == nil { bytes = await Self.remoteContentLength(url, headers: headers) }
             guard let bytes, bytes > 0, bytes <= 8 * 1_073_741_824 else { return }
             // Hold until the playback cache is essentially full (reader idle)
             // so the pass never competes with the initial buffering.
@@ -3536,7 +3557,7 @@ final class PlayerViewModel: ObservableObject {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
             guard !Task.isCancelled else { return }
-            let thumbnailer = ScrubThumbnailer(url: url)
+            let thumbnailer = ScrubThumbnailer(url: url, headers: headers)
             self?.thumbnailer = thumbnailer
             let thumbs = await thumbnailer.generate()
             guard !Task.isCancelled, self?.thumbnailer === thumbnailer else { return }
@@ -3564,10 +3585,15 @@ final class PlayerViewModel: ObservableObject {
 
     /// Actual remote file size via a HEAD request (nil when the server won't
     /// say). Used to gate the preview-thumbnail pass.
-    private static func remoteContentLength(_ url: URL) async -> Int64? {
+    private static func remoteContentLength(
+        _ url: URL, headers: [String: String]? = nil
+    ) async -> Int64? {
         var request = URLRequest(url: url)
         request.httpMethod = "HEAD"
         request.timeoutInterval = 8
+        for (key, value) in headers ?? [:] {
+            request.setValue(value, forHTTPHeaderField: key)
+        }
         guard let (_, response) = try? await URLSession.shared.data(for: request),
               let http = response as? HTTPURLResponse else { return nil }
         if let length = http.value(forHTTPHeaderField: "Content-Length"),

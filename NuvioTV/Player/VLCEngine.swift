@@ -32,9 +32,21 @@ final class VLCEngine: NSObject {
     }
 
     /// `networkCachingMs` is how much VLC pre-buffers — larger is smoother on
-    /// remote 4K, at the cost of RAM and a slower first frame.
-    func load(url: URL, networkCachingMs: Int) {
+    /// remote 4K, at the cost of RAM and a slower first frame. `headers` are
+    /// the addon's `behaviorHints.proxyHeaders.request` — libVLC has no generic
+    /// header option, but it does expose the two that scraper addons actually
+    /// send (Referer / User-Agent), which is what those CDNs check.
+    func load(url: URL, networkCachingMs: Int, headers: [String: String]? = nil) {
         let media = VLCMedia(url: url)
+        if let headers {
+            for (key, value) in headers {
+                switch key.lowercased() {
+                case "referer", "referrer": media.addOption(":http-referrer=\(value)")
+                case "user-agent": media.addOption(":http-user-agent=\(value)")
+                default: break
+                }
+            }
+        }
         media.addOption(":network-caching=\(networkCachingMs)")
         media.addOption(":file-caching=\(networkCachingMs)")
         // Ride out transient CDN drops instead of erroring out.
