@@ -27,28 +27,16 @@ struct CinemaHomeView: View {
     /// Focus target for Back — the hero's own button.
     @FocusState private var heroFocused: Bool
 
-    private var catalogRows: [HomeRow] {
-        viewModel.entries.compactMap { if case .catalog(let r) = $0 { return r } else { return nil } }
-    }
-    /// Catalog items by id, built ONCE per body pass. The art fallback below
-    /// used to call `catalogRows` per Continue-Watching item and then linear-
-    /// scan every row's items for a match — with 45 rows × 30 items and a dozen
-    /// CW cards that is tens of thousands of comparisons, redone on every
-    /// single body evaluation of this screen.
-    private var catalogItemsByID: [String: MetaItem] {
-        var out: [String: MetaItem] = [:]
-        for row in catalogRows {
-            for item in row.items where out[item.id] == nil { out[item.id] = item }
-        }
-        return out
-    }
+    /// Rows, Continue Watching and the collections strip all come from the
+    /// shared assembly on HomeViewModel — every theme derives them the same way.
     private var continueItems: [WatchProgress] {
-        let pool = catalogItemsByID
-        return progressStore.continueWatching(sortMode: homeCatalogSettings.continueWatchingSortMode)
-            .map { progressWithCatalogArt($0, pool: pool) }
+        viewModel.continueItems(progress: progressStore,
+                                sortMode: homeCatalogSettings.continueWatchingSortMode)
     }
     /// What the hero shows before any card has been focused.
-    private var heroFallback: MetaItem? { viewModel.initialHero ?? catalogRows.first?.items.first }
+    private var heroFallback: MetaItem? {
+        viewModel.initialHero ?? viewModel.catalogRows.first?.items.first
+    }
 
     var body: some View {
         ZStack(alignment: .top) {
@@ -95,10 +83,8 @@ struct CinemaHomeView: View {
     @ViewBuilder private func rows(backToTop: @escaping () -> Void) -> some View {
         // Collections that share one "Collections" row (viewMode != ROWS) render
         // once, at the first such entry's slot.
-        let sharedCollections = viewModel.entries.compactMap { e -> NuvioCollection? in
-            if case .collection(let c) = e, c.viewMode != "ROWS" { return c } else { return nil }
-        }
-        let firstSharedID = sharedCollections.first?.id
+        let sharedCollections = viewModel.sharedCollections
+        let firstSharedID = viewModel.firstSharedCollectionID
 
         // LAZY: this was a plain VStack, so every row in the home — 45+ on a
         // real account — built eagerly on load, each instantiating its own
@@ -143,24 +129,10 @@ struct CinemaHomeView: View {
     }
 
     private func openFolder(_ folder: NuvioCollectionFolder, in collection: NuvioCollection) {
-        let single = NuvioCollection(id: "folder:\(collection.id):\(folder.id)",
-                                     title: folder.title, folders: [folder])
-        onOpenCollection(single)
+        onOpenCollection(HomeViewModel.folderCollection(folder, in: collection))
     }
 
-    private func metaFor(_ p: WatchProgress) -> MetaItem {
-        if let m = catalogItemsByID[p.metaID] { return m }
-        return MetaItem(id: p.metaID, type: p.type, name: p.name,
-                        poster: p.poster, background: p.background, logo: p.logo)
-    }
-
-    private func progressWithCatalogArt(_ progress: WatchProgress, pool: [String: MetaItem]) -> WatchProgress {
-        guard (progress.poster == nil || progress.background == nil || progress.name.isEmpty),
-              let meta = pool[progress.metaID] else {
-            return progress
-        }
-        return progress.withFallbackMetadata(meta)
-    }
+    private func metaFor(_ p: WatchProgress) -> MetaItem { viewModel.metaFor(p) }
 }
 
 // MARK: - Hero

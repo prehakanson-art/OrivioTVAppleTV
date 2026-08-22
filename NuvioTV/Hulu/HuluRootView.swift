@@ -30,13 +30,10 @@ struct HuluRootView: View {
 
     // MARK: Orivio → Hulu data
 
-    private var catalogRows: [HomeRow] {
-        homeViewModel.entries.compactMap { if case .catalog(let r) = $0 { return r } else { return nil } }
-    }
-    private var pool: [MetaItem] {
-        var seen = Set<String>()
-        return catalogRows.flatMap(\.items).filter { seen.insert($0.id).inserted }
-    }
+    /// Rows and the de-duplicated item pool come from the shared assembly on
+    /// HomeViewModel — every theme derives them the same way.
+    private var catalogRows: [HomeRow] { homeViewModel.catalogRows }
+    private var pool: [MetaItem] { homeViewModel.orderedItems }
     private var featured: [HuluTitle] {
         var out = pool.filter { $0.background != nil }.prefix(6).map(HuluTitle.init)
         if out.isEmpty, let h = homeViewModel.initialHero { out = [HuluTitle(h)] }
@@ -83,11 +80,7 @@ struct HuluRootView: View {
     private var suggestions: [HuluTitle] { Array(pool.prefix(20)).map(HuluTitle.init) }
 
     private func progressWithCatalogArt(_ progress: WatchProgress) -> WatchProgress {
-        guard (progress.poster == nil || progress.background == nil || progress.name.isEmpty),
-              let meta = pool.first(where: { $0.id == progress.metaID }) else {
-            return progress
-        }
-        return progress.withFallbackMetadata(meta)
+        homeViewModel.withCatalogArt(progress)
     }
 
     // MARK: Body
@@ -169,9 +162,7 @@ struct HuluRootView: View {
                 HuluHubsView(collections: collections.collections,
                              onOpenCollection: onOpenCollection,
                              onOpenFolder: { folder, coll in
-                                 let single = NuvioCollection(id: "folder:\(coll.id):\(folder.id)",
-                                                              title: folder.title, folders: [folder])
-                                 onOpenCollection(single)
+                                 onOpenCollection(HomeViewModel.folderCollection(folder, in: coll))
                              })
             case .search:
                 HuluSearchView(suggestions: suggestions, searchViewModel: searchViewModel,

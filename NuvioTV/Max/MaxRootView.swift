@@ -42,13 +42,10 @@ struct MaxRootView: View {
 
     // MARK: Orivio → Max data pools
 
-    private var catalogRows: [HomeRow] {
-        homeViewModel.entries.compactMap { if case .catalog(let r) = $0 { return r } else { return nil } }
-    }
-    private var pool: [MetaItem] {
-        var seen = Set<String>()
-        return catalogRows.flatMap(\.items).filter { seen.insert($0.id).inserted }
-    }
+    /// Rows and the de-duplicated item pool come from the shared assembly on
+    /// HomeViewModel — every theme derives them the same way.
+    private var catalogRows: [HomeRow] { homeViewModel.catalogRows }
+    private var pool: [MetaItem] { homeViewModel.orderedItems }
     private var featured: [MaxTitle] {
         var out = pool.filter { $0.background != nil }.prefix(6).map(MaxTitle.init)
         if out.isEmpty, let h = homeViewModel.initialHero { out = [MaxTitle(h)] }
@@ -193,9 +190,7 @@ struct MaxRootView: View {
                                   onOpenCategory: { openedCategory = $0 },
                                   onOpenCollection: { onOpenCollection($0) },
                                   onOpenFolder: { folder, coll in
-                                      let single = NuvioCollection(id: "folder:\(coll.id):\(folder.id)",
-                                                                   title: folder.title, folders: [folder])
-                                      onOpenCollection(single)
+                                      onOpenCollection(HomeViewModel.folderCollection(folder, in: coll))
                                   })
             case .section(.search):
                 MaxSearchView(suggestions: suggestions, searchViewModel: searchViewModel,

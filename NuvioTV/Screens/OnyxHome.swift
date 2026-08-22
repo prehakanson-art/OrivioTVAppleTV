@@ -69,24 +69,15 @@ struct OnyxHomeView: View {
     /// in `hero.progress`, committed atomically with the item.
     @State private var hero = HeroFocus()
 
-    private var catalogRows: [HomeRow] {
-        viewModel.entries.compactMap { if case .catalog(let r) = $0 { return r } else { return nil } }
-    }
+    /// Rows, Continue Watching and the collections strip come from the shared
+    /// assembly on HomeViewModel — every theme derives them the same way.
     private var continueItems: [WatchProgress] {
-        progressStore.continueWatching(sortMode: homeCatalogSettings.continueWatchingSortMode)
-            .map(progressWithCatalogArt)
+        viewModel.continueItems(progress: progressStore,
+                                sortMode: homeCatalogSettings.continueWatchingSortMode)
     }
     /// What the hero shows before any card has been focused.
     private var heroFallback: MetaItem? {
-        viewModel.initialHero ?? catalogRows.first?.items.first
-    }
-
-    private func progressWithCatalogArt(_ progress: WatchProgress) -> WatchProgress {
-        guard (progress.poster == nil || progress.background == nil || progress.name.isEmpty),
-              let meta = catalogRows.lazy.flatMap(\.items).first(where: { $0.id == progress.metaID }) else {
-            return progress
-        }
-        return progress.withFallbackMetadata(meta)
+        viewModel.initialHero ?? viewModel.catalogRows.first?.items.first
     }
 
     var body: some View {
@@ -127,10 +118,8 @@ struct OnyxHomeView: View {
     }
 
     @ViewBuilder private var rows: some View {
-        let sharedCollections = viewModel.entries.compactMap { e -> NuvioCollection? in
-            if case .collection(let c) = e, c.viewMode != "ROWS" { return c } else { return nil }
-        }
-        let firstSharedID = sharedCollections.first?.id
+        let sharedCollections = viewModel.sharedCollections
+        let firstSharedID = viewModel.firstSharedCollectionID
 
         if !continueItems.isEmpty {
             OnyxContinueRow(
@@ -162,18 +151,10 @@ struct OnyxHomeView: View {
     }
 
     private func openFolder(_ folder: NuvioCollectionFolder, in collection: NuvioCollection) {
-        let single = NuvioCollection(id: "folder:\(collection.id):\(folder.id)",
-                                     title: folder.title, folders: [folder])
-        onOpenCollection(single)
+        onOpenCollection(HomeViewModel.folderCollection(folder, in: collection))
     }
 
-    private func metaFor(_ p: WatchProgress) -> MetaItem {
-        for row in catalogRows {
-            if let m = row.items.first(where: { $0.id == p.metaID }) { return m }
-        }
-        return MetaItem(id: p.metaID, type: p.type, name: p.name,
-                        poster: p.poster, background: p.background, logo: p.logo)
-    }
+    private func metaFor(_ p: WatchProgress) -> MetaItem { viewModel.metaFor(p) }
 }
 
 // MARK: - Full-screen crossfading backdrop

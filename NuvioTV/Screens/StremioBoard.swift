@@ -36,28 +36,13 @@ struct StremioBoardView: View {
     /// Height of the hero region; the rows are inset by this and scroll behind it.
     private static let heroHeight: CGFloat = 560
 
-    private var catalogRows: [HomeRow] {
-        viewModel.entries.compactMap { if case .catalog(let r) = $0 { return r } else { return nil } }
-    }
+    /// Rows, Continue Watching and the item index come from the shared assembly
+    /// on HomeViewModel — every theme derives them the same way.
+    private var catalogRows: [HomeRow] { viewModel.catalogRows }
 
-    /// All catalog items, de-duped — used to enrich a focused Continue-Watching
-    /// item (whose WatchProgress lacks description/genres/rating) with the full
-    /// MetaItem when the same title also appears in a catalog row.
-    private var pool: [MetaItem] {
-        var seen = Set<String>()
-        return catalogRows.flatMap(\.items).filter { seen.insert($0.id).inserted }
-    }
     /// Upgrade a card's light MetaItem with the catalog copy (art) before it
     /// reaches the hero — CW cards carry only name + art fragments.
-    private func enrich(_ m: MetaItem) -> MetaItem { pool.first { $0.id == m.id } ?? m }
-
-    private func progressWithCatalogArt(_ progress: WatchProgress, pool: [MetaItem]) -> WatchProgress {
-        guard (progress.poster == nil || progress.background == nil || progress.name.isEmpty),
-              let meta = pool.first(where: { $0.id == progress.metaID }) else {
-            return progress
-        }
-        return progress.withFallbackMetadata(meta)
-    }
+    private func enrich(_ m: MetaItem) -> MetaItem { viewModel.itemIndex[m.id] ?? m }
 
     /// Full meta for a committed hero item (runtime / cast / synopsis) —
     /// catalog items carry only light metadata, but the hero shows the same
@@ -103,12 +88,9 @@ struct StremioBoardView: View {
                             if viewModel.isLoading && viewModel.entries.isEmpty {
                                 ForEach(0..<3, id: \.self) { _ in StremioSkeletonRow() }
                             } else {
-                                // Pool computed ONCE per body pass — the art
-                                // fallback used to rebuild it per CW item.
-                                let pool = self.pool
-                                let continueItems = progressStore
-                                    .continueWatching(sortMode: homeCatalogSettings.continueWatchingSortMode)
-                                    .map { progressWithCatalogArt($0, pool: pool) }
+                                let continueItems = viewModel.continueItems(
+                                    progress: progressStore,
+                                    sortMode: homeCatalogSettings.continueWatchingSortMode)
                                 if !continueItems.isEmpty {
                                     StremioContinueRow(
                                         items: continueItems, onResume: onResume, onSelect: onSelect,

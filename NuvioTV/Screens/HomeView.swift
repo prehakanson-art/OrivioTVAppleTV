@@ -59,7 +59,9 @@ enum HomeCatalogCache {
 
 @MainActor
 final class HomeViewModel: ObservableObject {
-    @Published var entries: [HomeEntry] = []
+    @Published var entries: [HomeEntry] = [] {
+        didSet { rebuildItemIndex() }
+    }
     @Published var isLoading = false
     /// Current phase label for the first-run stepped loading backdrop
     /// (nil when not doing a cold, cache-less load).
@@ -73,6 +75,87 @@ final class HomeViewModel: ObservableObject {
     var initialHero: MetaItem?
 
     private var loadedFingerprint: [String] = []
+
+    // MARK: - Shared home assembly
+    //
+    // Every themed home derives the same things from `entries`: the catalog
+    // rows, the Continue Watching list with its artwork fallback, the shared
+    // collections strip. Each theme used to carry its own copy — `catalogRows`
+    // in five files, `metaFor` in six, `progressWithCatalogArt` in four — so a
+    // fix (or a performance bug) in one never reached the others. They live
+    // here once now; a theme supplies only the look.
+
+    /// Catalog rows, in Home order.
+    var catalogRows: [HomeRow] {
+        entries.compactMap { if case .catalog(let row) = $0 { return row } else { return nil } }
+    }
+
+    /// Every catalog item by id, rebuilt only when `entries` changes. The
+    /// per-theme copies re-derived this inside a loop over Continue Watching
+    /// items — 45 rows x 30 items scanned per card, on every body pass.
+    private(set) var itemIndex: [String: MetaItem] = [:]
+
+    /// Every catalog item, de-duplicated, in HOME ORDER. Order matters — the
+    /// Max and Hulu spotlights take the first few with backdrop art, so this
+    /// cannot be served from `itemIndex.values`, which is unordered.
+    private(set) var orderedItems: [MetaItem] = []
+
+    private func rebuildItemIndex() {
+        var index: [String: MetaItem] = [:]
+        var ordered: [MetaItem] = []
+        for case .catalog(let row) in entries {
+            for item in row.items where index[item.id] == nil {
+                index[item.id] = item
+                ordered.append(item)
+            }
+        }
+        itemIndex = index
+        orderedItems = ordered
+    }
+
+    /// A Continue Watching row's full MetaItem, upgraded from the catalog copy
+    /// when one is loaded (CW rows carry only name + art fragments).
+    func metaFor(_ progress: WatchProgress) -> MetaItem {
+        itemIndex[progress.metaID]
+            ?? MetaItem(id: progress.metaID, type: progress.type, name: progress.name,
+                        poster: progress.poster, background: progress.background,
+                        logo: progress.logo)
+    }
+
+    /// Fill in artwork/title a Continue Watching row is missing from the
+    /// catalog copy of the same title, when Home has one loaded.
+    func withCatalogArt(_ progress: WatchProgress) -> WatchProgress {
+        guard progress.poster == nil || progress.background == nil || progress.name.isEmpty,
+              let meta = itemIndex[progress.metaID] else { return progress }
+        return progress.withFallbackMetadata(meta)
+    }
+
+    /// Continue Watching for a themed home: sorted per the user's setting, with
+    /// the catalog artwork fallback applied.
+    func continueItems(
+        progress store: ProgressStore, sortMode: ContinueWatchingSortMode
+    ) -> [WatchProgress] {
+        store.continueWatching(sortMode: sortMode).map(withCatalogArt)
+    }
+
+    /// Collections that share ONE combined "Collections" row (viewMode other
+    /// than ROWS); a theme renders them at `firstSharedCollectionID`'s slot.
+    var sharedCollections: [NuvioCollection] {
+        entries.compactMap {
+            if case .collection(let c) = $0, c.viewMode != "ROWS" { return c } else { return nil }
+        }
+    }
+
+    var firstSharedCollectionID: String? { sharedCollections.first?.id }
+
+    /// One folder presented as its own single-folder collection — what every
+    /// theme opens when a folder tile is selected.
+    nonisolated static func folderCollection(
+        _ folder: NuvioCollectionFolder, in collection: NuvioCollection
+    ) -> NuvioCollection {
+        NuvioCollection(id: "folder:\(collection.id):\(folder.id)",
+                        title: folder.title, folders: [folder])
+    }
 
     func loadIfNeeded(
         addonManager: AddonManager,
@@ -817,10 +900,8 @@ struct HomeView: View {
         // • FOLDERS/COMBINED → all share ONE "Collections" row of collection
         //               buttons (rendered at the first such collection's slot);
         //               a button opens that whole collection's discover/browse.
-        let sharedCollections = viewModel.entries.compactMap { entry -> NuvioCollection? in
-            if case .collection(let c) = entry, c.viewMode != "ROWS" { return c } else { return nil }
-        }
-        let firstSharedID = sharedCollections.first?.id
+        let sharedCollections = viewModel.sharedCollections
+        let firstSharedID = viewModel.firstSharedCollectionID
 
         ForEach(viewModel.entries) { entry in
             switch entry {
@@ -855,11 +936,7 @@ struct HomeView: View {
     /// folder (its content + Sort, no tabs), reusing the collection browser
     /// with a synthetic single-folder collection.
     private func openFolder(_ folder: NuvioCollectionFolder, in collection: NuvioCollection) {
-        let single = NuvioCollection(
-            id: "folder:\(collection.id):\(folder.id)",
-            title: folder.title,
-            folders: [folder]
-        )
+        let single = HomeViewModel.folderCollection(folder, in: collection)
         onOpenCollection(single)
     }
 
