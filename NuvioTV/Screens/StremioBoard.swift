@@ -319,43 +319,30 @@ private struct StremioCatalogRow: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        ThemedCardRow(
+            items: row.items,
+            spacing: landscape ? 26 : 24,
+            horizontalPadding: 60,
+            onBackAtStart: onBackAtRoot,
+            onFocusedIDChange: { if $0 != nil { onRowFocus() } }
+        ) {
             // Row heading only — the real Stremio board has no "See All" pill.
             Text(row.title)
                 .font(StremioFont.bold(34))
                 .foregroundStyle(.white)
                 .padding(.leading, 60)
-
-            ScrollViewReader { proxy in
-                ScrollView(.horizontal) {
-                    LazyHStack(alignment: .top, spacing: landscape ? 26 : 24) {
-                        ForEach(row.items) { item in
-                            Button { onSelect(item) } label: {
-                                StremioPosterCard(item: item, width: landscape ? 340 : 190,
-                                                  landscape: landscape, parallax: perf.cardParallaxEffective)
-                                    .onFocusChange { if $0 { onFocus(item) } }
-                            }
-                            // Native tvOS card style (lift + 3D trackpad tilt) when
-                            // parallax is on; a plain scale-only focus on the A8.
-                            .stremioCardStyle(parallax: perf.cardParallaxEffective)
-                            .posterHoldMenu(item) { onSelect(item) }
-                            .focused($focusedID, equals: item.id)
-                            .id(item.id)
-                        }
-                    }
-                    .padding(.horizontal, 60)
-                    .padding(.vertical, 14)
-                }
-                .scrollClipDisabled()
-                // Back jumps to the first card; Back from the first card bubbles
-                // to the board (which opens the sidebar).
-                .onExitCommand {
-                    stremioBackToStart(proxy, first: row.items.first?.id, focused: focusedID,
-                                       onBackAtRoot: onBackAtRoot) { focusedID = $0 }
-                }
+        } card: { item, focusID in
+            Button { onSelect(item) } label: {
+                StremioPosterCard(item: item, width: landscape ? 340 : 190,
+                                  landscape: landscape, parallax: perf.cardParallaxEffective)
+                    .onFocusChange { if $0 { onFocus(item) } }
             }
+            // Native tvOS card style (lift + 3D trackpad tilt) when parallax is
+            // on; a plain scale-only focus on the A8.
+            .stremioCardStyle(parallax: perf.cardParallaxEffective)
+            .posterHoldMenu(item) { onSelect(item) }
+            .focused(focusID, equals: item.id)
         }
-        .onChange(of: focusedID) { _, id in if id != nil { onRowFocus() } }
         // No `.focusSection()`: it grouped the See-All + posters so a vertical
         // move landed on See-All and lost the column. Without it, tvOS keeps the
         // horizontal position across rows (Down from the 3rd poster → the 3rd

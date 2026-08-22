@@ -273,33 +273,20 @@ private struct CinemaContinueRow: View {
     let onFocusItem: (WatchProgress) -> Void
     var onBackAtStart: () -> Void = {}
 
-    @FocusState private var focusedID: String?
-
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        ThemedCardRow(items: items, spacing: 28, onBackAtStart: onBackAtStart) {
             Text("Continue Watching")
                 .font(.system(size: 30, weight: .bold))
                 .foregroundStyle(theme.palette.textPrimary)
-            ScrollViewReader { proxy in
-                ScrollView(.horizontal) {
-                    LazyHStack(spacing: 28) {
-                        ForEach(items) { p in
-                            CinemaContinueCard(
-                                progress: p,
-                                focusID: $focusedID,
-                                onResume: { onResume(p) },
-                                onResumeFromStart: { onResumeFromStart(p) },
-                                onDetails: { onDetails(p) },
-                                onFocus: { onFocusItem(p) }
-                            )
-                            .id(p.id)
-                        }
-                    }
-                    .padding(.vertical, 14)
-                }
-                .scrollClipDisabled()
-                .onExitCommand { cinemaBackToStart(proxy, first: items.first?.id, focused: focusedID, onBackAtStart: onBackAtStart) { focusedID = $0 } }
-            }
+        } card: { p, focusID in
+            CinemaContinueCard(
+                progress: p,
+                focusID: focusID,
+                onResume: { onResume(p) },
+                onResumeFromStart: { onResumeFromStart(p) },
+                onDetails: { onDetails(p) },
+                onFocus: { onFocusItem(p) }
+            )
         }
     }
 }
@@ -438,15 +425,14 @@ private struct CinemaCatalogRow: View {
     /// otherwise swallows Back at the tab level, so this defaults to a no-op).
     var onBackAtStart: () -> Void = {}
 
-    @FocusState private var focusedID: String?
-
     private var landscape: Bool {
         let t = row.catalog?.type
         return t == "tv" || t == "channel"
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        ThemedCardRow(items: row.items, spacing: landscape ? 28 : 24,
+                      onBackAtStart: onBackAtStart) {
             HStack {
                 Text(row.title).font(.system(size: 30, weight: .bold))
                     .foregroundStyle(theme.palette.textPrimary)
@@ -456,33 +442,11 @@ private struct CinemaCatalogRow: View {
                         .buttonStyle(CinemaCardStyle())
                 }
             }
-            ScrollViewReader { proxy in
-                ScrollView(.horizontal) {
-                    LazyHStack(spacing: landscape ? 28 : 24) {
-                        ForEach(row.items) { item in
-                            CinemaPosterCard(item: item, landscape: landscape, focusID: $focusedID,
-                                             onSelect: { onSelect(item) }, onFocus: { onFocusItem(item) })
-                            .id(item.id)
-                        }
-                    }
-                    .padding(.vertical, 14)
-                }
-                .scrollClipDisabled()
-                // Back jumps to the first card (scroll + focus it — the LazyHStack
-                // may have unloaded it); Back from the first card bubbles up.
-                .onExitCommand { cinemaBackToStart(proxy, first: row.items.first?.id, focused: focusedID, onBackAtStart: onBackAtStart) { focusedID = $0 } }
-            }
+        } card: { item, focusID in
+            CinemaPosterCard(item: item, landscape: landscape, focusID: focusID,
+                             onSelect: { onSelect(item) }, onFocus: { onFocusItem(item) })
         }
     }
-}
-
-/// Shared Back-to-first for the Cinema rows: scroll the first card into view and
-/// focus it unless already there, in which case bubble up.
-private func cinemaBackToStart(_ proxy: ScrollViewProxy, first: String?, focused: String?,
-                               onBackAtStart: () -> Void, setFocus: @escaping (String) -> Void) {
-    guard let first, focused != first else { onBackAtStart(); return }
-    withAnimation(.easeOut(duration: 0.3)) { proxy.scrollTo(first, anchor: .leading) }
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { setFocus(first) }
 }
 
 /// Equatable so a focus step — which writes the ROW's @FocusState and re-runs
