@@ -238,6 +238,17 @@ struct RootView: View {
                     }
                     // Dev: jump straight to the profile gate.
                     if args.contains("-profileGateDemo") { showProfileGate = true }
+                    // Dev/recovery: run the account-wide watch-history clear on
+                    // launch (same code path as the Settings button) — lets a
+                    // flooded device be repaired over devicectl without driving
+                    // the tvOS UI. Waits for sign-in state to settle first.
+                    if args.contains("-clearWatchHistory") {
+                        Task { @MainActor [weak nuvioSync] in
+                            try? await Task.sleep(nanoseconds: 8_000_000_000)
+                            await nuvioSync?.clearWatchHistoryEverywhere()
+                            NSLog("[OrivioSync] -clearWatchHistory launch action finished")
+                        }
+                    }
                 }
             }
             .fullScreenCover(isPresented: $showProfileGate) {

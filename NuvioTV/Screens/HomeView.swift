@@ -145,6 +145,10 @@ final class HomeViewModel: ObservableObject {
             collectionKeys.append(key)
             collectionByKey[key] = collection
         }
+        NSLog("[OrivioHome] load: %d catalogs, %d collections (%d pinned), %d order keys",
+              catalogKeys.count, collectionKeys.count,
+              collections.collections.filter(\.pinToTop).count,
+              settings.orderKeys.count)
 
         let mergedKeys = settings
             .mergedOrder(catalogKeys: catalogKeys, collectionKeys: collectionKeys)
