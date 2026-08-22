@@ -406,13 +406,14 @@ private struct StremioSkeletonRow: View {
 /// focus visuals and store changes invalidate through their own dependencies,
 /// which bypass ==.
 struct StremioPosterCard: View, Equatable {
+    /// Read through a tiny wrapper rather than an @EnvironmentObject on the
+    /// card: holding the stores here re-rendered the whole card — art, gloss,
+    /// badge, bar — on every publish from either.
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.item == rhs.item && lhs.width == rhs.width
             && lhs.landscape == rhs.landscape && lhs.parallax == rhs.parallax
     }
 
-    @EnvironmentObject private var progressStore: ProgressStore
-    @EnvironmentObject private var library: LibraryStore
     @ObservedObject private var perf = PerformanceSettingsStore.shared
     @Environment(\.isFocused) private var isFocused
     let item: MetaItem
@@ -438,21 +439,8 @@ struct StremioPosterCard: View, Equatable {
                 .overlay { if isFocused { gloss } }
                 .clipShape(RoundedRectangle(cornerRadius: StremioFocus.cardRadius, style: .continuous))
                 // Purple library check (top-left), like the real Stremio posters.
-                .overlay(alignment: .topLeading) {
-                    if library.contains(item) { StremioCheckBadge() }
-                }
-            if let f = progressStore.continueFractions[item.id], f > 0 {
-                GeometryReader { geo in
-                    ZStack(alignment: .leading) {
-                        Capsule().fill(Color.black.opacity(0.55))
-                        Capsule().fill(StremioSurfaces.accentBright)
-                            .frame(width: geo.size.width * CGFloat(min(max(f, 0.03), 1)))
-                    }
-                }
-                .frame(height: 5)
-                .padding(.horizontal, 8)
-                .padding(.bottom, 8)
-            }
+                .overlay(alignment: .topLeading) { StremioLibraryOverlay(item: item) }
+            StremioProgressBar(itemID: item.id)
         }
         .frame(width: width, height: height)
         // Focus indicator: the native `.card` platter's lift/tilt when parallax is
@@ -623,5 +611,39 @@ private struct StremioContinueCard: View, Equatable {
                        ? nil : .easeInOut(duration: 1.6).repeatForever(autoreverses: true),
                        value: sheen)
             .allowsHitTesting(false)
+    }
+}
+
+
+/// The purple library check, owning its own LibraryStore subscription so a
+/// library change re-renders this badge instead of every visible poster.
+private struct StremioLibraryOverlay: View {
+    @EnvironmentObject private var library: LibraryStore
+    let item: MetaItem
+    var body: some View {
+        if library.contains(item) { StremioCheckBadge() }
+    }
+}
+
+/// The resume bar across the bottom of a poster. Same reasoning as
+/// StremioLibraryOverlay: ProgressStore publishes on every playback save and
+/// every sync pull, and this keeps that inside a 5pt bar.
+private struct StremioProgressBar: View {
+    @EnvironmentObject private var progressStore: ProgressStore
+    let itemID: String
+
+    var body: some View {
+        if let f = progressStore.continueFractions[itemID], f > 0 {
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.black.opacity(0.55))
+                    Capsule().fill(StremioSurfaces.accentBright)
+                        .frame(width: geo.size.width * CGFloat(min(max(f, 0.03), 1)))
+                }
+            }
+            .frame(height: 5)
+            .padding(.horizontal, 8)
+            .padding(.bottom, 8)
+        }
     }
 }

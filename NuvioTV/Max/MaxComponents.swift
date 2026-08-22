@@ -109,7 +109,6 @@ struct MaxPosterCard: View, Equatable {
     // the store, so they all rebuilt on any library change, for nothing.
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.title == rhs.title }
 
-    @EnvironmentObject private var watched: WatchedStore
     let title: MaxTitle
     var externalFocus: FocusState<Bool>.Binding? = nil
     let onSelect: () -> Void
@@ -131,8 +130,7 @@ struct MaxPosterCard: View, Equatable {
                 // Focus is read INSIDE the label (`@Environment(\.isFocused)`),
                 // which reflects the button's own focus; it reports back up so the
                 // spacer can reserve the reflow gap.
-                MaxPosterLabel(title: title, isWatched: title.meta.map(watched.isWatched) ?? false,
-                               held: held, onFocusChanged: { gained in
+                MaxPosterLabel(title: title, held: held, onFocusChanged: { gained in
                     focused = gained
                     if gained { held = false }
                     onFocusChanged(gained)
@@ -156,7 +154,6 @@ struct MaxPosterCard: View, Equatable {
 private struct MaxPosterLabel: View {
     @Environment(\.isFocused) private var isFocused
     let title: MaxTitle
-    let isWatched: Bool
     var held: Bool = false
     let onFocusChanged: (Bool) -> Void
 
@@ -172,7 +169,7 @@ private struct MaxPosterLabel: View {
                     if let f = title.progress { MaxProgressBar(fraction: f) }
                 }
                 .overlay(alignment: .topTrailing) {
-                    if isWatched && !title.isSeries { MaxWatchedBadge() }
+                    if !title.isSeries, let meta = title.meta { MaxWatchedOverlay(item: meta) }
                 }
                 // The landscape art expands to the right into the reserved gap.
                 .overlay(alignment: .topLeading) {
@@ -679,5 +676,17 @@ private struct MaxDefaultFocus: ViewModifier {
     let ns: Namespace.ID?
     func body(content: Content) -> some View {
         if let ns { content.prefersDefaultFocus(in: ns) } else { content }
+    }
+}
+
+
+/// Owns the WatchedStore subscription so the CARD doesn't — a store publish
+/// re-renders this tick, not the whole poster. MaxCardMenu owns the same
+/// stores for the hold menu, for the same reason.
+private struct MaxWatchedOverlay: View {
+    @EnvironmentObject private var watched: WatchedStore
+    let item: MetaItem
+    var body: some View {
+        if watched.isWatched(item) { MaxWatchedBadge() }
     }
 }

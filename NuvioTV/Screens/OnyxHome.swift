@@ -363,8 +363,10 @@ private struct OnyxCatalogRow: View {
 private struct OnyxPosterCard: View, Equatable {
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.item == rhs.item }
 
-    @EnvironmentObject private var library: LibraryStore
-    @EnvironmentObject private var watched: WatchedStore
+    // No store subscriptions on the card: the shared hold menu owns them, and
+    // the watched tick owns its own (OnyxWatchedOverlay). Held here, every
+    // visible card rebuilt whenever either store published — on every sync
+    // pull — which is what made this theme drag next to Cinema.
     let item: MetaItem
     let onSelect: () -> Void
     let onFocusChanged: (Bool) -> Void
@@ -373,7 +375,7 @@ private struct OnyxPosterCard: View, Equatable {
 
     var body: some View {
         Button(action: onSelect) {
-            OnyxPosterLabel(item: item, isWatched: watched.isWatched(item), held: held,
+            OnyxPosterLabel(item: item, held: held,
                             onFocusChanged: { gained in
                                 if gained { held = false }
                                 onFocusChanged(gained)
@@ -381,24 +383,13 @@ private struct OnyxPosterCard: View, Equatable {
         }
         .buttonStyle(OnyxCardStyle())
         .simultaneousGesture(LongPressGesture(minimumDuration: 0.35).onEnded { _ in held = true })
-        .contextMenu {
-            Button { onSelect() } label: { Label("Go to Details", systemImage: "info.circle") }
-            Button { library.toggle(item) } label: {
-                Label(library.contains(item) ? "Remove from Library" : "Add to Library",
-                      systemImage: library.contains(item) ? "bookmark.slash" : "bookmark")
-            }
-            Button { watched.toggleMovie(item) } label: {
-                Label(watched.isWatched(item) ? "Mark as Unwatched" : "Mark as Watched",
-                      systemImage: watched.isWatched(item) ? "eye.slash" : "checkmark.circle")
-            }
-        }
+        .posterHoldMenu(item, onDetails: onSelect)
     }
 }
 
 private struct OnyxPosterLabel: View {
     @Environment(\.isFocused) private var isFocused
     let item: MetaItem
-    let isWatched: Bool
     var held: Bool = false
     let onFocusChanged: (Bool) -> Void
 
@@ -421,7 +412,7 @@ private struct OnyxPosterLabel: View {
                     .frame(width: OnyxLayout.posterW, height: OnyxLayout.posterH)
                     .clipShape(RoundedRectangle(cornerRadius: OnyxLayout.cardRadius, style: .continuous))
                     .overlay(alignment: .topTrailing) {
-                        if isMovie && isWatched { OnyxWatchedBadge() }
+                        if isMovie { OnyxWatchedOverlay(item: item) }
                     }
                     .shadow(color: .black.opacity(0.12), radius: 4)
                     .transition(.opacity)
@@ -482,7 +473,6 @@ private struct OnyxContinueRow: View {
 private struct OnyxContinueCard: View, Equatable {
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.progress == rhs.progress }
 
-    @EnvironmentObject private var progressStore: ProgressStore
     let progress: WatchProgress
     let onResume: () -> Void
     let onResumeFromStart: () -> Void
@@ -503,13 +493,8 @@ private struct OnyxContinueCard: View, Equatable {
         }
         .buttonStyle(OnyxCardStyle())
         .simultaneousGesture(LongPressGesture(minimumDuration: 0.35).onEnded { _ in held = true })
-        .contextMenu {
-            Button { onDetails() } label: { Label("Go to Details", systemImage: "info.circle") }
-            Button { onResumeFromStart() } label: { Label("Start from Beginning", systemImage: "gobackward") }
-            Button(role: .destructive) {
-                progressStore.removeShow(metaID: progress.metaID, notifyTrakt: true)
-            } label: { Label("Remove from Continue Watching", systemImage: "xmark") }
-        }
+        .contextMenu { OnyxContinueMenu(progress: progress, onDetails: onDetails,
+                                        onResumeFromStart: onResumeFromStart) }
     }
 }
 
@@ -739,5 +724,35 @@ enum OnyxFormat {
             return rem.isEmpty ? "S\(s) E\(e)" : "S\(s) E\(e) • \(rem)"
         }
         return rem
+    }
+}
+
+
+/// Owns the WatchedStore subscription so the CARD doesn't. A store publish
+/// re-renders this tick, not the poster, its overlays and its menu.
+private struct OnyxWatchedOverlay: View {
+    @EnvironmentObject private var watched: WatchedStore
+    let item: MetaItem
+    var body: some View {
+        if watched.isWatched(item) { OnyxWatchedBadge() }
+    }
+}
+
+/// Onyx's Continue Watching hold menu. A view rather than an inline closure so
+/// the ProgressStore subscription lives here instead of on the card. The item
+/// list is the theme's own (no "Play Manually"), which is why it doesn't use
+/// the shared continueHoldMenu.
+private struct OnyxContinueMenu: View {
+    @EnvironmentObject private var progressStore: ProgressStore
+    let progress: WatchProgress
+    let onDetails: () -> Void
+    let onResumeFromStart: () -> Void
+
+    var body: some View {
+        Button { onDetails() } label: { Label("Go to Details", systemImage: "info.circle") }
+        Button { onResumeFromStart() } label: { Label("Start from Beginning", systemImage: "gobackward") }
+        Button(role: .destructive) {
+            progressStore.removeShow(metaID: progress.metaID, notifyTrakt: true)
+        } label: { Label("Remove from Continue Watching", systemImage: "xmark") }
     }
 }
