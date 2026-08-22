@@ -13,7 +13,22 @@ enum WatchHistoryClearState {
     static func markClearedNow() -> Date {
         let date = Date()
         UserDefaults.standard.set(date.timeIntervalSince1970, forKey: clearedAtKey)
+        // An explicit new clear overrides an earlier reset.
+        UserDefaults.standard.removeObject(forKey: clearedResetKey)
         return date
+    }
+
+    private static let clearedResetKey = "nuvio.watchHistoryClearedAt.reset.v1"
+
+    /// Whether this device deliberately dropped its clear point. Sticky,
+    /// because the point also lives in the account blob: without this, the very
+    /// next pull re-adopted the horizon that was just reset and nothing changed.
+    static var wasReset: Bool { UserDefaults.standard.bool(forKey: clearedResetKey) }
+
+    /// Forget the clear point entirely, and stop the account re-supplying it.
+    static func reset() {
+        UserDefaults.standard.removeObject(forKey: clearedAtKey)
+        UserDefaults.standard.set(true, forKey: clearedResetKey)
     }
 
     /// Adopt a clear point learned from the account (synced prefs blob). The
@@ -23,7 +38,9 @@ enum WatchHistoryClearState {
     /// account, undoing the curation done on the device that cleared. Newest
     /// wins; nil never regresses an existing local clear.
     static func adopt(_ remote: Date?) {
-        guard let remote else { return }
+        // A device that reset its horizon must not have it handed back by the
+        // account on the next pull.
+        guard !wasReset, let remote else { return }
         if let clearedAt, clearedAt >= remote { return }
         UserDefaults.standard.set(remote.timeIntervalSince1970, forKey: clearedAtKey)
     }

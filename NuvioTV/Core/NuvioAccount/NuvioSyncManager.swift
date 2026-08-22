@@ -90,7 +90,11 @@ final class NuvioSyncManager: ObservableObject {
     private func isSeeded(_ kind: String) -> Bool { UserDefaults.standard.bool(forKey: seededKey(kind)) }
     private func setSeeded(_ kind: String) { UserDefaults.standard.set(true, forKey: seededKey(kind)) }
     private func clearedWatchHistoryKey() -> String { "nuvio.sync.clearedWatchHistory.v1.p\(pid)" }
-    private func repairedWatchHistoryClearKey() -> String { "nuvio.sync.repairedWatchHistoryClear.v1.p\(pid)" }
+    /// Bumped whenever the repair below learns to fix something new, so it
+    /// runs once more on installs where the previous version already ran.
+    /// v3: also drops the clear HORIZON and pushes that up, since the account
+    /// blob was handing the horizon straight back on the next pull.
+    private func repairedWatchHistoryClearKey() -> String { "nuvio.sync.repairedWatchHistoryClear.v3.p\(pid)" }
 
     /// The active profile scopes all personal-data sync. Addons stay global
     /// (profile 1) so the same sources are available on every profile.
@@ -642,6 +646,15 @@ final class NuvioSyncManager: ObservableObject {
         savePendingDeletes([])
         savePendingWatchedDeletes([])
         UserDefaults.standard.set(true, forKey: repairedWatchHistoryClearKey())
+        // Drop the clear HORIZON too. Clearing Trakt's continue-watching list
+        // used to advance it, which then filtered every older row out of the
+        // Trakt import and (with the rule removed above) had been deleting
+        // account rows as well. The list it was protecting is empty now, so the
+        // horizon has nothing left to do and is only blocking real syncing.
+        WatchHistoryClearState.reset()
+        // Ship the cleared state so the account stops handing this horizon back
+        // to every device that pulls.
+        scheduleAppPreferencesPush()
         NuvioSyncDiagnostics.record(
             .warning,
             area: "Orivio",
@@ -816,23 +829,16 @@ final class NuvioSyncManager: ObservableObject {
                 syncSource: "nuvio"
             )
         }
-        // Enforce the (synced) watch-history clear point on the ACCOUNT
-        // snapshot too: rows older than the clear are flood remnants — a
-        // container without the clear point re-imported the full Trakt history
-        // and pushed it up. Drop them locally AND queue their server deletes,
-        // so the account converges back to the post-clear state instead of
-        // re-flooding every device on every pull.
-        if let clearedAt = WatchHistoryClearState.clearedAt {
-            let stale = pulled.filter { $0.updatedAt <= clearedAt }
-            if !stale.isEmpty {
-                pulled.removeAll { $0.updatedAt <= clearedAt }
-                deleteWatchProgress(keys: stale.map(\.id))
-                NuvioSyncDiagnostics.record(
-                    .warning, area: "Orivio",
-                    "Dropped \(stale.count) watch-progress rows older than the history clear (\(clearedAt)) and queued their account deletes."
-                )
-            }
-        }
+        // NOTE: no clear-horizon filter here, deliberately. An earlier version
+        // dropped every account row older than the watch-history clear AND
+        // queued its deletion, to converge the account after a Trakt flood.
+        // That was a permanent rule applied to every pull, so it also deleted
+        // legitimate rows that arrive with an older timestamp — anything
+        // imported from Stremio carries its ORIGINAL watch time — which is
+        // exactly why Stremio Continue Watching stopped syncing. The clear
+        // itself already deletes the account rows (clearWatchHistoryEverywhere),
+        // so nothing here needs to re-litigate it. The horizon still filters
+        // TRAKT re-imports, which is what it was built for.
         pulled = await enrichMetadata(pulled)
         let before = progressStore.continueWatching(sortMode: .recentlyWatched).count
         progressStore.replaceWithNuvioSnapshot(pulled, preserveLocalAdditions: !seeded)

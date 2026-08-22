@@ -223,9 +223,10 @@ final class TraktSyncManager: ObservableObject {
     /// watching". Deliberately NOT the watched history: this clears only the
     /// partially-watched rows, which is what re-imports into Continue Watching
     /// here. Also advances the local clear horizon so the rows can't be pulled
-    /// straight back in before Trakt's own list settles. Returns the number
+    /// Returns the number
     /// removed, or nil if the list couldn't be fetched (an outage must not be
-    /// reported as "nothing to clear").
+    /// reported as "nothing to clear"). The watch-history clear horizon is left
+    /// alone — see the note at the end of this method.
     @discardableResult
     func clearTraktContinueWatching() async -> Int? {
         guard let token = await validToken() else { return nil }
@@ -235,7 +236,11 @@ final class TraktSyncManager: ObservableObject {
             guard let playbackID = row.playbackID else { continue }
             if await TraktService.removePlayback(playbackID: playbackID, accessToken: token) { removed += 1 }
         }
-        WatchHistoryClearState.markClearedNow()
+        // Deliberately does NOT advance the watch-history clear horizon.
+        // Emptying Trakt's in-progress list is what stops those rows coming
+        // back; moving the horizon would ALSO hide every older row from every
+        // other source (Stremio imports carry their original watch time), which
+        // is a far bigger hammer than the user asked for.
         NSLog("[OrivioTrakt] cleared %d of %d playback rows", removed, rows.count)
         trakt.setSyncStatus("Cleared \(removed) Trakt continue-watching rows")
         return removed
