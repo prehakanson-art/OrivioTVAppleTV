@@ -401,9 +401,17 @@ final class HomeViewModel: ObservableObject {
 @MainActor
 final class HeroFocus: ObservableObject {
     @Published var item: MetaItem?
+    /// Continue-Watching context for the committed item (episode line,
+    /// remaining time), committed atomically with `item` by themes whose hero
+    /// surfaces it (Onyx). nil whenever the committed item isn't a CW card.
+    @Published private(set) var progress: WatchProgress?
     /// Fetches full metadata for a bare item (Continue Watching rows only
     /// store name + art) — set by HomeView. Successful results are cached.
     var enrich: ((MetaItem) async -> MetaItem?)?
+    /// Classic only enriches items with NO synopsis (CW cards). Themes whose
+    /// hero shows fields catalog items never carry (Stremio board: runtime,
+    /// cast) enrich every committed item instead — still debounced and cached.
+    var enrichAlways = false
     private var task: Task<Void, Never>?
 
     // MARK: Spotlight rotation (Apple TV theme)
@@ -489,10 +497,15 @@ final class HeroFocus: ObservableObject {
         return 60_000_000
     }
 
-    func focus(_ newItem: MetaItem) {
+    func focus(_ newItem: MetaItem, progress newProgress: WatchProgress? = nil) {
         // Browsing cards counts as interaction — pause spotlight rotation.
         lastInteraction = Date()
-        guard newItem.id != (pendingID ?? item?.id) else { return }
+        guard newItem.id != (pendingID ?? item?.id) else {
+            // Same title, different context (catalog card ↔ its CW card):
+            // nothing to decode, just swap the progress line.
+            if progress?.id != newProgress?.id { progress = newProgress }
+            return
+        }
         task?.cancel()
         pendingID = newItem.id
         task = Task { @MainActor in
@@ -500,11 +513,15 @@ final class HeroFocus: ObservableObject {
             guard !Task.isCancelled else { return }
             let display = enriched[newItem.id] ?? newItem
             let fade = PerformanceSettingsStore.shared.heroCrossfadeEffective
-            withAnimation(fade ? .easeInOut(duration: 0.4) : nil) { item = display }
+            withAnimation(fade ? .easeInOut(duration: 0.4) : nil) {
+                item = display
+                progress = newProgress
+            }
             pendingID = nil
             // Bare item (no synopsis): fetch the full meta so the billboard
             // shows description/genres/rating, and swap it in if still current.
-            guard display.description == nil, let enrich else { return }
+            guard enrichAlways || display.description == nil, let enrich,
+                  enriched[display.id] == nil else { return }
             guard let full = await enrich(display), !Task.isCancelled,
                   self.item?.id == display.id else { return }
             enriched[display.id] = full

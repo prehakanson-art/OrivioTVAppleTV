@@ -60,11 +60,14 @@ struct OnyxHomeView: View {
     let onSeeAll: (InstalledAddon, ManifestCatalog, String) -> Void
     let onOpenCollection: (NuvioCollection) -> Void
 
-    /// The title the hero + full-screen backdrop reflect — follows focus.
-    @State private var focused: MetaItem?
-    /// Continue-Watching context for the hero (remaining + episode line), set
-    /// only while a CW card is focused.
-    @State private var focusedProgress: WatchProgress?
+    /// The focus-followed hero, ISOLATED from this view: cards report focus
+    /// into it, and only the backdrop + hero subviews observe it. Held as
+    /// plain @State (not @StateObject) deliberately — the root must NOT
+    /// subscribe, or every D-pad step would re-render the whole home and
+    /// decode a fresh full-screen backdrop per step (the A8 stutter the
+    /// Classic home's HeroFocus debounce exists to prevent). CW context rides
+    /// in `hero.progress`, committed atomically with the item.
+    @State private var hero = HeroFocus()
 
     private var catalogRows: [HomeRow] {
         viewModel.entries.compactMap { if case .catalog(let r) = $0 { return r } else { return nil } }
@@ -73,8 +76,9 @@ struct OnyxHomeView: View {
         progressStore.continueWatching(sortMode: homeCatalogSettings.continueWatchingSortMode)
             .map(progressWithCatalogArt)
     }
-    private var heroItem: MetaItem? {
-        focused ?? viewModel.initialHero ?? catalogRows.first?.items.first
+    /// What the hero shows before any card has been focused.
+    private var heroFallback: MetaItem? {
+        viewModel.initialHero ?? catalogRows.first?.items.first
     }
 
     private func progressWithCatalogArt(_ progress: WatchProgress) -> WatchProgress {
@@ -88,7 +92,7 @@ struct OnyxHomeView: View {
     var body: some View {
         ZStack(alignment: .topLeading) {
             // 1. Full-screen backdrop of the focused title (fixed; rows scroll over it).
-            OnyxBackdrop(url: heroItem?.background ?? heroItem?.poster,
+            OnyxBackdrop(hero: hero, fallback: heroFallback,
                          placeholder: theme.palette.background)
                 .ignoresSafeArea()
 
@@ -102,7 +106,7 @@ struct OnyxHomeView: View {
                         NuvioLoadingView(label: "Loading")
                             .frame(maxWidth: .infinity).frame(height: 400)
                     } else {
-                        OnyxHero(item: heroItem, progress: heroProgress)
+                        OnyxHero(hero: hero, fallback: heroFallback)
                             .frame(height: OnyxLayout.heroHeight, alignment: .bottomLeading)
 
                         LazyVStack(alignment: .leading, spacing: OnyxLayout.sectionSpacing) {
@@ -122,13 +126,6 @@ struct OnyxHomeView: View {
         }
     }
 
-    /// Only surface CW context on the hero when the focused title IS the focused
-    /// CW card (not when focus has moved on to a catalog row).
-    private var heroProgress: WatchProgress? {
-        guard let focusedProgress, let heroItem, focusedProgress.metaID == heroItem.id else { return nil }
-        return focusedProgress
-    }
-
     @ViewBuilder private var rows: some View {
         let sharedCollections = viewModel.entries.compactMap { e -> NuvioCollection? in
             if case .collection(let c) = e, c.viewMode != "ROWS" { return c } else { return nil }
@@ -141,14 +138,14 @@ struct OnyxHomeView: View {
                 onResume: onResume,
                 onResumeFromStart: onResumeFromStart,
                 onDetails: { onSelect(metaFor($0)) },
-                onFocusItem: { p in focused = metaFor(p); focusedProgress = p }
+                onFocusItem: { p in hero.focus(metaFor(p), progress: p) }
             )
         }
         ForEach(viewModel.entries) { entry in
             switch entry {
             case .catalog(let row):
                 OnyxCatalogRow(row: row, onSelect: onSelect, onSeeAll: onSeeAll,
-                               onFocusItem: { focused = $0; focusedProgress = nil })
+                               onFocusItem: { hero.focus($0) })
             case .collection(let collection):
                 if collection.viewMode == "ROWS" {
                     CollectionRowSection(
@@ -183,8 +180,16 @@ struct OnyxHomeView: View {
 
 private struct OnyxBackdrop: View {
     @ObservedObject private var perf = PerformanceSettingsStore.shared
-    let url: String?
+    /// Observed HERE, not at the root — a hero change re-renders the backdrop
+    /// and hero subviews only, never the rows scrolling over them.
+    @ObservedObject var hero: HeroFocus
+    let fallback: MetaItem?
     let placeholder: Color
+
+    private var url: String? {
+        let item = hero.item ?? fallback
+        return item?.background ?? item?.poster
+    }
 
     var body: some View {
         GeometryReader { geo in
@@ -243,9 +248,17 @@ private struct OnyxGradients: View {
 // MARK: - Hero (passive, reflects focus — no button)
 
 private struct OnyxHero: View {
-    let item: MetaItem?
-    let progress: WatchProgress?
+    @ObservedObject var hero: HeroFocus
+    let fallback: MetaItem?
     @State private var contentRating: String?
+
+    private var item: MetaItem? { hero.item ?? fallback }
+    /// Only surface CW context when the committed title IS the focused CW card
+    /// (not once focus has moved on to a catalog row).
+    private var progress: WatchProgress? {
+        guard let p = hero.progress, p.metaID == item?.id else { return nil }
+        return p
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {

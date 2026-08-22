@@ -21,8 +21,15 @@ struct CinemaHomeView: View {
     let onSeeAll: (InstalledAddon, ManifestCatalog, String) -> Void
     let onOpenCollection: (NuvioCollection) -> Void
 
-    /// The item the hero reflects — follows focus as you move across cards.
-    @State private var focused: MetaItem?
+    /// The focus-followed hero, ISOLATED from this view: cards report focus
+    /// into it, only the hero subview observes it. Held as plain @State (not
+    /// @StateObject / @ObservedObject) deliberately — the root must NOT
+    /// subscribe, or every D-pad step would re-render the whole home (hero +
+    /// every row) and decode a fresh full-screen backdrop per step: the
+    /// "stepping through a row stutters" cost on the A8/A10X. HeroFocus also
+    /// debounces the commit with a tier-aware settle window, exactly like the
+    /// Classic home (see HeroFocus.settleNanos).
+    @State private var hero = HeroFocus()
 
     private var catalogRows: [HomeRow] {
         viewModel.entries.compactMap { if case .catalog(let r) = $0 { return r } else { return nil } }
@@ -31,7 +38,8 @@ struct CinemaHomeView: View {
         progressStore.continueWatching(sortMode: homeCatalogSettings.continueWatchingSortMode)
             .map(progressWithCatalogArt)
     }
-    private var heroItem: MetaItem? { focused ?? viewModel.initialHero ?? catalogRows.first?.items.first }
+    /// What the hero shows before any card has been focused.
+    private var heroFallback: MetaItem? { viewModel.initialHero ?? catalogRows.first?.items.first }
 
     var body: some View {
         ZStack(alignment: .top) {
@@ -39,7 +47,7 @@ struct CinemaHomeView: View {
 
             ScrollView(.vertical) {
                 VStack(alignment: .leading, spacing: 40) {
-                    CinemaHero(item: heroItem, onPlay: { if let h = heroItem { onSelect(h) } })
+                    CinemaHero(hero: hero, fallback: heroFallback, onPlay: onSelect)
                         .frame(height: 620)
                         .focusSection()
 
@@ -74,14 +82,14 @@ struct CinemaHomeView: View {
                     onResume: onResume,
                     onResumeFromStart: onResumeFromStart,
                     onDetails: { onSelect(metaFor($0)) },
-                    onFocusItem: { focused = metaFor($0) }
+                    onFocusItem: { hero.focus(metaFor($0)) }
                 )
             }
             ForEach(viewModel.entries) { entry in
                 switch entry {
                 case .catalog(let row):
                     CinemaCatalogRow(row: row, onSelect: onSelect, onSeeAll: onSeeAll,
-                                     onFocusItem: { focused = $0 })
+                                     onFocusItem: { hero.focus($0) })
                 case .collection(let collection):
                     if collection.viewMode == "ROWS" {
                         // Each collection = its own row of folder buttons.
@@ -129,9 +137,14 @@ struct CinemaHomeView: View {
 private struct CinemaHero: View {
     @EnvironmentObject private var theme: ThemeManager
     @ObservedObject private var perf = PerformanceSettingsStore.shared
-    let item: MetaItem?
-    let onPlay: () -> Void
+    /// Observed HERE, not at the root — a hero change re-renders this subview
+    /// only, never the rows behind it.
+    @ObservedObject var hero: HeroFocus
+    let fallback: MetaItem?
+    let onPlay: (MetaItem) -> Void
     @State private var contentRating: String?
+
+    private var item: MetaItem? { hero.item ?? fallback }
 
     var body: some View {
         ZStack(alignment: .bottomLeading) {
@@ -180,7 +193,8 @@ private struct CinemaHero: View {
                         .lineLimit(2)
                         .frame(maxWidth: 900, alignment: .leading)
                 }
-                CinemaPlayButton(title: item?.type == "series" ? "Go to Show" : "Go to Movie", action: onPlay)
+                CinemaPlayButton(title: item?.type == "series" ? "Go to Show" : "Go to Movie",
+                                 action: { if let item { onPlay(item) } })
                     .padding(.top, 8)
             }
             .padding(.leading, 60)

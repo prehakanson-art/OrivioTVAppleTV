@@ -21,18 +21,20 @@ struct StremioBoardView: View {
     var onContentReady: () -> Void = {}
     var onBackAtRoot: () -> Void = {}
 
-    /// The item the top preview panel reflects — updated as focus moves.
-    @State private var focusedItem: MetaItem?
-    /// The focused row's key — scrolled to a consistent line just below the hero.
+    /// The focus-followed hero, ISOLATED from this view: cards report focus
+    /// into it, and only the backdrop + info subviews observe it. Held as
+    /// plain @State (not @StateObject) deliberately — the root must NOT
+    /// subscribe, or every D-pad step would re-render the whole board and
+    /// decode a fresh full-screen backdrop per step (the A8 stutter the
+    /// Classic home's HeroFocus debounce exists to prevent). HeroFocus also
+    /// caches enrichments, so re-focusing a title never re-fetches its meta.
+    @State private var hero = HeroFocus()
+    /// The focused row's key — scrolled to a consistent line just below the
+    /// hero. Root state is fine here: it changes once per ROW, not per card.
     @State private var focusedRowKey: String?
 
     /// Height of the hero region; the rows are inset by this and scroll behind it.
     private static let heroHeight: CGFloat = 560
-
-    private var continueItems: [WatchProgress] {
-        progressStore.continueWatching(sortMode: homeCatalogSettings.continueWatchingSortMode)
-            .map(progressWithCatalogArt)
-    }
 
     private var catalogRows: [HomeRow] {
         viewModel.entries.compactMap { if case .catalog(let r) = $0 { return r } else { return nil } }
@@ -45,9 +47,11 @@ struct StremioBoardView: View {
         var seen = Set<String>()
         return catalogRows.flatMap(\.items).filter { seen.insert($0.id).inserted }
     }
+    /// Upgrade a card's light MetaItem with the catalog copy (art) before it
+    /// reaches the hero — CW cards carry only name + art fragments.
     private func enrich(_ m: MetaItem) -> MetaItem { pool.first { $0.id == m.id } ?? m }
 
-    private func progressWithCatalogArt(_ progress: WatchProgress) -> WatchProgress {
+    private func progressWithCatalogArt(_ progress: WatchProgress, pool: [MetaItem]) -> WatchProgress {
         guard (progress.poster == nil || progress.background == nil || progress.name.isEmpty),
               let meta = pool.first(where: { $0.id == progress.metaID }) else {
             return progress
@@ -55,23 +59,16 @@ struct StremioBoardView: View {
         return progress.withFallbackMetadata(meta)
     }
 
-    /// Set the hero to a focused item, then fetch its FULL meta (runtime / cast /
-    /// synopsis) in the background — catalog items carry only light metadata, but
-    /// the hero shows the same info line + cast as the real Stremio board.
-    @State private var heroTask: Task<Void, Never>?
-    private func focus(_ m: MetaItem) {
-        let e = enrich(m)
-        if focusedItem?.id != e.id { focusedItem = e }
-        heroTask?.cancel()
-        heroTask = Task { await loadFullMeta(e) }
-    }
-    @MainActor private func loadFullMeta(_ e: MetaItem) async {
-        try? await Task.sleep(nanoseconds: 250_000_000)   // debounce fast focus moves
-        if Task.isCancelled { return }
-        guard let addon = addonManager.metaAddon(for: e.type, id: e.id),
-              let full = try? await StremioAPI.meta(addon: addon, type: e.type, id: e.id),
-              !Task.isCancelled, focusedItem?.id == e.id else { return }
-        focusedItem = MetaItem(
+    /// Full meta for a committed hero item (runtime / cast / synopsis) —
+    /// catalog items carry only light metadata, but the hero shows the same
+    /// info line + cast as the real Stremio board. Installed as `hero.enrich`,
+    /// so HeroFocus debounces it behind the settle window and caches results
+    /// (the old per-focus fetch re-downloaded the same meta every visit).
+    private func fullMeta(_ e: MetaItem) async -> MetaItem? {
+        guard let addon = await addonManager.metaAddon(for: e.type, id: e.id),
+              let full = try? await StremioAPI.meta(addon: addon, type: e.type, id: e.id)
+        else { return nil }
+        return MetaItem(
             id: e.id, type: e.type, name: full.name.isEmpty ? e.name : full.name,
             poster: e.poster, background: e.background ?? full.background, logo: full.logo ?? e.logo,
             description: full.description ?? e.description,
@@ -106,10 +103,16 @@ struct StremioBoardView: View {
                             if viewModel.isLoading && viewModel.entries.isEmpty {
                                 ForEach(0..<3, id: \.self) { _ in StremioSkeletonRow() }
                             } else {
+                                // Pool computed ONCE per body pass — the art
+                                // fallback used to rebuild it per CW item.
+                                let pool = self.pool
+                                let continueItems = progressStore
+                                    .continueWatching(sortMode: homeCatalogSettings.continueWatchingSortMode)
+                                    .map { progressWithCatalogArt($0, pool: pool) }
                                 if !continueItems.isEmpty {
                                     StremioContinueRow(
                                         items: continueItems, onResume: onResume, onSelect: onSelect,
-                                        onFocus: { focus($0) }, onRowFocus: { focusedRowKey = "row_cw" },
+                                        onFocus: { hero.focus(enrich($0)) }, onRowFocus: { focusedRowKey = "row_cw" },
                                         onBackAtRoot: onBackAtRoot
                                     )
                                     .id("row_cw")
@@ -117,7 +120,7 @@ struct StremioBoardView: View {
                                 ForEach(catalogRows) { row in
                                     StremioCatalogRow(
                                         row: row, onSelect: onSelect,
-                                        onFocus: { focus($0) }, onRowFocus: { focusedRowKey = "row_\(row.id)" },
+                                        onFocus: { hero.focus($0) }, onRowFocus: { focusedRowKey = "row_\(row.id)" },
                                         onBackAtRoot: onBackAtRoot
                                     )
                                     .id("row_\(row.id)")
@@ -141,27 +144,31 @@ struct StremioBoardView: View {
                 }
             }
 
-            StremioHeroBackdrop(item: focusedItem)
+            StremioHeroBackdrop(hero: hero)
                 .frame(height: Self.heroHeight)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                 .allowsHitTesting(false)
 
-            StremioHeroInfo(item: focusedItem)
+            StremioHeroInfo(hero: hero)
                 .frame(height: Self.heroHeight - 96, alignment: .topLeading)
                 .padding(.top, 46)
                 .padding(.leading, 60)
                 .padding(.trailing, 60)
                 .allowsHitTesting(false)
-                .animation(perf.heroCrossfadeEffective ? .easeInOut(duration: 0.3) : nil, value: focusedItem?.id)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .task {
+            hero.enrichAlways = true   // hero shows runtime/cast — light items never carry them
+            hero.enrich = { [weak addonManager] item in
+                guard addonManager != nil else { return nil }
+                return await fullMeta(item)
+            }
             await viewModel.loadIfNeeded(addonManager: addonManager, collections: collections, settings: homeCatalogSettings)
-            if focusedItem == nil, let first = catalogRows.first?.items.first { focus(first) }
+            if hero.item == nil, let first = catalogRows.first?.items.first { hero.focus(first) }
             onContentReady()
         }
         .onChange(of: viewModel.entries.count) { _, _ in
-            if focusedItem == nil, let first = catalogRows.first?.items.first { focus(first) }
+            if hero.item == nil, let first = catalogRows.first?.items.first { hero.focus(first) }
         }
         .onChange(of: addonManager.addons) { _, _ in
             Task { await viewModel.load(addonManager: addonManager, collections: collections, settings: homeCatalogSettings) }
@@ -178,7 +185,11 @@ struct StremioBoardView: View {
 /// the same treatment as the other themes' heros (`HeroBackdropView`). The art
 /// crossfades as focus moves.
 private struct StremioHeroBackdrop: View {
-    let item: MetaItem?
+    /// Observed HERE, not at the root — a hero change re-renders the backdrop
+    /// and info subviews only, never the rows.
+    @ObservedObject var hero: HeroFocus
+
+    private var item: MetaItem? { hero.item }
 
     var body: some View {
         GeometryReader { geo in
@@ -230,9 +241,19 @@ private struct StremioHeroBackdrop: View {
 /// TITLE as bold text, a space-separated meta line ("109 min   2026   8.0  IMDb"
 /// with a yellow IMDb badge), the overview, and the CAST line at the bottom.
 private struct StremioHeroInfo: View {
-    let item: MetaItem?
+    @ObservedObject var hero: HeroFocus
+    @ObservedObject private var perf = PerformanceSettingsStore.shared
+
+    private var item: MetaItem? { hero.item }
 
     var body: some View {
+        content
+            // The crossfade that used to live on the root — moved here with
+            // the state it animates, so the root never observes the hero.
+            .animation(perf.heroCrossfadeEffective ? .easeInOut(duration: 0.3) : nil, value: item?.id)
+    }
+
+    @ViewBuilder private var content: some View {
         if let item {
             VStack(alignment: .leading, spacing: 0) {
                 Text(item.name)
