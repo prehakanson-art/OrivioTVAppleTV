@@ -768,9 +768,21 @@ final class NuvioSyncManager: ObservableObject {
         return try? JSONSerialization.data(withJSONObject: body)
     }
 
+    private var loggedWatchProgressColumns = false
+
     private func pullWatchProgress() async throws {
         guard account.accessToken != nil else { return }
         let data = try await authedPost(RPC.url(RPC.pullWatchProgress), body: ["p_profile_id": pid])
+        // Diagnostic, ONCE per session: the columns the account actually stores
+        // per row. The table holds ids and positions only — no title or artwork
+        // — so every client has to resolve "tt…" into a title itself. A client
+        // showing the raw id is one that isn't enriching, not a bad push.
+        if !loggedWatchProgressColumns,
+           let raw = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]],
+           let first = raw.first {
+            loggedWatchProgressColumns = true
+            NSLog("[OrivioSync] watch_progress columns: %@", first.keys.sorted().joined(separator: ","))
+        }
         let rows = try JSONDecoder().decode([SupabaseWatchProgress].self, from: data)
         let seeded = isSeeded("progress")
         if rows.isEmpty && !seeded {
@@ -1453,6 +1465,8 @@ final class NuvioSyncManager: ObservableObject {
             "p_origin_client_id": clientID
         ]
         _ = try await authedPost(RPC.url(RPC.pushCollections), body: body)
+        NSLog("[OrivioCollections] pushed %d collections to the shared table (p%d)",
+              (collectionsValue as? [Any])?.count ?? 0, pid)
     }
 
     /// Whether the one-time "adopt every profile's collections into the shared
