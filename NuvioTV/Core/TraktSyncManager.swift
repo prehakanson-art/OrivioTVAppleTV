@@ -185,7 +185,12 @@ final class TraktSyncManager: ObservableObject {
         // forms of every Trakt row, so a local row keyed under one identity
         // can't be mistaken for missing because Trakt reported the other.
         // Rows that ORIGINATED from Trakt are excluded: pushing those back
-        // would resurrect items the user deleted on trakt.tv itself.
+        // would resurrect items the user deleted on trakt.tv itself. That test
+        // is the row's SOURCE, not "was it ever merged from outside" — the
+        // externally-merged flag is also set for Stremio imports, so using it
+        // here meant nothing watched in Stremio ever reached Trakt, while
+        // everything flowed the other way. A Trakt-origin row that is watched
+        // again locally becomes a "nuvio" row and pushes normally.
         var remoteKeys = Set<String>()
         for s in remote {
             var idForms: [String] = []
@@ -201,7 +206,7 @@ final class TraktSyncManager: ObservableObject {
         }
         let localOnly = progress.serviceBackedForSync()
             .filter { $0.metaID.hasPrefix("tt") && !remoteKeys.contains($0.id) }
-            .filter { !progress.wasExternallyMerged($0.id) }
+            .filter { $0.syncSource != "trakt" }
             .filter { $0.durationSeconds > 0 }
             .filter { let f = $0.positionSeconds / $0.durationSeconds; return f > 0.01 && f < 0.95 }
             .sorted { $0.updatedAt > $1.updatedAt }
