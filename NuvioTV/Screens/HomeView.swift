@@ -111,27 +111,10 @@ final class HomeViewModel: ObservableObject {
         // then let the layout settings decide order and visibility.
         var catalogByKey: [String: (addon: InstalledAddon, catalog: ManifestCatalog)] = [:]
         var catalogKeys: [String] = []
-        // Second-and-later installs of the SAME addon id get their own key
-        // namespace, so two configured instances don't collide (see
-        // AddonManager.catalogKeyNamespaces).
-        let namespaces = addonManager.catalogKeyNamespaces
         for addon in addonManager.catalogAddons {
-            // NO per-addon cap here. There used to be a `.prefix(6)`, which
-            // silently disagreed with every other enumeration in the app:
-            // Settings → Layout, Discover, the collection source picker and the
-            // sync payload all list a catalog addon's FULL set. So an addon
-            // declaring more than six usable catalogs (the TMDB addon has ten,
-            // AIOLists-style configs have far more) showed rows in Layout that
-            // could be renamed, reordered and toggled on — and then never
-            // appeared on Home, because the key wasn't in `catalogByKey` and
-            // the loop below quietly skips keys it can't resolve.
-            // The row ceiling that actually protects the focus engine is
-            // `AddonSweepLimits.maxHomeRows`, applied to the merged order a few
-            // lines down — i.e. against the user's OWN ranking, so the cut is
-            // the rows they placed last rather than an arbitrary six per addon.
-            for catalog in (addon.manifest.catalogs ?? []) where !catalog.requiresExtra {
+            for catalog in (addon.manifest.catalogs ?? []).filter({ !$0.requiresExtra }).prefix(6) {
                 let key = HomeCatalogSettingsStore.catalogKey(
-                    addon: addon, catalog: catalog, namespaces: namespaces
+                    addonID: addon.manifest.id, type: catalog.type, catalogID: catalog.id
                 )
                 guard catalogByKey[key] == nil else { continue }
                 catalogKeys.append(key)

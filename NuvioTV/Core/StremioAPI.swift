@@ -138,16 +138,6 @@ enum StremioAPI {
         if let search, !search.isEmpty {
             extras.append("search=\(encodePathComponent(search))")
         } else {
-            // Required extras the catalog can answer for itself (see
-            // ManifestCatalog.autoExtras). Without these the addon rejects the
-            // request or returns nothing — Cinemeta's "by year" catalogs
-            // REQUIRE `genre`, so unfilled they were dead everywhere. An
-            // explicit `genre` from the caller (the Discover picker) wins over
-            // the auto-filled one.
-            for auto in catalog.autoExtras {
-                if auto.name == "genre", genre?.isEmpty == false { continue }
-                extras.append("\(encodePathComponent(auto.name))=\(encodePathComponent(auto.value))")
-            }
             if let genre, !genre.isEmpty { extras.append("genre=\(encodePathComponent(genre))") }
             if let skip, skip > 0 { extras.append("skip=\(skip)") }
         }

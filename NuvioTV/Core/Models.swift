@@ -131,49 +131,11 @@ struct ManifestCatalog: Codable, Identifiable, Hashable {
     let extraRequired: [String]?
     let extraSupported: [String]?
 
-    /// Every extra this catalog REQUIRES, from either spelling of the field
-    /// (`extraRequired: [...]` and/or `extra: [{isRequired: true}]`).
-    var requiredExtraNames: [String] {
-        var names: [String] = []
-        var seen = Set<String>()
-        for name in extraRequired ?? [] where seen.insert(name).inserted { names.append(name) }
-        for e in extra ?? [] where e.isRequired == true {
-            guard let name = e.name, seen.insert(name).inserted else { continue }
-            names.append(name)
-        }
-        return names
-    }
-
-    /// Values we can supply for the required extras without asking the user:
-    /// a required extra that ships an `options` list is satisfied by its FIRST
-    /// option, which is what the official clients do (Cinemeta's "by year"
-    /// catalogs require `genre` and list every year — Stremio just picks one).
-    /// `search` is never auto-filled: a search catalog has no standalone form.
-    /// Returned in manifest order so the request path stays deterministic.
-    var autoExtras: [(name: String, value: String)] {
-        requiredExtraNames.compactMap { name in
-            guard name != "search",
-                  let option = extra?.first(where: { $0.name == name })?.options?.first,
-                  !option.isEmpty
-            else { return nil }
-            return (name, option)
-        }
-    }
-
-    /// True when this catalog needs an extra we CANNOT provide on our own —
-    /// a search term, or a required extra with no `options` to pick from
-    /// (Cinemeta's `lastVideosIds` / `calendarVideosIds`). Those can't be shown
-    /// as a plain row or browsed, so they're filtered out of Home, Discover,
-    /// Settings → Layout and the collection source picker.
-    ///
-    /// A catalog whose required extras are ALL auto-fillable is NOT in this
-    /// bucket: it renders like any other catalog, with `StremioAPI.catalog`
-    /// filling the required values in.
+    /// Catalogs that require an extra argument (search, genre...) cannot be
+    /// shown as plain home rows.
     var requiresExtra: Bool {
-        let required = requiredExtraNames
-        guard !required.isEmpty else { return false }
-        let satisfiable = Set(autoExtras.map(\.name))
-        return required.contains { !satisfiable.contains($0) }
+        if let extraRequired, !extraRequired.isEmpty { return true }
+        return extra?.contains { $0.isRequired == true } ?? false
     }
 
     var supportsSearch: Bool {

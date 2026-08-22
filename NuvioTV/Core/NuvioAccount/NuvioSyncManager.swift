@@ -1531,8 +1531,7 @@ final class NuvioSyncManager: ObservableObject {
         guard account.accessToken != nil else { return }
         let payload = homeCatalogSettings.exportPayload(
             addons: addonManager.catalogAddons,
-            collections: collectionsStore.collections,
-            namespaces: addonManager.catalogKeyNamespaces
+            collections: collectionsStore.collections
         )
         guard let encoded = try? JSONEncoder().encode(payload),
               let localJSON = try? JSONSerialization.jsonObject(with: encoded) as? [String: Any] else { return }

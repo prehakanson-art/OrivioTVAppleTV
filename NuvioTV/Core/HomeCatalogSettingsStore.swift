@@ -243,25 +243,6 @@ final class HomeCatalogSettingsStore: ObservableObject {
         "\(addonID)_\(type)_\(catalogID)"
     }
 
-    /// The key for one catalog of one INSTALLED addon.
-    ///
-    /// Keys are built from the addon's manifest id (the Android wire format),
-    /// but addons are installed by manifest URL — so two configured instances
-    /// of the same addon (two AIOLists / TMDB / MDBList configs, a common way
-    /// to run several custom catalogs) produced byte-identical keys. Everything
-    /// that de-duplicates by key — Home, Settings → Layout, the sync payload —
-    /// then kept only the FIRST instance and silently dropped the other's
-    /// catalogs. `namespaces` (from `AddonManager.catalogKeyNamespaces`) hands
-    /// the first install the bare, syncable id and gives later ones a suffix.
-    nonisolated static func catalogKey(
-        addon: InstalledAddon, catalog: ManifestCatalog, namespaces: [String: String]
-    ) -> String {
-        catalogKey(
-            addonID: namespaces[addon.manifestURL] ?? addon.manifest.id,
-            type: catalog.type, catalogID: catalog.id
-        )
-    }
-
     nonisolated static func collectionKey(_ collectionID: String) -> String {
         "collection_\(collectionID)"
     }
@@ -395,17 +376,14 @@ final class HomeCatalogSettingsStore: ObservableObject {
     /// (then collections), exactly like Android's buildHomeCatalogSyncPayload;
     /// disabled keys and custom titles ship as-is (they already include anything
     /// pulled from the phone, so cross-device state isn't dropped).
-    func exportPayload(
-        addons: [InstalledAddon], collections: [NuvioCollection],
-        namespaces: [String: String] = [:]
-    ) -> SyncHomeCatalogPayload {
+    func exportPayload(addons: [InstalledAddon], collections: [NuvioCollection]) -> SyncHomeCatalogPayload {
         var catalogKeys: [String] = []
         var collectionKeys: [String] = []
         var seen = Set<String>()
 
         for addon in addons {
             for catalog in (addon.manifest.catalogs ?? []) where !catalog.requiresExtra {
-                let key = Self.catalogKey(addon: addon, catalog: catalog, namespaces: namespaces)
+                let key = Self.catalogKey(addonID: addon.manifest.id, type: catalog.type, catalogID: catalog.id)
                 guard seen.insert(key).inserted else { continue }
                 catalogKeys.append(key)
             }
