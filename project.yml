@@ -84,6 +84,13 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.orivio.tv.appletv
+        # Signing team for device builds, HERE rather than only in the
+        # generated pbxproj: Xcode's GUI writes the team into project.pbxproj,
+        # where any xcodegen regeneration (or a git checkout of the file)
+        # silently drops it — and a device build then dies with "Signing for
+        # 'NuvioTV' requires a development team".
+        DEVELOPMENT_TEAM: CYCSPZ5MTR
+        CODE_SIGN_STYLE: Automatic
         SWIFT_VERSION: "5.9"
         TARGETED_DEVICE_FAMILY: "3"
         # Tracks the Android APK release this port mirrors (v0.7.15-beta).
