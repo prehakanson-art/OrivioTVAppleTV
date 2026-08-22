@@ -36,9 +36,22 @@ struct CinemaHomeView: View {
     private var catalogRows: [HomeRow] {
         viewModel.entries.compactMap { if case .catalog(let r) = $0 { return r } else { return nil } }
     }
+    /// Catalog items by id, built ONCE per body pass. The art fallback below
+    /// used to call `catalogRows` per Continue-Watching item and then linear-
+    /// scan every row's items for a match — with 45 rows × 30 items and a dozen
+    /// CW cards that is tens of thousands of comparisons, redone on every
+    /// single body evaluation of this screen.
+    private var catalogItemsByID: [String: MetaItem] {
+        var out: [String: MetaItem] = [:]
+        for row in catalogRows {
+            for item in row.items where out[item.id] == nil { out[item.id] = item }
+        }
+        return out
+    }
     private var continueItems: [WatchProgress] {
-        progressStore.continueWatching(sortMode: homeCatalogSettings.continueWatchingSortMode)
-            .map(progressWithCatalogArt)
+        let pool = catalogItemsByID
+        return progressStore.continueWatching(sortMode: homeCatalogSettings.continueWatchingSortMode)
+            .map { progressWithCatalogArt($0, pool: pool) }
     }
     /// What the hero shows before any card has been focused.
     private var heroFallback: MetaItem? { viewModel.initialHero ?? catalogRows.first?.items.first }
@@ -142,16 +155,14 @@ struct CinemaHomeView: View {
     }
 
     private func metaFor(_ p: WatchProgress) -> MetaItem {
-        for row in catalogRows {
-            if let m = row.items.first(where: { $0.id == p.metaID }) { return m }
-        }
+        if let m = catalogItemsByID[p.metaID] { return m }
         return MetaItem(id: p.metaID, type: p.type, name: p.name,
                         poster: p.poster, background: p.background, logo: p.logo)
     }
 
-    private func progressWithCatalogArt(_ progress: WatchProgress) -> WatchProgress {
+    private func progressWithCatalogArt(_ progress: WatchProgress, pool: [String: MetaItem]) -> WatchProgress {
         guard (progress.poster == nil || progress.background == nil || progress.name.isEmpty),
-              let meta = catalogRows.lazy.flatMap(\.items).first(where: { $0.id == progress.metaID }) else {
+              let meta = pool[progress.metaID] else {
             return progress
         }
         return progress.withFallbackMetadata(meta)
@@ -348,7 +359,9 @@ extension View {
 }
 
 private struct CinemaContinueCard: View {
-    @EnvironmentObject private var progressStore: ProgressStore
+    // See CinemaPosterCard: the store subscription belongs to the shared hold-
+    // menu modifier, not to the card. ProgressStore publishes on every playback
+    // save and every sync pull.
     @EnvironmentObject private var theme: ThemeManager
     @ObservedObject private var perf = PerformanceSettingsStore.shared
     @FocusState private var focused: Bool
@@ -377,13 +390,9 @@ private struct CinemaContinueCard: View {
             .cinemaCardStyle(parallax)
             .focused($focused)
             .focused(focusID, equals: progress.id)
-            .contextMenu {
-                Button { onDetails() } label: { Label("Go to Details", systemImage: "info.circle") }
-                Button { onResumeFromStart() } label: { Label("Start from Beginning", systemImage: "gobackward") }
-                Button(role: .destructive) {
-                    progressStore.removeShow(metaID: progress.metaID, notifyTrakt: true)
-                } label: { Label("Remove from Continue Watching", systemImage: "xmark") }
-            }
+            .continueHoldMenu(progress, onDetails: onDetails,
+                              onPlayManually: onDetails,
+                              onResumeFromStart: onResumeFromStart)
             .onChange(of: focused) { _, f in if f { onFocus() } }
 
             Text(progress.name)
@@ -508,8 +517,13 @@ private func cinemaBackToStart(_ proxy: ScrollViewProxy, first: String?, focused
 }
 
 private struct CinemaPosterCard: View {
-    @EnvironmentObject private var library: LibraryStore
-    @EnvironmentObject private var watched: WatchedStore
+    // NO @EnvironmentObject for LibraryStore / WatchedStore here. The hold menu
+    // needs them, but declaring them on the CARD subscribes the card's whole
+    // body — artwork, overlays, shadow — to both stores, so every visible card
+    // rebuilt whenever either published. They publish on every sync pull, so
+    // browsing during a sync rebuilt the entire visible grid. The shared
+    // `posterHoldMenu` modifier owns those subscriptions instead, which is why
+    // it exists; only the menu re-renders.
     @EnvironmentObject private var theme: ThemeManager
     @ObservedObject private var perf = PerformanceSettingsStore.shared
     @FocusState private var focused: Bool
@@ -534,17 +548,7 @@ private struct CinemaPosterCard: View {
             .cinemaCardStyle(parallax)
             .focused($focused)
             .focused(focusID, equals: item.id)
-            .contextMenu {
-                Button { onSelect() } label: { Label("Go to Details", systemImage: "info.circle") }
-                Button { library.toggle(item) } label: {
-                    Label(library.contains(item) ? "Remove from Library" : "Add to Library",
-                          systemImage: library.contains(item) ? "bookmark.slash" : "bookmark")
-                }
-                Button { watched.toggleMovie(item) } label: {
-                    Label(watched.isWatched(item) ? "Mark as Unwatched" : "Mark as Watched",
-                          systemImage: watched.isWatched(item) ? "eye.slash" : "checkmark.circle")
-                }
-            }
+            .posterHoldMenu(item, onDetails: onSelect)
             .onChange(of: focused) { _, f in if f { onFocus() } }
 
             if landscape {
