@@ -383,7 +383,14 @@ private struct OnyxCatalogRow: View {
     }
 }
 
-private struct OnyxPosterCard: View {
+/// Equatable so a focus step — which writes the row's @FocusState and re-runs
+/// the row body — skips the bodies of unchanged cards instead of rebuilding
+/// every card in the row. Same gate the classic home's HomePosterCell uses;
+/// focus visuals and store changes invalidate through their own dependencies,
+/// which bypass ==.
+private struct OnyxPosterCard: View, Equatable {
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.item == rhs.item }
+
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var watched: WatchedStore
     let item: MetaItem
@@ -499,7 +506,10 @@ private struct OnyxContinueRow: View {
     }
 }
 
-private struct OnyxContinueCard: View {
+/// Equatable for the same reason as OnyxPosterCard.
+private struct OnyxContinueCard: View, Equatable {
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.progress == rhs.progress }
+
     @EnvironmentObject private var progressStore: ProgressStore
     let progress: WatchProgress
     let onResume: () -> Void

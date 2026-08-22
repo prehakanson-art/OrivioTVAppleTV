@@ -1,11 +1,5 @@
 import SwiftUI
 
-// Cinema theme — a from-scratch home screen. Owns its hero, rows, and cards;
-// reuses NOTHING from the retired Modern/Nova themes. Only the shared DATA layer
-// (HomeViewModel, ProgressStore) and the shared detail route are reused. Every
-// card carries its OWN `.contextMenu`, so hold menus work everywhere — including
-// Continue Watching, which is the whole point of the rebuild.
-
 struct CinemaHomeView: View {
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var addonManager: AddonManager
@@ -358,7 +352,10 @@ extension View {
     }
 }
 
-private struct CinemaContinueCard: View {
+/// Equatable for the same reason as CinemaPosterCard.
+private struct CinemaContinueCard: View, Equatable {
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.progress == rhs.progress }
+
     // See CinemaPosterCard: the store subscription belongs to the shared hold-
     // menu modifier, not to the card. ProgressStore publishes on every playback
     // save and every sync pull.
@@ -516,7 +513,19 @@ private func cinemaBackToStart(_ proxy: ScrollViewProxy, first: String?, focused
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { setFocus(first) }
 }
 
-private struct CinemaPosterCard: View {
+/// Equatable so a focus step — which writes the ROW's @FocusState and re-runs
+/// the row body — skips the bodies of unchanged cards. Without this every card
+/// in the row rebuilt its button/artwork/menu tree on every single D-pad step
+/// (measured: ~13 card bodies per press, against the ~2 that actually change).
+/// `==` covers the data and layout inputs only; the closures are stable for the
+/// life of the row, and this card's own focus visuals invalidate through its
+/// internal @FocusState, which bypasses the == gate. Same pattern the classic
+/// home's HomePosterCell already uses.
+private struct CinemaPosterCard: View, Equatable {
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.item == rhs.item && lhs.landscape == rhs.landscape
+    }
+
     // NO @EnvironmentObject for LibraryStore / WatchedStore here. The hold menu
     // needs them, but declaring them on the CARD subscribes the card's whole
     // body — artwork, overlays, shadow — to both stores, so every visible card

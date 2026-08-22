@@ -431,7 +431,17 @@ private struct StremioSkeletonRow: View {
 /// Stremio's warm near-white focus FRAME (#F2F2F2, not purple), a glossy sheen
 /// and the episode-count / progress badges. Posters are slightly squarer than a
 /// standard 2:3 movie poster (width × 1.42), matching the real app.
-struct StremioPosterCard: View {
+/// Equatable so a focus step — which writes the row's @FocusState and re-runs
+/// the row body — skips the bodies of unchanged cards instead of rebuilding
+/// every card in the row. Same gate the classic home's HomePosterCell uses;
+/// focus visuals and store changes invalidate through their own dependencies,
+/// which bypass ==.
+struct StremioPosterCard: View, Equatable {
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.item == rhs.item && lhs.width == rhs.width
+            && lhs.landscape == rhs.landscape && lhs.parallax == rhs.parallax
+    }
+
     @EnvironmentObject private var progressStore: ProgressStore
     @EnvironmentObject private var library: LibraryStore
     @ObservedObject private var perf = PerformanceSettingsStore.shared
@@ -568,7 +578,12 @@ private struct StremioContinueRow: View {
 
 /// Continue-Watching card — a PORTRAIT poster with the purple library check and a
 /// thin progress bar, exactly like the real Stremio board (no title / play icon).
-private struct StremioContinueCard: View {
+/// Equatable for the same reason as StremioPosterCard.
+private struct StremioContinueCard: View, Equatable {
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.progress == rhs.progress && lhs.parallax == rhs.parallax
+    }
+
     @ObservedObject private var perf = PerformanceSettingsStore.shared
     @Environment(\.isFocused) private var isFocused
     let progress: WatchProgress
