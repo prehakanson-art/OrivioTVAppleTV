@@ -197,7 +197,13 @@ struct FusionFolderStack: View {
     }
 }
 
-struct CollectionTileCard: View {
+/// Equatable so a focus step — which writes the row's @FocusState and re-runs
+/// the row body — skips the bodies of unchanged tiles instead of rebuilding
+/// every one in the row. Focus visuals come through \.isFocused, which
+/// bypasses the == gate.
+struct CollectionTileCard: View, Equatable {
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.collection == rhs.collection }
+
     @EnvironmentObject private var theme: ThemeManager
     @ObservedObject private var perf = PerformanceSettingsStore.shared
     @Environment(\.isFocused) private var isFocused
@@ -286,7 +292,18 @@ struct CollectionTileCard: View {
     private var glowEnabled: Bool { collection.focusGlowEnabled ?? true }
 }
 
-struct CollectionFolderCard: View {
+/// Equatable so a focus step — which writes the row's @FocusState and re-runs
+/// the row body — skips the bodies of unchanged tiles instead of rebuilding
+/// every tile in the row. This row is rendered by EVERY theme, and a real
+/// library has collections with 100-200 folders in one strip. Focus visuals
+/// come through \.isFocused, which bypasses the == gate.
+struct CollectionFolderCard: View, Equatable {
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.folder == rhs.folder && lhs.fallbackTitle == rhs.fallbackTitle
+            && lhs.glowEnabled == rhs.glowEnabled && lhs.showTitle == rhs.showTitle
+            && lhs.forceLandscape == rhs.forceLandscape
+    }
+
     @EnvironmentObject private var theme: ThemeManager
     @ObservedObject private var perf = PerformanceSettingsStore.shared
     @Environment(\.isFocused) private var isFocused

@@ -598,7 +598,16 @@ private struct OnyxContinueLabel: View {
 
 /// The 560pt landscape art shown when a card is focused (Modern). Reused by both
 /// catalog posters (logo overlay) and Continue Watching (episode summary).
-private struct OnyxLandscapeCard: View {
+/// Equatable so a focus step — which writes the row's @FocusState and re-runs
+/// the row body — skips the bodies of unchanged tiles instead of rebuilding
+/// every one in the row. Focus visuals come through \.isFocused, which
+/// bypasses the == gate.
+private struct OnyxLandscapeCard: View, Equatable {
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.url == rhs.url && lhs.logo == rhs.logo && lhs.title == rhs.title
+            && lhs.summary == rhs.summary && lhs.progressFraction == rhs.progressFraction
+    }
+
     let url: String?
     let logo: String?
     let title: String
@@ -648,7 +657,12 @@ private struct OnyxLandscapeCard: View {
     }
 }
 
-private struct OnyxContinueSummary: View {
+private struct OnyxContinueSummary: View, Equatable {
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.episode == rhs.episode && lhs.title == rhs.title
+            && lhs.episodeTitle == rhs.episodeTitle
+    }
+
     let episode: String?
     let title: String
     let episodeTitle: String?

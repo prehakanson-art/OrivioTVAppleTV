@@ -320,7 +320,13 @@ struct LiveTVView: View {
 }
 
 /// A landscape channel tile — logo on a dark plate with the name underneath.
-private struct ChannelCard: View {
+/// Equatable so a focus step — which writes the row's @FocusState and re-runs
+/// the row body — skips the bodies of unchanged tiles instead of rebuilding
+/// every one in the row. Focus visuals come through \.isFocused, which
+/// bypasses the == gate.
+private struct ChannelCard: View, Equatable {
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.channel == rhs.channel }
+
     @EnvironmentObject private var theme: ThemeManager
     @ObservedObject private var perf = PerformanceSettingsStore.shared
     @Environment(\.isFocused) private var isFocused

@@ -98,7 +98,14 @@ struct MaxPosterRail: View {
 /// The morphing poster: portrait art at rest, a 560pt landscape card on focus.
 /// White border is the focus signal (Max's flat highlight); the title name fades
 /// in beneath, its space always reserved so the row never jumps vertically.
-struct MaxPosterCard: View {
+/// Equatable so a focus step — which writes the row's @FocusState and re-runs
+/// the row body — skips the bodies of unchanged cards instead of rebuilding
+/// every card in the row. Same gate the classic home's HomePosterCell uses;
+/// focus visuals and store changes invalidate through their own dependencies,
+/// which bypass ==.
+struct MaxPosterCard: View, Equatable {
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.title == rhs.title }
+
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var watched: WatchedStore
     let title: MaxTitle
@@ -222,7 +229,12 @@ private struct MaxLandscapeArt: View {
 
 /// A plain 2:3 poster — white border + scale on focus, title fades in below.
 /// Used in grids (Search / My Stuff / Categories) and behind the Top 10 numerals.
-struct MaxPortraitCard: View {
+/// Equatable for the same reason as MaxPosterCard.
+struct MaxPortraitCard: View, Equatable {
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.title == rhs.title && lhs.width == rhs.width
+    }
+
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var watched: WatchedStore
     @ObservedObject private var perf = PerformanceSettingsStore.shared
@@ -263,7 +275,10 @@ struct MaxPortraitCard: View {
 /// A 2:3 poster that FILLS its grid column (no fixed width), so a LazyVGrid never
 /// overflows and overlaps its neighbours regardless of column count / area width.
 /// Used in every grid (Search / My Stuff / Categories / hub genre lists).
-struct MaxGridCard: View {
+/// Equatable for the same reason as MaxPosterCard.
+struct MaxGridCard: View, Equatable {
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.title == rhs.title }
+
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var watched: WatchedStore
     let title: MaxTitle

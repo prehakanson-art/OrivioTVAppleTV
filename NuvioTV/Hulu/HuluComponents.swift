@@ -19,7 +19,15 @@ struct HuluRail: Identifiable {
 
 // MARK: - Rich tall tile
 
-struct HuluRichTile: View {
+/// Equatable so a focus step — which writes the row's @FocusState and re-runs
+/// the row body — skips the bodies of unchanged tiles instead of rebuilding
+/// every one in the row. Focus visuals come through \.isFocused, which
+/// bypasses the == gate.
+struct HuluRichTile: View, Equatable {
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.title == rhs.title && lhs.width == rhs.width
+    }
+
     let title: HuluTitle
     var width: CGFloat = 300
     var focus: FocusState<Bool>.Binding? = nil
@@ -62,7 +70,12 @@ struct HuluRichTile: View {
 
 // MARK: - Landscape card
 
-struct HuluLandscapeCard: View {
+/// Equatable for the same reason as HuluPosterCard.
+struct HuluLandscapeCard: View, Equatable {
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.title == rhs.title && lhs.width == rhs.width
+    }
+
     let title: HuluTitle
     var width: CGFloat = 380
     var focus: FocusState<Bool>.Binding? = nil
@@ -102,7 +115,16 @@ struct HuluLandscapeCard: View {
 
 // MARK: - Ranked poster card
 
-struct HuluPosterCard: View {
+/// Equatable so a focus step — which writes the row's @FocusState and re-runs
+/// the row body — skips the bodies of unchanged cards instead of rebuilding
+/// every card in the row. Same gate the classic home's HomePosterCell uses;
+/// focus visuals and store changes invalidate through their own dependencies,
+/// which bypass ==.
+struct HuluPosterCard: View, Equatable {
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.title == rhs.title && lhs.rank == rhs.rank && lhs.width == rhs.width
+    }
+
     @EnvironmentObject private var theme: ThemeManager
     @ObservedObject private var perf = PerformanceSettingsStore.shared
     let title: HuluTitle
@@ -154,7 +176,13 @@ struct HuluPosterCard: View {
 
 // MARK: - Progress card (Continue Watching / My Stuff)
 
-struct HuluProgressCard: View {
+/// Equatable for the same reason as HuluPosterCard.
+struct HuluProgressCard: View, Equatable {
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.title == rhs.title && lhs.label == rhs.label && lhs.subtitle == rhs.subtitle
+            && lhs.progress == rhs.progress && lhs.badge == rhs.badge && lhs.width == rhs.width
+    }
+
     @EnvironmentObject private var theme: ThemeManager
     @ObservedObject private var perf = PerformanceSettingsStore.shared
     let title: HuluTitle
