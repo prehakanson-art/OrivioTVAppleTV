@@ -701,10 +701,15 @@ final class ThemeManager: ObservableObject {
         font = s.font
         experienceMode = s.experienceMode
         settingsUiStyle = s.settingsUiStyle
+        // Keep the CURRENT theme when the remote snapshot doesn't carry one
+        // (a blob from an older build, or one whose id this build doesn't
+        // know) — same rule as the look axes below. Falling back to the
+        // DEFAULT here meant a stale blob reverted a just-picked theme to
+        // Classic on the next pull.
         appThemeID = Self.launchThemeOverride
             ?? s.appThemeID.flatMap { id in AppThemes.all.contains { $0.id == id } ? id : nil }
-            ?? AppThemes.defaultID
-        atvAppearance = Self.launchAppearanceOverride ?? s.atvAppearance ?? .system
+            ?? appThemeID
+        atvAppearance = Self.launchAppearanceOverride ?? s.atvAppearance ?? atvAppearance
         // Keep the CURRENT (locally-chosen) look axes when the remote snapshot
         // doesn't specify them — otherwise an older blob (nil fields) would stomp
         // a selection the user just made in Settings back to Orivio.

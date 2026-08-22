@@ -1773,7 +1773,19 @@ final class NuvioSyncManager: ObservableObject {
     /// applyRemote would clobber the not-yet-pushed local edit. The generation
     /// counter guards a race: a push that was already in flight when a NEWER
     /// edit arrived must not clear the flag that newer edit just set.
-    private var appPreferencesDirty = false
+    ///
+    /// PERSISTED across launches. The edit itself lands in UserDefaults
+    /// instantly, but the push rides a 1.5s debounce plus a network round
+    /// trip — and on the 2 GB Apple TV HD, tvOS jetsams the backgrounded app
+    /// long before a slow push completes. With the flag in memory only, the
+    /// next launch saw nothing dirty, pulled first, and applyRemote overwrote
+    /// the local edit with the stale server blob: pick a theme, watch it
+    /// revert to Classic a few minutes later. Now a killed-before-push edit
+    /// re-flushes on the next sync BEFORE the pull, so local wins.
+    private var appPreferencesDirty = UserDefaults.standard.bool(forKey: appPrefsDirtyKey) {
+        didSet { UserDefaults.standard.set(appPreferencesDirty, forKey: Self.appPrefsDirtyKey) }
+    }
+    private static let appPrefsDirtyKey = "nuvio.sync.appPrefsDirty.v1"
     private var appPrefsGeneration = 0
 
     private func scheduleAppPreferencesPush() {
