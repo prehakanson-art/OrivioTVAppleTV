@@ -1878,7 +1878,7 @@ final class NuvioSyncManager: ObservableObject {
             // this one has never seen, and the library is account-wide.
             collectionsStore.mergeIntoLibrary(collections)
         }
-        collectionsStore.applyRemoteHidden(Set(snapshot.hiddenCollectionIDs ?? []))
+        collectionsStore.applyRemoteHidden(snapshot.hiddenCollectionIDs.map(Set.init))
         // Only apply when the remote blob actually CARRIES these keys. A blob
         // written before they existed decodes them as nil, and treating nil as
         // "empty" let the pull wipe a local choice before the push in the same

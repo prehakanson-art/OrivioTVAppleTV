@@ -398,6 +398,7 @@ final class CollectionsStore: ObservableObject {
     /// handled by the caller).
     func applyRemoteGlobalHidden(_ ids: Set<String>) {
         guard ids != globalHiddenIDs else { return }
+        NSLog("[OrivioCollections] applyRemoteGlobalHidden %d->%d", globalHiddenIDs.count, ids.count)
         suppressChange = true
         defer { suppressChange = false }
         globalHiddenIDs = ids
@@ -407,6 +408,8 @@ final class CollectionsStore: ObservableObject {
 
     func applyRemoteHiddenFolders(profile: Set<String>, global: Set<String>) {
         guard profile != hiddenFolderIDs || global != globalHiddenFolderIDs else { return }
+        NSLog("[OrivioCollections] applyRemoteHiddenFolders profile %d->%d global %d->%d",
+              hiddenFolderIDs.count, profile.count, globalHiddenFolderIDs.count, global.count)
         suppressChange = true
         defer { suppressChange = false }
         hiddenFolderIDs = profile
@@ -512,8 +515,14 @@ final class CollectionsStore: ObservableObject {
     }
 
     /// Apply a pulled hidden-set for the active profile without echoing back.
-    func applyRemoteHidden(_ ids: Set<String>) {
-        guard ids != hiddenIDs else { return }
+    /// Apply this profile's hidden set from the account. `nil` means the blob
+    /// doesn't CARRY the key (written before it existed) — which must not be
+    /// read as "nothing is hidden", or the pull un-hides collections the user
+    /// switched off and the next push writes that back. Same rule the
+    /// account-wide setters below already follow.
+    func applyRemoteHidden(_ ids: Set<String>?) {
+        guard let ids, ids != hiddenIDs else { return }
+        NSLog("[OrivioCollections] applyRemoteHidden %d->%d (p%d)", hiddenIDs.count, ids.count, profileID)
         suppressChange = true
         defer { suppressChange = false }
         hiddenIDs = ids
@@ -564,7 +573,7 @@ final class CollectionsStore: ObservableObject {
 
     private func recomputeVisible() {
         let hiddenFolders = effectiveHiddenFolders
-        collections = library.compactMap { collection in
+        let next: [NuvioCollection] = library.compactMap { collection in
             guard !hiddenIDs.contains(collection.id),
                   !globalHiddenIDs.contains(collection.id) else { return nil }
             guard !hiddenFolders.isEmpty else { return collection }
@@ -574,6 +583,18 @@ final class CollectionsStore: ObservableObject {
             // show — drop the empty row rather than render a dead tile.
             return trimmed.folders.isEmpty ? nil : trimmed
         }
+        // Publish ONLY on a real change. One account sync calls this five or
+        // six times over (library merge, prefs blob, profile-hidden,
+        // account-hidden, hidden folders), and an unconditional assignment
+        // republished `collections` every time even when the visible set was
+        // identical. Home rebuilds its rows on that publish, so a login turned
+        // into a burst of full Home reloads — the collections row blinking in
+        // and out until the last one settled.
+        guard next != collections else { return }
+        NSLog("[OrivioCollections] visible=%d/%d hiddenIDs=%d global=%d hiddenFolders=%d (p%d)",
+              next.count, library.count, hiddenIDs.count,
+              globalHiddenIDs.count, hiddenFolders.count, profileID)
+        collections = next
     }
 
     // MARK: Persistence

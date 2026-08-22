@@ -242,6 +242,35 @@ struct RootView: View {
                     // launch (same code path as the Settings button) — lets a
                     // flooded device be repaired over devicectl without driving
                     // the tvOS UI. Waits for sign-in state to settle first.
+                    // Dev/recovery: import Continue Watching rows from
+                    // Documents/orivio-progress-restore.json (an array of
+                    // WatchProgress, e.g. lifted from a device backup) and push
+                    // them to the account. Each row is re-stamped to NOW, both
+                    // so it wins over anything stale and so it sits after the
+                    // watch-history clear horizon instead of being filtered out
+                    // by it on the next pull.
+                    if args.contains("-restoreProgress") {
+                        Task { @MainActor [weak nuvioSync] in
+                            try? await Task.sleep(nanoseconds: 6_000_000_000)
+                            let url = FileManager.default
+                                .urls(for: .documentDirectory, in: .userDomainMask)[0]
+                                .appendingPathComponent("orivio-progress-restore.json")
+                            guard let data = try? Data(contentsOf: url),
+                                  let rows = try? JSONDecoder().decode([WatchProgress].self, from: data)
+                            else {
+                                NSLog("[OrivioSync] -restoreProgress: no readable payload at %@", url.path)
+                                return
+                            }
+                            let stamped = rows.map { row -> WatchProgress in
+                                var copy = row
+                                copy.updatedAt = Date()
+                                return copy
+                            }
+                            progressStore.importEntries(stamped)
+                            await nuvioSync?.pushThisDevice()
+                            NSLog("[OrivioSync] -restoreProgress: imported %d rows", stamped.count)
+                        }
+                    }
                     if args.contains("-clearWatchHistory") {
                         Task { @MainActor [weak nuvioSync] in
                             try? await Task.sleep(nanoseconds: 8_000_000_000)
