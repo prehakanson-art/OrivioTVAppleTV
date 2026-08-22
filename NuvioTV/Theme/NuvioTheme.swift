@@ -604,6 +604,7 @@ final class ThemeManager: ObservableObject {
     private static let experienceKey = "nuvio.theme.experience"
     private static let settingsStyleKey = "nuvio.theme.settingsstyle"
     private static let appThemeKey = "nuvio.theme.appTheme"
+    private static let explicitAppThemeKey = "nuvio.theme.appTheme.chosenHere.v1"
     private static let atvAppearanceKey = "nuvio.theme.atvAppearance"
     private static let detailStyleKey = "nuvio.theme.detailStyle"
     private static let profileStyleKey = "nuvio.theme.profileStyle"
@@ -706,9 +707,17 @@ final class ThemeManager: ObservableObject {
         // know) — same rule as the look axes below. Falling back to the
         // DEFAULT here meant a stale blob reverted a just-picked theme to
         // Classic on the next pull.
-        appThemeID = Self.launchThemeOverride
-            ?? s.appThemeID.flatMap { id in AppThemes.all.contains { $0.id == id } ? id : nil }
-            ?? appThemeID
+        // A theme chosen on this device wins over the blob's (see
+        // hasExplicitAppTheme). Without that, every profile switch — which runs
+        // a full sync — reapplied that profile's stored theme over the user's
+        // pick, and the push right after made the revert permanent.
+        if let forced = Self.launchThemeOverride {
+            appThemeID = forced
+        } else if !hasExplicitAppTheme,
+                  let remote = s.appThemeID,
+                  AppThemes.all.contains(where: { $0.id == remote }) {
+            appThemeID = remote
+        }
         atvAppearance = Self.launchAppearanceOverride ?? s.atvAppearance ?? atvAppearance
         // Keep the CURRENT (locally-chosen) look axes when the remote snapshot
         // doesn't specify them — otherwise an older blob (nil fields) would stomp
@@ -722,7 +731,27 @@ final class ThemeManager: ObservableObject {
 
     /// The currently selected app theme.
     var appTheme: AppTheme { AppThemes.theme(id: appThemeID) }
-    func setAppTheme(_ t: AppTheme) { appThemeID = t.id }
+    /// The user picking a theme in Settings — as opposed to one arriving from
+    /// the account. Records that THIS DEVICE has an explicit choice, which then
+    /// outranks anything a pulled blob carries (see `applyRemote`).
+    func setAppTheme(_ t: AppTheme) {
+        hasExplicitAppTheme = true
+        appThemeID = t.id
+    }
+
+    /// Whether someone has chosen a theme on this device.
+    ///
+    /// This matters because the theme is a DEVICE-level look but it rides the
+    /// per-PROFILE preferences blob. Switching profiles runs a full sync, whose
+    /// pull carries that profile's stored theme — so picking Cinema on one
+    /// profile and later switching to another silently reverted the look, and
+    /// the following push wrote the reverted value back. Once the user has
+    /// picked here, a pulled theme no longer overrides it; a device that has
+    /// never chosen still adopts the account's, so a fresh install looks right.
+    private(set) var hasExplicitAppTheme: Bool {
+        get { UserDefaults.standard.bool(forKey: Self.explicitAppThemeKey) }
+        set { UserDefaults.standard.set(newValue, forKey: Self.explicitAppThemeKey) }
+    }
 
     /// Root-level font design applied app-wide. Fusion routes Serif to headings
     /// ONLY (§8), so the global design stays sans when Serif is picked and the

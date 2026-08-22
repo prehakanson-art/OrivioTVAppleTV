@@ -236,6 +236,17 @@ struct RootView: View {
                         selectedTab = 1
                         searchPath.append(Route.discover)
                     }
+                    // Dev: pick a theme exactly as Settings does (persisted AND
+                    // marked as an explicit choice), so the "does my pick
+                    // survive a sync/profile switch" path can be exercised
+                    // without driving the tvOS UI. Distinct from -onyxTheme &c,
+                    // which force a theme for the session only.
+                    if let picked = args.first(where: { $0.hasPrefix("-pickTheme:") })?
+                        .replacingOccurrences(of: "-pickTheme:", with: ""),
+                       let match = AppThemes.all.first(where: { $0.id == picked }) {
+                        theme.setAppTheme(match)
+                        NSLog("[OrivioTheme] -pickTheme applied: %@", match.id)
+                    }
                     // Dev: jump straight to the profile gate.
                     if args.contains("-profileGateDemo") { showProfileGate = true }
                     // Dev/recovery: run the account-wide watch-history clear on
