@@ -1865,6 +1865,14 @@ final class NuvioSyncManager: ObservableObject {
     private func pullAppPreferences() async {
         guard account.accessToken != nil,
               let playerSettings, let tmdbSettings, let themeManager else { return }
+        // A sync already PAST its "flush dirty first" step when the user picks a
+        // theme would fetch the pre-change blob and apply it here — reverting
+        // the pick, and then the debounced push would ship the REVERTED value,
+        // making it permanent. Syncs run every 60-90s and take ~30s, so that
+        // window is wide open. Snapshot the edit generation and bail if a local
+        // edit landed while this pull was in flight; the pending push ships it,
+        // and the next sync pulls cleanly.
+        let generationAtStart = appPrefsGeneration
         guard let data = try? await authedPost(
             RPC.url(RPC.pullProfileSettingsBlob),
             body: ["p_profile_id": pid, "p_platform": Self.settingsBlobPlatform]
@@ -1877,6 +1885,13 @@ final class NuvioSyncManager: ObservableObject {
                 AppPreferencesSnapshot.self, from: Data(json.utf8)
             )
         else { return }
+        guard !appPreferencesDirty, appPrefsGeneration == generationAtStart else {
+            NuvioSyncDiagnostics.record(
+                .info, area: "Orivio",
+                "Skipped applying account preferences: a local change landed while pulling."
+            )
+            return
+        }
         playerSettings.applyRemote(snapshot.player)
         tmdbSettings.applyRemote(snapshot.tmdb)
         themeManager.applyRemote(snapshot.theme)

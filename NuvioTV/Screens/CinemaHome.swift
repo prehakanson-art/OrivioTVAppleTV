@@ -30,6 +30,8 @@ struct CinemaHomeView: View {
     /// debounces the commit with a tier-aware settle window, exactly like the
     /// Classic home (see HeroFocus.settleNanos).
     @State private var hero = HeroFocus()
+    /// Focus target for Back — the hero's own button.
+    @FocusState private var heroFocused: Bool
 
     private var catalogRows: [HomeRow] {
         viewModel.entries.compactMap { if case .catalog(let r) = $0 { return r } else { return nil } }
@@ -45,29 +47,45 @@ struct CinemaHomeView: View {
         ZStack(alignment: .top) {
             theme.palette.background.ignoresSafeArea()
 
+            ScrollViewReader { proxy in
             ScrollView(.vertical) {
                 VStack(alignment: .leading, spacing: 40) {
-                    CinemaHero(hero: hero, fallback: heroFallback, onPlay: onSelect)
+                    CinemaHero(hero: hero, fallback: heroFallback, onPlay: onSelect,
+                               focusTarget: $heroFocused)
                         .frame(height: 620)
                         .focusSection()
+                        .id(Self.topAnchor)
 
                     if viewModel.isLoading && viewModel.entries.isEmpty {
                         NuvioLoadingView(label: "Loading")
                             .frame(maxWidth: .infinity).frame(height: 300)
                     } else {
-                        rows
+                        rows(backToTop: { backToTop(proxy) })
                     }
                 }
                 .padding(.bottom, 80)
             }
             .ignoresSafeArea(edges: [.top, .horizontal])
+            }
         }
         .task {
             await viewModel.loadIfNeeded(addonManager: addonManager, collections: collections, settings: homeCatalogSettings)
         }
     }
 
-    @ViewBuilder private var rows: some View {
+    private static let topAnchor = "cinema_top"
+
+    /// Back at the start of a row: scroll to the hero and put focus on it, so
+    /// the button is reachable and Up from there lands on the tab bar. The root
+    /// swallows `onExitCommand`, and the rows' `onBackAtStart` was never wired,
+    /// so Back did NOTHING anywhere on this screen — you could only climb out
+    /// by holding Up through every row.
+    private func backToTop(_ proxy: ScrollViewProxy) {
+        withAnimation(.easeOut(duration: 0.25)) { proxy.scrollTo(Self.topAnchor, anchor: .top) }
+        heroFocused = true
+    }
+
+    @ViewBuilder private func rows(backToTop: @escaping () -> Void) -> some View {
         // Collections that share one "Collections" row (viewMode != ROWS) render
         // once, at the first such entry's slot.
         let sharedCollections = viewModel.entries.compactMap { e -> NuvioCollection? in
@@ -75,21 +93,29 @@ struct CinemaHomeView: View {
         }
         let firstSharedID = sharedCollections.first?.id
 
-        VStack(alignment: .leading, spacing: 40) {
+        // LAZY: this was a plain VStack, so every row in the home — 45+ on a
+        // real account — built eagerly on load, each instantiating its own
+        // LazyHStack and kicking off artwork decodes for cards nobody had
+        // scrolled to yet. That is most of why this theme crawls on the older
+        // boxes. Trade-off, same one Onyx already takes: a row recycled off
+        // screen loses its horizontal scroll position.
+        LazyVStack(alignment: .leading, spacing: 40) {
             if !continueItems.isEmpty {
                 CinemaContinueRow(
                     items: continueItems,
                     onResume: onResume,
                     onResumeFromStart: onResumeFromStart,
                     onDetails: { onSelect(metaFor($0)) },
-                    onFocusItem: { hero.focus(metaFor($0)) }
+                    onFocusItem: { hero.focus(metaFor($0)) },
+                    onBackAtStart: backToTop
                 )
             }
             ForEach(viewModel.entries) { entry in
                 switch entry {
                 case .catalog(let row):
                     CinemaCatalogRow(row: row, onSelect: onSelect, onSeeAll: onSeeAll,
-                                     onFocusItem: { hero.focus($0) })
+                                     onFocusItem: { hero.focus($0) },
+                                     onBackAtStart: backToTop)
                 case .collection(let collection):
                     if collection.viewMode == "ROWS" {
                         // Each collection = its own row of folder buttons.
@@ -142,6 +168,8 @@ private struct CinemaHero: View {
     @ObservedObject var hero: HeroFocus
     let fallback: MetaItem?
     let onPlay: (MetaItem) -> Void
+    /// Bound to the root's Back target so Back from a row can land here.
+    var focusTarget: FocusState<Bool>.Binding
     @State private var contentRating: String?
 
     private var item: MetaItem? { hero.item ?? fallback }
@@ -195,6 +223,7 @@ private struct CinemaHero: View {
                 }
                 CinemaPlayButton(title: item?.type == "series" ? "Go to Show" : "Go to Movie",
                                  action: { if let item { onPlay(item) } })
+                    .focused(focusTarget)
                     .padding(.top, 8)
             }
             .padding(.leading, 60)
