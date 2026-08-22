@@ -646,6 +646,32 @@ final class NuvioSyncManager: ObservableObject {
         )
     }
 
+    /// USER-INITIATED clear of the whole watch history — Continue Watching and
+    /// watched items, locally AND on the account. Marks the (synced) clear
+    /// point first, so Trakt re-imports and account pulls on every install are
+    /// filtered from this moment; then deletes the account rows. The prefs
+    /// push carries the new clear point to the account right away.
+    func clearWatchHistoryEverywhere() async {
+        let clearedAt = WatchHistoryClearState.markClearedNow()
+        NuvioSyncDiagnostics.record(
+            .warning, area: "Orivio",
+            "User cleared watch history (horizon \(clearedAt)) for profile \(pid)."
+        )
+        let progressKeys = progressStore.clearAllProgress(notify: false)
+        let watchedItems = watchedStore.clearAll(notify: false)
+        guard account.accessToken != nil else { return }
+        if !progressKeys.isEmpty {
+            deleteWatchProgress(keys: progressKeys)
+            await drainPendingDeletes()
+        }
+        if !watchedItems.isEmpty {
+            deleteWatchedItems(watchedItems)
+            await drainPendingWatchedDeletes()
+        }
+        await pushAppPreferences()   // ship the clear point account-wide now
+        NuvioSyncDiagnostics.record(.success, area: "Orivio", "Watch history cleared for profile \(pid).")
+    }
+
     private func clearWatchHistoryIfNeeded() async throws -> Bool {
         guard account.accessToken != nil else { return false }
         guard !UserDefaults.standard.bool(forKey: clearedWatchHistoryKey()) else { return false }
@@ -774,6 +800,23 @@ final class NuvioSyncManager: ObservableObject {
                 updatedAt: Date(timeIntervalSince1970: Double(row.lastWatched) / 1000.0),
                 syncSource: "nuvio"
             )
+        }
+        // Enforce the (synced) watch-history clear point on the ACCOUNT
+        // snapshot too: rows older than the clear are flood remnants — a
+        // container without the clear point re-imported the full Trakt history
+        // and pushed it up. Drop them locally AND queue their server deletes,
+        // so the account converges back to the post-clear state instead of
+        // re-flooding every device on every pull.
+        if let clearedAt = WatchHistoryClearState.clearedAt {
+            let stale = pulled.filter { $0.updatedAt <= clearedAt }
+            if !stale.isEmpty {
+                pulled.removeAll { $0.updatedAt <= clearedAt }
+                deleteWatchProgress(keys: stale.map(\.id))
+                NuvioSyncDiagnostics.record(
+                    .warning, area: "Orivio",
+                    "Dropped \(stale.count) watch-progress rows older than the history clear (\(clearedAt)) and queued their account deletes."
+                )
+            }
         }
         pulled = await enrichMetadata(pulled)
         let before = progressStore.continueWatching(sortMode: .recentlyWatched).count
@@ -1766,6 +1809,11 @@ final class NuvioSyncManager: ObservableObject {
         var globalHiddenFolderIDs: [String]?
         /// Whole collections switched off account-wide.
         var globalHiddenCollectionIDs: [String]?
+        /// When the user last cleared watch history, synced so EVERY install
+        /// filters Trakt re-imports and account pulls by the same horizon.
+        /// Container-local only, this let any other install of the app flood
+        /// the account with the full Trakt history the user had cleared.
+        var watchHistoryClearedAt: Date?
     }
 
     /// Set when a local app-pref-backed change (collections included) is waiting
@@ -1819,6 +1867,7 @@ final class NuvioSyncManager: ObservableObject {
         playerSettings.applyRemote(snapshot.player)
         tmdbSettings.applyRemote(snapshot.tmdb)
         themeManager.applyRemote(snapshot.theme)
+        WatchHistoryClearState.adopt(snapshot.watchHistoryClearedAt)
         if let home = snapshot.home { homeCatalogSettings.applyRemotePresentation(home) }
         if let debrid = snapshot.debrid { debridStore?.applyRemote(debrid) }
         if let plugins = snapshot.plugins, let pluginStore {
@@ -1867,7 +1916,8 @@ final class NuvioSyncManager: ObservableObject {
             hiddenCollectionIDs: collectionsStore.hiddenIDsForSync,
             hiddenFolderIDs: collectionsStore.hiddenFolderIDsForSync,
             globalHiddenFolderIDs: collectionsStore.globalHiddenFolderIDsForSync,
-            globalHiddenCollectionIDs: collectionsStore.globalHiddenCollectionIDsForSync
+            globalHiddenCollectionIDs: collectionsStore.globalHiddenCollectionIDsForSync,
+            watchHistoryClearedAt: WatchHistoryClearState.clearedAt
         )
         guard let data = try? JSONEncoder().encode(snapshot),
               let json = String(data: data, encoding: .utf8) else { return }

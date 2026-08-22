@@ -11,10 +11,21 @@ enum WatchHistoryClearState {
 
     @discardableResult
     static func markClearedNow() -> Date {
-        if let clearedAt { return clearedAt }
         let date = Date()
         UserDefaults.standard.set(date.timeIntervalSince1970, forKey: clearedAtKey)
         return date
+    }
+
+    /// Adopt a clear point learned from the account (synced prefs blob). The
+    /// clear point used to be CONTAINER-LOCAL only — so any other install of
+    /// the app (a dev build, a fresh sideload) had none, re-imported the
+    /// user's entire Trakt history unfiltered, and pushed the flood up to the
+    /// account, undoing the curation done on the device that cleared. Newest
+    /// wins; nil never regresses an existing local clear.
+    static func adopt(_ remote: Date?) {
+        guard let remote else { return }
+        if let clearedAt, clearedAt >= remote { return }
+        UserDefaults.standard.set(remote.timeIntervalSince1970, forKey: clearedAtKey)
     }
 }
 

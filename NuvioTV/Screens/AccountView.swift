@@ -78,6 +78,7 @@ struct AccountView: View {
     }
 
     @FocusState private var focusedControl: AccountFocus?
+    @State private var confirmClearHistory = false
     @State private var selectedSection: AccountSection = .orivio
 
     var body: some View {
@@ -327,6 +328,20 @@ struct AccountView: View {
                     }
                 }
                 .focused($focusedControl, equals: .pushDevice)
+            }
+
+            AccountPrimaryButton(title: "Clear Watch History", systemImage: "trash", filled: false) {
+                confirmClearHistory = true
+            }
+            .alert("Clear Watch History?", isPresented: $confirmClearHistory) {
+                Button("Clear Everywhere", role: .destructive) {
+                    runSyncAction(label: "Clear watch history") { sync in
+                        await sync.clearWatchHistoryEverywhere()
+                    }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Removes every Continue Watching and watched item from this device and your account, and stops Trakt from re-importing anything watched before now. This cannot be undone.")
             }
 
             if let syncStatus {
