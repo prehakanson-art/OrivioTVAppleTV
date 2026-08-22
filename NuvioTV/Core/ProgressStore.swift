@@ -485,10 +485,28 @@ final class ProgressStore: ObservableObject {
     func continueWatching(sortMode: ContinueWatchingSortMode) -> [WatchProgress] {
         var latestPerShow: [String: WatchProgress] = [:]
         for item in items.values where item.fraction < 0.95 {
-            if let existing = latestPerShow[item.metaID], existing.updatedAt >= item.updatedAt { continue }
+            if let existing = latestPerShow[item.metaID] {
+                // Ties broken by id, NOT by whichever the dictionary happened to
+                // yield first: `items` is a Dictionary, so its iteration order
+                // is arbitrary and differs run to run. With equal timestamps
+                // that made the surviving row for a show — its poster, its
+                // episode — change on its own.
+                guard (item.updatedAt, item.id) > (existing.updatedAt, existing.id) else { continue }
+            }
             latestPerShow[item.metaID] = item
         }
-        let byRecency = latestPerShow.values.sorted { $0.updatedAt > $1.updatedAt }
+        // Sort on (timestamp, id) so equal timestamps have ONE defined order.
+        // sorted(by:) is not a stable sort, and its input here is unordered
+        // dictionary values, so tied rows came out in a different order every
+        // time this ran — and it runs on every body pass. That is the Continue
+        // Watching row visibly reshuffling while you sit on the home screen.
+        //
+        // Ties are not rare: anything imported in a batch shares a timestamp —
+        // a Trakt history import stamps hundreds of rows within the same
+        // moment, and a restore writes them all at once.
+        let byRecency = latestPerShow.values.sorted {
+            ($0.updatedAt, $0.id) > ($1.updatedAt, $1.id)
+        }
         switch sortMode {
         case .recentlyWatched:
             return byRecency
