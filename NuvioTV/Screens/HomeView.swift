@@ -1,5 +1,6 @@
 import SwiftUI
 
+
 struct HomeRow: Identifiable {
     let id: String
     let title: String
@@ -851,11 +852,13 @@ struct HomeView: View {
             // Row layouts keep the eager VStack (its LazyHStack children stay
             // lazy) so vertical focus moves never wait on row creation.
             Group {
-                if layout == .grid {
-                    LazyVStack(alignment: .leading, spacing: NuvioSpacing.xl) { rowsContent }
-                } else {
-                    VStack(alignment: .leading, spacing: NuvioSpacing.xl) { rowsContent }
-                }
+                // LAZY for BOTH layouts now. The eager VStack was deliberate —
+                // it keeps a row's LazyHStack alive so its horizontal scroll
+                // position survives — but it means every row in the home sits
+                // materialized in the tree, so any parent re-render rebuilds
+                // ALL of them. Measured on this account: 40 row bodies per
+                // D-pad step, against 1.3 in the themes that went lazy.
+                LazyVStack(alignment: .leading, spacing: NuvioSpacing.xl) { rowsContent }
             }
             .padding(.top, layout == .grid ? 40 : NuvioSpacing.md)
             .padding(.bottom, NuvioSpacing.huge)
