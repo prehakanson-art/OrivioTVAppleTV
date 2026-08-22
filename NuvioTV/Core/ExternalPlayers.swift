@@ -62,6 +62,15 @@ enum ExternalPlayers {
                 return URL(string: s)
             }
         ),
+        ExternalPlayer(
+            id: "senplayer", name: "SenPlayer", probeScheme: "senplayer",
+            makeURL: { stream, _ in
+                // Only `url` — SenPlayer's play action takes no subtitle
+                // parameter (its other documented action is `/download`), so a
+                // forwarded subtitle is simply not passed here.
+                URL(string: "senplayer://x-callback-url/play?url=\(encode(stream))")
+            }
+        ),
     ]
 
     /// The players actually installed on this Apple TV, catalog order.

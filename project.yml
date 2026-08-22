@@ -68,6 +68,11 @@ targets:
           - vlc-x-callback
           - nplayer-http
           - open-vidhub
+          # SenPlayer: converts dual-layer Dolby Vision Profile 7 to 8.1 on the
+          # fly, which the Apple TV cannot decode natively — handing a P7 remux
+          # to it is the alternative to this app's own libdovi conversion (see
+          # PlayerSettings.dolbyVisionProfile7) or the HDR10 fallback.
+          - senplayer
         # Deep links: nuvio:// (open a title) + stremio:// (install an addon).
         CFBundleURLTypes:
           - CFBundleURLName: tv.nuvio.deeplink

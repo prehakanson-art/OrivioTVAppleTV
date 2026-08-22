@@ -39,6 +39,7 @@
 		<string>vlc-x-callback</string>
 		<string>nplayer-http</string>
 		<string>open-vidhub</string>
+		<string>senplayer</string>
 	</array>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
