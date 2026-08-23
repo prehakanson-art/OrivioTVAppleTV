@@ -319,6 +319,23 @@ struct StremioLibraryItem: Decodable {
             case lastWatched, timeOffset, duration, timeWatched, overallTimeWatched, video_id, timesWatched, flaggedWatched
             case last_watched, time_offset, time_watched, overall_time_watched, times_watched, flagged_watched
         }
+
+        /// Rebuild the wire form, so a state we pulled can be written back
+        /// untouched. Required because putLibrary REPLACES the whole item:
+        /// pushing a library row without its state silently wipes that title's
+        /// resume point in Stremio.
+        var wireForm: [String: Any] {
+            var out: [String: Any] = [:]
+            if let lastWatched { out["last_watched"] = lastWatched }
+            if let timeOffset { out["time_offset"] = timeOffset }
+            if let duration { out["duration"] = duration }
+            if let timeWatched { out["time_watched"] = timeWatched }
+            if let overallTimeWatched { out["overall_time_watched"] = overallTimeWatched }
+            if let video_id { out["video_id"] = video_id }
+            if let timesWatched { out["times_watched"] = timesWatched }
+            if let flaggedWatched { out["flagged_watched"] = flaggedWatched }
+            return out
+        }
     }
 
     enum CodingKeys: String, CodingKey {
@@ -344,6 +361,16 @@ enum StremioDate {
 // MARK: - Sync (Stremio → Orivio stores)
 
 enum StremioSync {
+    /// Playback state exactly as Stremio last reported it, keyed by item id.
+    ///
+    /// putLibrary REPLACES each item wholesale, so any library row pushed
+    /// without a `state` wipes that title's resume point in Stremio. We push
+    /// every library row on every sync, so titles we happened to have no local
+    /// progress for were being cleared there — which is why Stremio's continue
+    /// watching kept emptying out. Anything we don't have our own state for is
+    /// written back from here, untouched.
+    private(set) static var lastPulledStates: [String: [String: Any]] = [:]
+
     /// Pull the Stremio library and merge it into Orivio's Library / Continue
     /// Watching / Watched stores. One-way (Stremio → Orivio); non-destructive
     /// (`reconcile: false`) so it never deletes local items. Returns a summary.
@@ -368,7 +395,12 @@ enum StremioSync {
         var saved: [SavedLibraryItem] = []
         var continueWatching: [WatchProgress] = []
         var watchedItems: [WatchedItem] = []
+        var pulledStates: [String: [String: Any]] = [:]
         let clearedAt = WatchHistoryClearState.clearedAt
+        // Import accounting, so "nothing came across" can be answered with
+        // numbers instead of a guess.
+        var withState = 0, withPosition = 0, skippedFinished = 0,
+            skippedNoPosition = 0, skippedCleared = 0
 
         for li in items {
             let removed = li.removed ?? false
@@ -383,17 +415,31 @@ enum StremioSync {
             }
 
             guard let st = li.state else { continue }
+            withState += 1
+            pulledStates[li.id] = st.wireForm
             let (pos, dur) = playbackSeconds(offset: st.timeOffset, duration: st.duration)
             let (season, episode) = parseVideoID(st.video_id)
             let lastWatched = StremioDate.parse(st.lastWatched) ?? Date()
-            if let clearedAt, lastWatched <= clearedAt { continue }
+            if pos > 0 { withPosition += 1 }
+            if let clearedAt, lastWatched <= clearedAt { skippedCleared += 1; continue }
             let finished = (st.flaggedWatched ?? 0) > 0
             let inferredDuration = dur > 0 ? dur : 0
-            let unfinishedProgress = pos > 0 && inferredDuration > 60 && pos / inferredDuration < 0.95
+            // Stremio very often stores a real resume point with NO duration —
+            // it only records what the player told it. Requiring a duration
+            // here silently dropped most of the continue-watching list on
+            // import. A row with a position but no runtime is kept with
+            // duration 0 and filled in from the title's metadata below
+            // (enrichContinueWatching); the 95%-finished test moves there too,
+            // since it cannot be applied before a duration is known.
+            //
+            // Still excluded: entries with no position at all. Stremio keeps a
+            // series pointer with no offset, and importing those as ~0s
+            // progress made hundreds of dormant library rows look active.
+            let unfinishedProgress = pos > 0
+                && (inferredDuration <= 0 || (inferredDuration > 60 && pos / inferredDuration < 0.95))
 
-            // Continue Watching = real unfinished playback. Stremio can also store
-            // a series pointer with no runtime/offset; importing that as 0/1s
-            // progress made hundreds of old library entries look active.
+            if finished, pos > 0 { skippedFinished += 1 }
+            if !finished, pos <= 0 { skippedNoPosition += 1 }
             if !finished && unfinishedProgress {
                 // Key must match ProgressStore.key: movie = id, episode = video_id.
                 let key = (li.type == "series" ? (st.video_id ?? li.id) : li.id)
@@ -418,6 +464,8 @@ enum StremioSync {
             }
         }
 
+        lastPulledStates = pulledStates
+
         let addonStates = addonDescriptors
             .filter { !$0.transportUrl.isEmpty }
             .map { AddonManager.RemoteAddonState(manifestURL: $0.transportUrl, enabled: true) }
@@ -429,8 +477,21 @@ enum StremioSync {
             saved = await enrichLibraryItems(saved, addonManager: addonManager)
             library.mergeRemote(saved, reconcile: false)
         }
+        NuvioSyncDiagnostics.record(
+            .info, area: "Stremio",
+            "Library \(items.count) rows · \(withState) with state · \(withPosition) with a position · "
+            + "kept \(continueWatching.count) · skipped \(skippedFinished) finished, "
+            + "\(skippedNoPosition) with no position, \(skippedCleared) before the clear point."
+        )
         if !continueWatching.isEmpty {
+            let before = continueWatching.count
             continueWatching = await enrichContinueWatching(continueWatching, addonManager: addonManager)
+            if continueWatching.count != before {
+                NuvioSyncDiagnostics.record(
+                    .info, area: "Stremio",
+                    "Metadata pass dropped \(before - continueWatching.count) row(s) that turned out to be finished."
+                )
+            }
             progress.mergeExternal(continueWatching)
         }
         if !watchedItems.isEmpty { watched.mergeRemote(watchedItems, reconcile: false) }
@@ -560,6 +621,11 @@ enum StremioSync {
                 "temp": false
             ]
             if let poster = item.poster { row["poster"] = poster }
+            // Carry Stremio's own playback state back untouched. The progress
+            // and watched passes below overwrite it for titles we actually
+            // track; everything else keeps the resume point it already had
+            // instead of being reset to nothing.
+            if let existing = lastPulledStates[item.id] { row["state"] = existing }
             rows[item.id] = row
         }
 
@@ -655,20 +721,49 @@ enum StremioSync {
         ISO8601DateFormatter().string(from: date)
     }
 
+    /// Runtime to assume when neither Stremio nor the metadata addon knows one.
+    /// Same shape the Trakt import uses, so a row without a duration still gets
+    /// a sensible resume percentage instead of being thrown away.
+    nonisolated private static func fallbackRuntime(for type: String) -> Double {
+        (type == "series" ? 45 : 100) * 60
+    }
+
     @MainActor
     private static func enrichContinueWatching(
         _ entries: [WatchProgress],
         addonManager: AddonManager
     ) async -> [WatchProgress] {
         var metaByID: [String: MetaItem] = [:]
-        for entry in entries where entry.type == "series" {
-            guard metaByID[entry.metaID] == nil else { continue }
+        // Series always (episode title/thumbnail), plus anything missing a
+        // duration — including movies — since that is what makes the row
+        // importable at all. Bounded so a large library can't turn one sync
+        // into hundreds of meta fetches.
+        var fetched = 0
+        for entry in entries where entry.type == "series" || entry.durationSeconds <= 60 {
+            guard metaByID[entry.metaID] == nil, fetched < 40 else { continue }
+            fetched += 1
             if let meta = await resolveSyncMetadata(id: entry.metaID, type: entry.type, addonManager: addonManager) {
                 metaByID[entry.metaID] = meta
             }
         }
 
-        return entries.map { entry in
+        return entries.compactMap { entry -> WatchProgress? in
+            // Fill in a missing duration, then apply the finished test that the
+            // import could not.
+            var entry = entry
+            if entry.durationSeconds <= 60 {
+                let runtime = metaByID[entry.metaID]?.runtimeSeconds
+                    ?? fallbackRuntime(for: entry.type)
+                entry.durationSeconds = runtime
+                guard entry.positionSeconds / runtime < 0.95 else { return nil }
+            }
+            return enrichSeriesFields(entry, metaByID: metaByID)
+        }
+    }
+
+    private static func enrichSeriesFields(
+        _ entry: WatchProgress, metaByID: [String: MetaItem]
+    ) -> WatchProgress {
             guard entry.type == "series", let meta = metaByID[entry.metaID] else { return entry }
             let video = meta.videos?.first { $0.id == entry.id }
                 ?? meta.videos?.first { $0.season == entry.season && $0.episode == entry.episode }
@@ -692,7 +787,6 @@ enum StremioSync {
                 syncSource: entry.syncSource,
                 hasNewEpisode: entry.hasNewEpisode
             )
-        }
     }
 
     /// "<id>:<season>:<episode>" → (season, episode). nil for movies.
