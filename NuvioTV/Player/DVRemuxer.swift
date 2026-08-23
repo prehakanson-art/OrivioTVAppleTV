@@ -4,6 +4,56 @@ import Libavcodec
 import Libavformat
 import Libavutil
 
+/// Captures FFmpeg's own error lines so a failed remux can say WHY.
+///
+/// "mux header failed (-22)" is FFmpeg for "something was invalid" — the real
+/// reason ("Could not find tag for codec X in stream #N", "dimensions not
+/// set"…) only exists as an av_log line. KSPlayer installs a global callback
+/// that swallows those into its own logger, so this replaces it with a chained
+/// version: errors are kept in a small ring (and NSLog'd).
+///
+/// KNOWN TRADE: KSPlayer's callback also fed avfilter lines into
+/// options.filter(log:) for idet deinterlace detection. That plumbing is NOT
+/// replicated — the avfilter headers aren't exposed to this target — and it
+/// is safe to drop here because nothing in this app enables autoDeInterlace
+/// or a video filter chain. If either is ever turned on, this capture must
+/// grow the avfilter branch back.
+enum FFmpegLogCapture {
+    nonisolated(unsafe) private static var ring: [String] = []
+    nonisolated(unsafe) private static var installed = false
+    private static let lock = NSLock()
+
+    static func install() {
+        lock.lock(); defer { lock.unlock() }
+        guard !installed else { return }
+        installed = true
+        av_log_set_callback { ptr, level, format, args in
+            guard let format else { return }
+            var line = String(cString: format)
+            if let args { line = NSString(format: line, arguments: args) as String }
+            guard level <= AV_LOG_ERROR else { return }
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return }
+            FFmpegLogCapture.append(trimmed)
+        }
+    }
+
+    private static func append(_ line: String) {
+        lock.lock(); defer { lock.unlock() }
+        ring.append(line)
+        if ring.count > 8 { ring.removeFirst(ring.count - 8) }
+        NSLog("[FFmpegError] %@", line)
+    }
+
+    /// The most recent error lines, newest last. Cleared on read.
+    static func drainRecent() -> [String] {
+        lock.lock(); defer { lock.unlock() }
+        let out = ring
+        ring = []
+        return out
+    }
+}
+
 /// On-device Dolby Vision remux server.
 ///
 /// tvOS only outputs true (dynamic-metadata) Dolby Vision when a DV-tagged
@@ -122,6 +172,7 @@ final class DVRemuxer {
     // MARK: - Remux thread
 
     private func run() {
+        FFmpegLogCapture.install()
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         } catch {
@@ -304,11 +355,22 @@ final class DVRemuxer {
         }
 
         var muxOpts: OpaquePointer?
-        av_dict_set(&muxOpts, "movflags", "+frag_keyframe+empty_moov+default_base_moof", 0)
+        // delay_moov: movenc builds some audio sample entries (AC3's dac3 box
+        // among them) from the FIRST PACKETS, so writing moov at header time
+        // fails with "Cannot write moov atom before AC3 packets" — the exact
+        // error a P7 remux carrying a plain AC3 core hits (E-AC3 sources never
+        // did, which is why this path used to look fine). Deferring moov to
+        // the first fragment flush is safe for our splitter: it defines the
+        // init segment as everything before the first moof, wherever the moov
+        // bytes arrive in that stretch.
+        av_dict_set(&muxOpts, "movflags", "+frag_keyframe+empty_moov+default_base_moof+delay_moov", 0)
+        _ = FFmpegLogCapture.drainRecent()   // only THIS call's errors
         var writeResult = avformat_write_header(octx, &muxOpts)
         av_dict_free(&muxOpts)
         guard writeResult >= 0 else {
-            report { self.onError?("mux header failed (\(writeResult))") }
+            let detail = FFmpegLogCapture.drainRecent().joined(separator: " | ")
+            report { self.onError?("mux header failed (\(writeResult))"
+                + (detail.isEmpty ? "" : " — \(detail)")) }
             return
         }
 

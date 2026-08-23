@@ -547,6 +547,10 @@ final class PlayerViewModel: ObservableObject {
         remuxer.onError = { [weak self] message in
             guard let self, self.dvRemuxer === remuxer else { return }
             NSLog("[OrivioDV] remux error: %@", message)
+            // The panel said "Native DV" the moment the remux STARTED; a
+            // failure must correct it or the info panel lies about the output.
+            self.decisionLog.record("Dolby Vision", "HDR10-mapped decode",
+                                    because: "native-DV remux failed: \(message)")
             self.dvFailedURLs.insert(urlString)
             self.dvRemuxer = nil
             if self.usingNativeDV { self.abandonNativeDV() }

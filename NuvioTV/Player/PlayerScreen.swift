@@ -1049,7 +1049,12 @@ struct InfoPullDownPanel: View {
                             Text(row.value)
                                 .font(.system(size: 19, weight: .semibold))
                                 .foregroundStyle(.white.opacity(0.95))
-                                .lineLimit(2)
+                                // Playback Path rows carry full sentences — a
+                                // remux failure REASON most of all. Truncating
+                                // the one line that explains a fallback defeats
+                                // the panel's purpose; wrap instead.
+                                .lineLimit(4)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                     }
                 }
