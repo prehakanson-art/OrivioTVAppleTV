@@ -538,22 +538,33 @@ final class PlayerViewModel: ObservableObject {
         remuxer.onIneligible = { [weak self] reason in
             guard let self, self.dvRemuxer === remuxer else { return }
             NSLog("[OrivioDV] ineligible: %@", reason)
+            Self.dvTrail("ineligible — \(reason)")
             self.decisionLog.record("Dolby Vision", "HDR10-mapped decode",
                                     because: "remux ineligible: \(reason)")
             self.dvFailedURLs.insert(urlString)
+            if self.usingNativeDV { self.abandonNativeDV(reason: "became ineligible mid-play: \(reason)") }
+            // Cleanup AFTER the abandon forensics have read the directory.
+            self.dvRemuxer?.cleanup()
             self.dvRemuxer = nil
-            if self.usingNativeDV { self.abandonNativeDV() }
         }
         remuxer.onError = { [weak self] message in
             guard let self, self.dvRemuxer === remuxer else { return }
             NSLog("[OrivioDV] remux error: %@", message)
+            // Persisted so the failure is readable AFTER the fact (the console
+            // attach keeps dying with the app lifecycle) — same pattern as the
+            // other diagnostics. Newest failure wins; success clears it.
+            Self.dvTrail("remux error — \(message)")
             // The panel said "Native DV" the moment the remux STARTED; a
             // failure must correct it or the info panel lies about the output.
             self.decisionLog.record("Dolby Vision", "HDR10-mapped decode",
                                     because: "native-DV remux failed: \(message)")
             self.dvFailedURLs.insert(urlString)
+            if self.usingNativeDV { self.abandonNativeDV(reason: "remux error mid-play: \(message)") }
+            // Cleanup AFTER the abandon forensics have read the directory —
+            // and always cleanup, or failed remuxers leak their segment dirs
+            // in tmp (found five of them during the P7 investigation).
+            self.dvRemuxer?.cleanup()
             self.dvRemuxer = nil
-            if self.usingNativeDV { self.abandonNativeDV() }
         }
         remuxer.onProgress = { [weak self] written in
             guard let self, self.dvRemuxer === remuxer else { return }
@@ -588,6 +599,7 @@ final class PlayerViewModel: ObservableObject {
         usingNativeDV = true
         pendingResume = nil
         showToast("Dolby Vision — native output")
+        Self.dvTrail("switched to native DV OK")
         NSLog("[OrivioDV] switching to native playlist (offset %.1fs)", dvTimeOffset)
         load(entry: currentEntry, overrideURL: playlist)
     }
@@ -608,9 +620,38 @@ final class PlayerViewModel: ObservableObject {
 
     /// Any DV failure: return to the FFmpeg engine at the same position —
     /// i.e. exactly the pre-DV behavior (decoded HDR10).
-    private func abandonNativeDV() {
+    /// Append one line to the persisted DV trail (newest LAST — the previous
+    /// overwrite-style key lost the interesting first error under the later
+    /// abandon message).
+    static func dvTrail(_ line: String) {
+        var trail = UserDefaults.standard.stringArray(forKey: "dev.dvTrail") ?? []
+        trail.append("\(Date()): \(line)")
+        if trail.count > 30 { trail.removeFirst(trail.count - 30) }
+        UserDefaults.standard.set(trail, forKey: "dev.dvTrail")
+    }
+
+    private func abandonNativeDV(reason: String = "unspecified") {
         guard usingNativeDV else { resetNativeDV(); return }
-        NSLog("[OrivioDV] abandoning native DV — falling back to FFmpeg engine")
+        NSLog("[OrivioDV] abandoning native DV (%@) — falling back to FFmpeg engine", reason)
+        Self.dvTrail("abandoned after switch — \(reason)")
+        // Forensics: what did the remux directory actually hold when AVPlayer
+        // gave up on it? This is the difference between "playlist never
+        // existed" and "playlist existed and AVPlayer rejected the media".
+        if let dir = dvRemuxer?.directory {
+            let names = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
+            let sizes = names.prefix(8).map { name -> String in
+                let attrs = try? FileManager.default.attributesOfItem(atPath: dir.appendingPathComponent(name).path)
+                return "\(name)=\((attrs?[.size] as? Int) ?? -1)b"
+            }
+            Self.dvTrail("dir at abandon: \(names.count) files [\(sizes.joined(separator: ", "))]")
+            if let playlist = try? String(contentsOf: dir.appendingPathComponent("dv.m3u8"), encoding: .utf8) {
+                Self.dvTrail("playlist: \(playlist.replacingOccurrences(of: "\n", with: " | "))")
+            }
+        } else {
+            Self.dvTrail("dir at abandon: remuxer already gone")
+        }
+        decisionLog.record("Dolby Vision", "HDR10-mapped decode",
+                           because: "native DV abandoned: \(reason)")
         if let urlString = currentEntry.stream.url { dvFailedURLs.insert(urlString) }
         showToast("Native Dolby Vision failed — using HDR10")
         pendingResume = position > 10 ? position : nil
@@ -2966,7 +3007,7 @@ final class PlayerViewModel: ObservableObject {
             // A stuck DV playlist load falls back to the FFmpeg engine, not
             // to a different source — the source itself is fine.
             if self.usingNativeDV {
-                self.abandonNativeDV()
+                self.abandonNativeDV(reason: "DV playlist never started (load watchdog)")
                 return
             }
             self.showToast("Source didn't load — trying another")
@@ -3063,7 +3104,7 @@ final class PlayerViewModel: ObservableObject {
         // Native-DV playback died → the remux/playlist is the suspect, not
         // the source. Fall back to the FFmpeg engine on the same source.
         if usingNativeDV {
-            abandonNativeDV()
+            abandonNativeDV(reason: "playback error on the DV playlist: \(error.localizedDescription)")
             return
         }
         guard !isFailingOver else { return }

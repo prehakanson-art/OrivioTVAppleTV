@@ -402,6 +402,24 @@ final class DVRemuxer {
             let isAudio = streamIndex == audioIndex
             guard isVideo || isAudio else { continue }
 
+            // P7 conversion FIRST — before any timing bookkeeping. A pure-EL
+            // packet is dropped entirely here; letting it reach the keyframe
+            // tracker first would append phantom cut points that no muxed
+            // fragment ever matches, skewing every later segment duration.
+            // On malformed/failed conversion `convertedAccessUnit` returns nil
+            // and the untouched packet is muxed — a bad frame degrades to the
+            // original rather than corrupting the stream.
+            var converted: [UInt8]?
+            if needsProfile7Conversion, isVideo {
+                converted = convertedAccessUnit(packet, nalLengthSize: nalLengthSize)
+                if let converted, converted.isEmpty {
+                    // Whole packet was enhancement layer (key-flagged, one per
+                    // frame in this mux — the same packets that shredded the
+                    // playlist into single-frame fragments). Skip it.
+                    continue
+                }
+            }
+
             let inTB = isVideo ? inVideoTB : inAudioTB
             if packet.pointee.pts != Int64.min {   // AV_NOPTS_VALUE
                 let ptsSec = Double(packet.pointee.pts) * av_q2d(inTB)
@@ -417,16 +435,6 @@ final class DVRemuxer {
             let outStream = isVideo ? outVideo : outAudio
 
             // Profile 7 → 8.1: if this video access unit's RPU NAL(s) convert,
-            // mux a scratch packet carrying the rewritten bytes (props copied
-            // from the original) instead of the source packet. On any
-            // malformed/failed conversion `convertedAccessUnit` returns nil and
-            // we mux the untouched packet — a bad frame degrades to the
-            // original rather than corrupting the stream.
-            var converted: [UInt8]?
-            if needsProfile7Conversion, isVideo {
-                converted = convertedAccessUnit(packet, nalLengthSize: nalLengthSize)
-            }
-
             if let converted {
                 let outPkt = av_packet_alloc()
                 defer { var p = outPkt; av_packet_free(&p) }
@@ -599,13 +607,22 @@ final class DVRemuxer {
 
     // MARK: - Dolby Vision Profile 7 → 8.1
 
-    /// Walk the packet's length-prefixed HEVC NAL units; convert any Dolby
-    /// Vision RPU NAL (type 62) from Profile 7 to 8.1 via libdovi and re-emit
-    /// the access unit. Returns the rewritten bytes, or nil when nothing was
-    /// converted (mux the original) or the bitstream looks malformed (bail —
-    /// keep the original). Enhancement-layer handling: single-track DV7 keeps
-    /// only the base layer here; a separate EL track is never selected as the
-    /// video stream, so it's naturally dropped.
+    /// Walk the packet's length-prefixed HEVC NAL units: convert any Dolby
+    /// Vision RPU NAL (type 62) from Profile 7 to 8.1 via libdovi, and DISCARD
+    /// enhancement-layer NALs (type 63 — the Dolby single-stream EL carriage).
+    ///
+    /// Dropping the EL is not an optimisation, it is the conversion. The dvvC
+    /// we write declares "profile 8.1, single layer, el_present = 0"; leaving
+    /// unspec63 EL data in the bitstream contradicts that declaration, and
+    /// VideoToolbox answers the contradiction by silently never producing a
+    /// frame — the "switched to native DV, then the watchdog fired with no
+    /// error" failure, reproduced on a real P7 disc remux. dovi_tool's own
+    /// P7→8.1 is exactly: convert RPU, keep BL, discard EL.
+    ///
+    /// Returns the rewritten bytes; an EMPTY array when the whole packet was
+    /// enhancement layer (caller must drop the packet, not mux a 0-byte one);
+    /// nil when nothing needed changing or the AU looked malformed (caller
+    /// muxes the original).
     private func convertedAccessUnit(
         _ packet: UnsafeMutablePointer<AVPacket>, nalLengthSize: Int
     ) -> [UInt8]? {
@@ -628,7 +645,10 @@ final class DVRemuxer {
             i += nalLen
             // HEVC NAL type = bits 1..6 of the first header byte.
             let nalType = (nal[0] >> 1) & 0x3F
-            if nalType == 62, let newNal = DoviConverter.convertRPU7to81(Data(nal)) {
+            if nalType == 63 {
+                // Enhancement layer — discarded (see doc comment).
+                converted = true
+            } else if nalType == 62, let newNal = DoviConverter.convertRPU7to81(Data(nal)) {
                 appendLengthPrefixed(&out, [UInt8](newNal), nalLengthSize)
                 converted = true
             } else {
