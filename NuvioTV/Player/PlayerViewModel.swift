@@ -470,6 +470,17 @@ final class PlayerViewModel: ObservableObject {
     /// remux when every gate passes; playback continues undisturbed until the
     /// playlist is ready, then switches in place.
     private func maybeStartNativeDV() {
+        // Compatibility mode: never leave the plain decode path. The HDR10-
+        // mapped Metal output is the most forgiving pipeline this player has.
+        if activeMode == .compatibility {
+            if playerLayer?.player.tracks(mediaType: .video)
+                .first(where: \.isEnabled)?.dovi != nil, !dvAttempted {
+                dvAttempted = true
+                decisionLog.record("Dolby Vision", "HDR10-mapped decode",
+                                   because: "Compatibility mode skips the native-DV remux")
+            }
+            return
+        }
         guard settings.nativeDolbyVision,
               !usingNativeDV, !dvAttempted, dvRemuxer == nil, !isExiting,
               // Auto or explicit FFmpeg: both decode DV as HDR10-mapped Metal
@@ -484,13 +495,30 @@ final class PlayerViewModel: ObservableObject {
         else { return }
         let track = player.tracks(mediaType: .video).first(where: \.isEnabled)
             ?? player.tracks(mediaType: .video).first
-        // Profile 5/8 always; Profile 7 only with the libdovi
-        // 7→8.1 conversion enabled (DVRemuxer rewrites its RPUs).
-        let p7ok = settings.dolbyVisionProfile7
-        guard let profile = track?.dovi?.dv_profile,
-              profile == 5 || profile == 8 || (profile == 7 && p7ok) else { return }
+        // Profile 5/8 always; Profile 7 only with the libdovi 7→8.1 conversion
+        // enabled. Fidelity mode turns the conversion on regardless of the
+        // tier default — its contract is "never silently downgrade".
+        let p7ok = activeMode == .fidelity || settings.dolbyVisionProfile7
+        guard let profile = track?.dovi?.dv_profile else { return }
+        guard profile == 5 || profile == 8 || (profile == 7 && p7ok) else {
+            if profile == 7, !dvAttempted {
+                dvAttempted = true
+                decisionLog.record("Dolby Vision", "HDR10 base layer",
+                                   because: "Profile 7 conversion is off (Settings → Playback)")
+            }
+            return
+        }
 
         dvAttempted = true
+        decisionLog.record(
+            "Dolby Vision",
+            profile == 7 ? "Native DV (Profile 7 → 8.1)" : "Native DV (Profile \(Int(profile)))",
+            because: profile == 7
+                ? (activeMode == .fidelity && !settings.dolbyVisionProfile7
+                    ? "Fidelity mode converts Profile 7 even where the tier default is off"
+                    : "dual-layer P7 converted so Apple's pipeline accepts it")
+                : "display supports Dolby Vision; remuxing for Apple's pipeline"
+        )
         NSLog("[OrivioDV] DV profile %d detected — starting background remux", Int(profile))
         startDVRemux(from: max(position - 2, 0), isRestart: false)
     }
@@ -510,6 +538,8 @@ final class PlayerViewModel: ObservableObject {
         remuxer.onIneligible = { [weak self] reason in
             guard let self, self.dvRemuxer === remuxer else { return }
             NSLog("[OrivioDV] ineligible: %@", reason)
+            self.decisionLog.record("Dolby Vision", "HDR10-mapped decode",
+                                    because: "remux ineligible: \(reason)")
             self.dvFailedURLs.insert(urlString)
             self.dvRemuxer = nil
             if self.usingNativeDV { self.abandonNativeDV() }
@@ -653,6 +683,12 @@ final class PlayerViewModel: ObservableObject {
     private var pendingResume: Double?
     /// Options of the stream currently loading, kept for open-timing logs.
     private var currentOptions: KSOptions?
+    /// Why the current playback path looks the way it does — shown in the
+    /// pull-down info panel. Reset at every load.
+    private(set) var decisionLog = PlaybackDecisionLog()
+    /// The active policy, read once per load so a mid-playback settings edit
+    /// can't leave the session half in one mode and half in another.
+    private(set) var activeMode: PlaybackMode = .automatic
     private var loadStartedAt: Date?
     private var currentURL: URL?
 
@@ -797,16 +833,33 @@ final class PlayerViewModel: ObservableObject {
         // route (TV/receiver/soundbar) reports spatial-audio support — Atmos
         // setups get the Atmos-capable path, everything else keeps the
         // battle-tested AVAudioEngine. Settings can force either side.
+        let spatialRoute = AVAudioSession.sharedInstance().currentRoute.outputs
+            .contains { $0.isSpatialAudioEnabled }
         let useRenderer: Bool
-        switch settings.audioOutputMode {
-        case .auto:
-            useRenderer = AVAudioSession.sharedInstance().currentRoute.outputs
-                .contains { $0.isSpatialAudioEnabled }
-        case .renderer:
-            useRenderer = true
-        case .engine:
+        // Playback mode overrides: Fidelity insists on the Atmos-capable
+        // renderer whenever the route can use it; Compatibility pins the
+        // battle-tested AVAudioEngine. Automatic follows the audio setting.
+        switch settings.playbackMode {
+        case .fidelity:
+            useRenderer = spatialRoute || settings.audioOutputMode == .renderer
+        case .compatibility:
             useRenderer = false
+        case .automatic:
+            switch settings.audioOutputMode {
+            case .auto: useRenderer = spatialRoute
+            case .renderer: useRenderer = true
+            case .engine: useRenderer = false
+            }
         }
+        decisionLog.record(
+            "Audio Route",
+            useRenderer ? "Enhanced renderer (Atmos-capable)" : "Standard (AVAudioEngine)",
+            because: settings.playbackMode == .compatibility
+                ? "Compatibility mode pins the standard engine"
+                : (useRenderer
+                    ? (spatialRoute ? "output route reports spatial-audio support" : "forced in audio settings")
+                    : (spatialRoute ? "forced in audio settings" : "output route has no spatial-audio support"))
+        )
         KSOptions.audioPlayerType = useRenderer
             ? AudioRendererPlayer.self : AudioEnginePlayer.self
         fetchEnrichedMeta()
@@ -820,6 +873,19 @@ final class PlayerViewModel: ObservableObject {
         // NB: the idle timer is managed by `isPlaying` (kept awake only while
         // actually playing) — NOT disabled for the whole session, which used
         // to leave the Apple TV never sleeping / never showing its screensaver.
+        // Replay this title's remembered choices before the first load, so a
+        // file that needed VLC (or 1.5x, or French audio) last time starts
+        // that way now. Only user-made choices are stored, so replaying them
+        // is doing what the user already asked for.
+        if let memory = PlaybackMemory.memory(for: request.meta.id) {
+            if let speed = memory.speed { playbackSpeed = speed }
+            if settings.playerEngine == .auto, let raw = memory.engine,
+               let engine = PlayerEngine(rawValue: raw), engine != .auto {
+                sessionEngine = engine
+                decisionLog.record("Engine", engine.label,
+                                   because: "you switched this title to it last time")
+            }
+        }
         load(entry: request.entry)
         maybeRouteToVLCForASS()
     }
@@ -1007,7 +1073,14 @@ final class PlayerViewModel: ObservableObject {
     /// source panels, failover identity). A normal load (nil) always resets
     /// any DV session first.
     private func load(entry: StreamEntry, overrideURL: URL? = nil) {
-        if overrideURL == nil { resetNativeDV() }
+        if overrideURL == nil {
+            resetNativeDV()
+            decisionLog.reset()
+            activeMode = settings.playbackMode
+            if activeMode != .automatic {
+                decisionLog.record("Mode", activeMode.label, because: "chosen in Settings → Playback")
+            }
+        }
         guard let url = overrideURL ?? entry.stream.url.flatMap(URL.init(string:)) else {
             overlay = .error("This source has no playable link.")
             return
@@ -1027,6 +1100,7 @@ final class PlayerViewModel: ObservableObject {
         // VLC engine path: self-contained, skips all the KSPlayer/FFmpeg setup.
         // (Never for the DV playlist — that must ride the native pipeline.)
         if effectiveEngine == .vlc, overrideURL == nil {
+            decisionLog.record("Engine", "VLC", because: "selected as the playback engine")
             loadViaVLC(url: url)
             return
         }
@@ -1086,6 +1160,14 @@ final class PlayerViewModel: ObservableObject {
         let ffmpegContainers: Set<String> = ["mkv", "avi", "flv", "wmv", "ts", "m2ts", "webm"]
         let nativeContainers: Set<String> = ["mp4", "m4v", "mov", "m3u8", "mp3", "aac"]
         var ext = url.pathExtension.lowercased()
+        // A container learned from an earlier sniff of this exact URL beats
+        // every guess below — extensionless debrid links stop defaulting to
+        // FFmpeg once we know they are plain MP4.
+        if ext.isEmpty, overrideURL == nil, let learned = ContainerSniffer.cached(url.absoluteString) {
+            ext = learned
+            decisionLog.record("Container", learned.uppercased(),
+                               because: "learned from an earlier probe of this link")
+        }
         if ext.isEmpty,
            let filename = currentEntry.stream.title,
            let dotExt = filename.split(separator: ".").last.map({ String($0).lowercased() }),
@@ -1117,6 +1199,37 @@ final class PlayerViewModel: ObservableObject {
             }
         }
         KSOptions.firstPlayerType = needsFFmpeg ? KSMEPlayer.self : KSAVPlayer.self
+        if overrideURL != nil {
+            decisionLog.record("Engine", "Native (AVPlayer)",
+                               because: "Dolby Vision playlist must ride Apple's pipeline")
+        } else {
+            let why: String
+            switch effectiveEngine {
+            case .native: why = "forced to Native in the engine picker"
+            case .ffmpeg: why = "forced to FFmpeg in the engine picker"
+            default:
+                why = ext.isEmpty
+                    ? "no file extension — FFmpeg plays every container"
+                    : (needsFFmpeg ? "\(ext.uppercased()) container needs the FFmpeg demuxer"
+                                   : "\(ext.uppercased()) is native-friendly")
+            }
+            decisionLog.record("Engine", needsFFmpeg ? "FFmpeg" : "Native (AVPlayer)", because: why)
+        }
+        // Unknown container: probe the real one in the background. This never
+        // delays the open — FFmpeg is already the safe default — it informs
+        // the decision panel now and routes the NEXT open of this link right.
+        if ext.isEmpty, overrideURL == nil {
+            let sniffURL = url.absoluteString
+            let sniffHeaders = entry.stream.behaviorHints?.proxyHeaders?.requestHeaders
+            Task { [weak self] in
+                guard let found = await ContainerSniffer.sniff(sniffURL, headers: sniffHeaders) else { return }
+                await MainActor.run {
+                    guard let self, self.currentURL?.absoluteString == sniffURL else { return }
+                    self.decisionLog.record("Container", found.uppercased(),
+                                            because: "probed from the stream's first bytes; next open routes directly")
+                }
+            }
+        }
         // Second engine = KSPlayer's own transparent retry when the first one
         // errors. It is only worth having when the other engine could actually
         // play this container.
@@ -1579,14 +1692,28 @@ final class PlayerViewModel: ObservableObject {
 
         // Preferred audio language: when configured and the stream carries a
         // matching track, switch to it (highest channel count wins).
-        if !settings.preferredAudioLanguage.isEmpty {
-            let want = settings.preferredAudioLanguage
+        let rememberedAudio = PlaybackMemory.memory(for: meta.id)?.audioLanguage
+        if rememberedAudio != nil || !settings.preferredAudioLanguage.isEmpty {
+            let want = rememberedAudio ?? settings.preferredAudioLanguage
+            // Ranking inside the language: never a commentary/descriptive
+            // track, then Atmos-capable (DD+ carries Atmos through tvOS
+            // natively), then channel count. The file's own default only wins
+            // when no preferred-language track exists.
             let matches = player.tracks(mediaType: .audio)
                 .filter { ($0.languageCode ?? "").hasPrefix(want) }
-                .sorted { Self.channelCount($0) > Self.channelCount($1) }
+                .sorted { a, b in
+                    let aSec = Self.isSecondaryAudio(a), bSec = Self.isSecondaryAudio(b)
+                    if aSec != bSec { return !aSec }
+                    let aAtmos = Self.audioFormat(a).atmosCapable
+                    let bAtmos = Self.audioFormat(b).atmosCapable
+                    if aAtmos != bAtmos { return aAtmos }
+                    return Self.channelCount(a) > Self.channelCount(b)
+                }
             if let best = matches.first, !best.isEnabled {
                 player.select(track: best)
                 selectedAudioID = "audio-\(best.trackID)"
+                decisionLog.record("Audio Track", trackLabel(best),
+                                   because: "preferred language, ranked by Atmos capability and channels")
             }
         }
 
@@ -1629,6 +1756,12 @@ final class PlayerViewModel: ObservableObject {
     /// a preferred-language request waits for a match rather than settling for
     /// the first track immediately.
     private func applyDefaultSubtitleIfNeeded(allowFallback: Bool = false) {
+        // The user turned subtitles OFF on this title before; honour that over
+        // the global on-by-default.
+        if PlaybackMemory.memory(for: meta.id)?.subtitleLanguage == "off" {
+            subtitleAutoApplied = true
+            return
+        }
         guard settings.subtitlesOnByDefault, !subtitleAutoApplied else { return }
         let real = subtitleOptions.filter { $0.id != "sub-off" }
         guard !real.isEmpty else { return }
@@ -1735,7 +1868,63 @@ final class PlayerViewModel: ObservableObject {
            !label.localizedCaseInsensitiveContains(language) {
             label += " (\(language))"
         }
-        return label.isEmpty ? "Track \(track.trackID)" : label
+        if label.isEmpty { label = "Track \(track.trackID)" }
+        // Codec + channels + the HONEST output note. A TrueHD Atmos track is
+        // not "Atmos" on tvOS — the platform can't bitstream it, so it decodes
+        // to PCM. Saying so in the picker is the difference between a player
+        // that reports its source and one that reports its marketing.
+        let audio = Self.audioFormat(track)
+        var parts: [String] = []
+        if let codec = audio.codec, !label.localizedCaseInsensitiveContains(codec) {
+            parts.append(codec)
+        }
+        let channels = Self.channelCount(track)
+        if channels > 2, !label.contains("\(channels)") {
+            parts.append(Self.channelLabel(channels))
+        }
+        if audio.decodedToPCM { parts.append("→ PCM") }
+        return parts.isEmpty ? label : "\(label) · \(parts.joined(separator: " "))"
+    }
+
+    /// What an audio track IS and what tvOS can DO with it.
+    ///
+    /// tvOS bitstreams Dolby Digital and DD+ (including DD+ Atmos); everything
+    /// lossless — TrueHD, DTS-HD MA, DTS:X — must be decoded to multichannel
+    /// PCM. That is an Apple platform rule (Infuse documents the identical
+    /// limitation), so the UI must never promise "Atmos" off a TrueHD track.
+    static func audioFormat(_ track: any MediaPlayerTrack) -> (
+        codec: String?, decodedToPCM: Bool, atmosCapable: Bool
+    ) {
+        let sub = track.formatDescription.map {
+            CMFormatDescriptionGetMediaSubType($0).description
+                .trimmingCharacters(in: CharacterSet(charactersIn: "'")).lowercased()
+        } ?? ""
+        let name = track.name.lowercased()
+        func has(_ needles: String...) -> Bool {
+            needles.contains { sub.contains($0) || name.contains($0) }
+        }
+        if has("trhd", "truehd", "mlp") {
+            return ("TrueHD" + (has("atmos") ? " Atmos" : ""), true, false)
+        }
+        if has("dtsh", "dts-hd", "dtsx", "dts:x") { return ("DTS-HD", true, false) }
+        if has("dtsc", "dtse", "dts") { return ("DTS", true, false) }
+        if has("ec-3", "ec3", "eac3", "e-ac-3") {
+            return ("Dolby Digital+" + (has("atmos", "joc") ? " Atmos" : ""), false, true)
+        }
+        if has("ac-3", "ac3") { return ("Dolby Digital", false, false) }
+        if has("flac") { return ("FLAC", true, false) }
+        if has("opus") { return ("Opus", true, false) }
+        if has("aac") { return ("AAC", false, false) }
+        if has("lpcm", "pcm", "sowt", "twos") { return ("PCM", false, false) }
+        return (nil, false, false)
+    }
+
+    /// Tracks nobody wants auto-selected: commentaries and descriptive audio.
+    /// They stay in the picker; they just never win the automatic choice.
+    static func isSecondaryAudio(_ track: any MediaPlayerTrack) -> Bool {
+        let name = track.name.lowercased()
+        return ["commentary", "comment", "description", "descriptive", "narration"]
+            .contains { name.contains($0) }
     }
 
     // MARK: - Transport
@@ -2332,6 +2521,11 @@ final class PlayerViewModel: ObservableObject {
         switch track.payload {
         case .track(let mediaTrack):
             playerLayer?.player.select(track: mediaTrack)
+            // Remember the LANGUAGE, not the track id — ids differ per file,
+            // the language carries to every episode of the show.
+            if let lang = mediaTrack.languageCode, !lang.isEmpty {
+                PlaybackMemory.update(meta.id) { $0.audioLanguage = lang }
+            }
         case .vlcAudio(let id):
             vlcEngine?.selectAudio(id)
         default:
@@ -2341,6 +2535,11 @@ final class PlayerViewModel: ObservableObject {
 
     func selectSubtitle(_ track: TrackOption) {
         selectedSubtitleID = track.id
+        if track.id == "sub-off" {
+            // An explicit OFF is a choice too — remember it, or the on-by-
+            // default logic re-enables subtitles on the next episode.
+            PlaybackMemory.update(meta.id) { $0.subtitleLanguage = "off" }
+        }
         switch track.payload {
         case .subtitle(let info):
             // Addon subtitles are downloaded + parsed on selection, which can
@@ -2359,6 +2558,7 @@ final class PlayerViewModel: ObservableObject {
 
     func setSpeed(_ speed: Float) {
         playbackSpeed = speed
+        PlaybackMemory.update(meta.id) { $0.speed = speed == 1 ? nil : speed }
         if let vlcEngine { vlcEngine.rate = speed }
         else { playerLayer?.player.playbackRate = speed }
         showToast("Speed \(speed == 1 ? "Normal" : String(format: "%gx", speed))")
@@ -2650,6 +2850,7 @@ final class PlayerViewModel: ObservableObject {
             return
         }
         sessionEngine = engine
+        PlaybackMemory.update(meta.id) { $0.engine = engine.rawValue }
         overlay = .none
         let resumeAt = position
         countdownTask?.cancel()
@@ -3568,6 +3769,33 @@ final class PlayerViewModel: ObservableObject {
         }
     }
 
+    // MARK: - Diagnostics HUD
+
+    struct DiagnosticsSnapshot {
+        var engine = "—"
+        var fps = 0.0
+        var droppedFrames: UInt32 = 0
+        var avSyncDiff = 0.0
+        var bitrateMbps = 0.0
+        var bufferSeconds = 0.0
+        var downloadedMB = 0.0
+    }
+
+    /// One coherent read of the live playback internals, for the HUD.
+    func diagnosticsSnapshot() -> DiagnosticsSnapshot {
+        var snap = DiagnosticsSnapshot()
+        snap.engine = usingVLC ? "VLC" : engineName + (usingNativeDV ? " · native DV" : "")
+        snap.bufferSeconds = max(buffered - position, 0)
+        if let info = playerLayer?.player.dynamicInfo {
+            snap.fps = info.displayFPS
+            snap.droppedFrames = info.droppedVideoFrameCount
+            snap.avSyncDiff = info.audioVideoSyncDiff
+            snap.bitrateMbps = Double(info.videoBitrate) / 1_000_000
+            snap.downloadedMB = Double(info.bytesRead) / 1_048_576
+        }
+        return snap
+    }
+
     /// Nearest preview frame for a scrub target, if generation has finished.
     func thumbnail(at time: Double) -> UIImage? {
         guard !scrubThumbnails.isEmpty else { return nil }
@@ -3715,6 +3943,18 @@ final class PlayerViewModel: ObservableObject {
     /// player. Built on demand — the panel is transient.
     func mediaInfoSections() -> [MediaInfoSection] {
         var sections: [MediaInfoSection] = []
+
+        // WHY the session looks like this — the decision log, verbatim. First
+        // section because it answers the question people actually open this
+        // panel with ("why is this not Dolby Vision / why FFmpeg").
+        if !decisionLog.entries.isEmpty {
+            sections.append(.init(
+                title: "Playback Path",
+                rows: decisionLog.entries.map {
+                    .init(label: $0.stage, value: "\($0.choice) — \($0.reason)")
+                }
+            ))
+        }
         let player = playerLayer?.player
 
         var file: [MediaInfoRow] = []
@@ -3812,6 +4052,15 @@ final class PlayerViewModel: ObservableObject {
             let count = player?.tracks(mediaType: .audio).count ?? 1
             if count > 1 {
                 audio.append(.init(label: "Tracks", value: "\(count)"))
+            }
+            let fmt = Self.audioFormat(track)
+            if fmt.decodedToPCM {
+                audio.append(.init(
+                    label: "Output",
+                    value: "Decoded to \(Self.channelLabel(Self.channelCount(track))) PCM — tvOS can't bitstream \(fmt.codec ?? "this format")"
+                ))
+            } else if fmt.atmosCapable {
+                audio.append(.init(label: "Output", value: "Dolby Digital+ — Atmos passes through when the route supports it"))
             }
             sections.append(.init(title: "Audio", rows: audio))
         }

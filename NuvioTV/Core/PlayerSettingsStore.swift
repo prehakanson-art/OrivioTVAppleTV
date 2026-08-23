@@ -228,6 +228,9 @@ struct PlayerSettings: Codable, Equatable {
     /// Preferred audio language (ISO 639-1 code); "" = stream default. When a
     /// stream carries a matching track it's selected automatically.
     var preferredAudioLanguage: String = ""
+    /// Playback policy: Automatic / Maximum Fidelity / Compatibility.
+    /// Governs the DV path, P7 conversion and audio route (see PlaybackMode).
+    var playbackMode: PlaybackMode = .automatic
     /// Playback engine selection (see PlayerEngine).
     var playerEngine: PlayerEngine = .auto
     /// Playback buffer sizing (see BufferProfile).
@@ -447,6 +450,7 @@ struct PlayerSettings: Codable, Equatable {
         subtitleBackgroundOpacity = (try? c.decode(Int.self, forKey: .subtitleBackgroundOpacity)) ?? d.subtitleBackgroundOpacity
         subtitleVerticalOffset = (try? c.decode(Int.self, forKey: .subtitleVerticalOffset)) ?? d.subtitleVerticalOffset
         preferredAudioLanguage = (try? c.decode(String.self, forKey: .preferredAudioLanguage)) ?? d.preferredAudioLanguage
+        playbackMode = (try? c.decode(PlaybackMode.self, forKey: .playbackMode)) ?? d.playbackMode
         playerEngine = (try? c.decode(PlayerEngine.self, forKey: .playerEngine)) ?? d.playerEngine
         bufferProfile = (try? c.decode(BufferProfile.self, forKey: .bufferProfile)) ?? d.bufferProfile
         externalPlayerID = (try? c.decode(String.self, forKey: .externalPlayerID)) ?? d.externalPlayerID

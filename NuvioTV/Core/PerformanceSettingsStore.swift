@@ -85,6 +85,10 @@ final class PerformanceSettingsStore: ObservableObject {
         /// Developer: live FPS counter overlaid on the app. Off by default,
         /// never set by the tier defaults — a diagnostic, not an effect.
         var showFPSOverlay = false
+        /// In-player diagnostics HUD: engine, fps, dropped frames, A/V drift,
+        /// bitrate, buffer depth. Answers "why is this stuttering" on the
+        /// couch, without a Mac attached.
+        var showPlayerDiagnostics = false
         /// Motion allowed on collection folder tiles when focused. Defaults per
         /// hardware tier (off on the 2 GB HD and the 3 GB 4K gen 1).
         var collectionGifQuality: CollectionGifQuality = .deviceDefault
@@ -94,7 +98,7 @@ final class PerformanceSettingsStore: ObservableObject {
         private enum CodingKeys: String, CodingKey {
             case heroBackdrop, heroCrossfade, cardShadows, focusZoom, cardParallax
             case artworkPrefetch, artworkFadeIn
-            case sidebarAnimation, buttonAnimations, showFPSOverlay
+            case sidebarAnimation, buttonAnimations, showFPSOverlay, showPlayerDiagnostics
             case collectionGifQuality
         }
 
@@ -113,6 +117,7 @@ final class PerformanceSettingsStore: ObservableObject {
             sidebarAnimation = (try? c.decode(Bool.self, forKey: .sidebarAnimation)) ?? true
             buttonAnimations = (try? c.decode(Bool.self, forKey: .buttonAnimations)) ?? true
             showFPSOverlay = (try? c.decode(Bool.self, forKey: .showFPSOverlay)) ?? false
+            showPlayerDiagnostics = (try? c.decode(Bool.self, forKey: .showPlayerDiagnostics)) ?? false
             collectionGifQuality = (try? c.decode(CollectionGifQuality.self, forKey: .collectionGifQuality))
                 ?? .deviceDefault
         }
@@ -186,8 +191,10 @@ final class PerformanceSettingsStore: ObservableObject {
     /// Restore the hardware-tuned baseline for this box (the first-run defaults).
     func resetToRecommended() {
         let show = settings.showFPSOverlay   // a diagnostic, not part of the reset
+        let diag = settings.showPlayerDiagnostics
         var s = Self.tierDefaults()
         s.showFPSOverlay = show
+        s.showPlayerDiagnostics = diag
         settings = s
     }
 

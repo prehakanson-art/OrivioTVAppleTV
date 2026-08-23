@@ -57,6 +57,15 @@ struct PlayerScreen: View {
             SubtitleOverlayView(model: viewModel.subtitleModel, settings: viewModel.settings)
                 .ignoresSafeArea()
 
+            // Diagnostics HUD (Settings → Performance → Developer). Above the
+            // subtitles, below the controls; hidden while any panel is open so
+            // it never fights the UI for the corner.
+            if PerformanceSettingsStore.shared.settings.showPlayerDiagnostics
+                || ProcessInfo.processInfo.arguments.contains("-playerHUD"),
+               viewModel.overlay == .none || viewModel.overlay == .controls {
+                PlayerDiagnosticsHUD(viewModel: viewModel)
+            }
+
             // Window-level TRACKPAD capture (indirect touches) — the single,
             // reliable source for taps/swipes/scrub. Active over bare video,
             // the pause overlay, and while scrubbing.

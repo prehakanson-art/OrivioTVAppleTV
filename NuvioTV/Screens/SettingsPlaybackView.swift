@@ -198,6 +198,14 @@ struct PlaybackSettingsDetail: View {
                 ) { store.settings.playerEngine = PlayerEngine(rawValue: $0) ?? .auto }
 
                 NuvioDropdown(
+                    title: "Playback mode",
+                    subtitle: "Automatic picks the best supported path. Maximum Fidelity never downgrades (native Dolby Vision, Profile 7 conversion always on, Atmos renderer when the route supports it) — heaviest on older boxes. Compatibility takes the most forgiving path for streams that misbehave.",
+                    icon: "dial.high.fill",
+                    selection: store.settings.playbackMode.rawValue,
+                    options: PlaybackMode.allCases.map { NuvioDropdownOption($0.rawValue, $0.label) }
+                ) { store.settings.playbackMode = PlaybackMode(rawValue: $0) ?? .automatic }
+
+                NuvioDropdown(
                     title: "Buffer ahead",
                     subtitle: "How much of the video to download ahead so a slow/bursty connection doesn't rebuffer. Auto sizes to the file. The MB/GB options pre-load roughly that much of the movie before it's needed. Capped to what your Apple TV's memory can hold (no disk cache on tvOS), so on a 3 GB model the big options top out ~600 MB.",
                     icon: "gauge.with.dots.needle.50percent",

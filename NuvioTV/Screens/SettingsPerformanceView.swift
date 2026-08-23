@@ -148,6 +148,13 @@ struct PerformanceSettingsDetail: View {
                     subtitle: "Overlay a live frames-per-second read-out on the whole app (green = smooth, amber = some drops, red = janky), so you can see the effect of these switches while you browse. Off by default.",
                     isOn: s.showFPSOverlay
                 )
+
+                PerfToggleRow(
+                    icon: "waveform.path.ecg",
+                    title: "Playback diagnostics HUD",
+                    subtitle: "Live engine, fps, dropped frames, A/V drift, bitrate and buffer depth over the video. For chasing stutter on this box.",
+                    isOn: s.showPlayerDiagnostics
+                )
             }
 
             Text("Everything ON is the app's full look. Turn things OFF top-to-bottom until the Home screen feels right — each switch only removes visual polish, never content or features. These switches are per-device and don't sync to your account.")
