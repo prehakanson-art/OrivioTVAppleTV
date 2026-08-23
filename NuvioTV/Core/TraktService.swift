@@ -54,6 +54,7 @@ final class TraktStore: ObservableObject {
     private static let tokenKey = "nuvio.trakt.tokens.v1"
     private static let userKey = "nuvio.trakt.user.v1"
     private static let perProfileKey = "nuvio.trakt.perProfileAccounts.v1"
+    private static let explicitLoginKey = "nuvio.trakt.signedInHere.v1"
     /// Same key ProfileStore uses, read directly so the scope is right from
     /// launch even when signed out of the Orivio account (the sync manager,
     /// which scopes the other stores, only runs while signed in).
@@ -111,6 +112,14 @@ final class TraktStore: ObservableObject {
                     UserDefaults.standard.set(UserDefaults.standard.string(forKey: Self.userKey),
                                               forKey: scopedUserKey)
                 }
+                // Whoever is using the app now owns the login it ends up with,
+                // however it got there — inherited from the shared account or
+                // already sitting in this profile's slot. Without this the
+                // profile holds tokens it never "claimed", and the account is
+                // then refused permission to refresh them.
+                if UserDefaults.standard.data(forKey: scopedTokenKey) != nil {
+                    signedInHere = true
+                }
             }
             reloadAccount()
         }
@@ -122,6 +131,32 @@ final class TraktStore: ObservableObject {
     private var scopeSuffix: String { perProfileAccounts ? ".p\(profileID)" : "" }
     private var scopedTokenKey: String { Self.tokenKey + scopeSuffix }
     private var scopedUserKey: String { Self.userKey + scopeSuffix }
+    private var scopedExplicitKey: String { Self.explicitLoginKey + scopeSuffix }
+
+    /// Whether THIS profile connected Trakt itself.
+    ///
+    /// The account stores Trakt credentials per profile, but while the login
+    /// was shared every profile switch pushed the same tokens into whichever
+    /// profile was active — so every profile's row on the server now holds the
+    /// same account. Without this, turning per-profile accounts on changed
+    /// nothing visible: each profile signed straight back in from its polluted
+    /// row. A profile with no explicit login here ignores what the account
+    /// offers and shows the connect screen, which is the point of the setting.
+    private var signedInHere: Bool {
+        get { UserDefaults.standard.bool(forKey: scopedExplicitKey) }
+        set { UserDefaults.standard.set(newValue, forKey: scopedExplicitKey) }
+    }
+
+    /// Called by the device-code flow when a login completes on this profile.
+    func markSignedInHere() { signedInHere = true }
+
+    /// Forget a deleted profile's Trakt account so a recycled profile id never
+    /// inherits it.
+    func forgetProfile(_ id: Int) {
+        for key in [Self.tokenKey, Self.userKey, Self.explicitLoginKey] {
+            UserDefaults.standard.removeObject(forKey: key + ".p\(id)")
+        }
+    }
 
     /// Point the store at a profile. No-op unless per-profile accounts are on,
     /// in which case the previous profile's login is swapped out for this
@@ -179,6 +214,7 @@ final class TraktStore: ObservableObject {
         username = nil
         UserDefaults.standard.removeObject(forKey: scopedTokenKey)
         UserDefaults.standard.removeObject(forKey: scopedUserKey)
+        signedInHere = false
         if !applyingRemote { onLocalChange?() }
     }
 
@@ -188,6 +224,9 @@ final class TraktStore: ObservableObject {
     /// Trakt row — absence usually means "never synced from this device", not
     /// "signed out everywhere".
     func applyRemote(access: String?, refresh: String?, username: String?) {
+        // Per-profile mode: only a profile that connected Trakt itself accepts
+        // an account-supplied login. See `signedInHere`.
+        guard !perProfileAccounts || signedInHere else { return }
         applyingRemote = true
         defer { applyingRemote = false }
         if let access, let refresh, !access.isEmpty {

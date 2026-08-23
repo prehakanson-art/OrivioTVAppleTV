@@ -200,9 +200,15 @@ final class ProfileStore: ObservableObject {
 
     /// Deletes a profile. Profile 1 (primary) can't be removed; deleting the
     /// active profile switches back to profile 1.
+    /// Fired when a profile is deleted, so per-profile state elsewhere (the
+    /// Trakt account, for one) can be dropped rather than inherited by the next
+    /// profile to reuse that id.
+    var onProfileDeleted: ((Int) -> Void)?
+
     func delete(id: Int) {
         guard id != 1, profiles.contains(where: { $0.id == id }) else { return }
         profiles.removeAll { $0.id == id }
+        onProfileDeleted?(id)
         saveList()
         if activeProfileID == id { setActive(1) }
         notifyChange()

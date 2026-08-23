@@ -212,6 +212,7 @@ struct TraktDetail: View {
                 let result = await TraktService.pollToken(deviceCode: code.deviceCode, clientSecret: TraktStore.clientSecret)
                 switch result {
                 case .authorized(let access, let refresh):
+                    trakt.markSignedInHere()
                     trakt.store(access: access, refresh: refresh)
                     let name = await TraktService.fetchUsername(accessToken: access)
                     trakt.setUsername(name)

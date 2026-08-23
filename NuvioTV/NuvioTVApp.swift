@@ -195,6 +195,7 @@ struct RootView: View {
                     // the sync manager owns profile scoping for every other
                     // store, but it only runs while signed in.
                     profiles.onSwitchLocal = { [weak trakt] id in trakt?.setProfile(id) }
+                    profiles.onProfileDeleted = { [weak trakt] id in trakt?.forgetProfile(id) }
                     traktSync = TraktSyncManager(
                         trakt: trakt, watched: watched, progress: progressStore,
                         library: library, ratings: ratings, addonManager: addonManager
@@ -251,6 +252,10 @@ struct RootView: View {
                     // same calls Settings and the profile gate make.
                     if args.contains("-traktPerProfile") { trakt.perProfileAccounts = true }
                     if args.contains("-traktShared") { trakt.perProfileAccounts = false }
+                    if let f = args.first(where: { $0.hasPrefix("-traktForget:") })?
+                        .replacingOccurrences(of: "-traktForget:", with: ""), let id = Int(f) {
+                        trakt.forgetProfile(id)   // same path a profile deletion takes
+                    }
                     if let p = args.first(where: { $0.hasPrefix("-profile:") })?
                         .replacingOccurrences(of: "-profile:", with: ""), let id = Int(p) {
                         profiles.setActive(id)
