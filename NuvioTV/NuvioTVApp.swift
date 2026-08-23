@@ -241,6 +241,19 @@ struct RootView: View {
                         selectedTab = 1
                         searchPath.append(Route.discover)
                     }
+                    // Dev: report what Trakt resolves to for the ACTIVE profile,
+                    // after sync has had a chance to interfere. Reading the raw
+                    // defaults keys can't answer this — the answer depends on
+                    // which scope the store chose.
+                    if args.contains("-traktReport") {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
+                            let report = "profile=\(profiles.activeProfileID)"
+                                + " perProfile=\(trakt.perProfileAccounts)"
+                                + " signedIn=\(trakt.isSignedIn)"
+                                + " user=\(trakt.username ?? "-")"
+                            UserDefaults.standard.set(report, forKey: "dev.traktReport")
+                        }
+                    }
                     // Dev: remove a title from Continue Watching through the
                     // same call the hold menu makes, so the fan-out to Orivio,
                     // Trakt and Stremio can be exercised without the tvOS UI.

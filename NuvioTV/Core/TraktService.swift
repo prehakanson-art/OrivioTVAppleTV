@@ -101,26 +101,7 @@ final class TraktStore: ObservableObject {
         didSet {
             guard perProfileAccounts != oldValue else { return }
             UserDefaults.standard.set(perProfileAccounts, forKey: Self.perProfileKey)
-            if perProfileAccounts {
-                // Turning it ON: whoever is using the app now keeps the login
-                // that was already set up, and the other profiles start empty.
-                // The device-wide copy is left untouched, so turning it back
-                // off restores the shared account exactly as it was.
-                if UserDefaults.standard.data(forKey: scopedTokenKey) == nil,
-                   let shared = UserDefaults.standard.data(forKey: Self.tokenKey) {
-                    UserDefaults.standard.set(shared, forKey: scopedTokenKey)
-                    UserDefaults.standard.set(UserDefaults.standard.string(forKey: Self.userKey),
-                                              forKey: scopedUserKey)
-                }
-                // Whoever is using the app now owns the login it ends up with,
-                // however it got there — inherited from the shared account or
-                // already sitting in this profile's slot. Without this the
-                // profile holds tokens it never "claimed", and the account is
-                // then refused permission to refresh them.
-                if UserDefaults.standard.data(forKey: scopedTokenKey) != nil {
-                    signedInHere = true
-                }
-            }
+            if perProfileAccounts { adoptSharedLoginIntoPrimaryProfile() }
             reloadAccount()
         }
     }
@@ -150,12 +131,59 @@ final class TraktStore: ObservableObject {
     /// Called by the device-code flow when a login completes on this profile.
     func markSignedInHere() { signedInHere = true }
 
+    /// Splitting accounts hands the existing login to PROFILE 1, not to
+    /// whoever happens to be using the app.
+    ///
+    /// Seeding the active profile instead meant that switching to a profile
+    /// with no Trakt and toggling the setting off and on again copied the main
+    /// account into it — so the second profile could never get its own login,
+    /// which is the bug this fixes. Only profile 1 inherits, and only when it
+    /// has nothing of its own; every other profile keeps whatever it had
+    /// (preserved in the background across toggles) or starts at the connect
+    /// screen. The device-wide copy is never touched, so turning the setting
+    /// off always falls back to the main account.
+    private func adoptSharedLoginIntoPrimaryProfile() {
+        let shared = UserDefaults.standard.data(forKey: Self.tokenKey)
+        let primaryToken = Self.tokenKey + ".p1"
+        if UserDefaults.standard.data(forKey: primaryToken) == nil, let shared {
+            UserDefaults.standard.set(shared, forKey: primaryToken)
+            UserDefaults.standard.set(UserDefaults.standard.string(forKey: Self.userKey),
+                                      forKey: Self.userKey + ".p1")
+            UserDefaults.standard.set(true, forKey: Self.explicitLoginKey + ".p1")
+        }
+        // Clear COPIES of the main account sitting in other profiles' slots.
+        //
+        // While the login was shared, every profile switch wrote the same
+        // tokens into whichever profile was active, so those slots hold the
+        // main account without anyone having connected it there. Splitting the
+        // accounts has to start those profiles empty, or the setting looks like
+        // it did nothing. A profile that connected its OWN account has
+        // different tokens and is left alone — that is the login kept in the
+        // background across toggles.
+        guard let shared else { return }
+        for id in 2...Self.maxProfileID {
+            let tokenKey = Self.tokenKey + ".p\(id)"
+            guard UserDefaults.standard.data(forKey: tokenKey) == shared else { continue }
+            UserDefaults.standard.removeObject(forKey: tokenKey)
+            UserDefaults.standard.removeObject(forKey: Self.userKey + ".p\(id)")
+            UserDefaults.standard.removeObject(forKey: Self.explicitLoginKey + ".p\(id)")
+        }
+    }
+
+    /// Highest profile id the app allows (mirrors ProfileStore.maxProfiles).
+    private static let maxProfileID = ProfileStore.maxProfiles
+
     /// Forget a deleted profile's Trakt account so a recycled profile id never
     /// inherits it.
     func forgetProfile(_ id: Int) {
         for key in [Self.tokenKey, Self.userKey, Self.explicitLoginKey] {
             UserDefaults.standard.removeObject(forKey: key + ".p\(id)")
         }
+        // Drop the live session too when it belongs to the profile being
+        // forgotten. Clearing only storage left the tokens in memory, and the
+        // sync manager's periodic refresh then wrote them straight back into
+        // the slot that was just cleared.
+        if id == profileID { reloadAccount() }
     }
 
     /// Point the store at a profile. No-op unless per-profile accounts are on,
