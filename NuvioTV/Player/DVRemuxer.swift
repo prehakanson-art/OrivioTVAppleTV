@@ -227,18 +227,34 @@ final class DVRemuxer {
         var dvProfile: UInt8 = 0
         var audioIndex: Int32 = -1
         var audioScore = -1
+        // Dual-track Profile 7 (the MakeMKV disc layout): the BASE layer is a
+        // plain HEVC track with NO Dolby Vision config — the config and the
+        // per-frame RPUs ride the half-resolution ENHANCEMENT track. Selecting
+        // "the track with the DOVI config" therefore selects the EL, and the
+        // output is a stream whose dvvC promises 4K Dolby Vision while its
+        // samples are ~300-byte MEL placeholder frames — which VideoToolbox
+        // declines without ever raising an error. Found by pulling exactly
+        // such an output off the device and walking its NALs.
+        var doviIndex: Int32 = -1          // track carrying the DOVI config
+        var largestHEVC: Int32 = -1        // biggest HEVC track = the real BL
+        var largestWidth: Int32 = -1
 
         let streamCount = Int(ictx!.pointee.nb_streams)
         for i in 0 ..< streamCount {
             guard let stream = ictx!.pointee.streams[i], let par = stream.pointee.codecpar else { continue }
             let isAttachedPic = (stream.pointee.disposition & AV_DISPOSITION_ATTACHED_PIC) != 0
-            if par.pointee.codec_type == AVMEDIA_TYPE_VIDEO, !isAttachedPic, videoIndex < 0 {
+            if par.pointee.codec_type == AVMEDIA_TYPE_VIDEO, !isAttachedPic {
                 guard par.pointee.codec_id == AV_CODEC_ID_HEVC else { continue }
+                if par.pointee.width > largestWidth {
+                    largestWidth = par.pointee.width
+                    largestHEVC = Int32(i)
+                }
                 var sideSize = 0
-                if let side = av_stream_get_side_data(stream, AV_PKT_DATA_DOVI_CONF, &sideSize), sideSize > 0 {
+                if doviIndex < 0,
+                   let side = av_stream_get_side_data(stream, AV_PKT_DATA_DOVI_CONF, &sideSize), sideSize > 0 {
                     let record = side.withMemoryRebound(to: DOVIDecoderConfigurationRecord.self, capacity: 1) { $0.pointee }
                     dvProfile = record.dv_profile
-                    videoIndex = Int32(i)
+                    doviIndex = Int32(i)
                 }
             } else if par.pointee.codec_type == AVMEDIA_TYPE_AUDIO {
                 // Priority: E-AC3 (Atmos-capable) > AC3 > AAC.
@@ -265,13 +281,30 @@ final class DVRemuxer {
             }
         }
 
-        guard videoIndex >= 0 else {
+        guard doviIndex >= 0 else {
             report { self.onIneligible?("no Dolby Vision video stream") }
             return
         }
+        // Which layout?
+        //  single-track: the DOVI-config track IS the biggest HEVC track —
+        //                BL, EL and RPUs interleaved in one stream.
+        //  dual-track:   the config rides a separate (half-res) EL track; the
+        //                real video is the biggest HEVC track. Video comes
+        //                from the BL, RPUs are pulled from the EL packets,
+        //                converted, and injected into the BL access units.
+        let isDualTrack = largestHEVC >= 0 && largestHEVC != doviIndex
+        videoIndex = isDualTrack ? largestHEVC : doviIndex
+        let elIndex: Int32 = isDualTrack ? doviIndex : -1
         // Profile 7 (dual-layer) is convertible to 8.1 via libdovi when the
         // experimental toggle is on; otherwise it's ineligible → HDR10 path.
         let needsProfile7Conversion = (dvProfile == 7) && convertProfile7
+        // A dual-track file that is NOT being converted has nothing DV to
+        // offer from its BL alone (the BL carries no RPUs) — and profiles
+        // other than 7 don't come dual-track.
+        if isDualTrack && !needsProfile7Conversion {
+            report { self.onIneligible?("dual-track Profile 7 needs the 7→8.1 conversion enabled") }
+            return
+        }
         guard dvProfile == 5 || dvProfile == 8 || needsProfile7Conversion else {
             report { self.onIneligible?("Dolby Vision profile \(dvProfile) (only 5/8 supported)") }
             return
@@ -329,7 +362,10 @@ final class DVRemuxer {
 
         // movenc reads DV config (and HDR mastering metadata for the fallback
         // path) from STREAM side data, which parameters_copy doesn't carry.
-        copyStreamSideData(from: inVideo, to: outVideo, type: AV_PKT_DATA_DOVI_CONF)
+        // Dual-track: the DOVI config lives on the EL stream, not the BL we
+        // copy the video from — take it from whichever stream carries it.
+        let doviSource = (elIndex >= 0 ? ictx!.pointee.streams[Int(elIndex)] : nil) ?? inVideo
+        copyStreamSideData(from: doviSource, to: outVideo, type: AV_PKT_DATA_DOVI_CONF)
         copyStreamSideData(from: inVideo, to: outVideo, type: AV_PKT_DATA_MASTERING_DISPLAY_METADATA)
         copyStreamSideData(from: inVideo, to: outVideo, type: AV_PKT_DATA_CONTENT_LIGHT_LEVEL)
 
@@ -386,10 +422,75 @@ final class DVRemuxer {
         // NAL length-prefix size for RPU conversion (hvcC byte 21, low 2 bits).
         // MP4/MKV HEVC is always length-prefixed; default 4 if unreadable.
         var nalLengthSize = 4
+        // Dual-track state: converted RPUs from the EL keyed by µs pts, and BL
+        // video packets waiting for their frame's RPU. Both tracks stamp the
+        // same pts per frame (they came off the same disc), so exact matching
+        // works; the small pending cap bounds memory and gives up gracefully
+        // on a frame whose RPU never shows (written without one).
+        var elNalLengthSize = 4
+        if elIndex >= 0, let elStream = ictx!.pointee.streams[Int(elIndex)],
+           let extra = elStream.pointee.codecpar.pointee.extradata,
+           elStream.pointee.codecpar.pointee.extradata_size > 21 {
+            elNalLengthSize = Int(extra[21] & 0x03) + 1
+        }
+        var rpuByPTS: [Int64: [UInt8]] = [:]
+        var rpuOrder: [Int64] = []
+        var blPending: [UnsafeMutablePointer<AVPacket>] = []
+        defer { for pkt in blPending { var p: UnsafeMutablePointer<AVPacket>? = pkt; av_packet_free(&p) } }
         if needsProfile7Conversion,
            let extra = inVideo.pointee.codecpar.pointee.extradata,
            inVideo.pointee.codecpar.pointee.extradata_size > 22 {
             nalLengthSize = Int(extra[21] & 0x03) + 1
+        }
+
+        // Shared writer for a video packet whose bytes were rebuilt (single-
+        // track conversion, or dual-track RPU injection). Returns FFmpeg's
+        // write result.
+        func writeRebuiltVideo(_ source: UnsafeMutablePointer<AVPacket>, bytes: [UInt8]) -> Int32 {
+            let outPkt = av_packet_alloc()
+            defer { var p = outPkt; av_packet_free(&p) }
+            guard let outPkt, av_new_packet(outPkt, Int32(bytes.count)) >= 0 else { return -1 }
+            bytes.withUnsafeBufferPointer { memcpy(outPkt.pointee.data, $0.baseAddress, bytes.count) }
+            av_packet_copy_props(outPkt, source)
+            outPkt.pointee.stream_index = outVideo.pointee.index
+            av_packet_rescale_ts(outPkt, inVideoTB, outVideo.pointee.time_base)
+            outPkt.pointee.pos = -1
+            return av_interleaved_write_frame(octx, outPkt)
+        }
+
+        /// Frame key for BL↔EL matching: pts normalised to microseconds, so
+        /// differing track timebases can't break the equality.
+        func ptsKey(_ pts: Int64, _ tb: AVRational) -> Int64 {
+            av_rescale_q(pts, tb, AVRational(num: 1, den: 1_000_000))
+        }
+
+        /// Drain buffered BL packets: each goes out with its frame's converted
+        /// RPU appended as the AU's final NAL. `force` (cap hit / EOF) writes
+        /// without an RPU rather than stalling — one frame of missing dynamic
+        /// metadata beats a stuck remux.
+        func drainPending(force: Bool) -> Bool {
+            while let head = blPending.first {
+                let key = ptsKey(head.pointee.pts, inVideoTB)
+                var payload: [UInt8]?
+                if let rpu = rpuByPTS.removeValue(forKey: key) {
+                    rpuOrder.removeAll { $0 == key }
+                    var bytes = [UInt8](UnsafeBufferPointer(start: head.pointee.data, count: Int(head.pointee.size)))
+                    appendLengthPrefixed(&bytes, rpu, nalLengthSize)
+                    payload = bytes
+                } else if !force && blPending.count <= 16 {
+                    return true   // wait for this frame's RPU
+                }
+                let bytes = payload ?? [UInt8](UnsafeBufferPointer(start: head.pointee.data, count: Int(head.pointee.size)))
+                let result = writeRebuiltVideo(head, bytes: bytes)
+                var dead: UnsafeMutablePointer<AVPacket>? = head
+                av_packet_free(&dead)
+                blPending.removeFirst()
+                if result < 0 {
+                    report { self.onError?("mux write failed (\(result)) during dual-track merge") }
+                    return false
+                }
+            }
+            return true
         }
 
         while !cancelled {
@@ -398,6 +499,26 @@ final class DVRemuxer {
             defer { av_packet_unref(packet) }
 
             let streamIndex = packet.pointee.stream_index
+
+            // Dual-track: EL packets are metadata donors, never muxed. Pull the
+            // RPU out, convert it 7→8.1, file it under the frame's pts.
+            if elIndex >= 0, streamIndex == elIndex {
+                if let elStream = ictx!.pointee.streams[Int(elIndex)],
+                   let rpu = extractRPU(packet, nalLengthSize: elNalLengthSize),
+                   let conv = DoviConverter.convertRPU7to81(rpu) {
+                    let key = ptsKey(packet.pointee.pts, elStream.pointee.time_base)
+                    rpuByPTS[key] = [UInt8](conv)
+                    rpuOrder.append(key)
+                    // Bound the map: an RPU whose BL frame never arrives (edits,
+                    // discontinuities) must not accumulate forever.
+                    while rpuOrder.count > 64 {
+                        rpuByPTS.removeValue(forKey: rpuOrder.removeFirst())
+                    }
+                }
+                if !drainPending(force: false) { return }
+                continue
+            }
+
             let isVideo = streamIndex == videoIndex
             let isAudio = streamIndex == audioIndex
             guard isVideo || isAudio else { continue }
@@ -410,7 +531,7 @@ final class DVRemuxer {
             // and the untouched packet is muxed — a bad frame degrades to the
             // original rather than corrupting the stream.
             var converted: [UInt8]?
-            if needsProfile7Conversion, isVideo {
+            if needsProfile7Conversion, isVideo, elIndex < 0 {
                 converted = convertedAccessUnit(packet, nalLengthSize: nalLengthSize)
                 if let converted, converted.isEmpty {
                     // Whole packet was enhancement layer (key-flagged, one per
@@ -430,6 +551,19 @@ final class DVRemuxer {
                         keyframes.append(ptsSec - firstWrittenPTS)
                     }
                 }
+            }
+
+            // Dual-track BL video: buffer for RPU injection instead of writing
+            // straight through. Audio continues on the immediate path (the
+            // interleaver absorbs the ≤16-frame skew).
+            if elIndex >= 0, isVideo {
+                guard let clone = av_packet_clone(packet) else {
+                    report { self.onError?("packet clone failed") }
+                    return
+                }
+                blPending.append(clone)
+                if !drainPending(force: blPending.count > 16) { return }
+                continue
             }
 
             let outStream = isVideo ? outVideo : outAudio
@@ -481,6 +615,9 @@ final class DVRemuxer {
         }
 
         if cancelled { return }
+
+        // Flush any BL frames still waiting on RPUs — at EOF none are coming.
+        if !drainPending(force: true) { return }
 
         // Flush the final fragment + finalize the playlist.
         av_write_trailer(octx)
@@ -656,6 +793,27 @@ final class DVRemuxer {
             }
         }
         return converted ? out : nil
+    }
+
+    /// First Dolby Vision RPU NAL (type 62) in a packet, or nil. Used on EL
+    /// packets in the dual-track layout, where the RPU rides the enhancement
+    /// track and everything else in the packet is discarded.
+    private func extractRPU(
+        _ packet: UnsafeMutablePointer<AVPacket>, nalLengthSize: Int
+    ) -> Data? {
+        guard let data = packet.pointee.data, packet.pointee.size > 0 else { return nil }
+        let size = Int(packet.pointee.size)
+        let buf = UnsafeBufferPointer(start: data, count: size)
+        var i = 0
+        while i + nalLengthSize <= size {
+            var nalLen = 0
+            for k in 0 ..< nalLengthSize { nalLen = (nalLen << 8) | Int(buf[i + k]) }
+            i += nalLengthSize
+            guard nalLen > 0, i + nalLen <= size else { return nil }
+            if (buf[i] >> 1) & 0x3F == 62 { return Data(buf[i ..< i + nalLen]) }
+            i += nalLen
+        }
+        return nil
     }
 
     private func appendLengthPrefixed(_ out: inout [UInt8], _ nal: [UInt8], _ lengthSize: Int) {

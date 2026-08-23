@@ -647,6 +647,36 @@ final class PlayerViewModel: ObservableObject {
             if let playlist = try? String(contentsOf: dir.appendingPathComponent("dv.m3u8"), encoding: .utf8) {
                 Self.dvTrail("playlist: \(playlist.replacingOccurrences(of: "\n", with: " | "))")
             }
+            // PRESERVE the rejected output for offline analysis — teardown
+            // cleans the tmp dir minutes later, which is how the first three
+            // captured failures evaporated before they could be pulled off the
+            // device. COPY the analysis-critical files individually rather
+            // than moving the whole directory: the remuxer is still writing
+            // into it at abandon time, and the earlier moveItem failed
+            // silently behind a try?. Every failure is trailed this time.
+            let fm = FileManager.default
+            // Caches, not Documents: tvOS gives apps no writable Documents
+            // directory — the previous attempt failed with a permission error
+            // straight from the platform.
+            let keep = fm.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("dv-failed-output", isDirectory: true)
+            try? fm.removeItem(at: keep)
+            do {
+                try fm.createDirectory(at: keep, withIntermediateDirectories: true)
+                var kept: [String] = []
+                for name in ["init.mp4", "dv.m3u8", "seg00000.m4s", "seg00001.m4s"] {
+                    do {
+                        try fm.copyItem(at: dir.appendingPathComponent(name),
+                                        to: keep.appendingPathComponent(name))
+                        kept.append(name)
+                    } catch {
+                        Self.dvTrail("preserve \(name) failed: \(error.localizedDescription)")
+                    }
+                }
+                Self.dvTrail("preserved \(kept.joined(separator: ", ")) in Documents/dv-failed-output")
+            } catch {
+                Self.dvTrail("preserve dir failed: \(error.localizedDescription)")
+            }
         } else {
             Self.dvTrail("dir at abandon: remuxer already gone")
         }
