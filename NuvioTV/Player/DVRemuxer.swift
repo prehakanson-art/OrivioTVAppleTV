@@ -1,8 +1,103 @@
 import Foundation
+import Network
 import KSPlayer
 import Libavcodec
 import Libavformat
 import Libavutil
+
+/// Loopback HTTP server for the remux output.
+///
+/// AVPlayer does not play HLS from file:// URLs at all — handed one, the item
+/// sits at status .unknown forever with no error, which was the terminal
+/// failure behind every "native DV never started": the identical playlist
+/// stalls from disk and plays over http://127.0.0.1 (verified byte-for-byte
+/// with the artifact pulled off the device). The remuxer's own doc always
+/// called it a "remux server"; this is the server it never had.
+///
+/// Minimal by intent: GET only, loopback only, serves exactly one directory,
+/// supports Range (AVPlayer uses it), closes after each response.
+final class DVSegmentServer {
+    private var listener: NWListener?
+    private let directory: URL
+    private(set) var port: UInt16 = 0
+
+    init(directory: URL) { self.directory = directory }
+
+    func start() -> Bool {
+        let params = NWParameters.tcp
+        params.requiredLocalEndpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: .any)
+        guard let listener = try? NWListener(using: params) else { return false }
+        self.listener = listener
+        let ready = DispatchSemaphore(value: 0)
+        listener.stateUpdateHandler = { state in
+            if case .ready = state { ready.signal() }
+            if case .failed = state { ready.signal() }
+        }
+        listener.newConnectionHandler = { [weak self] conn in self?.serve(conn) }
+        listener.start(queue: DispatchQueue(label: "dv-http"))
+        _ = ready.wait(timeout: .now() + 2)
+        port = listener.port?.rawValue ?? 0
+        return port != 0
+    }
+
+    func stop() {
+        listener?.cancel()
+        listener = nil
+    }
+
+    var playlistURL: URL? {
+        port == 0 ? nil : URL(string: "http://127.0.0.1:\(port)/dv.m3u8")
+    }
+
+    private func serve(_ conn: NWConnection) {
+        conn.start(queue: DispatchQueue.global(qos: .userInitiated))
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 16384) { [weak self] data, _, _, _ in
+            guard let self, let data, let head = String(data: data, encoding: .utf8) else {
+                conn.cancel(); return
+            }
+            let lines = head.components(separatedBy: "\r\n")
+            let parts = (lines.first ?? "").split(separator: " ")
+            guard parts.count >= 2, parts[0] == "GET" else {
+                self.respond(conn, status: "405 Method Not Allowed", body: Data()); return
+            }
+            // Strict: last path component only — no traversal, one directory.
+            let name = String(parts[1]).components(separatedBy: "/").last ?? ""
+            let file = self.directory.appendingPathComponent(name)
+            guard !name.isEmpty, !name.contains(".."),
+                  let payload = try? Data(contentsOf: file) else {
+                self.respond(conn, status: "404 Not Found", body: Data()); return
+            }
+            let type = name.hasSuffix(".m3u8") ? "application/vnd.apple.mpegurl" : "video/mp4"
+            // Range support: AVPlayer asks for ranges on segments.
+            var body = payload
+            var status = "200 OK"
+            var extra = ""
+            if let rangeLine = lines.first(where: { $0.lowercased().hasPrefix("range:") }),
+               let spec = rangeLine.split(separator: "=").last {
+                let bounds = spec.split(separator: "-", omittingEmptySubsequences: false)
+                let from = Int(bounds.first ?? "") ?? 0
+                let to = bounds.count > 1 ? (Int(bounds[1] ) ?? payload.count - 1) : payload.count - 1
+                if from >= 0, from < payload.count, to >= from {
+                    let upper = min(to, payload.count - 1)
+                    body = payload.subdata(in: from ..< upper + 1)
+                    status = "206 Partial Content"
+                    extra = "Content-Range: bytes \(from)-\(upper)/\(payload.count)\r\n"
+                }
+            }
+            self.respond(conn, status: status, body: body,
+                         headers: "Content-Type: \(type)\r\nCache-Control: no-cache\r\n" + extra)
+        }
+    }
+
+    private func respond(_ conn: NWConnection, status: String, body: Data, headers: String = "") {
+        var head = "HTTP/1.1 \(status)\r\n"
+        head += headers
+        head += "Content-Length: \(body.count)\r\nConnection: close\r\n\r\n"
+        var out = Data(head.utf8)
+        out.append(body)
+        conn.send(content: out, completion: .contentProcessed { _ in conn.cancel() })
+    }
+}
 
 /// Captures FFmpeg's own error lines so a failed remux can say WHY.
 ///
@@ -99,6 +194,9 @@ final class DVRemuxer {
     var onError: ((String) -> Void)?
 
     let directory: URL
+    /// The loopback HTTP server AVPlayer streams from — HLS never plays from
+    /// file:// (see DVSegmentServer).
+    private var server: DVSegmentServer?
     private let inputURLString: String
     private let startAtSeconds: Double
     private let preferredAudioLanguage: String
@@ -141,6 +239,8 @@ final class DVRemuxer {
 
     /// Remove the segment directory (call after the player has moved off it).
     func cleanup() {
+        server?.stop()
+        server = nil
         try? FileManager.default.removeItem(at: directory)
     }
 
@@ -736,9 +836,14 @@ final class DVRemuxer {
 
     private func signalReadyIfNeeded() {
         guard !readySignalled, segmentIndex > 0 else { return }
+        let srv = server ?? DVSegmentServer(directory: directory)
+        server = srv
+        guard srv.port != 0 || srv.start(), let url = srv.playlistURL else {
+            report { self.onError?("local HTTP server failed to start") }
+            return
+        }
         readySignalled = true
         let start = firstWrittenPTS.isNaN ? startAtSeconds : firstWrittenPTS
-        let url = playlistURL
         report { self.onReady?(url, start) }
     }
 
