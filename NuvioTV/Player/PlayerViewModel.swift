@@ -3611,6 +3611,39 @@ final class PlayerViewModel: ObservableObject {
         let value: String
     }
 
+    /// "4:2:0 10-bit"-style label from the decoded pixel format.
+    private static func chromaLabel(_ track: MediaPlayerTrack) -> String? {
+        guard let format = track.formatDescription else { return nil }
+        let subtype = CMFormatDescriptionGetMediaSubType(format)
+        switch subtype {
+        case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+             kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+             kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+             kCVPixelFormatType_420YpCbCr10BiPlanarFullRange:
+            return "4:2:0"
+        case kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange,
+             kCVPixelFormatType_422YpCbCr8BiPlanarFullRange,
+             kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange,
+             kCVPixelFormatType_422YpCbCr10BiPlanarFullRange:
+            return "4:2:2"
+        case kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange,
+             kCVPixelFormatType_444YpCbCr8BiPlanarFullRange,
+             kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange,
+             kCVPixelFormatType_444YpCbCr10BiPlanarFullRange:
+            return "4:4:4"
+        default:
+            return nil
+        }
+    }
+
+    /// Trim Apple's verbose colour constants ("ITU_R_2020") to something a
+    /// person reads at a glance.
+    private static func shortColorTag(_ raw: String) -> String {
+        raw.replacingOccurrences(of: "ITU_R_", with: "BT.")
+            .replacingOccurrences(of: "SMPTE_ST_", with: "SMPTE ")
+            .replacingOccurrences(of: "_", with: " ")
+    }
+
     struct MediaInfoSection: Identifiable {
         let id = UUID()
         let title: String
@@ -3715,13 +3748,47 @@ final class PlayerViewModel: ObservableObject {
             if track.bitDepth > 0 {
                 video.append(.init(label: "Bit Depth", value: "\(track.bitDepth)-bit"))
             }
-            if usingNativeDV {
-                video.append(.init(label: "HDR", value: "Dolby Vision (native output)"))
-            } else if track.dovi != nil {
-                video.append(.init(label: "HDR", value: "Dolby Vision → HDR10"))
+            // Chroma + colour signalling. Worth showing verbatim rather than
+            // collapsed into "HDR": a file can be BT.2020/PQ and still not be
+            // Dolby Vision, and a wrong range or matrix is exactly what makes
+            // an image look washed out or crushed.
+            if let chroma = Self.chromaLabel(track) {
+                video.append(.init(label: "Chroma", value: chroma))
+            }
+            if let primaries = track.colorPrimaries {
+                video.append(.init(label: "Primaries", value: Self.shortColorTag(primaries)))
+            }
+            if let transfer = track.transferFunction {
+                video.append(.init(label: "Transfer", value: Self.shortColorTag(transfer)))
+            }
+            if let matrix = track.yCbCrMatrix {
+                video.append(.init(label: "Matrix", value: Self.shortColorTag(matrix)))
+            }
+            // Dolby Vision reported by PROFILE, not just as a yes/no. The
+            // profile decides what can happen: 5 and 8 go out natively, 7 is
+            // dual-layer and only plays natively after the RPU conversion, and
+            // an 8.x file carries an HDR10 base layer to fall back on.
+            if let dovi = track.dovi {
+                let profile = Int(dovi.dv_profile)
+                let level = Int(dovi.dv_level)
+                var detail = "Profile \(profile)"
+                if profile == 8 { detail += ".\(Int(dovi.dv_bl_signal_compatibility_id))" }
+                if level > 0 { detail += " · level \(level)" }
+                video.append(.init(label: "Dolby Vision", value: detail))
+                video.append(.init(
+                    label: "DV Output",
+                    value: usingNativeDV
+                        ? "Native Dolby Vision"
+                        : (profile == 7 && !settings.dolbyVisionProfile7
+                            ? "HDR10 base layer (Profile 7 conversion off)"
+                            : "HDR10 base layer")
+                ))
             } else if let range = track.formatDescription?.dynamicRange, range != .sdr {
                 // HDR10 / HLG — anything beyond SDR is worth surfacing.
                 video.append(.init(label: "HDR", value: range.description))
+            }
+            if track.fieldOrder != .progressive {
+                video.append(.init(label: "Scan", value: "Interlaced (\(track.fieldOrder))"))
             }
             sections.append(.init(title: "Video", rows: video))
         }
