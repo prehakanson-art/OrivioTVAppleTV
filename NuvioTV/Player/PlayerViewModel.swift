@@ -231,6 +231,20 @@ final class NuvioPlayerOptions: KSOptions {
     /// PlayerViewModel.load(); hops to main there.
     var onDisplayCriteriaApplied: (() -> Void)?
 
+    /// SUPPRESSED ON PURPOSE. KSPlayer clears preferredDisplayCriteria from
+    /// the player layer's deinit, via an async hop to main — a SECOND display
+    /// renegotiation, landing at a moment nobody controls, typically while the
+    /// view hierarchy is being torn down and right after the app has already
+    /// requested its own switch back. Two handshakes overlapping a surface
+    /// teardown is the recipe for the grey/miscoloured screen that only a TV
+    /// power-cycle clears (KSPlayer's own comment notes rapid changes leave
+    /// isDisplayModeSwitchInProgress stuck true, and they stopped checking it).
+    ///
+    /// The app owns this lifecycle instead: exactly one reset, at a moment of
+    /// its choosing, behind a black cover, with time to settle before anything
+    /// else changes. See PlayerViewModel.prepareForExit().
+    override func playerLayerDeinit() {}
+
     /// Counts softened drops so every 3rd still drops (catch-up pressure).
     private var softenCount = 0
 
@@ -3766,9 +3780,27 @@ final class PlayerViewModel: ObservableObject {
         // Drop any overlay so the wait shows the bare (paused) video, not a
         // half-dead confirm dialog.
         overlay = .none
-        // Kick the display-mode switch off immediately, over the player's own
-        // screen — the same thing KSPlayerLayer's deinit would do later.
-        UIApplication.shared.ks_keyWindow?.avDisplayManager.preferredDisplayCriteria = nil
+        // Release the display mode — ONCE, here, while the player's own black
+        // screen is still up and nothing else is changing. KSPlayer's deinit
+        // reset is suppressed (NuvioPlayerOptions.playerLayerDeinit) so this
+        // is the only handshake, and exitPlayer holds the cover until it has
+        // had time to settle.
+        //
+        // Skipped entirely when the user has turned the restore off: some TVs
+        // mis-handshake no matter how gently the switch is sequenced, and not
+        // switching back at all is the only thing that always works. tvOS
+        // returns the display to its home-screen format on its own terms.
+        if displayCriteriaApplied, settings.restoreDisplayModeOnExit {
+            UIApplication.shared.ks_keyWindow?.avDisplayManager.preferredDisplayCriteria = nil
+        }
+    }
+
+    /// Seconds the exit must hold its black cover before tearing the player
+    /// down, so the display-mode handshake finishes over a static screen
+    /// instead of a disappearing video surface. Zero when no switch was made
+    /// this session (the common case — exits stay instant).
+    var exitDisplaySettleDelay: Double {
+        displayCriteriaApplied && settings.restoreDisplayModeOnExit ? 1.6 : 0
     }
 
     func teardown() {

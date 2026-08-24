@@ -7,6 +7,9 @@ struct PlayerScreen: View {
     @EnvironmentObject private var watched: WatchedStore
     @StateObject private var viewModel: PlayerViewModel
     @FocusState private var catcherFocused: Bool
+    /// Opaque cover held over the last frame while the display-mode handshake
+    /// settles on exit. See exitPlayer().
+    @State private var exitCoverVisible = false
 
     let dismiss: () -> Void
 
@@ -31,6 +34,8 @@ struct PlayerScreen: View {
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
+            // NB: the exit cover is added at the END of this ZStack (see the
+            // overlay below) so it sits above every control.
 
             // In the default FIT mode the video view is hosted RAW — no
             // GeometryReader, no scaleEffect. A Core Animation transform on the
@@ -260,6 +265,12 @@ struct PlayerScreen: View {
         }
         .animation(.easeOut(duration: 0.18), value: viewModel.overlay)
         .animation(.easeOut(duration: 0.2), value: viewModel.isResyncing)
+        // Held over the last frame while the display-mode handshake settles.
+        // Opaque and above everything, so the renegotiation happens over a
+        // static black screen — never over a video surface being torn down.
+        .overlay {
+            if exitCoverVisible { Color.black.ignoresSafeArea() }
+        }
         .animation(.easeOut(duration: 0.16), value: viewModel.isScrubbing)
         .animation(.easeOut(duration: 0.16), value: viewModel.peekVisible)
         .animation(.easeOut(duration: 0.2), value: viewModel.showBufferSpinner)
@@ -365,16 +376,34 @@ struct PlayerScreen: View {
         viewModel.commitScrub()
     }
 
-    /// Confirmed exit is immediate. The confirmation button remains the guard
-    /// against accidental Back presses; once the user chooses Exit, teardown
-    /// starts and the cover is dismissed without an extra display-mode wait.
+    /// Exit is immediate UNLESS a display-mode switch happened this session.
+    ///
+    /// When one did, prepareForExit releases the mode and this holds the black
+    /// cover for a beat before dismissing, so the HDMI handshake completes
+    /// over a static screen rather than over a video surface being destroyed —
+    /// the overlap that leaves some TVs grey until they are power-cycled. The
+    /// wait is zero for every ordinary (SDR / no-switch) exit, so nothing gets
+    /// slower for the common case.
     private func exitPlayer() {
         guard !viewModel.isExiting else { return }
         NSLog("[OrivioPlayer] exitPlayer() called — overlay=%@", String(describing: viewModel.overlay))
         viewModel.prepareForExit()
-        var transaction = Transaction()
-        transaction.disablesAnimations = true
-        withTransaction(transaction) { dismiss() }
+        let settle = viewModel.exitDisplaySettleDelay
+        guard settle > 0 else {
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) { dismiss() }
+            return
+        }
+        // isExiting is already true, so every input path is inert while this
+        // runs — a Back press during the wait can't re-enter the exit flow.
+        exitCoverVisible = true
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: UInt64(settle * 1_000_000_000))
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) { dismiss() }
+        }
     }
 
     private var remoteCatcher: some View {

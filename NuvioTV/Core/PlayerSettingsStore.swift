@@ -338,6 +338,16 @@ struct PlayerSettings: Codable, Equatable {
     /// works; off falls back to the HDR10 base layer every HDR10+ stream
     /// already carries, so turning it off never costs the picture.
     var hdr10PlusPassthrough: Bool = true
+
+    /// Put the TV back in its home-screen display mode when playback ends.
+    ///
+    /// ON is correct behaviour and the default. OFF exists because some TVs
+    /// mis-handshake the HDMI mode change on the way OUT and wedge on a grey
+    /// or miscoloured screen until they are power-cycled — no app-side
+    /// sequencing fully prevents that on those panels, and simply never
+    /// switching back does. The Apple TV then stays in the content's mode
+    /// until tvOS moves it on its own terms.
+    var restoreDisplayModeOnExit: Bool = true
     /// Convert Dolby Vision Profile 7 (dual-layer) → 8.1 via
     /// libdovi so DV7 files also get native DV output (the base layer is kept,
     /// the enhancement layer dropped, each RPU rewritten 7→8.1). The DEFAULT is
@@ -494,6 +504,7 @@ struct PlayerSettings: Codable, Equatable {
         matchFrameRate = (try? c.decode(Bool.self, forKey: .matchFrameRate)) ?? d.matchFrameRate
         nativeDolbyVision = (try? c.decode(Bool.self, forKey: .nativeDolbyVision)) ?? d.nativeDolbyVision
         hdr10PlusPassthrough = (try? c.decode(Bool.self, forKey: .hdr10PlusPassthrough)) ?? d.hdr10PlusPassthrough
+        restoreDisplayModeOnExit = (try? c.decode(Bool.self, forKey: .restoreDisplayModeOnExit)) ?? d.restoreDisplayModeOnExit
         dolbyVisionProfile7 = (try? c.decode(Bool.self, forKey: .dolbyVisionProfile7)) ?? d.dolbyVisionProfile7
         dolbyVisionProfile7Pace = (try? c.decode(DolbyVisionRemuxPace.self, forKey: .dolbyVisionProfile7Pace)) ?? d.dolbyVisionProfile7Pace
         fullAssSubtitles = (try? c.decode(Bool.self, forKey: .fullAssSubtitles)) ?? d.fullAssSubtitles
