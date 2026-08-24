@@ -418,7 +418,8 @@ final class PlayerViewModel: ObservableObject {
         // the remux at the target (the source supports range requests).
         if usingNativeDV {
             let windowEnd = dvRemuxFinished ? .infinity : dvTimeOffset + dvWrittenSeconds
-            if seconds < dvTimeOffset - 2 || seconds > windowEnd + 4 {
+            let windowStart = dvTimeOffset + dvPrunedThrough
+            if seconds < windowStart - 2 || seconds > windowEnd + 4 {
                 restartNativeDV(at: seconds)
                 return
             }
@@ -463,6 +464,10 @@ final class PlayerViewModel: ObservableObject {
     private var dvTimeOffset: Double = 0
     /// Seconds of content written past dvTimeOffset (the seekable window).
     private var dvWrittenSeconds: Double = 0
+    /// Seconds pruned off the FRONT of that window — already-watched segments
+    /// whose files were deleted to bound disk use. A seek behind this point
+    /// re-remuxes instead of requesting a file that no longer exists.
+    private var dvPrunedThrough: Double = 0
     private var dvRemuxFinished = false
     /// Full duration from the FFmpeg session — the growing playlist's own
     /// duration would otherwise creep up the timeline as segments land.
@@ -606,6 +611,10 @@ final class PlayerViewModel: ObservableObject {
             guard let self, self.dvRemuxer === remuxer else { return }
             self.dvWrittenSeconds = max(self.dvWrittenSeconds, written)
         }
+        remuxer.onWindowStart = { [weak self] pruned in
+            guard let self, self.dvRemuxer === remuxer else { return }
+            self.dvPrunedThrough = max(self.dvPrunedThrough, pruned)
+        }
         remuxer.onFinished = { [weak self] in
             guard let self, self.dvRemuxer === remuxer else { return }
             self.dvRemuxFinished = true
@@ -649,6 +658,7 @@ final class PlayerViewModel: ObservableObject {
         position = clamped
         clock.position = clamped
         dvWrittenSeconds = 0
+        dvPrunedThrough = 0
         dvRemuxFinished = false
         NSLog("[OrivioDV] out-of-window seek → re-remux from %.1fs", clamped)
         startDVRemux(from: max(clamped - 2, 0), isRestart: true)
@@ -735,6 +745,7 @@ final class PlayerViewModel: ObservableObject {
         dvRestarting = false
         dvTimeOffset = 0
         dvWrittenSeconds = 0
+        dvPrunedThrough = 0
         dvRemuxFinished = false
         dvFullDuration = 0
         // Back to the default payload. Left at .hdr10Plus, the next title's DV
@@ -4496,6 +4507,14 @@ extension PlayerViewModel: KSPlayerLayerDelegate {
     }
 
     func player(layer: KSPlayerLayer, currentTime: TimeInterval, totalTime: TimeInterval) {
+        // Feed the remuxer the viewer's position BEFORE the offset is applied:
+        // the engine-relative time is already measured from the remux origin,
+        // which is what pacing and pruning compare against. This is the signal
+        // that keeps the worker from running away from the player.
+        if usingNativeDV, let remuxer = dvRemuxer, currentTime.isFinite {
+            remuxer.playheadSeconds = currentTime
+            remuxer.playheadUpdatedAt = Date()
+        }
         // Native-DV: the playlist timeline starts at dvTimeOffset — map every
         // engine-relative time back to the absolute source timeline so
         // position/progress/subtitles/auto-next all keep working unchanged.

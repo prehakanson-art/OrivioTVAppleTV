@@ -223,6 +223,38 @@ final class DVRemuxer {
     /// Wall-clock anchor, captured when the first content packet is seen.
     private var paceStartWall: Date?
 
+    /// Where the viewer actually is, in seconds past `firstWrittenPTS` — the
+    /// same origin `contentAhead` and `segmentStarts` use, so all three
+    /// compare directly. -1 = not reported yet. Written from the main thread
+    /// on each position tick, read on the worker.
+    ///
+    /// This is what turns pacing from "download at a fixed multiple of
+    /// realtime, forever" into "stay a bounded distance ahead of the viewer".
+    /// The old wall-clock rule kept pulling at 1.5x the CONTENT bitrate for
+    /// the whole movie — 105 Mbps sustained on a 70 Mbps remux — which is a
+    /// bandwidth demand many links simply can't meet, and it front-ran the
+    /// player into constant rebuffering on exactly the files this feature is
+    /// for. It also wrote the entire movie to disk (~60 GB for a 2-hour UHD
+    /// remux), which no Apple TV has room for.
+    @Atomic var playheadSeconds: Double = -1
+    /// When playheadSeconds was last written. A stale playhead falls back to
+    /// the wall-clock rule so a silent player can never wedge the worker.
+    @Atomic var playheadUpdatedAt: Date = .distantPast
+
+    /// Seconds of already-watched content kept on disk behind the playhead.
+    /// Anything older is deleted; the player is told, and turns a seek that
+    /// far back into a re-remux rather than a request for a deleted file.
+    var retentionSeconds: Double = 150
+
+    /// Content seconds pruned from the front so far (the window start).
+    private var prunedThrough: Double = 0
+    /// Playlist index of the oldest segment still on disk.
+    private var firstRetainedSegment = 0
+    /// Cumulative start time of each segment, for prune decisions.
+    private var segmentStarts: [Double] = []
+    /// Reports the new window start after pruning (main thread).
+    var onWindowStart: ((Double) -> Void)?
+
     init(input: String, startAt: Double, preferredAudioLanguage: String = "",
          convertProfile7: Bool = false,
          allowHDR10Only: Bool = false) {
@@ -248,8 +280,19 @@ final class DVRemuxer {
         cancelled = true
     }
 
-    /// Remove the segment directory (call after the player has moved off it).
+    /// Stop the worker and remove the segment directory.
+    ///
+    /// CANCELLING FIRST IS THE WHOLE POINT. The worker thread captures self
+    /// strongly, so a remuxer that is merely dereferenced is not deallocated —
+    /// its thread keeps running av_read_frame, keeps pulling the source at up
+    /// to the paced rate, and keeps writing segments into a directory that no
+    /// longer exists. Every failed DV attempt therefore left a full-bitrate
+    /// downloader running for the rest of the session, competing with the
+    /// playback it had just fallen back to: "native DV failed and it keeps
+    /// buffering on plain FFmpeg" was this, and the failure paths that give up
+    /// BEFORE switching in (the common ones) never called cancel() at all.
     func cleanup() {
+        cancel()
         server?.stop()
         server = nil
         try? FileManager.default.removeItem(at: directory)
@@ -729,8 +772,25 @@ final class DVRemuxer {
             // wall clock only, so it can never deadlock waiting on the playhead.
             if paceSpeedFactor > 0, let startWall = paceStartWall, !firstWrittenPTS.isNaN {
                 let contentAhead = lastVideoPTS - firstWrittenPTS
-                while !cancelled,
-                      contentAhead > Date().timeIntervalSince(startWall) * paceSpeedFactor + paceLeadSeconds {
+                while !cancelled {
+                    // Wall-clock budget: the original rule, kept as the floor
+                    // that guarantees progress before the player has switched
+                    // in (nobody is reporting a playhead yet) and whenever the
+                    // reports go stale.
+                    let wallBudget =
+                        Date().timeIntervalSince(startWall) * paceSpeedFactor + paceLeadSeconds
+                    // Playhead budget: never get more than the head-start
+                    // ahead of what is actually being watched. Because the
+                    // budget is always playhead + leadSeconds, a player that
+                    // is stalled (position frozen while it rebuffers) still
+                    // gets a full head-start of new content — so this throttle
+                    // cannot deadlock the thing it is feeding.
+                    let head = playheadSeconds
+                    let playheadFresh = Date().timeIntervalSince(playheadUpdatedAt) < 10
+                    let playheadBudget = (head >= 0 && playheadFresh)
+                        ? head + paceLeadSeconds
+                        : Double.infinity
+                    if contentAhead <= min(wallBudget, playheadBudget) { break }
                     Thread.sleep(forTimeInterval: 0.2)
                 }
             }
@@ -818,7 +878,9 @@ final class DVRemuxer {
             duration = max(lastVideoPTS - (firstWrittenPTS.isNaN ? 0 : firstWrittenPTS) - base + 0.04, 0.04)
         }
         segmentDurations.append(duration)
+        segmentStarts.append(segmentStarts.last.map { $0 + (segmentDurations.dropLast().last ?? 0) } ?? 0)
         segmentIndex += 1
+        pruneWatchedSegments()
 
         writePlaylist(ended: false)
         if segmentIndex >= 3 { signalReadyIfNeeded() }
@@ -835,6 +897,37 @@ final class DVRemuxer {
     }
 
     // MARK: - Playlist
+
+    /// Delete segment FILES that the viewer is well past.
+    ///
+    /// The playlist keeps its entries and its timeline: dropping lines and
+    /// bumping EXT-X-MEDIA-SEQUENCE would turn this into a sliding live
+    /// playlist and change how AVPlayer maps currentTime, which the player's
+    /// seek translation depends on. Only the bytes go. The player is told the
+    /// new window start and turns a seek behind it into a re-remux, so nobody
+    /// ever requests a file that isn't there.
+    private func pruneWatchedSegments() {
+        let head = playheadSeconds
+        guard head >= 0, Date().timeIntervalSince(playheadUpdatedAt) < 30 else { return }
+        let cutoff = head - retentionSeconds
+        guard cutoff > 0 else { return }
+        var pruned = false
+        while firstRetainedSegment < segmentIndex,
+              firstRetainedSegment < segmentStarts.count,
+              segmentStarts[firstRetainedSegment]
+                  + (segmentDurations.indices.contains(firstRetainedSegment)
+                     ? segmentDurations[firstRetainedSegment] : 0) < cutoff {
+            let name = String(format: "seg%05d.m4s", firstRetainedSegment)
+            try? FileManager.default.removeItem(at: directory.appendingPathComponent(name))
+            prunedThrough = segmentStarts[firstRetainedSegment]
+            firstRetainedSegment += 1
+            pruned = true
+        }
+        if pruned {
+            let start = prunedThrough
+            report { self.onWindowStart?(start) }
+        }
+    }
 
     private func writePlaylist(ended: Bool) {
         var lines = [
