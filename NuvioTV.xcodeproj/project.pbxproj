@@ -92,7 +92,6 @@
 		93D9C17201FE340994DE008F /* StremioNav.swift in Sources */ = {isa = PBXBuildFile; fileRef = 266C115A676FB5B37B2FC761 /* StremioNav.swift */; };
 		93E54350111ACD546EF3AA86 /* TMDBService.swift in Sources */ = {isa = PBXBuildFile; fileRef = E3BA0288809B5DD6BEFC91DE /* TMDBService.swift */; };
 		940EF9F55F7D3674E2E712FC /* NuvioAuthModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3DA2F1D1196039A07AE5F6E0 /* NuvioAuthModels.swift */; };
-		948DDDB74756ED1594B6D0FB /* SubtitleProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9B6486364A772D88D23EE575 /* SubtitleProbe.swift */; };
 		954267FE8B47C238B5ED55D1 /* WatchedStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B526B12FF40C35C8286806C2 /* WatchedStore.swift */; };
 		95D56F234169C4D3C66B6EC7 /* ProfilesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1B7D256E3B5029E76D7C03D /* ProfilesView.swift */; };
 		96D2CB47BCA0FE3E4D612153 /* HomeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = ADBB2C0716736EF000BE1068 /* HomeView.swift */; };
@@ -139,6 +138,7 @@
 		E2CFF35E41DBA1ED383BD452 /* CommunityCollectionsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = EDFA7EC018CBBC0C2C165D94 /* CommunityCollectionsView.swift */; };
 		E373E2BFA1CA4BC70051A3AA /* ThemedDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B70422822F30616E5627F138 /* ThemedDetailView.swift */; };
 		E443BC9DF49F9CC79A5971CD /* AddonCatalogService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16C3CC132C8AA81FEAD97A0F /* AddonCatalogService.swift */; };
+		E49DA432855CAADA04F61C1A /* StreamProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3AFF7295F1567705FF1F5B5D /* StreamProbe.swift */; };
 		E5B79A409AAB47A1AC1155D8 /* DetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 243ACB41C793BA410B49B210 /* DetailView.swift */; };
 		E70E13C52AD92FE35CBC2E4C /* CatalogSeeAllView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 09C3A6238099830333C1A60E /* CatalogSeeAllView.swift */; };
 		E7D11030D6A9778E46F942EB /* PerformanceSettingsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 378BD17D8C6352257471571D /* PerformanceSettingsStore.swift */; };
@@ -202,6 +202,7 @@
 		39DC3B35BA33139C3E0E7E57 /* ATVSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ATVSettingsView.swift; sourceTree = "<group>"; };
 		3A1B94052D73FAE9626AEBA3 /* DebridService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebridService.swift; sourceTree = "<group>"; };
 		3A901073E967FB097E347259 /* CollectionsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CollectionsStore.swift; sourceTree = "<group>"; };
+		3AFF7295F1567705FF1F5B5D /* StreamProbe.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamProbe.swift; sourceTree = "<group>"; };
 		3DA2F1D1196039A07AE5F6E0 /* NuvioAuthModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioAuthModels.swift; sourceTree = "<group>"; };
 		40ED41BE6AC1AE734241A985 /* LibraryStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryStore.swift; sourceTree = "<group>"; };
 		414898F11CD091C483A70A67 /* MDBListService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MDBListService.swift; sourceTree = "<group>"; };
@@ -243,7 +244,6 @@
 		8E7D954FA6B8F52309A05490 /* StremioAPI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StremioAPI.swift; sourceTree = "<group>"; };
 		918B41E012EC14B4B09F7155 /* NuvioLocalBackupService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioLocalBackupService.swift; sourceTree = "<group>"; };
 		969D7289F1E624FC42108D86 /* NuvioSyncManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioSyncManager.swift; sourceTree = "<group>"; };
-		9B6486364A772D88D23EE575 /* SubtitleProbe.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubtitleProbe.swift; sourceTree = "<group>"; };
 		9BE091846427522F2BC04294 /* StremioBoard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StremioBoard.swift; sourceTree = "<group>"; };
 		9F731E55D56113BBF882CA93 /* M3UService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = M3UService.swift; sourceTree = "<group>"; };
 		A26744F92AC1D7E60BF3416E /* HomeCatalogSettingsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeCatalogSettingsStore.swift; sourceTree = "<group>"; };
@@ -559,7 +559,7 @@
 				E6F178D2C0DFC1696A87DB92 /* ScrubberViews.swift */,
 				1970D6E8918900E798318067 /* ScrubThumbnailer.swift */,
 				0AABBCDB9DAA6E74AB201B6E /* SidePanels.swift */,
-				9B6486364A772D88D23EE575 /* SubtitleProbe.swift */,
+				3AFF7295F1567705FF1F5B5D /* StreamProbe.swift */,
 				E07F3565C7E5BB417A83893E /* TrailerPlayer.swift */,
 				760F22FDFFEF572A2AB98E3D /* VLCEngine.swift */,
 			);
@@ -839,6 +839,7 @@
 				563A626670904DF05648D760 /* SidebarNav.swift in Sources */,
 				9E84617B508432C86A202A4E /* SourceSelection.swift in Sources */,
 				2DCA83982721109BBFD27A97 /* StreamBadges.swift in Sources */,
+				E49DA432855CAADA04F61C1A /* StreamProbe.swift in Sources */,
 				7000373F832F741F5E30C8D0 /* StreamsView.swift in Sources */,
 				8BEFD722640C2C3DCF9F0E71 /* StremioAPI.swift in Sources */,
 				AE8A26A212CF6A062EA2F0B7 /* StremioAccount.swift in Sources */,
@@ -851,7 +852,6 @@
 				1D5290072980FEA7079EEE83 /* StremioSettings.swift in Sources */,
 				C600249401D4B97C5E980D06 /* StremioSyncManager.swift in Sources */,
 				7663CBA85576AA0034F84B29 /* StremioTokens.swift in Sources */,
-				948DDDB74756ED1594B6D0FB /* SubtitleProbe.swift in Sources */,
 				3E75BF4F2B2008787D63DDDD /* TMDBBrowseView.swift in Sources */,
 				93E54350111ACD546EF3AA86 /* TMDBService.swift in Sources */,
 				E373E2BFA1CA4BC70051A3AA /* ThemedDetailView.swift in Sources */,

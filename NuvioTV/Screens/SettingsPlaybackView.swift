@@ -250,6 +250,14 @@ struct PlaybackSettingsDetail: View {
                 }
 
                 PlaybackToggleRow(
+                    icon: "rectangle.on.rectangle.badge.gearshape",
+                    title: "HDR10+ passthrough",
+                    subtitle: "Send HDR10+ dynamic metadata to the TV instead of the plain HDR10 base layer, so brightness is mapped scene by scene. The metadata lives inside the video, and only Apple's own pipeline carries it through — so a matching file is remuxed on-device the same way Dolby Vision is, and falls back to HDR10 if anything fails. Needs an Apple TV 4K (3rd gen) or newer on tvOS 18.4+, an HDR10+ TV, and an HDR10+ file; Dolby Vision always wins when a file has both.",
+                    isOn: s.hdr10PlusPassthrough,
+                    unavailable: PerformanceProfile.hdr10PlusUnavailableReason
+                )
+
+                PlaybackToggleRow(
                     icon: "sparkles.tv.fill",
                     title: "Native Dolby Vision",
                     subtitle: "Play Dolby Vision files (profile 5/8) through Apple's video pipeline for true dynamic DV on DV-capable TVs. Remuxes on-device; falls back to the standard HDR10 engine automatically if anything fails. Off = always use the standard engine.",
@@ -575,10 +583,19 @@ private struct PlaybackToggleRow: View {
     let title: String
     let subtitle: String
     @Binding var isOn: Bool
+    /// Non-nil = this Apple TV can't do it. The row still shows (so the
+    /// feature is discoverable and the limit is explained rather than
+    /// mysterious) but reads as off and refuses to toggle.
+    var unavailable: String?
 
     var body: some View {
-        Button { isOn.toggle() } label: {
-            PlaybackToggleLabel(icon: icon, title: title, subtitle: subtitle, isOn: isOn)
+        Button { if unavailable == nil { isOn.toggle() } } label: {
+            PlaybackToggleLabel(
+                icon: icon, title: title,
+                subtitle: unavailable.map { "\(subtitle)\n\nUnavailable: \($0)." } ?? subtitle,
+                isOn: isOn && unavailable == nil,
+                dimmed: unavailable != nil
+            )
         }
         .buttonStyle(PlainCardButtonStyle())
     }
@@ -591,6 +608,7 @@ private struct PlaybackToggleLabel: View {
     let title: String
     let subtitle: String
     let isOn: Bool
+    var dimmed = false
 
     var body: some View {
         HStack(alignment: .top, spacing: NuvioSpacing.md) {
@@ -615,6 +633,7 @@ private struct PlaybackToggleLabel: View {
         .frame(minHeight: 76)
         .frame(maxWidth: .infinity)
         .background(SettingsRowBackground(isFocused: isFocused))
+        .opacity(dimmed ? 0.5 : 1)
     }
 }
 

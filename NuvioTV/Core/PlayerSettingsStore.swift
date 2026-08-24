@@ -330,6 +330,14 @@ struct PlayerSettings: Codable, Equatable {
     /// to the standard engine automatically. Off = always use the standard
     /// HDR10 path.
     var nativeDolbyVision: Bool = true
+
+    /// HDR10+ passthrough. Apple added HDR10+ output in tvOS 18.4 and ONLY on
+    /// the Apple TV 4K 3rd gen (A15) — `PerformanceProfile.supportsHDR10Plus`
+    /// is the real gate, and this switch does nothing on older boxes (its row
+    /// is disabled there and says why). On by default so capable hardware just
+    /// works; off falls back to the HDR10 base layer every HDR10+ stream
+    /// already carries, so turning it off never costs the picture.
+    var hdr10PlusPassthrough: Bool = true
     /// Convert Dolby Vision Profile 7 (dual-layer) → 8.1 via
     /// libdovi so DV7 files also get native DV output (the base layer is kept,
     /// the enhancement layer dropped, each RPU rewritten 7→8.1). The DEFAULT is
@@ -485,6 +493,7 @@ struct PlayerSettings: Codable, Equatable {
         matchContentDisplayMode = (try? c.decode(Bool.self, forKey: .matchContentDisplayMode)) ?? d.matchContentDisplayMode
         matchFrameRate = (try? c.decode(Bool.self, forKey: .matchFrameRate)) ?? d.matchFrameRate
         nativeDolbyVision = (try? c.decode(Bool.self, forKey: .nativeDolbyVision)) ?? d.nativeDolbyVision
+        hdr10PlusPassthrough = (try? c.decode(Bool.self, forKey: .hdr10PlusPassthrough)) ?? d.hdr10PlusPassthrough
         dolbyVisionProfile7 = (try? c.decode(Bool.self, forKey: .dolbyVisionProfile7)) ?? d.dolbyVisionProfile7
         dolbyVisionProfile7Pace = (try? c.decode(DolbyVisionRemuxPace.self, forKey: .dolbyVisionProfile7Pace)) ?? d.dolbyVisionProfile7Pace
         fullAssSubtitles = (try? c.decode(Bool.self, forKey: .fullAssSubtitles)) ?? d.fullAssSubtitles

@@ -203,6 +203,15 @@ final class DVRemuxer {
     /// Convert Profile 7 (dual-layer) → 8.1 via libdovi so DV7 also gets
     /// native output. Off = P7 is ineligible and falls back to HDR10.
     private let convertProfile7: Bool
+    /// Also remux plain HDR10/HDR10+ (no Dolby Vision at all).
+    ///
+    /// HDR10+ dynamic metadata rides as a per-frame SEI inside the video
+    /// bitstream, so a stream copy carries it through untouched — but only
+    /// AVPlayer hands the bitstream to the display pipeline intact; the
+    /// FFmpeg/Metal path decodes to pixel buffers and the dynamic metadata is
+    /// gone. An HDR10+ MKV therefore needs exactly this remux to reach the TV
+    /// as HDR10+, for the same reason a DV MKV does.
+    private let allowHDR10Only: Bool
     /// Worker-thread QoS (set before start()). A lower QoS lets tvOS shed the
     /// conversion under UI pressure instead of starving the main thread.
     var qos: QualityOfService = .userInitiated
@@ -215,11 +224,13 @@ final class DVRemuxer {
     private var paceStartWall: Date?
 
     init(input: String, startAt: Double, preferredAudioLanguage: String = "",
-         convertProfile7: Bool = false) {
+         convertProfile7: Bool = false,
+         allowHDR10Only: Bool = false) {
         inputURLString = input
         startAtSeconds = max(startAt, 0)
         self.preferredAudioLanguage = preferredAudioLanguage
         self.convertProfile7 = convertProfile7
+        self.allowHDR10Only = allowHDR10Only
         directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("dv-remux-\(UUID().uuidString)", isDirectory: true)
     }
@@ -338,6 +349,7 @@ final class DVRemuxer {
         var doviIndex: Int32 = -1          // track carrying the DOVI config
         var largestHEVC: Int32 = -1        // biggest HEVC track = the real BL
         var largestWidth: Int32 = -1
+        var largestIsPQ = false
 
         let streamCount = Int(ictx!.pointee.nb_streams)
         for i in 0 ..< streamCount {
@@ -348,6 +360,7 @@ final class DVRemuxer {
                 if par.pointee.width > largestWidth {
                     largestWidth = par.pointee.width
                     largestHEVC = Int32(i)
+                    largestIsPQ = par.pointee.color_trc == AVCOL_TRC_SMPTE2084
                 }
                 var sideSize = 0
                 if doviIndex < 0,
@@ -381,8 +394,17 @@ final class DVRemuxer {
             }
         }
 
-        guard doviIndex >= 0 else {
-            report { self.onIneligible?("no Dolby Vision video stream") }
+        // HDR10/HDR10+ only (no Dolby Vision anywhere): eligible when the
+        // caller asked for it and the video really is PQ HDR. dvProfile stays
+        // 0, which the tagging below already treats as "plain HEVC" — hvc1,
+        // no dvvC — and no RPU conversion runs.
+        let hdr10OnlyPath = doviIndex < 0 && allowHDR10Only && largestHEVC >= 0 && largestIsPQ
+        guard doviIndex >= 0 || hdr10OnlyPath else {
+            report { self.onIneligible?(
+                self.allowHDR10Only
+                    ? "no Dolby Vision and no PQ HDR video stream"
+                    : "no Dolby Vision video stream"
+            ) }
             return
         }
         // Which layout?
@@ -392,8 +414,8 @@ final class DVRemuxer {
         //                real video is the biggest HEVC track. Video comes
         //                from the BL, RPUs are pulled from the EL packets,
         //                converted, and injected into the BL access units.
-        let isDualTrack = largestHEVC >= 0 && largestHEVC != doviIndex
-        videoIndex = isDualTrack ? largestHEVC : doviIndex
+        let isDualTrack = doviIndex >= 0 && largestHEVC >= 0 && largestHEVC != doviIndex
+        videoIndex = hdr10OnlyPath ? largestHEVC : (isDualTrack ? largestHEVC : doviIndex)
         let elIndex: Int32 = isDualTrack ? doviIndex : -1
         // Profile 7 (dual-layer) is convertible to 8.1 via libdovi when the
         // experimental toggle is on; otherwise it's ineligible → HDR10 path.
@@ -405,7 +427,7 @@ final class DVRemuxer {
             report { self.onIneligible?("dual-track Profile 7 needs the 7→8.1 conversion enabled") }
             return
         }
-        guard dvProfile == 5 || dvProfile == 8 || needsProfile7Conversion else {
+        guard hdr10OnlyPath || dvProfile == 5 || dvProfile == 8 || needsProfile7Conversion else {
             report { self.onIneligible?("Dolby Vision profile \(dvProfile) (only 5/8 supported)") }
             return
         }

@@ -435,9 +435,29 @@ final class PlayerViewModel: ObservableObject {
 
     // MARK: - Native Dolby Vision
 
-    /// True while playback runs off the DV-tagged local playlist (real DV out
-    /// through Apple's pipeline). See DVRemuxer for the machinery.
+    /// What the native remux path is being used FOR. The machinery is shared
+    /// — remux to fMP4, serve over loopback, hand AVPlayer the bitstream — but
+    /// the reason differs, and every label the user sees has to say which.
+    enum NativePassthrough {
+        case dolbyVision
+        /// HDR10+ dynamic metadata, which lives as a per-frame SEI inside the
+        /// video bitstream. A stream copy preserves it; the FFmpeg/Metal path
+        /// decodes it away. Same remux, different payload.
+        case hdr10Plus
+
+        var label: String { self == .dolbyVision ? "Dolby Vision" : "HDR10+" }
+        var stage: String { self == .dolbyVision ? "Dolby Vision" : "HDR10+" }
+    }
+
+    /// Which payload the current/attempted native session is carrying.
+    private(set) var nativeKind: NativePassthrough = .dolbyVision
+
+    /// True while playback runs off the tagged local playlist (real DV or
+    /// HDR10+ out through Apple's pipeline). See DVRemuxer for the machinery.
     @Published private(set) var usingNativeDV = false
+
+    /// HDR10+ dynamic metadata found in the source by the header probe.
+    @Published private(set) var hasHDR10Plus = false
     private var dvRemuxer: DVRemuxer?
     /// Absolute source time (seconds) that the local playlist's t=0 maps to.
     private var dvTimeOffset: Double = 0
@@ -523,6 +543,21 @@ final class PlayerViewModel: ObservableObject {
         startDVRemux(from: max(position - 2, 0), isRestart: false)
     }
 
+    /// Called from readyToPlay right after the DV attempt. If the probe already
+    /// found HDR10+ and DV declined this title, this is where HDR10+ picks it
+    /// up — the tracks are real by now, which is what the decision needs.
+    private func maybeStartNativeHDR10PlusAfterTracks() {
+        guard hasHDR10Plus, !usingNativeDV, dvRemuxer == nil else { return }
+        maybeStartNativeHDR10Plus()
+    }
+
+    /// What playback actually falls back TO when the native path fails —
+    /// different payloads degrade to different things, and the panel must not
+    /// call an HDR10+ fallback "HDR10-mapped decode from Dolby Vision".
+    private var nativeFallbackLabel: String {
+        nativeKind == .dolbyVision ? "HDR10-mapped decode" : "HDR10 (static metadata only)"
+    }
+
     private func startDVRemux(from startAt: Double, isRestart: Bool) {
         guard let urlString = currentEntry.stream.url else { return }
         if let old = dvRemuxer {
@@ -532,14 +567,15 @@ final class PlayerViewModel: ObservableObject {
         let remuxer = DVRemuxer(
             input: urlString, startAt: startAt,
             preferredAudioLanguage: settings.preferredAudioLanguage,
-            convertProfile7: settings.dolbyVisionProfile7
+            convertProfile7: settings.dolbyVisionProfile7,
+            allowHDR10Only: nativeKind == .hdr10Plus
         )
         dvRemuxer = remuxer
         remuxer.onIneligible = { [weak self] reason in
             guard let self, self.dvRemuxer === remuxer else { return }
             NSLog("[OrivioDV] ineligible: %@", reason)
             Self.dvTrail("ineligible — \(reason)")
-            self.decisionLog.record("Dolby Vision", "HDR10-mapped decode",
+            self.decisionLog.record(self.nativeKind.stage, self.nativeFallbackLabel,
                                     because: "remux ineligible: \(reason)")
             self.dvFailedURLs.insert(urlString)
             if self.usingNativeDV { self.abandonNativeDV(reason: "became ineligible mid-play: \(reason)") }
@@ -556,8 +592,8 @@ final class PlayerViewModel: ObservableObject {
             Self.dvTrail("remux error — \(message)")
             // The panel said "Native DV" the moment the remux STARTED; a
             // failure must correct it or the info panel lies about the output.
-            self.decisionLog.record("Dolby Vision", "HDR10-mapped decode",
-                                    because: "native-DV remux failed: \(message)")
+            self.decisionLog.record(self.nativeKind.stage, self.nativeFallbackLabel,
+                                    because: "native \(self.nativeKind.label) remux failed: \(message)")
             self.dvFailedURLs.insert(urlString)
             if self.usingNativeDV { self.abandonNativeDV(reason: "remux error mid-play: \(message)") }
             // Cleanup AFTER the abandon forensics have read the directory —
@@ -598,8 +634,8 @@ final class PlayerViewModel: ObservableObject {
         dvRemuxFinished = dvRemuxFinished || false
         usingNativeDV = true
         pendingResume = nil
-        showToast("Dolby Vision — native output")
-        Self.dvTrail("switched to native DV OK")
+        showToast("\(nativeKind.label) — native output")
+        Self.dvTrail("switched to native \(nativeKind.label) OK")
         NSLog("[OrivioDV] switching to native playlist (offset %.1fs)", dvTimeOffset)
         load(entry: currentEntry, overrideURL: playlist)
     }
@@ -632,7 +668,8 @@ final class PlayerViewModel: ObservableObject {
 
     private func abandonNativeDV(reason: String = "unspecified") {
         guard usingNativeDV else { resetNativeDV(); return }
-        NSLog("[OrivioDV] abandoning native DV (%@) — falling back to FFmpeg engine", reason)
+        NSLog("[OrivioDV] abandoning native %@ (%@) — falling back to FFmpeg engine",
+              nativeKind.label, reason)
         Self.dvTrail("abandoned after switch — \(reason)")
         // Forensics: what did the remux directory actually hold when AVPlayer
         // gave up on it? This is the difference between "playlist never
@@ -680,10 +717,10 @@ final class PlayerViewModel: ObservableObject {
         } else {
             Self.dvTrail("dir at abandon: remuxer already gone")
         }
-        decisionLog.record("Dolby Vision", "HDR10-mapped decode",
-                           because: "native DV abandoned: \(reason)")
+        decisionLog.record(nativeKind.stage, nativeFallbackLabel,
+                           because: "native \(nativeKind.label) abandoned: \(reason)")
         if let urlString = currentEntry.stream.url { dvFailedURLs.insert(urlString) }
-        showToast("Native Dolby Vision failed — using HDR10")
+        showToast("Native \(nativeKind.label) failed — using HDR10")
         pendingResume = position > 10 ? position : nil
         load(entry: currentEntry)   // overrideURL nil → resetNativeDV() runs
     }
@@ -700,6 +737,9 @@ final class PlayerViewModel: ObservableObject {
         dvWrittenSeconds = 0
         dvRemuxFinished = false
         dvFullDuration = 0
+        // Back to the default payload. Left at .hdr10Plus, the next title's DV
+        // session would mislabel itself and skip the dvvC handling.
+        nativeKind = .dolbyVision
     }
 
     /// Delete every remux directory. Only safe once playback is done.
@@ -962,28 +1002,91 @@ final class PlayerViewModel: ObservableObject {
             }
         }
         load(entry: request.entry)
-        maybeRouteToVLCForASS()
+        runStreamProbe()
     }
 
-    /// Full ASS rendering: if the toggle is on and this title carries a styled
-    /// ASS/SSA subtitle track, reload into VLC (which renders it with libass +
-    /// embedded fonts). Runs in parallel with the initial KSPlayer load — a
-    /// non-ASS title never pays for it, an ASS title flips to VLC once the
-    /// header probe returns. Only for the KSPlayer-family engine and a direct
-    /// URL (not the DV playlist / an explicit VLC/native/external choice).
-    private var assRouteAttempted = false
-    private func maybeRouteToVLCForASS() {
-        guard settings.fullAssSubtitles, !assRouteAttempted,
-              effectiveEngine == .auto || effectiveEngine == .ffmpeg,
-              let url = currentEntry.stream.url else { return }
-        assRouteAttempted = true
+    /// One header probe answering both questions that change how a title
+    /// plays, run in parallel with the initial load so nothing waits on it:
+    ///
+    /// - **Styled ASS/SSA** → reload into VLC, which renders it with libass +
+    ///   embedded MKV fonts (KSPlayer's own parser drops both).
+    /// - **HDR10+** → start the native remux so the dynamic metadata reaches
+    ///   the TV instead of being decoded away by the Metal path.
+    ///
+    /// Only the questions worth asking are asked: each gate is checked BEFORE
+    /// the probe, and a probe with nothing to answer never opens a connection.
+    /// Keyed by URL, not a one-shot flag: switching source mid-title (failover,
+    /// a different addon's link) hands us a DIFFERENT FILE, whose subtitle and
+    /// HDR properties are its own. The old one-shot version silently kept the
+    /// first file's answers for the rest of the session.
+    private var probedURLs: Set<String> = []
+    private func runStreamProbe() {
+        guard effectiveEngine == .auto || effectiveEngine == .ffmpeg,
+              let url = currentEntry.stream.url,
+              !probedURLs.contains(url) else { return }
+        let wantASS = settings.fullAssSubtitles
+        // HDR10+ is only worth probing for when this box can actually output
+        // it — otherwise the honest answer is already known (HDR10 base), and
+        // a scan on an A10X would cost startup for nothing.
+        let wantHDR10Plus = settings.hdr10PlusPassthrough
+            && PerformanceProfile.supportsHDR10Plus
+            && activeMode != .compatibility
+        guard wantASS || wantHDR10Plus else { return }
+        probedURLs.insert(url)
         Task { [weak self] in
-            guard await SubtitleProbe.hasStyledASS(url: url) else { return }
-            guard let self, !self.isExiting, !self.usingNativeDV,
+            let result = await StreamProbe.inspect(
+                url: url, needsStyledASS: wantASS, needsHDR10Plus: wantHDR10Plus
+            )
+            // Only apply to the source we probed — a failover may have moved on.
+            guard let self, !self.isExiting,
+                  self.currentEntry.stream.url == url else { return }
+            self.hasHDR10Plus = result.hasHDR10Plus
+            if result.hasHDR10Plus { self.maybeStartNativeHDR10Plus() }
+            guard result.hasStyledASS, !self.usingNativeDV,
                   self.effectiveEngine != .vlc else { return }
             NSLog("[OrivioSubs] styled ASS detected — routing to VLC for full rendering")
             self.switchEngine(.vlc)
         }
+    }
+
+    /// HDR10+ found and this Apple TV can output it: take the same native
+    /// remux the DV path uses, for the same reason — only AVPlayer hands the
+    /// bitstream to the display pipeline with its per-frame metadata intact.
+    ///
+    /// Deliberately yields to Dolby Vision: a file carrying both is a DV file
+    /// with an HDR10+ base, and DV is the better output. This only runs when
+    /// no DV session is running or pending.
+    private func maybeStartNativeHDR10Plus() {
+        guard PerformanceProfile.supportsHDR10Plus, settings.hdr10PlusPassthrough,
+              activeMode != .compatibility,
+              !usingNativeDV, !dvAttempted, dvRemuxer == nil, !isExiting,
+              effectiveEngine == .auto || effectiveEngine == .ffmpeg,
+              let player = playerLayer?.player, player is KSMEPlayer,
+              let urlString = currentEntry.stream.url,
+              !dvFailedURLs.contains(urlString),
+              currentURL?.isFileURL != true
+        else { return }
+        // A DV track means the DV path owns this title (it may not have run
+        // yet — readyToPlay fires it — so check the track, not just the flags).
+        //
+        // The probe can finish BEFORE the tracks exist, and an empty track list
+        // would read as "no DV" and let HDR10+ claim a Dolby Vision file. So
+        // bail while the list is empty; readyToPlay calls this again once the
+        // tracks are real, and whichever call arrives second does the work.
+        let videoTracks = player.tracks(mediaType: .video)
+        guard !videoTracks.isEmpty else { return }
+        let track = videoTracks.first(where: \.isEnabled) ?? videoTracks.first
+        if track?.dovi != nil {
+            decisionLog.record("HDR10+", "Dolby Vision instead",
+                               because: "the file also carries DV, which is the better output")
+            return
+        }
+        dvAttempted = true
+        nativeKind = .hdr10Plus
+        decisionLog.record("HDR10+", "Native HDR10+",
+                           because: "remuxing so the per-frame metadata survives to the TV")
+        NSLog("[OrivioHDR] HDR10+ detected — starting background remux")
+        startDVRemux(from: max(position - 2, 0), isRestart: false)
     }
 
     // MARK: - App background / foreground
@@ -1218,7 +1321,11 @@ final class PlayerViewModel: ObservableObject {
         // Native-DV session: if the user also enabled display matching, let
         // updateVideo request the real Dolby Vision mode instead of clamping
         // DV→HDR10 (the clamp exists for the decoded-HDR10 Metal path).
-        options.nativeDV = overrideURL != nil
+        // Only a real DV session may request the Dolby Vision display mode.
+        // HDR10+ rides the ordinary HDR10 mode — the dynamic metadata is
+        // in-band, so asking the TV for a DV mode would be both wrong and an
+        // extra HDMI handshake.
+        options.nativeDV = overrideURL != nil && nativeKind == .dolbyVision
 
         // Route containers AVPlayer can't handle (the typical debrid remux is
         // an MKV) STRAIGHT to the FFmpeg engine. Otherwise KSPlayer tries the
@@ -3213,6 +3320,7 @@ final class PlayerViewModel: ObservableObject {
             self.currentEntry = next
             self.pendingResume = resumeAt > 10 ? resumeAt : nil
             self.load(entry: next)
+            self.runStreamProbe()
         }
     }
 
@@ -3281,6 +3389,7 @@ final class PlayerViewModel: ObservableObject {
                 self.upNextCountdown = nil
                 self.pendingResume = resumeAt > 10 ? resumeAt : nil
                 self.load(entry: direct)
+                self.runStreamProbe()
             }
             return
         }
@@ -3293,6 +3402,7 @@ final class PlayerViewModel: ObservableObject {
         upNextCountdown = nil
         pendingResume = resumeAt > 10 ? resumeAt : nil
         load(entry: entry)
+        runStreamProbe()
     }
 
     var nextEpisode: MetaVideo? {
@@ -4102,6 +4212,22 @@ final class PlayerViewModel: ObservableObject {
                 // HDR10 / HLG — anything beyond SDR is worth surfacing.
                 video.append(.init(label: "HDR", value: range.description))
             }
+            // HDR10+ is separate from the HDR row above: it's HDR10 PLUS
+            // per-frame metadata, and what reaches the TV depends on hardware
+            // this specific box may not have. Say which, in words.
+            if hasHDR10Plus {
+                video.append(.init(label: "HDR10+", value: "Dynamic metadata present"))
+                video.append(.init(
+                    label: "HDR10+ Output",
+                    value: usingNativeDV && nativeKind == .hdr10Plus
+                        ? "Passed through to the TV"
+                        : (PerformanceProfile.supportsHDR10Plus
+                            ? (settings.hdr10PlusPassthrough
+                                ? "HDR10 base layer (passthrough didn't engage)"
+                                : "HDR10 base layer (passthrough off)")
+                            : "HDR10 base layer (\(PerformanceProfile.hdr10PlusUnavailableReason ?? "unsupported"))")
+                ))
+            }
             if track.fieldOrder != .progressive {
                 video.append(.init(label: "Scan", value: "Interlaced (\(track.fieldOrder))"))
             }
@@ -4244,6 +4370,7 @@ extension PlayerViewModel: KSPlayerLayerDelegate {
             if !usingNativeDV { chapters = layer.player.chapters }
             applyNativeDisplayCriteria()
             maybeStartNativeDV()
+            maybeStartNativeHDR10PlusAfterTracks()
             if playbackSpeed != 1 {
                 layer.player.playbackRate = playbackSpeed
             }

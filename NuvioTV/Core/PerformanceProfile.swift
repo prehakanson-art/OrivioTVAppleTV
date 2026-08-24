@@ -45,10 +45,55 @@ enum PerformanceProfile {
         return ProcessInfo.processInfo.physicalMemory < 3_500_000_000
     }()
 
+    /// Major number of the machine id ("AppleTV14,1" → 14), or 0 when the id
+    /// isn't an Apple TV (the Simulator reports the host Mac's).
+    static let machineGeneration: Int = {
+        guard machine.hasPrefix("AppleTV"),
+              let major = machine.dropFirst("AppleTV".count).split(separator: ",").first
+        else { return 0 }
+        return Int(major) ?? 0
+    }()
+
+    /// HDR10+ output, which needs BOTH:
+    ///
+    /// - **Apple TV 4K 3rd gen or newer** (AppleTV14,1 · A15 · 2022). Apple
+    ///   added HDR10+ in tvOS 18.4, and only on that hardware — the 2nd gen
+    ///   (AppleTV11,1) and 1st gen (AppleTV6,2) never got it, and no software
+    ///   update will change that.
+    /// - **tvOS 18.4 or newer**, where the support shipped.
+    ///
+    /// Everything else falls back to the HDR10 base layer, which every HDR10+
+    /// stream carries by design — so a non-capable box loses the dynamic
+    /// metadata, never the picture.
+    ///
+    /// Dev override: `-hdr10Plus` forces this true, the only way to exercise
+    /// the path in the Simulator (which reports the host Mac's machine id).
+    static let supportsHDR10Plus: Bool = {
+        if ProcessInfo.processInfo.arguments.contains("-hdr10Plus") { return true }
+        guard machineGeneration >= 14 else { return false }
+        if #available(tvOS 18.4, *) { return true }
+        return false
+    }()
+
+    /// Why HDR10+ is unavailable, for the settings row and the decision log.
+    /// nil when it IS available.
+    static var hdr10PlusUnavailableReason: String? {
+        guard !supportsHDR10Plus else { return nil }
+        if machineGeneration > 0, machineGeneration < 14 {
+            return "needs an Apple TV 4K (3rd gen) or newer — this is \(tierLabel)"
+        }
+        if #available(tvOS 18.4, *) {} else {
+            return "needs tvOS 18.4 or newer"
+        }
+        return "not supported by this Apple TV"
+    }
+
     /// Friendly hardware-tier name for the "Reset to recommended" affordance.
     static var tierLabel: String {
         if machine.hasPrefix("AppleTV5") { return "Apple TV HD" }
         if machine.hasPrefix("AppleTV6") { return "Apple TV 4K (1st gen)" }
+        if machine.hasPrefix("AppleTV11") { return "Apple TV 4K (2nd gen)" }
+        if machine.hasPrefix("AppleTV14") { return "Apple TV 4K (3rd gen)" }
         if isLowPower { return "this Apple TV" }
         if isMidPower { return "this Apple TV 4K" }
         return "Apple TV 4K"
