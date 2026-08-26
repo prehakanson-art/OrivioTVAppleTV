@@ -36,6 +36,9 @@ final class DVSampleEngine {
     var onEnded: (() -> Void)?
     /// Terminal failure after a successful start (decode/enqueue/network).
     var onError: ((String) -> Void)?
+    /// Underrun state: true while the network can't keep the queue fed and
+    /// playback is held; false when refilled and rolling again.
+    var onBuffering: ((Bool) -> Void)?
 
     private(set) var duration: Double = 0
     private(set) var videoFPS: Float = 0
@@ -147,11 +150,18 @@ final class DVSampleEngine {
     private var lastLayerRecoveryAt = Date.distantPast
     private var layerRecoveryCount = 0
 
+    /// The rate the USER wants — underrun auto-pause must not overwrite a
+    /// deliberate pause, and refill must not resume one.
+    private var userRate: Float = 1
+    private var autoPaused = false
+
     func play() {
+        userRate = 1
         synchronizer.setRate(1, time: synchronizer.currentTime())
     }
 
     func pause() {
+        userRate = 0
         synchronizer.setRate(0, time: synchronizer.currentTime())
     }
 
@@ -277,9 +287,15 @@ final class DVSampleEngine {
             }
         }
         guard videoIndex >= 0 else { return "no HEVC video track" }
-        guard audioIndex >= 0 else { return "no E-AC3/AC3/AAC audio track" }
-        guard dvProfile == 5 || dvProfile == 8 || (dvProfile == 7 && convertProfile7) else {
-            return "Dolby Vision profile \(dvProfile) not supported here"
+        guard audioIndex >= 0 else { return "no playable audio track" }
+        // DV files must be a profile this pipeline can tag; a file with NO
+        // DV config plays as plain HEVC (HDR10/HDR10+/SDR — the static and
+        // dynamic metadata ride the bitstream untouched, which IS HDR10+
+        // passthrough on capable boxes).
+        if dvProfile > 0 {
+            guard dvProfile == 5 || dvProfile == 8 || (dvProfile == 7 && convertProfile7) else {
+                return "Dolby Vision profile \(dvProfile) not supported here"
+            }
         }
         let needsP7 = dvProfile == 7
         if ictx!.pointee.duration > 0 {
@@ -293,17 +309,26 @@ final class DVSampleEngine {
             return "video track carries no hvcC"
         }
         let hvcC = Data(bytes: extra, count: Int(vPar.pointee.extradata_size))
-        // The dvvC the display pipeline sees: a converted P7 declares itself
-        // 8.1 single-layer (the same contract the remux path writes).
-        let outProfile = needsP7 ? 8 : dvProfile
-        let compatID = outProfile == 5 ? 0 : 1   // 8.x rides an HDR10 base
-        let dvvC = Self.doviConfigurationBox(
-            profile: outProfile, level: max(dvLevel, 1), compatibilityID: compatID
-        )
-        guard let vFormat = Self.makeDVVideoFormat(
-            width: Int32(vPar.pointee.width), height: Int32(vPar.pointee.height),
-            hvcC: hvcC, dvvC: dvvC
-        ) else { return "couldn't build the DV format description" }
+        let vFormat: CMFormatDescription?
+        if dvProfile > 0 {
+            // The dvvC the display pipeline sees: a converted P7 declares
+            // itself 8.1 single-layer (the remux path's exact contract).
+            let outProfile = needsP7 ? 8 : dvProfile
+            let compatID = outProfile == 5 ? 0 : 1   // 8.x rides an HDR10 base
+            let dvvC = Self.doviConfigurationBox(
+                profile: outProfile, level: max(dvLevel, 1), compatibilityID: compatID
+            )
+            vFormat = Self.makeDVVideoFormat(
+                width: Int32(vPar.pointee.width), height: Int32(vPar.pointee.height),
+                hvcC: hvcC, dvvC: dvvC
+            )
+        } else {
+            vFormat = Self.makeHEVCVideoFormat(
+                width: Int32(vPar.pointee.width), height: Int32(vPar.pointee.height),
+                hvcC: hvcC
+            )
+        }
+        guard let vFormat else { return "couldn't build the video format description" }
         videoFormat = vFormat
 
         guard audioFormats[audioIndex] != nil || decodeAudioIndices.contains(audioIndex) else {
@@ -348,6 +373,28 @@ final class DVSampleEngine {
                         self.reportedLayerFailure = true
                         let detail = self.displayLayer.error.map(String.init(describing:)) ?? "unknown"
                         self.onError?("display layer failed: \(detail)")
+                    }
+                }
+                // Underrun watch: an empty video queue mid-stream means the
+                // network fell behind — HOLD the clock (or audio keeps going
+                // and A/V drifts across the gap) and show buffering; resume
+                // when a real cushion is back. Hysteresis (enter at empty,
+                // exit at 16 AUs ≈ two-thirds of a second) prevents flapping.
+                self.queueLock.lock()
+                let depth = self.videoQueue.count
+                let eof = self.demuxEOF
+                self.queueLock.unlock()
+                if !eof {
+                    if depth == 0, !self.autoPaused, self.userRate > 0, self.synchronizer.rate > 0 {
+                        self.autoPaused = true
+                        self.synchronizer.setRate(0, time: self.synchronizer.currentTime())
+                        self.onBuffering?(true)
+                    } else if self.autoPaused, depth >= 16 {
+                        self.autoPaused = false
+                        if self.userRate > 0 {
+                            self.synchronizer.setRate(1, time: self.synchronizer.currentTime())
+                        }
+                        self.onBuffering?(false)
                     }
                 }
                 if self.audioRenderer.status == .failed, !self.reportedAudioFailure {
@@ -687,6 +734,27 @@ final class DVSampleEngine {
         let status = CMVideoFormatDescriptionCreate(
             allocator: kCFAllocatorDefault,
             codecType: kCMVideoCodecType_DolbyVisionHEVC,
+            width: width, height: height,
+            extensions: extensions as CFDictionary,
+            formatDescriptionOut: &format
+        )
+        return status == noErr ? format : nil
+    }
+
+    /// Plain HEVC (HDR10/HDR10+/SDR): hvc1 + hvcC, nothing else — every SEI
+    /// in the bitstream (static mastering metadata, HDR10+ dynamic metadata)
+    /// reaches the display pipeline untouched.
+    private static func makeHEVCVideoFormat(
+        width: Int32, height: Int32, hvcC: Data
+    ) -> CMFormatDescription? {
+        let atoms: [String: Any] = ["hvcC": hvcC]
+        let extensions: [String: Any] = [
+            kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms as String: atoms
+        ]
+        var format: CMFormatDescription?
+        let status = CMVideoFormatDescriptionCreate(
+            allocator: kCFAllocatorDefault,
+            codecType: kCMVideoCodecType_HEVC,
             width: width, height: height,
             extensions: extensions as CFDictionary,
             formatDescriptionOut: &format

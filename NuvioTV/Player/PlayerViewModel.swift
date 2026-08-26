@@ -747,8 +747,13 @@ final class PlayerViewModel: ObservableObject {
             )
             guard let self, !Task.isCancelled, !self.isExiting else { return }
             let p7ok = self.activeMode == .fidelity || self.settings.dolbyVisionProfile7
-            guard let profile = probe.dvProfile,
-                  profile == 5 || profile == 8 || (profile == 7 && p7ok),
+            // profile 0 = plain HEVC (HDR10/HDR10+/SDR) — the engine plays it
+            // natively with every bitstream SEI intact, so a DV-hinted title
+            // that turns out non-DV still direct-starts instead of falling to
+            // the decode path.
+            let profile = probe.dvProfile ?? 0
+            let dvOK = profile == 0 || profile == 5 || profile == 8 || (profile == 7 && p7ok)
+            guard probe.hasHEVC, dvOK,
                   probe.hasEligibleAudio,
                   probe.durationSeconds > 60,
                   self.activeMode != .compatibility
@@ -757,7 +762,7 @@ final class PlayerViewModel: ObservableObject {
                 self.load(entry: entry)
                 return
             }
-            Self.dvTrail("DV-first: profile \(profile), \(Int(probe.durationSeconds))s — direct native start")
+            Self.dvTrail("DV-first: profile \(profile == 0 ? "HEVC/\(probe.isPQ ? "HDR10" : "SDR")" : String(profile)), \(Int(probe.durationSeconds))s — direct native start")
             self.dvAttempted = true
             self.nativeKind = .dolbyVision
             let resume = max(max(self.pendingResume ?? 0, self.sessionResumeFloor), 0)
@@ -793,6 +798,11 @@ final class PlayerViewModel: ObservableObject {
                 // its own clock — the direct engine drives it from its ticks.
                 _ = self.subtitleModel.subtitle(currentTime: seconds + self.subtitleDelay)
             }
+            engine.onBuffering = { [weak self] buffering in
+                guard let self, self.dvDirectEngine === engine else { return }
+                self.isBuffering = buffering
+                self.isPlaying = !buffering && engine.isPlaying
+            }
             engine.onEnded = { [weak self] in
                 guard let self, self.dvDirectEngine === engine else { return }
                 self.handlePlayedToEnd()
@@ -813,11 +823,17 @@ final class PlayerViewModel: ObservableObject {
                     // error anywhere, maiden-flight bug).
                     self.videoRefreshID = UUID()
                     self.decisionLog.record("Dolby Vision",
-                                            "Native DV (direct sample feed, Profile \(profile))",
+                                            profile == 0
+                                                ? "Native \(probe.isPQ ? "HDR10\(probe.hasHDR10Plus ? "+" : "")" : "HEVC") (direct sample feed)"
+                                                : "Native DV (direct sample feed, Profile \(profile))",
                                             because: "compressed samples fed straight to the display pipeline — no remux, no server")
                     self.decisionLog.record("Engine", "DV Sample Feed",
                                             because: "AVSampleBufferDisplayLayer owns rendering for this session")
-                    self.requestDVDisplayMode(fps: engine.videoFPS)
+                    if profile > 0 {
+                        self.requestDVDisplayMode(fps: engine.videoFPS)
+                    } else if probe.isPQ {
+                        self.requestHDR10DisplayMode(fps: engine.videoFPS)
+                    }
                     // Pickers: audio from the engine's own track list;
                     // subtitles via the addon search — SubtitleOverlayView
                     // renders from SubtitleModel above any engine.
@@ -895,6 +911,25 @@ final class PlayerViewModel: ObservableObject {
         guard let criteria = AVDisplayCriteria(
             refreshRate: rate, videoDynamicRange: DynamicRange.dolbyVision.rawValue
         ) else { return }
+        if SessionDisplayMode.applyOnce(criteria, via: displayManager) {
+            displayCriteriaApplied = true
+        }
+    }
+
+    /// HDR10-range request for non-DV direct sessions, same pin discipline.
+    private func requestHDR10DisplayMode(fps: Float) {
+        guard let displayManager = UIApplication.shared.ks_keyWindow?.avDisplayManager,
+              displayManager.isDisplayCriteriaMatchingEnabled,
+              settings.matchContentDisplayMode || settings.matchFrameRate else { return }
+        var rate = Float(UIScreen.main.maximumFramesPerSecond)
+        if settings.matchFrameRate, fps > 0 {
+            rate = fps
+            if (23.5...24.2).contains(rate) { rate = 23.976 }
+        }
+        guard DynamicRange.availableHDRModes.contains(.hdr10),
+              let criteria = AVDisplayCriteria(
+                refreshRate: rate, videoDynamicRange: DynamicRange.hdr10.rawValue
+              ) else { return }
         if SessionDisplayMode.applyOnce(criteria, via: displayManager) {
             displayCriteriaApplied = true
         }
@@ -3999,6 +4034,13 @@ final class PlayerViewModel: ObservableObject {
     /// same quality to the front (used by the load-timeout failover, so a slow
     /// 4K link is replaced by another 4K link, not a random 480p one).
     private func attemptFailover(afterError error: Error, preferResolution: String? = nil) {
+        // Direct sample engine stalled/died → drop to the next tier on the
+        // same source rather than burning a different link.
+        if usingDVDirect {
+            Self.dvTrail("direct engine failover — \(error.localizedDescription)")
+            fallBackFromDirect(entry: currentEntry, reason: error.localizedDescription)
+            return
+        }
         // Native-DV playback died → the remux/playlist is the suspect, not
         // the source. Fall back to the FFmpeg engine on the same source.
         if usingNativeDV {

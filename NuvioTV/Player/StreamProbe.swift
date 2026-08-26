@@ -12,6 +12,11 @@ struct StreamProbeResult {
     /// Dolby Vision profile from the container's dvcC/dvvC record (nil when
     /// the stream carries none). Read from the header — no packet scan.
     var dvProfile: Int?
+    /// An HEVC video track exists (the direct engine's requirement).
+    var hasHEVC = false
+    /// The video is PQ-transfer HDR (HDR10 family) — drives the display-mode
+    /// request when there's no DV.
+    var isPQ = false
     /// Container duration in seconds (0 when unknown). Free with the header,
     /// and the DV-first path needs it — a session that never opens the FFmpeg
     /// engine has no other duration source until AVPlayer reports one.
@@ -94,6 +99,8 @@ enum StreamProbe {
                 if !isAttachedPic, videoIndex < 0, par.pointee.codec_id == AV_CODEC_ID_HEVC {
                     videoIndex = Int32(i)
                     isPQ = par.pointee.color_trc == AVCOL_TRC_SMPTE2084
+                    result.hasHEVC = true
+                    result.isPQ = isPQ
                     // Dolby Vision configuration rides the header as coded
                     // side data — same source KSPlayer's track parser uses.
                     if par.pointee.nb_coded_side_data > 0, let sideDatas = par.pointee.coded_side_data {
