@@ -829,8 +829,8 @@ final class PlayerViewModel: ObservableObject {
             self.dvDirectEngine = engine
             self.duration = probe.durationSeconds
             self.clock.duration = probe.durationSeconds
-            engine.onTime = { [weak self] seconds in
-                guard let self, self.dvDirectEngine === engine else { return }
+            engine.onTime = { [weak self, weak engine] seconds in
+                guard let self, let engine, self.dvDirectEngine === engine else { return }
                 self.position = seconds
                 self.clock.position = seconds
                 self.isPlaying = engine.isPlaying
@@ -855,17 +855,17 @@ final class PlayerViewModel: ObservableObject {
                 // its own clock — the direct engine drives it from its ticks.
                 _ = self.subtitleModel.subtitle(currentTime: seconds + self.subtitleDelay)
             }
-            engine.onBuffering = { [weak self] buffering in
-                guard let self, self.dvDirectEngine === engine else { return }
+            engine.onBuffering = { [weak self, weak engine] buffering in
+                guard let self, let engine, self.dvDirectEngine === engine else { return }
                 self.isBuffering = buffering
                 self.isPlaying = !buffering && engine.isPlaying
             }
-            engine.onEnded = { [weak self] in
-                guard let self, self.dvDirectEngine === engine else { return }
+            engine.onEnded = { [weak self, weak engine] in
+                guard let self, let engine, self.dvDirectEngine === engine else { return }
                 self.handlePlayedToEnd()
             }
-            engine.onError = { [weak self] message in
-                guard let self, self.dvDirectEngine === engine else { return }
+            engine.onError = { [weak self, weak engine] message in
+                guard let self, let engine, self.dvDirectEngine === engine else { return }
                 Self.dvTrail("direct engine error — \(message)")
                 self.fallBackFromDirect(entry: entry, reason: message)
             }

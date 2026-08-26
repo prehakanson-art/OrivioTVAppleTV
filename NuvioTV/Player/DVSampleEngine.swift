@@ -318,6 +318,22 @@ final class DVSampleEngine {
         synchronizer.removeRenderer(audioRenderer, at: .invalid)
         timeTimer?.invalidate()
         timeTimer = nil
+        // Drop the queued samples NOW. The queues held up to 240 compressed
+        // AUs (~80MB at UHD-remux bitrates) and stop() never cleared them —
+        // combined with the callback retain cycle below, that WAS the
+        // ~80MB-per-session creep that ended in jetsam.
+        queueLock.lock()
+        videoQueue.removeAll()
+        audioQueue.removeAll()
+        queueLock.unlock()
+        // Break the self-retain cycle: the VM's callbacks capture this engine
+        // strongly (for their `dvDirectEngine === engine` identity checks)
+        // and the engine stores those closures — engine → closure → engine
+        // kept every retired engine alive forever.
+        onTime = nil
+        onBuffering = nil
+        onEnded = nil
+        onError = nil
     }
 
     deinit {
