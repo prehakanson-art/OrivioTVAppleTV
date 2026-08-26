@@ -306,20 +306,19 @@ final class NuvioPlayerOptions: KSOptions {
         // (Settings → Playback) opts into the real rate switch (with the
         // 23.976 AFR bias: FFmpeg reports film as 23.97/23.98/24.0 but nearly
         // all "24fps" releases are 24000/1001, so bias near-24 to 23.976).
-        var rate = Float(UIScreen.main.maximumFramesPerSecond)   // current, no switch
-        if matchFrameRate {
-            rate = refreshRate
-            if (23.5...24.2).contains(rate) { rate = 23.976 }
-        }
-        // Now that we know whether a rate switch is happening, set the pulldown
-        // softening correctly. When Match Frame Rate drives the panel TO the
-        // content's native cadence there is no 3:2 pulldown to soften — leaving
-        // it on (the old unconditional `true`) made videoClockSync fight a
-        // cadence that isn't there, softening drops on an already-matched panel.
-        // Match-dynamic-range-only leaves the panel at 60Hz, so it stays on.
-        // Set it BEFORE the de-dup guard so it's right even when the criteria
-        // are unchanged and we return early below.
-        pulldown60Hz = !matchFrameRate
+        // ALWAYS match the content's rate on the one pinned switch (with the
+        // 23.976 AFR bias: FFmpeg reports film as 23.97/23.98/24.0 but nearly
+        // all "24fps" releases are 24000/1001). The rate switch was never the
+        // wedge — the REVERT was, and no in-app revert exists anymore. A 24fps
+        // movie in a 60Hz envelope is 3:2 pulldown judder, the thing a real
+        // player exists to avoid.
+        var rate = refreshRate
+        if (23.5...24.2).contains(rate) { rate = 23.976 }
+        // The panel is being driven TO the content's cadence, so there is no
+        // 3:2 pulldown to soften — leaving the softening on made
+        // videoClockSync fight a cadence that isn't there. Set BEFORE the
+        // de-dup guard so it's right even on the early return below.
+        pulldown60Hz = false
         guard lastAppliedDynamicRange != target.rawValue
             || lastAppliedRefreshRate != rate else { return }
         lastAppliedDynamicRange = target.rawValue
@@ -978,7 +977,7 @@ final class PlayerViewModel: ObservableObject {
         guard let displayManager = UIApplication.shared.ks_keyWindow?.avDisplayManager,
               displayManager.isDisplayCriteriaMatchingEnabled else { return }
         var rate = Float(UIScreen.main.maximumFramesPerSecond)
-        if settings.matchFrameRate, fps > 0 {
+        if fps > 0 {   // always match the content rate — the revert that made this risky is gone
             rate = fps
             if (23.5...24.2).contains(rate) { rate = 23.976 }
         }
@@ -1009,7 +1008,7 @@ final class PlayerViewModel: ObservableObject {
               let displayManager = UIApplication.shared.ks_keyWindow?.avDisplayManager,
               displayManager.isDisplayCriteriaMatchingEnabled else { return }
         var rate = Float(UIScreen.main.maximumFramesPerSecond)
-        if settings.matchFrameRate, fps > 0 {
+        if fps > 0 {   // always match the content rate — the revert that made this risky is gone
             rate = fps
             if (23.5...24.2).contains(rate) { rate = 23.976 }
         }

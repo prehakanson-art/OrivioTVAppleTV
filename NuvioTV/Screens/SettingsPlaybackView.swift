@@ -286,16 +286,11 @@ struct PlaybackSettingsDetail: View {
                 PlaybackToggleRow(
                     icon: "tv.fill",
                     title: "Match content display mode",
-                    subtitle: "Switch the TV into the video's HDR mode for native Dolby Vision/HDR. Uses the gentlest switch possible (dynamic range only, no refresh-rate change) to reduce grey-screen risk — but some TVs still mis-handshake and stick on grey until power-cycled, so leave off if that happens. Off = tone-map into the home screen's format.",
+                    subtitle: "Also switch the TV into the matching HDR mode and refresh rate for non-Dolby-Vision videos (HDR10/SDR). Dolby Vision always switches — that's the point of DV — and the mode is held until you leave the app, so the TV only ever sees one switch per session. Off = non-DV videos tone-map into the home screen's format.",
                     isOn: s.matchContentDisplayMode
                 )
 
-                PlaybackToggleRow(
-                    icon: "timer",
-                    title: "Match frame rate",
-                    subtitle: "Also switch the TV's refresh rate to the video's (e.g. 60→24Hz for film) for judder-free motion. OFF by default: a refresh-rate switch is a heavier HDMI handshake, and reverting it when you EXIT a video is what makes some TVs flicker or turn off. Leave off if exiting Dolby Vision/HDR videos disturbs your TV; 24fps content still plays smoothly under pulldown.",
-                    isOn: s.matchFrameRate
-                )
+                
 
                 NuvioDropdown(
                     title: "Video scaling",
