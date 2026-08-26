@@ -789,6 +789,12 @@ final class PlayerViewModel: ObservableObject {
                     self.hasStartedPlayback = true
                     self.loadPhase = nil
                     self.showControls()
+                    // The resume is DELIVERED — stop clamping saves to it.
+                    // Left set, max(position, pendingResume) meant Continue
+                    // Watching could never record a position below the
+                    // session's entry point: exit after a rewind (or earlier
+                    // than you resumed) and the row snapped back.
+                    self.pendingResume = nil
                 }
                 self.markLoadStarted()
                 self.markPlaybackProgressed(currentTime: seconds)

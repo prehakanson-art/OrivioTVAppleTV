@@ -103,6 +103,7 @@ final class DVSampleEngine {
     private var pcmFormat: CMFormatDescription?
     private var pcmRate: Int32 = 0
     private var pcmChannels: Int32 = 0
+    private var loggedAudioDecodeFailure = false
 
     /// Bounded sample queues — the "buffer that clears used stuff". The
     /// demux thread blocks when they're full; the renderers drain them.
@@ -590,7 +591,14 @@ final class DVSampleEngine {
             decodedFrame = av_frame_alloc()
         }
         guard let decoder = audioDecoder, let frame = decodedFrame else { return [] }
-        guard avcodec_send_packet(decoder, packet) >= 0 else { return [] }
+        let sendResult = avcodec_send_packet(decoder, packet)
+        guard sendResult >= 0 else {
+            if !loggedAudioDecodeFailure {
+                loggedAudioDecodeFailure = true
+                NSLog("[DVSample] audio decode send failed (%d) for stream %d", sendResult, streamIndex)
+            }
+            return []
+        }
 
         var out: [CMSampleBuffer] = []
         while avcodec_receive_frame(decoder, frame) >= 0 {
@@ -671,10 +679,31 @@ final class DVSampleEngine {
             mBitsPerChannel: 32,
             mReserved: 0
         )
+        // Multichannel LPCM is SILENT without a channel layout — the ASBD
+        // alone doesn't tell the renderer what the channels mean. This was
+        // "TrueHD doesn't work": stereo decode paths played (2ch needs no
+        // layout in practice) while every 5.1/7.1 lossless track sat mute.
+        // Tags follow FFmpeg's native channel order closely enough; exotic
+        // counts fall back to discrete-in-order, which always plays.
+        var layout = AudioChannelLayout()
+        switch channels {
+        case 1: layout.mChannelLayoutTag = kAudioChannelLayoutTag_Mono
+        case 2: layout.mChannelLayoutTag = kAudioChannelLayoutTag_Stereo
+        case 3: layout.mChannelLayoutTag = kAudioChannelLayoutTag_MPEG_3_0_A
+        case 4: layout.mChannelLayoutTag = kAudioChannelLayoutTag_Quadraphonic
+        case 5: layout.mChannelLayoutTag = kAudioChannelLayoutTag_MPEG_5_0_A
+        case 6: layout.mChannelLayoutTag = kAudioChannelLayoutTag_MPEG_5_1_A
+        case 7: layout.mChannelLayoutTag = kAudioChannelLayoutTag_MPEG_6_1_A
+        case 8: layout.mChannelLayoutTag = kAudioChannelLayoutTag_MPEG_7_1_C
+        default:
+            layout.mChannelLayoutTag =
+                kAudioChannelLayoutTag_DiscreteInOrder | UInt32(channels)
+        }
         var format: CMFormatDescription?
         let status = CMAudioFormatDescriptionCreate(
             allocator: kCFAllocatorDefault, asbd: &asbd,
-            layoutSize: 0, layout: nil, magicCookieSize: 0, magicCookie: nil,
+            layoutSize: MemoryLayout<AudioChannelLayout>.size, layout: &layout,
+            magicCookieSize: 0, magicCookie: nil,
             extensions: nil, formatDescriptionOut: &format
         )
         return status == noErr ? format : nil
