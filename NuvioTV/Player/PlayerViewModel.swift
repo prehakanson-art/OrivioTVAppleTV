@@ -1173,8 +1173,8 @@ final class PlayerViewModel: ObservableObject {
         }
         let after = result2 == KERN_SUCCESS ? Double(info2.phys_footprint) / 1_048_576 : -1
         Self.dvTrail(String(
-            format: "mem %.0f→%.0fMB int=%.0f cmp=%.0f %@ pos=%.0fs %@ (%@)",
-            mb, after, anon, comp, phase, position, DVSegmentServer.statsLine(), why
+            format: "mem %.0f→%.0fMB int=%.0f cmp=%.0f %@ pos=%.0fs (%@)",
+            mb, after, anon, comp, phase, position, why
         ))
     }
 
