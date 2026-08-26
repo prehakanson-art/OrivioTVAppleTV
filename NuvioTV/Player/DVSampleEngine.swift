@@ -104,6 +104,30 @@ final class DVSampleEngine {
     private var pcmRate: Int32 = 0
     private var pcmChannels: Int32 = 0
     private var loggedAudioDecodeFailure = false
+    private var loggedFirstPCM = false
+
+    // ---- PCM batching (worker thread) ----
+    // TrueHD decodes in ~40-sample crumbs: unbatched, that is 1,200 sample
+    // buffers PER SECOND at the renderer — it chokes, and the 96-deep queue
+    // holds 80ms. Accumulate into ~quarter-second chunks instead.
+    private var pcmBatch: [Float] = []
+    private var pcmBatchStartPTS: Double = -1
+    private var pcmBatchFrames = 0
+
+    private func flushPCMBatch(into out: inout [CMSampleBuffer]) {
+        guard pcmBatchFrames > 0, let format = pcmFormat, pcmChannels > 0 else {
+            pcmBatch.removeAll(keepingCapacity: true); pcmBatchFrames = 0; pcmBatchStartPTS = -1
+            return
+        }
+        if let sample = Self.makePCMSample(
+            pcm: pcmBatch, format: format, frames: pcmBatchFrames,
+            bytesPerFrame: Int(pcmChannels) * 4, ptsSeconds: pcmBatchStartPTS,
+            rate: pcmRate
+        ) { out.append(sample) }
+        pcmBatch.removeAll(keepingCapacity: true)
+        pcmBatchFrames = 0
+        pcmBatchStartPTS = -1
+    }
 
     /// Bounded sample queues — the "buffer that clears used stuff". The
     /// demux thread blocks when they're full; the renderers drain them.
@@ -391,6 +415,10 @@ final class DVSampleEngine {
             return "no playable audio track"
         }
         desiredAudioIndex = audioIndex
+        NSLog("[DVSample] audio: picked stream %d (%@ path); tracks=%@",
+              audioIndex,
+              decodeAudioIndices.contains(audioIndex) ? "decode" : "passthrough",
+              audioTracks.map { "\($0.index):\($0.label)" }.joined(separator: ", "))
 
         // ---- Start position + clock ----
         if startAt > 1 {
@@ -486,6 +514,9 @@ final class DVSampleEngine {
                     trimBefore = target - 0.05
                 }
                 if let decoder = audioDecoder { avcodec_flush_buffers(decoder) }
+                pcmBatch.removeAll(keepingCapacity: true)
+                pcmBatchFrames = 0
+                pcmBatchStartPTS = -1
             }
             let readResult = av_read_frame(ictx, packet)
             if readResult < 0 {
@@ -562,6 +593,9 @@ final class DVSampleEngine {
     // MARK: FFmpeg audio decode → LPCM
 
     private func closeAudioDecoder() {
+        pcmBatch.removeAll(keepingCapacity: true)
+        pcmBatchFrames = 0
+        pcmBatchStartPTS = -1
         if audioDecoder != nil { avcodec_free_context(&audioDecoder) }
         if decodedFrame != nil { av_frame_free(&decodedFrame) }
         audioDecoderIndex = -1
@@ -589,6 +623,9 @@ final class DVSampleEngine {
             audioDecoder = ctx
             audioDecoderIndex = streamIndex
             decodedFrame = av_frame_alloc()
+            NSLog("[DVSample] audio decoder opened for stream %d (%@)",
+                  streamIndex,
+                  avcodec_get_name(ctx.pointee.codec_id).map { String(cString: $0) } ?? "?")
         }
         guard let decoder = audioDecoder, let frame = decodedFrame else { return [] }
         let sendResult = avcodec_send_packet(decoder, packet)
@@ -609,21 +646,34 @@ final class DVSampleEngine {
             guard channels > 0, samples > 0, rate > 0 else { continue }
             guard let pcm = Self.interleaveToFloat32(frame: frame.pointee,
                                                     channels: channels, samples: samples)
-            else { continue }
+            else {
+                if !loggedAudioDecodeFailure {
+                    loggedAudioDecodeFailure = true
+                    NSLog("[DVSample] PCM interleave failed: fmt=%d ch=%d", frame.pointee.format, channels)
+                }
+                continue
+            }
+            if !loggedFirstPCM {
+                loggedFirstPCM = true
+                NSLog("[DVSample] first PCM out: %dch %dHz %d samples fmt=%d",
+                      channels, rate, samples, frame.pointee.format)
+            }
             if pcmFormat == nil || pcmRate != rate || pcmChannels != Int32(channels) {
                 pcmFormat = Self.makeLPCMFormat(rate: rate, channels: Int32(channels))
                 pcmRate = rate
                 pcmChannels = Int32(channels)
             }
-            guard let format = pcmFormat else { continue }
+            guard pcmFormat != nil else { continue }
             let pts = frame.pointee.pts != Int64.min
                 ? Double(frame.pointee.pts) * av_q2d(tb)
                 : Double(packet.pointee.pts) * av_q2d(tb)
-            if let sample = Self.makePCMSample(
-                pcm: pcm, format: format, frames: samples,
-                bytesPerFrame: channels * 4, ptsSeconds: pts,
-                rate: rate
-            ) { out.append(sample) }
+            if pcmBatchStartPTS < 0 { pcmBatchStartPTS = pts }
+            pcmBatch.append(contentsOf: pcm)
+            pcmBatchFrames += samples
+            // ~a quarter second per buffer: 4 buffers/s instead of 1,200.
+            if pcmBatchFrames >= Int(rate) / 4 {
+                flushPCMBatch(into: &out)
+            }
         }
         return out
     }
