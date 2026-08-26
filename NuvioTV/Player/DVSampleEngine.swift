@@ -210,16 +210,25 @@ final class DVSampleEngine {
     /// stereo route this fold is what the listener would hear anyway.
     let downmixToStereo: Bool
 
+    /// Play the HDR10 base layer only: strip every DV NAL (EL and RPU) and
+    /// publish a plain HEVC format description. The FEL policy — a full
+    /// enhancement layer can't ride the converted-8.1 path honestly, and its
+    /// approximate per-frame metadata is the prime suspect for composer-level
+    /// judder no pipeline probe can see.
+    let forceHDR10: Bool
+
     init(input: String, startAt: Double,
          preferredAudioLanguage: String, convertProfile7: Bool,
          requestHeaders: [String: String]? = nil,
-         downmixToStereo: Bool = false) {
+         downmixToStereo: Bool = false,
+         forceHDR10: Bool = false) {
         inputURLString = input
         self.startAt = max(startAt, 0)
         self.preferredAudioLanguage = preferredAudioLanguage
         self.convertProfile7 = convertProfile7
         self.requestHeaders = requestHeaders
         self.downmixToStereo = downmixToStereo
+        self.forceHDR10 = forceHDR10
     }
 
     // MARK: Lifecycle
@@ -515,7 +524,7 @@ final class DVSampleEngine {
         }
         let hvcC = Data(bytes: extra, count: Int(vPar.pointee.extradata_size))
         let vFormat: CMFormatDescription?
-        if dvProfile > 0 {
+        if dvProfile > 0, !forceHDR10 {
             // The dvvC the display pipeline sees: a converted P7 declares
             // itself 8.1 single-layer (the remux path's exact contract).
             let outProfile = needsP7 ? 8 : dvProfile
@@ -714,7 +723,12 @@ final class DVSampleEngine {
 
             bytesDemuxed += Int64(packet.pointee.size)
             var bytes = [UInt8](UnsafeBufferPointer(start: data, count: Int(packet.pointee.size)))
-            if isVideo, needsP7 {
+            if isVideo, forceHDR10, dvProfile > 0 {
+                if let stripped = Self.stripDVAccessUnit(bytes, nalLengthSize: nalLengthSize) {
+                    if stripped.isEmpty { continue }   // pure-DV packet: drop
+                    bytes = stripped
+                }
+            } else if isVideo, needsP7 {
                 if let converted = Self.convertP7AccessUnit(bytes, nalLengthSize: nalLengthSize) {
                     if converted.isEmpty { continue }   // pure-EL packet: drop
                     bytes = converted
@@ -1187,6 +1201,32 @@ final class DVSampleEngine {
     /// FEL/MEL in the player's decision panel. Single active DV engine at a
     /// time, so static state is safe; counters reset per engine start.
     nonisolated(unsafe) static var onELVerdict: ((String) -> Void)?
+
+    /// forceHDR10: drop every DV NAL (EL type 63 and RPU type 62), keep the
+    /// plain HEVC base layer untouched.
+    private static func stripDVAccessUnit(_ au: [UInt8], nalLengthSize: Int) -> [UInt8]? {
+        var out = [UInt8]()
+        out.reserveCapacity(au.count)
+        var i = 0
+        var changed = false
+        var kept = 0
+        while i + nalLengthSize <= au.count {
+            var len = 0
+            for k in 0 ..< nalLengthSize { len = (len << 8) | Int(au[i + k]) }
+            let start = i + nalLengthSize
+            guard len > 0, start + len <= au.count else { return nil }
+            let nalType = (au[start] >> 1) & 0x3F
+            if nalType == 63 || nalType == 62 {
+                changed = true
+            } else {
+                appendPrefixed(&out, Array(au[start ..< start + len]), nalLengthSize)
+                kept += 1
+            }
+            i = start + len
+        }
+        if kept == 0 { return [] }
+        return changed ? out : nil
+    }
 
     private static func convertP7AccessUnit(_ au: [UInt8], nalLengthSize: Int) -> [UInt8]? {
         var out = [UInt8]()

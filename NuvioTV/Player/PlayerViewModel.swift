@@ -832,12 +832,22 @@ final class PlayerViewModel: ObservableObject {
             // see DVSampleEngine.downmixToStereo.
             let spatial = AVAudioSession.sharedInstance().currentRoute.outputs
                 .contains { $0.isSpatialAudioEnabled }
+            // FEL POLICY. A Profile 7 FEL file carries a real residual
+            // enhancement layer that the converted-8.1 path throws away; the
+            // approximate per-frame metadata left behind is the standing
+            // suspect for composer-level judder (every measurable layer —
+            // clock, buffers, panel rate, feed — probed clean while FEL
+            // titles stuttered and P8/MEL titles played perfectly). Play the
+            // HDR10 base layer instead — smooth and honest, and what
+            // SenPlayer-class players effectively ship.
+            let felHDR10 = profile == 7 && probe.isFEL
             let engine = DVSampleEngine(
                 input: url.absoluteString, startAt: resume,
                 preferredAudioLanguage: self.settings.preferredAudioLanguage,
                 convertProfile7: p7ok,
                 requestHeaders: entry.stream.behaviorHints?.proxyHeaders?.requestHeaders,
-                downmixToStereo: !spatial
+                downmixToStereo: !spatial,
+                forceHDR10: felHDR10
             )
             self.dvDirectEngine = engine
             self.duration = probe.durationSeconds
@@ -891,10 +901,14 @@ final class PlayerViewModel: ObservableObject {
                     // conversion it is, the same honesty the remux path kept.
                     let realProfile = engine.detectedDVProfile > 0 ? engine.detectedDVProfile : profile
                     let dvLabel: String
+                    if engine.forceHDR10 {
+                        dvLabel = "Native HDR10 (P7 FEL base layer, direct sample feed)"
+                    } else {
                     switch realProfile {
                     case 0: dvLabel = "Native \(probe.isPQ ? "HDR10\(probe.hasHDR10Plus ? "+" : "")" : "HEVC") (direct sample feed)"
                     case 7: dvLabel = "Native DV (direct sample feed, Profile 7 → 8.1)"
                     default: dvLabel = "Native DV (direct sample feed, Profile \(realProfile))"
+                    }
                     }
                     self.decisionLog.record("Dolby Vision", dvLabel,
                                             because: "compressed samples fed straight to the display pipeline — no remux, no server")
@@ -916,7 +930,7 @@ final class PlayerViewModel: ObservableObject {
                     // and roll only once the panel has settled (UIScreen's
                     // fps changing is the ground truth that the mode took).
                     var switching = false
-                    if profile > 0 {
+                    if profile > 0, !engine.forceHDR10 {
                         switching = self.requestDVDisplayMode(fps: engine.videoFPS)
                     } else if probe.isPQ {
                         switching = self.requestHDR10DisplayMode(fps: engine.videoFPS)
