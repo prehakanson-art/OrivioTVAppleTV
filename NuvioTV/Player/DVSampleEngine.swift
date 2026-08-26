@@ -377,6 +377,12 @@ final class DVSampleEngine {
                 }
                 let fr = stream.pointee.avg_frame_rate
                 if fr.den > 0 { videoFPS = Float(av_q2d(fr)) }
+                // The A/B datum the jitter hunt needs: exact rate + bitrate.
+                let rfr = stream.pointee.r_frame_rate
+                NSLog("[DVSample] video: avg_fps=%d/%d (%.5f) r_fps=%d/%d container_bitrate=%.1f Mbps",
+                      fr.num, fr.den, fr.den > 0 ? av_q2d(fr) : 0,
+                      rfr.num, rfr.den,
+                      Double(inCtx.pointee.bit_rate) / 1_000_000)
             }
             if par.pointee.codec_type == AVMEDIA_TYPE_AUDIO {
                 let id = par.pointee.codec_id
