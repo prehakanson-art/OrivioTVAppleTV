@@ -135,7 +135,13 @@ final class DVSampleEngine {
     private let queueLock = NSCondition()
     private var videoQueue: [CMSampleBuffer] = []
     private var audioQueue: [CMSampleBuffer] = []
-    private let videoQueueCap = 48
+    /// Compressed access units are cheap (~bitrate-sized, no decoded frames):
+    /// 240 AUs ≈ 10s of 24fps video ≈ 40-100MB at 4K DV bitrates — the
+    /// cushion that rides out debrid/HTTP throughput oscillation. The old cap
+    /// of 48 (two seconds!) made every multi-second network dip an underrun,
+    /// and the live probe showed exactly that: vq sawtoothing 48→0 with the
+    /// clock flapping 0.22↔1.00 (the reported stop-go).
+    private let videoQueueCap = 240
     private let audioQueueCap = 96
 
     /// MKV timestamps are in MILLISECONDS; a 23.976fps frame lasts 41.708ms.
@@ -241,6 +247,12 @@ final class DVSampleEngine {
     private var autoPaused = false
     private var playbackClockStarted = false
     private let startupVideoPreroll = 18
+
+    /// Cushion required before resuming from an underrun. The old flat 16
+    /// (0.7s) meant each resume ran dry again within seconds on a feed
+    /// that's oscillating — pause/play machine-gunning. Demand a real
+    /// runway (~5s); near EOF take whatever remains so the tail still plays.
+    private func underrunResumeDepth(eof: Bool) -> Int { eof ? 1 : 120 }
 
     func play() {
         if userRate <= 0 { userRate = 1 }
@@ -562,7 +574,7 @@ final class DVSampleEngine {
                         self.autoPaused = true
                         self.synchronizer.setRate(0, time: self.synchronizer.currentTime())
                         self.onBuffering?(true)
-                    } else if self.autoPaused, depth >= 16 {
+                    } else if self.autoPaused, depth >= self.underrunResumeDepth(eof: eof) {
                         self.autoPaused = false
                         if self.userRate > 0 {
                             self.synchronizer.setRate(self.userRate, time: self.synchronizer.currentTime())
