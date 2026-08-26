@@ -1522,6 +1522,16 @@ final class PlayerViewModel: ObservableObject {
 
     /// Tear down DV state (normal loads, teardown). Keeps dvFailedURLs.
     private func resetNativeDV() {
+        // The DIRECT engine too: without this, an in-player engine switch (or
+        // any reload) built the new player while the old sample engine kept
+        // demuxing and playing audio — and activeVideoView still returned its
+        // layer: frozen picture over doubled audio ("switching players mid-
+        // movie freezes and everything is all weird").
+        if let engine = dvDirectEngine {
+            engine.stop()
+            dvDirectEngine = nil
+            videoRefreshID = UUID()   // make PlayerVideoView re-read activeVideoView
+        }
         dvRemuxer?.cancel()
         // Nothing will request another segment from a retired session — kill
         // its loopback server now, not at the directory purge minutes later.
