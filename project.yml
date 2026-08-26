@@ -87,7 +87,13 @@ targets:
           NSAllowsArbitraryLoads: true
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.orivio.tv.appletv
+        # RELEASE identity — owned by this machine's Personal Team so
+        # archiving/signing works straight from Xcode. The original
+        # com.orivio.tv.appletv belongs to a DIFFERENT team and cannot be
+        # registered here — every archive failed on it. An archive under
+        # this id installs as its own app, separate from historical
+        # sideloads of the original id.
+        PRODUCT_BUNDLE_IDENTIFIER: com.orivio.tv.appletv.dev
         # Signing team for device builds, HERE rather than only in the
         # generated pbxproj: Xcode's GUI writes the team into project.pbxproj,
         # where any xcodegen regeneration (or a git checkout of the file)
