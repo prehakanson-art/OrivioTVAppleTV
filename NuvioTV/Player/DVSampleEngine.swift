@@ -554,11 +554,12 @@ final class DVSampleEngine {
                         let vq = self.videoQueue.count
                         let aq = self.audioQueue.count
                         self.queueLock.unlock()
-                        NSLog("[DVSample] probe clock=%.4f vq=%d aq=%d vReady=%d aReady=%d rate=%.2f",
+                        NSLog("[DVSample] probe clock=%.4f vq=%d aq=%d vReady=%d aReady=%d rate=%.2f panel=%ldHz",
                               ratio, vq, aq,
                               self.displayLayer.isReadyForMoreMediaData ? 1 : 0,
                               self.audioRenderer.isReadyForMoreMediaData ? 1 : 0,
-                              self.synchronizer.rate)
+                              self.synchronizer.rate,
+                              UIScreen.main.maximumFramesPerSecond)
                     }
                     self.lastProbeWall = wall
                     self.lastProbeMedia = media

@@ -131,6 +131,7 @@ struct TrackOption: Identifiable, Equatable {
 enum SessionDisplayMode {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var pinned = false
+    nonisolated(unsafe) private static var pinnedRate: Float = 0
     nonisolated(unsafe) private static var observing = false
 
     /// The pin is per FOREGROUND STINT, not per process: when the app
@@ -150,7 +151,7 @@ enum SessionDisplayMode {
             object: nil, queue: .main
         ) { _ in
             UIApplication.shared.ks_keyWindow?.avDisplayManager.preferredDisplayCriteria = nil
-            lock.lock(); pinned = false; lock.unlock()
+            lock.lock(); pinned = false; pinnedRate = 0; lock.unlock()
             NSLog("[OrivioDisplay] backgrounded — pin cleared (display already reverted by tvOS)")
         }
     }
@@ -159,10 +160,22 @@ enum SessionDisplayMode {
     /// (not actor-isolated): callers arrive from KSPlayer's setup thread AND
     /// from the main actor, and a main.sync hop from main would deadlock.
     static func applyOnce(_ criteria: AVDisplayCriteria,
-                          via manager: AVDisplayManager) -> Bool {
+                          via manager: AVDisplayManager,
+                          rate: Float = 0) -> Bool {
+        // TRUST BUT VERIFY the pin: tvOS can revert the panel to its home
+        // rate when playback ends even while our criteria stay set. The pin
+        // then blocked the next playback's request and 24fps content played
+        // into a 60Hz panel — the "smooth after force-quit, stuttery after
+        // re-entry" 3:2-pulldown signature. If the panel no longer runs at
+        // the rate we negotiated, the pin is stale: clear it and re-request.
+        let current = Float(UIScreen.main.maximumFramesPerSecond)
         lock.lock()
+        if pinned, pinnedRate > 0, abs(current - pinnedRate) > 1.5 {
+            NSLog("[OrivioDisplay] pin stale (panel %.0f vs pinned %.3f) — re-requesting", current, pinnedRate)
+            pinned = false
+        }
         let first = !pinned
-        if first { pinned = true }
+        if first { pinned = true; pinnedRate = rate }
         lock.unlock()
         guard first else { return false }
         installBackgroundReleaseIfNeeded()
@@ -325,7 +338,7 @@ final class NuvioPlayerOptions: KSOptions {
         lastAppliedRefreshRate = rate
         guard let criteria = AVDisplayCriteria(refreshRate: rate, videoDynamicRange: target.rawValue)
         else { return }
-        guard SessionDisplayMode.applyOnce(criteria, via: displayManager) else { return }
+        guard SessionDisplayMode.applyOnce(criteria, via: displayManager, rate: rate) else { return }
         // The exit sequencing needs to know a real switch was requested this
         // SESSION (not just whether the toggle is on — native-DV sessions
         // switch with the toggle off), so it can wait out the switch-back
@@ -1039,7 +1052,7 @@ final class PlayerViewModel: ObservableObject {
         guard let criteria = AVDisplayCriteria(
             refreshRate: rate, videoDynamicRange: target.rawValue
         ) else { return false }
-        if SessionDisplayMode.applyOnce(criteria, via: displayManager) {
+        if SessionDisplayMode.applyOnce(criteria, via: displayManager, rate: rate) {
             displayCriteriaApplied = true
             return true
         }
@@ -1061,7 +1074,7 @@ final class PlayerViewModel: ObservableObject {
               let criteria = AVDisplayCriteria(
                 refreshRate: rate, videoDynamicRange: DynamicRange.hdr10.rawValue
               ) else { return false }
-        if SessionDisplayMode.applyOnce(criteria, via: displayManager) {
+        if SessionDisplayMode.applyOnce(criteria, via: displayManager, rate: rate) {
             displayCriteriaApplied = true
             return true
         }
