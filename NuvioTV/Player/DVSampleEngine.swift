@@ -54,6 +54,19 @@ final class DVSampleEngine {
     /// Eligible audio tracks discovered at open, for the picker.
     struct AudioTrack { let index: Int32; let label: String }
     private(set) var audioTracks: [AudioTrack] = []
+
+    struct SubtitleTrack { let index: Int32; let label: String; let isBitmap: Bool }
+    private(set) var subtitleTracks: [SubtitleTrack] = []
+    /// Which embedded subtitle stream to demux+decode (-1 = none). Set from
+    /// the main thread via selectSubtitle; read on the demux thread.
+    @Atomic private var activeSubtitleIndex: Int32 = -1
+    func selectSubtitle(_ index: Int32?) { activeSubtitleIndex = index ?? -1 }
+    /// One decoded subtitle event, delivered on MAIN:
+    /// (start, end, text, image). text==nil && image==nil is a CLEAR marker
+    /// (PGS emits explicit clears): end every part still open at `start`.
+    var onSubtitleEvent: ((Double, Double, String?, UIImage?) -> Void)?
+    private var subDecoder: UnsafeMutablePointer<AVCodecContext>?
+    private var subDecoderIndex: Int32 = -1
     var currentAudioIndex: Int32 { desiredAudioIndex }
 
     /// Switch audio live: the demux loop starts forwarding the new stream at
@@ -542,6 +555,36 @@ final class DVSampleEngine {
             chapters = found
         }
 
+        // ---- Embedded subtitle tracks (second pass; text + PGS bitmap) ----
+        for i in 0 ..< Int(inCtx.pointee.nb_streams) {
+            guard let stream = inCtx.pointee.streams[i],
+                  let par = stream.pointee.codecpar,
+                  par.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE else { continue }
+            let id = par.pointee.codec_id
+            let textCodec = id == AV_CODEC_ID_SUBRIP || id == AV_CODEC_ID_ASS
+                || id == AV_CODEC_ID_SSA || id == AV_CODEC_ID_MOV_TEXT || id == AV_CODEC_ID_TEXT
+            let bitmapCodec = id == AV_CODEC_ID_HDMV_PGS_SUBTITLE || id == AV_CODEC_ID_DVD_SUBTITLE
+            guard textCodec || bitmapCodec, avcodec_find_decoder(id) != nil else { continue }
+            var lang = ""
+            if let tag = av_dict_get(stream.pointee.metadata, "language", nil, 0)?.pointee.value {
+                lang = String(cString: tag)
+            }
+            var title = ""
+            if let tag = av_dict_get(stream.pointee.metadata, "title", nil, 0)?.pointee.value {
+                title = String(cString: tag)
+            }
+            let language = Locale.current.localizedString(forLanguageCode: lang) ?? lang
+            let kind = bitmapCodec ? "PGS" : (avcodec_get_name(id).map { String(cString: $0).uppercased() } ?? "SUB")
+            var label = [language, title, kind].filter { !$0.isEmpty }.joined(separator: " · ")
+            if label.isEmpty { label = "Track \(i)" }
+            if (stream.pointee.disposition & AV_DISPOSITION_FORCED) != 0 { label += " · Forced" }
+            subtitleTracks.append(SubtitleTrack(index: Int32(i), label: label, isBitmap: bitmapCodec))
+        }
+        if !subtitleTracks.isEmpty {
+            NSLog("[DVSample] embedded subtitles: %@",
+                  subtitleTracks.map { "\($0.index):\($0.label)" }.joined(separator: ", "))
+        }
+
         // ---- Format descriptions ----
         guard let vStream = ictx!.pointee.streams[Int(videoIndex)],
               let vPar = vStream.pointee.codecpar,
@@ -722,6 +765,7 @@ final class DVSampleEngine {
                     ptsGridAnchor = -1   // re-anchor the PTS grid at the seek target
                 }
                 if let decoder = audioDecoder { avcodec_flush_buffers(decoder) }
+                if let sdec = subDecoder { avcodec_flush_buffers(sdec) }
                 pcmBatch.removeAll(keepingCapacity: true)
                 pcmBatchFrames = 0
                 pcmBatchStartPTS = -1
@@ -734,7 +778,8 @@ final class DVSampleEngine {
             defer { av_packet_unref(packet) }
             let index = packet.pointee.stream_index
             let activeAudio = desiredAudioIndex
-            guard index == videoIndex || index == activeAudio else { continue }
+            let activeSub = activeSubtitleIndex
+            guard index == videoIndex || index == activeAudio || index == activeSub else { continue }
             guard packet.pointee.pts != Int64.min, let data = packet.pointee.data,
                   packet.pointee.size > 0 else { continue }
 
@@ -771,6 +816,10 @@ final class DVSampleEngine {
             }
             let displaySuppressed = isVideo && trimBefore > 0 && pts < trimBefore
 
+            if !isVideo, index == activeSub {
+                decodeSubtitlePacket(packet, streamIndex: index, tb: tb, ptsSeconds: pts)
+                continue
+            }
             // Non-passthrough audio: FFmpeg-decode to interleaved Float32 PCM
             // and enqueue the LPCM samples — this is what makes TrueHD, DTS,
             // FLAC and friends playable on this engine.
@@ -800,6 +849,8 @@ final class DVSampleEngine {
             enqueueBounded(sample, isVideo: isVideo, generation: myGeneration)
         }
         closeAudioDecoder()
+        if subDecoder != nil { avcodec_free_context(&subDecoder) }
+        subDecoderIndex = -1
         return nil
     }
 
@@ -817,6 +868,140 @@ final class DVSampleEngine {
             queueLock.broadcast()
         }
         queueLock.unlock()
+    }
+
+    // MARK: FFmpeg subtitle decode (text + PGS bitmap)
+
+    /// Worker thread only. Lazily (re)opens the decoder when the active
+    /// stream changes, decodes one packet, and posts the resulting cue (or
+    /// clear marker) to main via onSubtitleEvent.
+    private func decodeSubtitlePacket(
+        _ packet: UnsafeMutablePointer<AVPacket>, streamIndex: Int32, tb: AVRational,
+        ptsSeconds: Double
+    ) {
+        if subDecoderIndex != streamIndex {
+            if subDecoder != nil { avcodec_free_context(&subDecoder) }
+            subDecoderIndex = -1
+            guard let ictxLocal = liveFormatCtx,
+                  let stream = ictxLocal.pointee.streams[Int(streamIndex)],
+                  let par = stream.pointee.codecpar,
+                  let codec = avcodec_find_decoder(par.pointee.codec_id),
+                  let ctx = avcodec_alloc_context3(codec) else { return }
+            avcodec_parameters_to_context(ctx, par)
+            guard avcodec_open2(ctx, codec, nil) >= 0 else {
+                var dead: UnsafeMutablePointer<AVCodecContext>? = ctx
+                avcodec_free_context(&dead)
+                return
+            }
+            subDecoder = ctx
+            subDecoderIndex = streamIndex
+            NSLog("[DVSample] subtitle decoder opened for stream %d (%@)",
+                  streamIndex,
+                  avcodec_get_name(ctx.pointee.codec_id).map { String(cString: $0) } ?? "?")
+        }
+        guard let decoder = subDecoder else { return }
+        var sub = AVSubtitle()
+        var got: Int32 = 0
+        let rc = avcodec_decode_subtitle2(decoder, &sub, &got, packet)
+        guard rc >= 0, got != 0 else { return }
+        defer { avsubtitle_free(&sub) }
+        var start = ptsSeconds + Double(sub.start_display_time) / 1000
+        // PGS timestamps ride the AVSubtitle itself in AV_TIME_BASE.
+        if sub.pts != Int64.min {
+            start = Double(sub.pts) / Double(AV_TIME_BASE) + Double(sub.start_display_time) / 1000
+        }
+        var end = start + 6   // open-ended default; a later cue/clear truncates
+        if sub.end_display_time > sub.start_display_time, sub.end_display_time != UInt32.max {
+            end = start + Double(sub.end_display_time - sub.start_display_time) / 1000
+        } else if packet.pointee.duration > 0 {
+            end = start + Double(packet.pointee.duration) * av_q2d(tb)
+        }
+        guard start >= 0 else { return }
+        if sub.num_rects == 0 {   // explicit clear (PGS)
+            DispatchQueue.main.async { [weak self] in self?.onSubtitleEvent?(start, start, nil, nil) }
+            return
+        }
+        var texts: [String] = []
+        var image: UIImage?
+        for i in 0 ..< Int(sub.num_rects) {
+            guard let rect = sub.rects[i]?.pointee else { continue }
+            switch rect.type {
+            case SUBTITLE_ASS:
+                if let ass = rect.ass {
+                    let line = Self.assEventText(String(cString: ass))
+                    if !line.isEmpty { texts.append(line) }
+                }
+            case SUBTITLE_TEXT:
+                if let t = rect.text {
+                    let line = String(cString: t).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !line.isEmpty { texts.append(line) }
+                }
+            case SUBTITLE_BITMAP:
+                if image == nil { image = Self.imageFromSubtitleRect(rect) }
+            default:
+                break
+            }
+        }
+        let text = texts.isEmpty ? nil : texts.joined(separator: "\n")
+        guard text != nil || image != nil else { return }
+        let img = image
+        DispatchQueue.main.async { [weak self] in self?.onSubtitleEvent?(start, end, text, img) }
+    }
+
+    /// FFmpeg's decoded ASS event: "ReadOrder,Layer,Style,Name,MarginL,
+    /// MarginR,MarginV,Effect,Text" — the dialogue text is everything after
+    /// the 8th comma, with override tags stripped and \N line breaks kept.
+    private static func assEventText(_ event: String) -> String {
+        var text = event
+        var commas = 0
+        if let idx = text.indices.first(where: { i in
+            if text[i] == "," { commas += 1 }
+            return commas == 8
+        }) {
+            text = String(text[text.index(after: idx)...])
+        }
+        // Strip {\...} override blocks.
+        while let open = text.firstIndex(of: "{"), let close = text[open...].firstIndex(of: "}") {
+            text.removeSubrange(open ... close)
+        }
+        return text
+            .replacingOccurrences(of: "\\N", with: "\n")
+            .replacingOccurrences(of: "\\n", with: "\n")
+            .replacingOccurrences(of: "\\h", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// PAL8 bitmap rect (PGS/DVD) → RGBA UIImage.
+    private static func imageFromSubtitleRect(_ rect: AVSubtitleRect) -> UIImage? {
+        let w = Int(rect.w), h = Int(rect.h)
+        guard w > 0, h > 0,
+              let indices = rect.data.0,
+              let paletteBytes = rect.data.1 else { return nil }
+        let stride = Int(rect.linesize.0)
+        let palette = paletteBytes.withMemoryRebound(to: UInt32.self, capacity: 256) { pal in
+            (0 ..< 256).map { pal[$0] }
+        }
+        var rgba = [UInt8](repeating: 0, count: w * h * 4)
+        for y in 0 ..< h {
+            for x in 0 ..< w {
+                // FFmpeg subtitle palettes are 0xAARRGGBB.
+                let entry = palette[Int(indices[y * stride + x])]
+                let o = (y * w + x) * 4
+                rgba[o] = UInt8((entry >> 16) & 0xFF)
+                rgba[o + 1] = UInt8((entry >> 8) & 0xFF)
+                rgba[o + 2] = UInt8(entry & 0xFF)
+                rgba[o + 3] = UInt8((entry >> 24) & 0xFF)
+            }
+        }
+        guard let provider = CGDataProvider(data: Data(rgba) as CFData),
+              let cg = CGImage(
+                width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32,
+                bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue),
+                provider: provider, decode: nil, shouldInterpolate: true,
+                intent: .defaultIntent
+              ) else { return nil }
+        return UIImage(cgImage: cg)
     }
 
     // MARK: FFmpeg audio decode → LPCM

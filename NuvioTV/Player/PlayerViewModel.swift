@@ -553,6 +553,9 @@ final class PlayerViewModel: ObservableObject {
         isExiting ? nil : (dvDirectEngine?.videoView ?? vlcEngine?.videoView ?? playerLayer?.player.view)
     }
     let subtitleModel = SubtitleModel()
+    /// Embedded tracks bridged from the direct engine (this session).
+    private var dvEmbeddedSubs: [DVEmbeddedSubtitleInfo] = []
+    private var dvActiveEmbeddedSub: DVEmbeddedSubtitleInfo?
 
     var onDismiss: (() -> Void)?
 
@@ -890,6 +893,18 @@ final class PlayerViewModel: ObservableObject {
                                     payload: .dvDirectAudio($0.index))
                     }
                     self.selectedAudioID = "dvda-\(engine.currentAudioIndex)"
+                    // Embedded subtitle tracks: bridge each into the shared
+                    // SubtitleModel; the picker/overlay treat them like any
+                    // other subtitle source. Cues stream in live.
+                    self.dvEmbeddedSubs = engine.subtitleTracks.map {
+                        DVEmbeddedSubtitleInfo(streamIndex: $0.index, label: "\($0.label) · Embedded")
+                    }
+                    self.dvEmbeddedSubs.forEach { self.subtitleModel.addSubtitle(info: $0) }
+                    engine.onSubtitleEvent = { [weak self] start, end, text, image in
+                        guard let self, let active = self.dvActiveEmbeddedSub else { return }
+                        active.add(start: start, end: end, text: text, image: image,
+                                   playhead: self.position)
+                    }
                     self.fetchAddonSubtitles()
                     self.rebuildSubtitleOptions()
                     // Chapters (Skip Intro, timeline ticks) + scrub previews —
@@ -3266,11 +3281,21 @@ final class PlayerViewModel: ObservableObject {
                 showToast("Loading subtitles…")
             }
             subtitleModel.selectedSubtitleInfo = info
+            // Embedded track: tell the engine which stream to demux+decode.
+            if let embedded = info as? DVEmbeddedSubtitleInfo {
+                dvActiveEmbeddedSub = embedded
+                dvDirectEngine?.selectSubtitle(embedded.streamIndex)
+            } else {
+                dvActiveEmbeddedSub = nil
+                dvDirectEngine?.selectSubtitle(nil)
+            }
         case .vlcSubtitle(let id):
             // VLC renders its own subtitles; -1 disables them.
             vlcEngine?.selectSubtitle(id)
         default:
             subtitleModel.selectedSubtitleInfo = nil
+            dvActiveEmbeddedSub = nil
+            dvDirectEngine?.selectSubtitle(nil)
         }
     }
 
@@ -5228,6 +5253,64 @@ extension PlayerViewModel: KSPlayerLayerDelegate {
     func player(layer: KSPlayerLayer, bufferedCount: Int, consumeTime: TimeInterval) {}
 }
 
+
+/// One embedded subtitle track from the direct sample engine, bridged into
+/// KSPlayer's SubtitleModel so the existing picker, delay handling and
+/// SubtitleOverlayView (text AND image cues) all work unchanged. Parts
+/// stream in live from the demuxer as the engine reaches them.
+final class DVEmbeddedSubtitleInfo: SubtitleInfo {
+    let subtitleID: String
+    let name: String
+    var delay: TimeInterval = 0
+    var isEnabled: Bool = false
+    let streamIndex: Int32
+    var parts: [SubtitlePart] = []
+
+    init(streamIndex: Int32, label: String) {
+        self.streamIndex = streamIndex
+        subtitleID = "dvsub-\(streamIndex)"
+        name = label
+    }
+
+    func search(for time: TimeInterval) -> [SubtitlePart] {
+        var result = [SubtitlePart]()
+        for part in parts {
+            if part == time { result.append(part) }
+            else if part.start > time { break }
+        }
+        return result
+    }
+
+    /// Append one live cue: truncate any still-open part it supersedes,
+    /// dedup re-decoded cues after a backward seek, keep sorted, and prune
+    /// far-behind parts so PGS images don't accumulate for a whole movie.
+    func add(start: Double, end: Double, text: String?, image: UIImage?, playhead: Double) {
+        if text == nil, image == nil {   // clear marker
+            for part in parts.reversed() where part.end > start && part.start <= start {
+                part.end = start
+            }
+            return
+        }
+        let part = SubtitlePart(start, end, attributedString: text.map { NSAttributedString(string: $0) })
+        part.image = image
+        if let idx = parts.lastIndex(where: { abs($0.start - start) < 0.01 && ($0.image != nil) == (image != nil) }) {
+            parts[idx] = part
+        } else {
+            // A new image cue supersedes an open-ended one still running.
+            if image != nil {
+                for prev in parts.reversed() where prev.image != nil && prev.end > start && prev.start < start {
+                    prev.end = start
+                }
+            }
+            parts.append(part)
+            parts.sort(by: <)
+        }
+        let cutoff = playhead - 120
+        if let first = parts.first, first.start < cutoff - 60 {
+            parts.removeAll { $0.end < cutoff }
+        }
+    }
+}
 
 /// Releases the display-mode pin AFTER the player is gone.
 ///
