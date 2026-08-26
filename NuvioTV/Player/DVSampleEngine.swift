@@ -1,6 +1,7 @@
 import AVFoundation
 import CoreMedia
 import Foundation
+import KSPlayer
 import Libavcodec
 import Libavformat
 import Libavutil
@@ -42,6 +43,9 @@ final class DVSampleEngine {
 
     private(set) var duration: Double = 0
     private(set) var videoFPS: Float = 0
+    /// Container chapters (MKVs usually carry them) — feeds Skip Intro and
+    /// the timeline tick marks, same as the FFmpeg engine's list.
+    private(set) var chapters: [Chapter] = []
 
     /// Eligible audio tracks discovered at open, for the picker.
     struct AudioTrack { let index: Int32; let label: String }
@@ -70,6 +74,9 @@ final class DVSampleEngine {
     private let startAt: Double
     private let preferredAudioLanguage: String
     private let convertProfile7: Bool
+    /// Addon-declared request headers (Referer/User-Agent) — sources that
+    /// need them 403 a bare open.
+    private let requestHeaders: [String: String]?
 
     private let synchronizer = AVSampleBufferRenderSynchronizer()
     private var displayLayer: AVSampleBufferDisplayLayer { videoView.displayLayer }
@@ -116,11 +123,13 @@ final class DVSampleEngine {
     private let feedQueue = DispatchQueue(label: "dv-sample-feed")
 
     init(input: String, startAt: Double,
-         preferredAudioLanguage: String, convertProfile7: Bool) {
+         preferredAudioLanguage: String, convertProfile7: Bool,
+         requestHeaders: [String: String]? = nil) {
         inputURLString = input
         self.startAt = max(startAt, 0)
         self.preferredAudioLanguage = preferredAudioLanguage
         self.convertProfile7 = convertProfile7
+        self.requestHeaders = requestHeaders
     }
 
     // MARK: Lifecycle
@@ -217,6 +226,10 @@ final class DVSampleEngine {
         av_dict_set(&opts, "rw_timeout", "20000000", 0)
         av_dict_set(&opts, "reconnect", "1", 0)
         av_dict_set(&opts, "reconnect_streamed", "1", 0)
+        if let headers = requestHeaders, !headers.isEmpty {
+            let blob = headers.map { "\($0.key): \($0.value)" }.joined(separator: "\r\n") + "\r\n"
+            av_dict_set(&opts, "headers", blob, 0)
+        }
         defer { av_dict_free(&opts) }
         guard avformat_open_input(&ictx, inputURLString, nil, &opts) == 0, ictx != nil else {
             return "couldn't open source"
@@ -300,6 +313,21 @@ final class DVSampleEngine {
         let needsP7 = dvProfile == 7
         if ictx!.pointee.duration > 0 {
             duration = Double(ictx!.pointee.duration) / Double(AV_TIME_BASE)
+        }
+        if ictx!.pointee.nb_chapters > 0, let list = ictx!.pointee.chapters {
+            var found: [Chapter] = []
+            for c in 0 ..< Int(ictx!.pointee.nb_chapters) {
+                guard let chapter = list[c] else { continue }
+                let tb = chapter.pointee.time_base
+                let start = Double(chapter.pointee.start) * av_q2d(tb)
+                let end = Double(chapter.pointee.end) * av_q2d(tb)
+                var title = ""
+                if let tag = av_dict_get(chapter.pointee.metadata, "title", nil, 0)?.pointee.value {
+                    title = String(cString: tag)
+                }
+                found.append(Chapter(start: start, end: end, title: title))
+            }
+            chapters = found
         }
 
         // ---- Format descriptions ----

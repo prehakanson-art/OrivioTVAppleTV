@@ -773,7 +773,8 @@ final class PlayerViewModel: ObservableObject {
             let engine = DVSampleEngine(
                 input: url.absoluteString, startAt: resume,
                 preferredAudioLanguage: self.settings.preferredAudioLanguage,
-                convertProfile7: p7ok
+                convertProfile7: p7ok,
+                requestHeaders: entry.stream.behaviorHints?.proxyHeaders?.requestHeaders
             )
             self.dvDirectEngine = engine
             self.duration = probe.durationSeconds
@@ -844,6 +845,10 @@ final class PlayerViewModel: ObservableObject {
                     self.selectedAudioID = "dvda-\(engine.currentAudioIndex)"
                     self.fetchAddonSubtitles()
                     self.rebuildSubtitleOptions()
+                    // Chapters (Skip Intro, timeline ticks) + scrub previews —
+                    // the same features every other engine session gets.
+                    self.chapters = engine.chapters
+                    self.startThumbnailsIfNeeded()
                     self.trailMem("direct start")
                 } else {
                     Self.dvTrail("direct engine declined (\(reason)) — remux path")

@@ -62,6 +62,16 @@ public struct Chapter {
     public let start: TimeInterval
     public let end: TimeInterval
     public let title: String
+
+    // NUVIO PATCH: the memberwise init is internal, which forced the host
+    // app's own demux paths (DV remux, direct sample engine) to reinvent a
+    // parallel chapter type. A public init lets them feed the same chapter
+    // machinery every other engine uses.
+    public init(start: TimeInterval, end: TimeInterval, title: String) {
+        self.start = start
+        self.end = end
+        self.title = title
+    }
 }
 
 public protocol MediaPlayerProtocol: MediaPlayback {
