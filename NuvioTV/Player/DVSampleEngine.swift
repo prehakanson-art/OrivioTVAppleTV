@@ -250,9 +250,17 @@ final class DVSampleEngine {
 
     /// Cushion required before resuming from an underrun. The old flat 16
     /// (0.7s) meant each resume ran dry again within seconds on a feed
-    /// that's oscillating — pause/play machine-gunning. Demand a real
-    /// runway (~5s); near EOF take whatever remains so the tail still plays.
-    private func underrunResumeDepth(eof: Bool) -> Int { eof ? 1 : 120 }
+    /// that's oscillating — pause/play machine-gunning. Prefer a real
+    /// runway (~5s of AUs), but TIME-BOX the hold: on a feed that refills
+    /// slowly (the heavy-file case) waiting for the full cushion reads as
+    /// "frozen after rewind", so after a few seconds take a 1s cushion and
+    /// go. Near EOF take whatever remains so the tail still plays.
+    private var autoPausedAt = Date.distantPast
+
+    private func underrunResumeDepth(eof: Bool) -> Int {
+        if eof { return 1 }
+        return Date().timeIntervalSince(autoPausedAt) > 4 ? 24 : 120
+    }
 
     func play() {
         if userRate <= 0 { userRate = 1 }
@@ -572,10 +580,13 @@ final class DVSampleEngine {
                 if !eof {
                     if depth == 0, !self.autoPaused, self.userRate > 0, self.synchronizer.rate > 0 {
                         self.autoPaused = true
+                        self.autoPausedAt = Date()
+                        NSLog("[DVSample] underrun — holding clock (vq=0)")
                         self.synchronizer.setRate(0, time: self.synchronizer.currentTime())
                         self.onBuffering?(true)
                     } else if self.autoPaused, depth >= self.underrunResumeDepth(eof: eof) {
                         self.autoPaused = false
+                        NSLog("[DVSample] underrun over — resuming with vq=%d", depth)
                         if self.userRate > 0 {
                             self.synchronizer.setRate(self.userRate, time: self.synchronizer.currentTime())
                         }
