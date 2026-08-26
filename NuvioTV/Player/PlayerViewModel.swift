@@ -2666,6 +2666,18 @@ final class PlayerViewModel: ObservableObject {
             if let resume = pendingResume, resume > 5,
                duration == 0 || resume < duration - 30 {
                 vlcEngine?.seek(to: resume)
+                // VLCKit can override a seek issued at the first `playing`
+                // flip with its own position once the media finishes opening
+                // — the "VLC restarts the movie" bug. Re-assert until the
+                // position actually lands near the target.
+                Task { [weak self] in
+                    for _ in 0 ..< 4 {
+                        try? await Task.sleep(nanoseconds: 1_000_000_000)
+                        guard let self, !self.isExiting, self.vlcEngine != nil else { return }
+                        if self.position >= resume - 10 { return }
+                        self.vlcEngine?.seek(to: resume)
+                    }
+                }
             }
             pendingResume = nil
             if playbackSpeed != 1 {
@@ -4805,10 +4817,16 @@ final class PlayerViewModel: ObservableObject {
         dvDirectEngine = nil
         NSLog("[OrivioLeak] teardown() ran")
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
-            NSLog("[OrivioLeak] +5s: vm=%@ engine=%@ videoView=%@",
+            // presentedVC tells us whether the DISMISSED player cover is still
+            // mounted in the window: a dead 4K layer tree the render server
+            // keeps compositing would explain both the re-entry stutter and
+            // the corrupted-strip glitch.
+            let pvc = UIApplication.shared.ks_keyWindow?.rootViewController?.presentedViewController
+            NSLog("[OrivioLeak] +5s: vm=%@ engine=%@ videoView=%@ presentedVC=%@",
                   probeVM == nil ? "freed" : "ALIVE",
                   probeEngine == nil ? "freed" : "ALIVE",
-                  probeVideoView == nil ? "freed" : "ALIVE")
+                  probeVideoView == nil ? "freed" : "ALIVE",
+                  pvc.map { String(describing: type(of: $0)) } ?? "nil")
         }
         // Grab the live remuxer BEFORE resetNativeDV() retires it, so the
         // final purge actually has something to delete.
