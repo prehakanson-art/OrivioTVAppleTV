@@ -4824,6 +4824,27 @@ final class PlayerViewModel: ObservableObject {
         }
         sections.append(.init(title: "File", rows: file))
 
+        // Direct-engine sessions have no KSPlayer track objects — build the
+        // Video section from what the engine itself measured.
+        if let engine = dvDirectEngine {
+            var video: [MediaInfoRow] = []
+            let profile = engine.detectedDVProfile
+            video.append(.init(label: "Codec",
+                               value: profile > 0 && !engine.forceHDR10
+                                   ? "HEVC · Dolby Vision P\(profile)" : "HEVC"))
+            if engine.videoWidth > 0 {
+                video.append(.init(label: "Resolution", value: "\(engine.videoWidth) × \(engine.videoHeight)"))
+            }
+            if engine.videoFPS > 0 {
+                video.append(.init(label: "Frame Rate", value: String(format: "%.3f fps", engine.videoFPS)))
+            }
+            video.append(.init(label: "Display", value: "\(UIScreen.main.maximumFramesPerSecond) Hz"))
+            if engine.containerMbps > 0 {
+                video.append(.init(label: "Bitrate", value: String(format: "%.1f Mbps (container)", engine.containerMbps)))
+            }
+            sections.append(.init(title: "Video", rows: video))
+        }
+
         if let track = player?.tracks(mediaType: .video).first(where: \.isEnabled)
             ?? player?.tracks(mediaType: .video).first {
             var video: [MediaInfoRow] = []

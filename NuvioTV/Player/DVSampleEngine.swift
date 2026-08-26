@@ -43,6 +43,9 @@ final class DVSampleEngine {
 
     private(set) var duration: Double = 0
     private(set) var videoFPS: Float = 0
+    private(set) var videoWidth: Int = 0
+    private(set) var videoHeight: Int = 0
+    private(set) var containerMbps: Double = 0
     /// Container chapters (MKVs usually carry them) — feeds Skip Intro and
     /// the timeline tick marks, same as the FFmpeg engine's list.
     private(set) var chapters: [Chapter] = []
@@ -469,6 +472,9 @@ final class DVSampleEngine {
                 }
                 let fr = stream.pointee.avg_frame_rate
                 if fr.den > 0 { videoFPS = Float(av_q2d(fr)) }
+                videoWidth = Int(par.pointee.width)
+                videoHeight = Int(par.pointee.height)
+                containerMbps = Double(inCtx.pointee.bit_rate) / 1_000_000
                 // The A/B datum the jitter hunt needs: exact rate + bitrate.
                 let rfr = stream.pointee.r_frame_rate
                 NSLog("[DVSample] video: %dx%d avg_fps=%d/%d (%.5f) r_fps=%d/%d container_bitrate=%.1f Mbps",
