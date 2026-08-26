@@ -905,13 +905,22 @@ final class PlayerViewModel: ObservableObject {
                         engine.pause()
                         let before = UIScreen.main.maximumFramesPerSecond
                         Task { @MainActor in
-                            for _ in 0 ..< 14 {   // up to 3.5s
+                            // Wait for the mode to report in AND hold steady:
+                            // panels keep link-training for a while after they
+                            // claim the new mode, and attaching video during
+                            // that window is the overlap that wedges. Require
+                            // three consecutive stable polls post-change, then
+                            // a long quiet beat.
+                            var stable = 0
+                            var last = before
+                            for _ in 0 ..< 24 {   // up to 6s
                                 try? await Task.sleep(nanoseconds: 250_000_000)
-                                if UIScreen.main.maximumFramesPerSecond != before { break }
+                                let now = UIScreen.main.maximumFramesPerSecond
+                                if now != before, now == last { stable += 1 } else { stable = 0 }
+                                last = now
+                                if stable >= 3 { break }
                             }
-                            // One extra beat for the panel to finish syncing
-                            // after the mode reports in.
-                            try? await Task.sleep(nanoseconds: 750_000_000)
+                            try? await Task.sleep(nanoseconds: 2_500_000_000)
                             guard self.dvDirectEngine === engine, !self.isExiting else { return }
                             Self.dvTrail("display settled at \(UIScreen.main.maximumFramesPerSecond)fps — attaching video")
                             // Attach the engine's layer view: PlayerVideoView
