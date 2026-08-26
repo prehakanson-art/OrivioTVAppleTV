@@ -823,10 +823,17 @@ final class PlayerViewModel: ObservableObject {
                     // put on screen (black picture over a running clock, no
                     // error anywhere, maiden-flight bug).
                     self.videoRefreshID = UUID()
-                    self.decisionLog.record("Dolby Vision",
-                                            profile == 0
-                                                ? "Native \(probe.isPQ ? "HDR10\(probe.hasHDR10Plus ? "+" : "")" : "HEVC") (direct sample feed)"
-                                                : "Native DV (direct sample feed, Profile \(profile))",
+                    // Report what the ENGINE found in the stream itself, not
+                    // the preflight's guess — and name a converted P7 as the
+                    // conversion it is, the same honesty the remux path kept.
+                    let realProfile = engine.detectedDVProfile > 0 ? engine.detectedDVProfile : profile
+                    let dvLabel: String
+                    switch realProfile {
+                    case 0: dvLabel = "Native \(probe.isPQ ? "HDR10\(probe.hasHDR10Plus ? "+" : "")" : "HEVC") (direct sample feed)"
+                    case 7: dvLabel = "Native DV (direct sample feed, Profile 7 → 8.1)"
+                    default: dvLabel = "Native DV (direct sample feed, Profile \(realProfile))"
+                    }
+                    self.decisionLog.record("Dolby Vision", dvLabel,
                                             because: "compressed samples fed straight to the display pipeline — no remux, no server")
                     self.decisionLog.record("Engine", "DV Sample Feed",
                                             because: "AVSampleBufferDisplayLayer owns rendering for this session")

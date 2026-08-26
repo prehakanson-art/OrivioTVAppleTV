@@ -46,6 +46,10 @@ final class DVSampleEngine {
     /// Container chapters (MKVs usually carry them) — feeds Skip Intro and
     /// the timeline tick marks, same as the FFmpeg engine's list.
     private(set) var chapters: [Chapter] = []
+    /// The SOURCE's DV profile as read from its own dvcC/dvvC (0 = none) —
+    /// the decision panel must report what the file is, not what the probe
+    /// guessed or what the conversion outputs.
+    private(set) var detectedDVProfile = 0
 
     /// Eligible audio tracks discovered at open, for the picker.
     struct AudioTrack { let index: Int32; let label: String }
@@ -246,6 +250,7 @@ final class DVSampleEngine {
         // ---- Stream selection ----
         var videoIndex: Int32 = -1
         var audioIndex: Int32 = -1
+        var bestAudioScore = Int.min
         var dvProfile = 0
         var dvLevel = 0
         var nalLengthSize = 4
@@ -264,6 +269,7 @@ final class DVSampleEngine {
                             ) { $0 }.pointee
                             dvProfile = Int(record.dv_profile)
                             dvLevel = Int(record.dv_level)
+                            detectedDVProfile = dvProfile
                         }
                     }
                 }
@@ -296,8 +302,26 @@ final class DVSampleEngine {
                 let label = [language, codecName, channels > 0 ? "\(channels)ch" : ""]
                     .filter { !$0.isEmpty }.joined(separator: " · ")
                 audioTracks.append(AudioTrack(index: Int32(i), label: label.isEmpty ? "Track \(i)" : label))
-                if audioIndex < 0 { audioIndex = Int32(i) }
-                if !preferredAudioLanguage.isEmpty, lang.hasPrefix(preferredAudioLanguage) {
+                // RANKED default, not first-wins: remuxes routinely put a 2ch
+                // commentary first, and taking it made "native" sessions open
+                // on the director track. Same policy as the FFmpeg engine:
+                // language match dominates, then channel count; commentary /
+                // described-video tracks sink to the bottom no matter what.
+                var title = ""
+                if let t = av_dict_get(stream.pointee.metadata, "title", nil, 0)?.pointee.value {
+                    title = String(cString: t).lowercased()
+                }
+                let disposition = stream.pointee.disposition
+                var score = channels * 10
+                if (disposition & AV_DISPOSITION_DEFAULT) != 0 { score += 5 }
+                if !preferredAudioLanguage.isEmpty, lang.hasPrefix(preferredAudioLanguage) { score += 200 }
+                if (disposition & (AV_DISPOSITION_COMMENT | AV_DISPOSITION_VISUAL_IMPAIRED
+                                   | AV_DISPOSITION_HEARING_IMPAIRED)) != 0
+                    || title.contains("commentary") || title.contains("description") {
+                    score -= 10_000
+                }
+                if score > bestAudioScore {
+                    bestAudioScore = score
                     audioIndex = Int32(i)
                 }
             }
