@@ -900,6 +900,13 @@ final class PlayerViewModel: ObservableObject {
                                             because: "compressed samples fed straight to the display pipeline — no remux, no server")
                     self.decisionLog.record("Engine", "DV Sample Feed",
                                             because: "AVSampleBufferDisplayLayer owns rendering for this session")
+                    // FEL/MEL verdict arrives ~10s in, measured from the
+                    // stream itself — surface it in the decision panel.
+                    DVSampleEngine.onELVerdict = { [weak self] verdict in
+                        guard let self, self.dvDirectEngine != nil else { return }
+                        self.decisionLog.record("DV Layer", verdict,
+                                                because: "measured from the enhancement-layer NAL sizes in the stream")
+                    }
                     // SEQUENCE THE SWITCH LIKE INFUSE. Requesting the display
                     // mode right after attaching a live video surface put the
                     // HDMI renegotiation on top of a surface coming alive —

@@ -224,6 +224,8 @@ final class DVSampleEngine {
     /// the completion) when the file can't ride this pipeline — the caller
     /// falls back to the remux path. Runs its blocking probe OFF the caller.
     func start(completion: @escaping (Bool, String) -> Void) {
+        Self.elNalCount = 0
+        Self.elNalBytes = 0
         synchronizer.addRenderer(displayLayer)
         synchronizer.addRenderer(audioRenderer)
         let thread = Thread { [weak self] in
@@ -1171,6 +1173,10 @@ final class DVSampleEngine {
     nonisolated(unsafe) private static var rpuConversionFailures = 0
     nonisolated(unsafe) private static var elNalCount = 0
     nonisolated(unsafe) private static var elNalBytes = 0
+    /// Fired once (on main) when the P7 layer type is measured — surfaces
+    /// FEL/MEL in the player's decision panel. Single active DV engine at a
+    /// time, so static state is safe; counters reset per engine start.
+    nonisolated(unsafe) static var onELVerdict: ((String) -> Void)?
 
     private static func convertP7AccessUnit(_ au: [UInt8], nalLengthSize: Int) -> [UInt8]? {
         var out = [UInt8]()
@@ -1194,9 +1200,14 @@ final class DVSampleEngine {
                 elNalCount += 1
                 elNalBytes += len
                 if elNalCount == 240 {
+                    let avg = elNalBytes / elNalCount
+                    let fel = avg > 1000
                     NSLog("[DVSample] P7 enhancement layer: avg %d bytes/NAL over %d NALs — %@",
-                          elNalBytes / elNalCount, elNalCount,
-                          elNalBytes / elNalCount > 1000 ? "FEL (full residual layer)" : "MEL (empty shell)")
+                          avg, elNalCount, fel ? "FEL (full residual layer)" : "MEL (empty shell)")
+                    let verdict = fel
+                        ? "FEL — full enhancement layer (dropped; converted 8.1 metadata is approximate)"
+                        : "MEL — minimal enhancement layer (lossless 8.1 conversion)"
+                    DispatchQueue.main.async { onELVerdict?(verdict) }
                 }
             } else if nalType == 62 {
                 if let converted = DoviConverter.convertRPU7to81(Data(nal)) {
