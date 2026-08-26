@@ -4774,7 +4774,19 @@ final class PlayerViewModel: ObservableObject {
         vlcEngine?.stop()
         vlcEngine = nil
         dvDirectEngine?.stop()
+        // Leak probes: 5s after teardown everything below should be freed.
+        // Whichever line still prints ALIVE names the retention layer.
+        weak var probeVM: PlayerViewModel? = self
+        weak var probeEngine: DVSampleEngine? = dvDirectEngine
+        weak var probeVideoView: UIView? = dvDirectEngine?.videoView
         dvDirectEngine = nil
+        NSLog("[OrivioLeak] teardown() ran")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+            NSLog("[OrivioLeak] +5s: vm=%@ engine=%@ videoView=%@",
+                  probeVM == nil ? "freed" : "ALIVE",
+                  probeEngine == nil ? "freed" : "ALIVE",
+                  probeVideoView == nil ? "freed" : "ALIVE")
+        }
         // Grab the live remuxer BEFORE resetNativeDV() retires it, so the
         // final purge actually has something to delete.
         let liveRemuxer = dvRemuxer
