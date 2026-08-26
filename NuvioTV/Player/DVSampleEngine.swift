@@ -1155,6 +1155,8 @@ final class DVSampleEngine {
     /// Walk length-prefixed NALs: drop EL carriage (type 63), convert RPUs
     /// (type 62) via libdovi. Returns nil to keep the original packet, an
     /// empty array when the whole AU was enhancement layer.
+    nonisolated(unsafe) private static var rpuConversionFailures = 0
+
     private static func convertP7AccessUnit(_ au: [UInt8], nalLengthSize: Int) -> [UInt8]? {
         var out = [UInt8]()
         out.reserveCapacity(au.count)
@@ -1173,11 +1175,20 @@ final class DVSampleEngine {
             } else if nalType == 62 {
                 if let converted = DoviConverter.convertRPU7to81(Data(nal)) {
                     appendPrefixed(&out, [UInt8](converted), nalLengthSize)
-                    changed = true
+                    kept += 1
                 } else {
-                    appendPrefixed(&out, nal, nalLengthSize)
+                    // NEVER let a raw P7 RPU into the 8.1-tagged stream: it
+                    // references the enhancement layer we just deleted, and
+                    // the DV composer glitching on it per affected frame is
+                    // visible stutter no pipeline probe can see. A frame
+                    // with no DV metadata is benign; corrupt metadata isn't.
+                    rpuConversionFailures += 1
+                    if rpuConversionFailures == 1 || rpuConversionFailures % 100 == 0 {
+                        NSLog("[DVSample] P7 RPU conversion failed (%d so far) — dropping the frame's RPU",
+                              rpuConversionFailures)
+                    }
                 }
-                kept += 1
+                changed = true
             } else {
                 appendPrefixed(&out, nal, nalLengthSize)
                 kept += 1
