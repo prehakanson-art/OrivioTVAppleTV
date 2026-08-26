@@ -309,7 +309,7 @@
 		F5F58759EFC8800E97CDAD28 /* MaxSidebar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaxSidebar.swift; sourceTree = "<group>"; };
 		F6445656DB7DCAD1E90A05A4 /* FusionTokens.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FusionTokens.swift; sourceTree = "<group>"; };
 		F9033005E03573788ECC97D1 /* PluginStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PluginStore.swift; sourceTree = "<group>"; };
-		F927A2D709889D55514CB41C /* NuvioTVUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = NuvioTVUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		F927A2D709889D55514CB41C /* NuvioTVUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = NuvioTVUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		F96730C97830E457BF3C64FE /* HuluSidebar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HuluSidebar.swift; sourceTree = "<group>"; };
 		F9D3C6F762FE150F2A7E353A /* OnyxHome.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnyxHome.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -927,6 +927,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGNING_ALLOWED = NO;
+				DEVELOPMENT_TEAM = CYCSPZ5MTR;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -1001,6 +1002,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGNING_ALLOWED = NO;
+				DEVELOPMENT_TEAM = CYCSPZ5MTR;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
