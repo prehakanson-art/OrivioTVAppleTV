@@ -183,6 +183,10 @@ final class DVSampleEngine {
     private var demuxEOF = false
 
     @Atomic private var cancelled = false
+    /// Total stream bytes demuxed (packet payloads) — probe reads the delta
+    /// to report live ingest throughput.
+    @Atomic private var bytesDemuxed: Int64 = 0
+    private var lastProbeBytes: Int64 = 0
     /// Seek generation: bumping it makes the demux thread restart its read
     /// loop at `pendingSeekTo` and the feeders drop stale samples.
     @Atomic private var seekGeneration = 0
@@ -570,12 +574,17 @@ final class DVSampleEngine {
                         let vq = self.videoQueue.count
                         let aq = self.audioQueue.count
                         self.queueLock.unlock()
-                        NSLog("[DVSample] probe clock=%.4f vq=%d aq=%d vReady=%d aReady=%d rate=%.2f panel=%ldHz",
+                        let nowBytes = self.bytesDemuxed
+                        let feedMbps = Double(nowBytes - self.lastProbeBytes) * 8
+                            / max(wall - self.lastProbeWall, 0.001) / 1_000_000
+                        self.lastProbeBytes = nowBytes
+                        NSLog("[DVSample] probe clock=%.4f vq=%d aq=%d vReady=%d aReady=%d rate=%.2f panel=%ldHz feed=%.1fMbps",
                               ratio, vq, aq,
                               self.displayLayer.isReadyForMoreMediaData ? 1 : 0,
                               self.audioRenderer.isReadyForMoreMediaData ? 1 : 0,
                               self.synchronizer.rate,
-                              UIScreen.main.maximumFramesPerSecond)
+                              UIScreen.main.maximumFramesPerSecond,
+                              feedMbps)
                     }
                     self.lastProbeWall = wall
                     self.lastProbeMedia = media
@@ -703,6 +712,7 @@ final class DVSampleEngine {
             let dur = packet.pointee.duration > 0
                 ? Double(packet.pointee.duration) * av_q2d(tb) : 0
 
+            bytesDemuxed += Int64(packet.pointee.size)
             var bytes = [UInt8](UnsafeBufferPointer(start: data, count: Int(packet.pointee.size)))
             if isVideo, needsP7 {
                 if let converted = Self.convertP7AccessUnit(bytes, nalLengthSize: nalLengthSize) {
