@@ -260,10 +260,20 @@ final class DVSampleEngine {
     /// "frozen after rewind", so after a few seconds take a 1s cushion and
     /// go. Near EOF take whatever remains so the tail still plays.
     private var autoPausedAt = Date.distantPast
+    private var recentUnderruns = 0
+    private var lastUnderrunAt = Date.distantPast
 
     private func underrunResumeDepth(eof: Bool) -> Int {
         if eof { return 1 }
-        return Date().timeIntervalSince(autoPausedAt) > 4 ? 24 : 120
+        // A one-off hiccup resumes fast (time-boxed small cushion). REPEATED
+        // underruns mean the feed is genuinely slower than the movie right
+        // now (a debrid link warming up) — each one demands a deeper cushion,
+        // up to the full buffer, so a cold link produces one honest buffering
+        // pause instead of a minute of stop-go machine-gunning.
+        if recentUnderruns <= 1 {
+            return Date().timeIntervalSince(autoPausedAt) > 4 ? 24 : 120
+        }
+        return min(24 << min(recentUnderruns, 4), 240)   // 96, 192, 240…
     }
 
     func play() {
@@ -617,7 +627,10 @@ final class DVSampleEngine {
                     if depth == 0, !self.autoPaused, self.userRate > 0, self.synchronizer.rate > 0 {
                         self.autoPaused = true
                         self.autoPausedAt = Date()
-                        NSLog("[DVSample] underrun — holding clock (vq=0)")
+                        if Date().timeIntervalSince(self.lastUnderrunAt) > 90 { self.recentUnderruns = 0 }
+                        self.recentUnderruns += 1
+                        self.lastUnderrunAt = Date()
+                        NSLog("[DVSample] underrun #%d — holding clock (vq=0)", self.recentUnderruns)
                         self.synchronizer.setRate(0, time: self.synchronizer.currentTime())
                         self.onBuffering?(true)
                     } else if self.autoPaused, depth >= self.underrunResumeDepth(eof: eof) {
