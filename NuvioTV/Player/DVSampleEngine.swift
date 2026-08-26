@@ -105,9 +105,6 @@ final class DVSampleEngine {
     private var pcmChannels: Int32 = 0
     private var loggedAudioDecodeFailure = false
     private var loggedFirstPCM = false
-    private var depthMin = Int.max
-    private var depthTicks = 0
-    private var depthWindowGen = 0
 
     // ---- PCM batching (worker thread) ----
     // TrueHD decodes in ~40-sample crumbs: unbatched, that is 1,200 sample
@@ -116,15 +113,6 @@ final class DVSampleEngine {
     private var pcmBatch: [Float] = []
     private var pcmBatchStartPTS: Double = -1
     private var pcmBatchFrames = 0
-    /// Continuous audio clock: MKV stamps audio on a 1 ms grid, but TrueHD
-    /// frames are 0.833 ms apart — the container CANNOT express their true
-    /// times, so batches built from container stamps land ±1 ms and the
-    /// renderer stutters 46×/s, dragging the synchronizer (and video) with
-    /// it. Real time is the sample count: anchor once, then every batch is
-    /// anchor + framesEmitted/rate, re-anchoring only on genuine
-    /// discontinuities (seek, track switch, >100 ms container drift).
-    private var pcmClockAnchor: Double = .nan
-    private var pcmClockFrames = 0
 
     private func flushPCMBatch(into out: inout [CMSampleBuffer]) {
         guard pcmBatchFrames > 0, let format = pcmFormat, pcmChannels > 0 else {
@@ -136,7 +124,6 @@ final class DVSampleEngine {
             bytesPerFrame: Int(pcmChannels) * 4, ptsSeconds: pcmBatchStartPTS,
             rate: pcmRate
         ) { out.append(sample) }
-        pcmClockFrames += pcmBatchFrames
         pcmBatch.removeAll(keepingCapacity: true)
         pcmBatchFrames = 0
         pcmBatchStartPTS = -1
@@ -148,18 +135,8 @@ final class DVSampleEngine {
     private let queueLock = NSCondition()
     private var videoQueue: [CMSampleBuffer] = []
     private var audioQueue: [CMSampleBuffer] = []
-    /// ~8s of video: the pacing forensics showed the source CDN delivering
-    /// in bursts with 1-2s silences — a 2s queue drained on every burst gap
-    /// and each drain was a visible hitch ("kind of jittery"). ~8s absorbs
-    /// them for ~50 MB, pocket change at this engine's footprint.
-    private let videoQueueCap = 192
-    /// COUNT-based cap, so it must track batch duration: at 21 ms LPCM
-    /// batches, the old 96 held only ~2 s — and because the demuxer BLOCKS
-    /// on a full audio queue, video could never buffer past ~2 s either,
-    /// silently gutting the 8 s video cushion. 384 restores ~8 s for the
-    /// decode path (passthrough packets are ~32 ms, so ~12 s there — fine,
-    /// they're small).
-    private let audioQueueCap = 384
+    private let videoQueueCap = 48
+    private let audioQueueCap = 96
     private var demuxEOF = false
 
     @Atomic private var cancelled = false
@@ -170,8 +147,6 @@ final class DVSampleEngine {
     /// Post-seek trim point (worker thread): video before this decodes
     /// without displaying; audio before it is dropped.
     private var trimBefore: Double = -1
-    /// Anchor for the smoothed video timestamp grid (worker thread).
-    private var videoPTSEpoch: Double = -1
 
     /// The open input, for the audio decoder's stream lookups (worker only).
     private var liveFormatCtx: UnsafeMutablePointer<AVFormatContext>?
@@ -220,7 +195,6 @@ final class DVSampleEngine {
     /// deliberate pause, and refill must not resume one.
     private var userRate: Float = 1
     private var autoPaused = false
-    private var autoPausedAt = Date.distantPast
 
     func play() {
         userRate = 1
@@ -327,17 +301,8 @@ final class DVSampleEngine {
                 if let extra = par.pointee.extradata, par.pointee.extradata_size > 22, extra[0] == 1 {
                     nalLengthSize = Int(extra[21] & 0x03) + 1
                 }
-                // Frame rate with fallbacks: avg_frame_rate is unset on some
-                // MKVs, and a zero here made the display-mode request fall
-                // back to 60 Hz — 3:2 judder on every 24fps film. r_frame_rate
-                // is the container's nominal rate and nearly always present.
-                var fr = stream.pointee.avg_frame_rate
-                if fr.den <= 0 || fr.num <= 0 { fr = stream.pointee.r_frame_rate }
-                if fr.den > 0, fr.num > 0 { videoFPS = Float(av_q2d(fr)) }
-                NSLog("[DVSample] video fps=%.3f (avg=%d/%d r=%d/%d)",
-                      videoFPS,
-                      stream.pointee.avg_frame_rate.num, stream.pointee.avg_frame_rate.den,
-                      stream.pointee.r_frame_rate.num, stream.pointee.r_frame_rate.den)
+                let fr = stream.pointee.avg_frame_rate
+                if fr.den > 0 { videoFPS = Float(av_q2d(fr)) }
             }
             if par.pointee.codec_type == AVMEDIA_TYPE_AUDIO {
                 let id = par.pointee.codec_id
@@ -464,18 +429,7 @@ final class DVSampleEngine {
             guard let self else { return }
             self.startCompletion?(true, "")
             self.startCompletion = nil
-            // PRE-ROLL: anchor the clock at the start position but HOLD at
-            // rate 0 until a real cushion exists. Starting the instant the
-            // first frames arrived meant playback rode a fraction-of-a-second
-            // buffer whenever the CDN ran near 1× — every wobble a visible
-            // hitch (pacing floors pinned at ~8 on a slow session). The
-            // underrun machinery below releases the hold once the queue
-            // reaches its resume depth, exactly like any player's initial
-            // buffering phase.
-            self.synchronizer.setRate(0, time: CMTime(seconds: self.startAt, preferredTimescale: 90000))
-            self.autoPaused = true
-            self.autoPausedAt = Date()
-            self.onBuffering?(true)
+            self.synchronizer.setRate(1, time: CMTime(seconds: self.startAt, preferredTimescale: 90000))
             self.installFeeders()
             self.timeTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
                 guard let self else { return }
@@ -509,40 +463,17 @@ final class DVSampleEngine {
                 // network fell behind — HOLD the clock (or audio keeps going
                 // and A/V drifts across the gap) and show buffering; resume
                 // when a real cushion is back. Hysteresis (enter at empty,
-                // exit at 48 AUs ≈ two seconds) prevents flapping and gives
-                // marginal links actual runway after every rebuffer.
+                // exit at 16 AUs ≈ two-thirds of a second) prevents flapping.
                 self.queueLock.lock()
                 let depth = self.videoQueue.count
                 let eof = self.demuxEOF
                 self.queueLock.unlock()
-                // Pacing forensics: the minimum queue depth over each 10s
-                // window says whether frames are DELIVERED on time. A healthy
-                // floor (>8) with visible judder exonerates the pipeline and
-                // convicts the display side; a floor that kisses zero is
-                // starvation and the judder is ours.
-                self.depthMin = min(self.depthMin, depth)
-                self.depthTicks += 1
-                if self.depthTicks >= 20 {
-                    let seeked = self.seekGeneration != self.depthWindowGen
-                    NSLog("[DVSample] pacing: videoQueue floor=%d over 10s (now %d)%@",
-                          self.depthMin, depth, seeked ? " [seek in window]" : "")
-                    self.depthMin = Int.max
-                    self.depthTicks = 0
-                    self.depthWindowGen = self.seekGeneration
-                }
                 if !eof {
                     if depth == 0, !self.autoPaused, self.userRate > 0, self.synchronizer.rate > 0 {
                         self.autoPaused = true
-                        self.autoPausedAt = Date()
                         self.synchronizer.setRate(0, time: self.synchronizer.currentTime())
                         self.onBuffering?(true)
-                    } else if self.autoPaused,
-                              depth >= 48
-                              // Time-boxed: a slow CDN takes 30-45s to build
-                              // the full cushion — an unacceptable spinner.
-                              // After ~6s, start with a modest buffer and let
-                              // the underrun hold re-buffer if it must.
-                              || (depth >= 12 && Date().timeIntervalSince(self.autoPausedAt) > 6) {
+                    } else if self.autoPaused, depth >= 16 {
                         self.autoPaused = false
                         if self.userRate > 0 {
                             self.synchronizer.setRate(1, time: self.synchronizer.currentTime())
@@ -583,25 +514,14 @@ final class DVSampleEngine {
                     trimBefore = target - 0.05
                 }
                 if let decoder = audioDecoder { avcodec_flush_buffers(decoder) }
-                videoPTSEpoch = -1
-                pcmClockAnchor = .nan
-                pcmClockFrames = 0
                 pcmBatch.removeAll(keepingCapacity: true)
                 pcmBatchFrames = 0
                 pcmBatchStartPTS = -1
             }
             let readResult = av_read_frame(ictx, packet)
             if readResult < 0 {
-                // EOF (or read error): DON'T exit the thread — a viewer who
-                // skips back from the credits still needs a live demuxer.
-                // Park until a seek bumps the generation or the engine stops.
                 queueLock.lock(); demuxEOF = true; queueLock.broadcast(); queueLock.unlock()
-                while !cancelled, seekGeneration == myGeneration {
-                    Thread.sleep(forTimeInterval: 0.2)
-                }
-                if cancelled { break }
-                queueLock.lock(); demuxEOF = false; queueLock.unlock()
-                continue
+                break
             }
             defer { av_packet_unref(packet) }
             let index = packet.pointee.stream_index
@@ -614,26 +534,9 @@ final class DVSampleEngine {
             let tb = isVideo ? vTB
                 : (ictx!.pointee.streams[Int(index)]?.pointee.time_base ?? aTB)
             let pts = Double(packet.pointee.pts) * av_q2d(tb)
-            let dts = packet.pointee.dts != Int64.min
-                ? Double(packet.pointee.dts) * av_q2d(tb) : Double.nan
             let dur = packet.pointee.duration > 0
                 ? Double(packet.pointee.duration) * av_q2d(tb) : 0
 
-            var snappedPTS = pts
-            if isVideo, videoFPS > 1 {
-                // SNAP video PTS to the frame-rate grid. MKV timestamps are
-                // quantized to 1 ms, but 23.976 fps frames are 41.708 ms
-                // apart — playing the container's rounded stamps verbatim
-                // makes intervals alternate 41/42 ms against the vsync, a
-                // visible periodic judder on an otherwise perfect pipeline.
-                // Snapping to the nearest grid point (anchored at the first
-                // frame after open/seek) restores the true cadence; edits and
-                // discontinuities merely re-phase by <half a frame.
-                let grid = 1.0 / Double(videoFPS)
-                if videoPTSEpoch < 0 { videoPTSEpoch = pts }
-                let n = ((pts - videoPTSEpoch) / grid).rounded()
-                snappedPTS = videoPTSEpoch + n * grid
-            }
             var bytes = [UInt8](UnsafeBufferPointer(start: data, count: Int(packet.pointee.size)))
             if isVideo, needsP7 {
                 if let converted = Self.convertP7AccessUnit(bytes, nalLengthSize: nalLengthSize) {
@@ -657,19 +560,10 @@ final class DVSampleEngine {
                 }
                 continue
             }
-            // DTS must never exceed the (snapped) PTS — MKV commonly stores
-            // dts == pts, and the grid snap can move pts BACKWARD by up to
-            // half a millisecond, making pts < dts: CoreMedia rejects that
-            // as invalid timing, makeSample returned nil, and roughly half
-            // of all frames silently vanished — the queue never filled and
-            // the pre-roll hold never released ("not loading").
-            let safeDTS = dts.isFinite ? min(dts, snappedPTS) : Double.nan
             guard let sample = Self.makeSample(
                 bytes: bytes,
                 format: isVideo ? vFormat : audioFormats[index],
-                ptsSeconds: isVideo ? snappedPTS : pts,
-                durationSeconds: (isVideo && videoFPS > 1) ? 1.0 / Double(videoFPS) : dur,
-                dtsSeconds: isVideo ? safeDTS : Double.nan,
+                ptsSeconds: pts, durationSeconds: dur,
                 keyframe: (packet.pointee.flags & 0x0001) != 0
             ) else { continue }
             if displaySuppressed { Self.markDoNotDisplay(sample) }
@@ -689,28 +583,11 @@ final class DVSampleEngine {
                        : audioQueue.count >= audioQueueCap) {
             queueLock.wait(until: Date().addingTimeInterval(0.25))
         }
-        var wasEmpty = false
         if !cancelled, seekGeneration == generation {
-            if isVideo {
-                wasEmpty = videoQueue.isEmpty
-                videoQueue.append(sample)
-            } else {
-                wasEmpty = audioQueue.isEmpty
-                audioQueue.append(sample)
-            }
+            if isVideo { videoQueue.append(sample) } else { audioQueue.append(sample) }
             queueLock.broadcast()
         }
         queueLock.unlock()
-        // RE-KICK on empty→non-empty. requestMediaDataWhenReady only calls
-        // back when the renderer's readiness CHANGES — if it asked while our
-        // queue was momentarily empty, feed() returned empty-handed and the
-        // renderer, still "ready", never asked again: a permanent feeding
-        // deadlock whose probability was a startup race ("it just keeps
-        // loading"). The producer now re-primes the feeder whenever it fills
-        // an empty queue.
-        if wasEmpty {
-            feedQueue.async { [weak self] in self?.feed(video: isVideo) }
-        }
     }
 
     // MARK: FFmpeg audio decode → LPCM
@@ -719,8 +596,6 @@ final class DVSampleEngine {
         pcmBatch.removeAll(keepingCapacity: true)
         pcmBatchFrames = 0
         pcmBatchStartPTS = -1
-        pcmClockAnchor = .nan
-        pcmClockFrames = 0
         if audioDecoder != nil { avcodec_free_context(&audioDecoder) }
         if decodedFrame != nil { av_frame_free(&decodedFrame) }
         audioDecoderIndex = -1
@@ -792,31 +667,11 @@ final class DVSampleEngine {
             let pts = frame.pointee.pts != Int64.min
                 ? Double(frame.pointee.pts) * av_q2d(tb)
                 : Double(packet.pointee.pts) * av_q2d(tb)
-            if pcmClockAnchor.isNaN || abs(pts - (pcmClockAnchor + Double(pcmClockFrames + pcmBatchFrames) / Double(rate))) > 0.1 {
-                // (Re)anchor: first audio after open/seek/switch, or a real
-                // discontinuity — never for the container's 1 ms rounding.
-                // FLUSH FIRST: the pending batch belongs to the OLD anchor,
-                // and flushing bumps the frame counter — zeroing the counter
-                // before the flush credited the old batch's frames to the
-                // new anchor, offsetting every later batch by up to 21 ms.
-                flushPCMBatch(into: &out)   // don't blend across the jump
-                pcmClockAnchor = pts
-                pcmClockFrames = 0
-            }
-            if pcmBatchStartPTS < 0 {
-                pcmBatchStartPTS = pcmClockAnchor + Double(pcmClockFrames) / Double(rate)
-            }
+            if pcmBatchStartPTS < 0 { pcmBatchStartPTS = pts }
             pcmBatch.append(contentsOf: pcm)
             pcmBatchFrames += samples
-            // ~21ms per buffer (1024 frames at 48k): coarse quarter-second
-            // batches made the synchronizer's audio-slaved clock advance in
-            // 4 Hz steps, dragging VIDEO scheduling with it — the constant
-            // micro-jitter unique to decode-path audio tracks (passthrough
-            // EAC3, a continuous stream, played smooth on the same display).
-            // 1024-frame batches keep the renderer at a comfortable ~46
-            // buffers/s while giving the clock an effectively continuous
-            // reference.
-            if pcmBatchFrames >= 1024 {
+            // ~a quarter second per buffer: 4 buffers/s instead of 1,200.
+            if pcmBatchFrames >= Int(rate) / 4 {
                 flushPCMBatch(into: &out)
             }
         }
@@ -969,8 +824,7 @@ final class DVSampleEngine {
 
     private static func makeSample(
         bytes: [UInt8], format: CMFormatDescription?,
-        ptsSeconds: Double, durationSeconds: Double,
-        dtsSeconds: Double = .nan, keyframe: Bool
+        ptsSeconds: Double, durationSeconds: Double, keyframe: Bool
     ) -> CMSampleBuffer? {
         guard let format else { return nil }
         var block: CMBlockBuffer?
@@ -987,19 +841,11 @@ final class DVSampleEngine {
             )
         }) == noErr else { return nil }
 
-        // A real DTS matters: without one, VideoToolbox inside the display
-        // layer can't pipeline B-frame lookahead, so every 4K frame's decode
-        // races its own vsync deadline — landing sometimes before it and
-        // sometimes after, a CONSTANT presentation jitter over a perfectly
-        // fed queue on a correctly-matched 24 Hz display (all verified). The
-        // fMP4 paths AVPlayer plays smoothly always carry decode times; the
-        // demuxer gives them to us for free.
         var timing = CMSampleTimingInfo(
             duration: durationSeconds > 0
                 ? CMTime(seconds: durationSeconds, preferredTimescale: 90000) : .invalid,
             presentationTimeStamp: CMTime(seconds: ptsSeconds, preferredTimescale: 90000),
-            decodeTimeStamp: dtsSeconds.isFinite
-                ? CMTime(seconds: dtsSeconds, preferredTimescale: 90000) : .invalid
+            decodeTimeStamp: .invalid
         )
         var size = bytes.count
         var sample: CMSampleBuffer?
