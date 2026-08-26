@@ -166,13 +166,30 @@ final class DVSampleEngine {
         }
     }
 
+    // PTS regularity census (demux thread): how many frames land off the
+    // grid — the snap declines them silently, and irregular timestamps
+    // display raggedly. The census makes a dirty-muxed file visible.
+    private var ptsSeen = 0
+    private var ptsIrregular = 0
+    private var ptsWorstOff: Double = 0
+
     private func snapVideoPTS(_ pts: Double, dts: Double) -> Double {
         let frameDur = gridFrameDuration
         guard frameDur > 0 else { return pts }
         if ptsGridAnchor < 0 { ptsGridAnchor = pts; return pts }
         let idx = ((pts - ptsGridAnchor) / frameDur).rounded()
         let snapped = ptsGridAnchor + idx * frameDur
-        guard abs(snapped - pts) < 0.002 else { return pts }
+        let off = abs(snapped - pts)
+        ptsSeen += 1
+        if off >= 0.002 {
+            ptsIrregular += 1
+            if off > ptsWorstOff { ptsWorstOff = off }
+        }
+        if ptsSeen % 480 == 0 {
+            NSLog("[DVSample] pts census: %d frames, %d off-grid (worst %.1fms)",
+                  ptsSeen, ptsIrregular, ptsWorstOff * 1000)
+        }
+        guard off < 0.002 else { return pts }
         return max(snapped, dts)
     }
 
