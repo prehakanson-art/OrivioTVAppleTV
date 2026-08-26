@@ -3977,7 +3977,11 @@ final class PlayerViewModel: ObservableObject {
         sessionEngine = engine
         PlaybackMemory.update(meta.id) { $0.engine = engine.rawValue }
         overlay = .none
-        let resumeAt = position
+        // NOT raw `position`: load() zeroes it and it only ticks again once
+        // the new engine plays, so a second switch made while a load is still
+        // in flight read 0, wiped pendingResume, and restarted the movie from
+        // the beginning. Same guard the exit path uses.
+        let resumeAt = max(max(position, pendingResume ?? 0), sessionResumeFloor)
         countdownTask?.cancel()
         upNextCountdown = nil
         pendingResume = resumeAt > 10 ? resumeAt : nil
