@@ -448,10 +448,15 @@ final class PlayerViewModel: ObservableObject {
     /// mutually exclusive with `playerLayer`.
     private(set) var vlcEngine: VLCEngine?
     var usingVLC: Bool { vlcEngine != nil }
-    /// The UIView the active engine renders into (KSPlayer's player view or
-    /// VLC's drawable), handed to PlayerVideoView.
+    /// The direct Dolby Vision sample-feed engine (no AVPlayer, no HLS, no
+    /// CoreMedia retention) — the Infuse architecture. Mutually exclusive
+    /// with the other engines while active.
+    private(set) var dvDirectEngine: DVSampleEngine?
+    var usingDVDirect: Bool { dvDirectEngine != nil }
+    /// The UIView the active engine renders into (KSPlayer's player view,
+    /// VLC's drawable, or the DV sample layer), handed to PlayerVideoView.
     var activeVideoView: UIView? {
-        isExiting ? nil : (vlcEngine?.videoView ?? playerLayer?.player.view)
+        isExiting ? nil : (dvDirectEngine?.videoView ?? vlcEngine?.videoView ?? playerLayer?.player.view)
     }
     let subtitleModel = SubtitleModel()
 
@@ -460,12 +465,21 @@ final class PlayerViewModel: ObservableObject {
     // MARK: - Engine-agnostic transport (branch KS ↔ VLC)
 
     private func enginePlay() {
-        if let vlcEngine { vlcEngine.play() } else { playerLayer?.play() }
+        if let dvDirectEngine { dvDirectEngine.play() }
+        else if let vlcEngine { vlcEngine.play() } else { playerLayer?.play() }
     }
     private func enginePause() {
-        if let vlcEngine { vlcEngine.pause() } else { playerLayer?.pause() }
+        if let dvDirectEngine { dvDirectEngine.pause() }
+        else if let vlcEngine { vlcEngine.pause() } else { playerLayer?.pause() }
     }
     private func engineSeek(to seconds: Double, autoPlay: Bool) {
+        // Direct sample feed: its timeline IS the source timeline — no
+        // window, no offset, no re-remux. Seeks are plain.
+        if let dvDirectEngine {
+            dvDirectEngine.seek(to: seconds)
+            if autoPlay { dvDirectEngine.play() }
+            return
+        }
         // Native-DV session: the player's timeline is the local playlist,
         // which starts at dvTimeOffset and only extends as far as the remux
         // has written. In-window seeks translate; out-of-window seeks restart
@@ -707,18 +721,70 @@ final class PlayerViewModel: ObservableObject {
                 return
             }
             Self.dvTrail("DV-first: profile \(profile), \(Int(probe.durationSeconds))s — direct native start")
-            self.decisionLog.record("Dolby Vision",
-                                    "Native DV (direct start, Profile \(profile))",
-                                    because: "source advertised DV; skipping the intermediate engine entirely")
             self.dvAttempted = true
             self.nativeKind = .dolbyVision
-            self.usingNativeDV = true
-            self.dvRestarting = true
+            let resume = max(max(self.pendingResume ?? 0, self.sessionResumeFloor), 0)
+
+            // TIER 1: the sample-feed engine — no AVPlayer, no HLS, no
+            // CoreMedia retention; the app owns (and bounds) every buffer.
+            // Its failure falls to TIER 2, the remux+AVPlayer path.
+            let engine = DVSampleEngine(
+                input: url.absoluteString, startAt: resume,
+                preferredAudioLanguage: self.settings.preferredAudioLanguage,
+                convertProfile7: p7ok
+            )
+            self.dvDirectEngine = engine
             self.duration = probe.durationSeconds
             self.clock.duration = probe.durationSeconds
-            self.dvFullDuration = probe.durationSeconds
-            let resume = max(max(self.pendingResume ?? 0, self.sessionResumeFloor), 0)
-            self.startDVRemux(from: max(resume - 2, 0), isRestart: true)
+            engine.onTime = { [weak self] seconds in
+                guard let self, self.dvDirectEngine === engine else { return }
+                self.position = seconds
+                self.clock.position = seconds
+                self.isPlaying = engine.isPlaying
+                self.isBuffering = false
+                if !self.hasStartedPlayback, seconds > resume + 0.2 {
+                    self.hasStartedPlayback = true
+                    self.loadPhase = nil
+                    self.showControls()
+                }
+                self.markLoadStarted()
+                self.markPlaybackProgressed(currentTime: seconds)
+                self.saveProgressThrottled()
+                self.updateSkipIntro()
+            }
+            engine.onEnded = { [weak self] in
+                guard let self, self.dvDirectEngine === engine else { return }
+                self.handlePlayedToEnd()
+            }
+            engine.onError = { [weak self] message in
+                guard let self, self.dvDirectEngine === engine else { return }
+                Self.dvTrail("direct engine error — \(message)")
+                self.fallBackFromDirect(entry: entry, reason: message)
+            }
+            engine.start { [weak self] ok, reason in
+                guard let self, self.dvDirectEngine === engine else { return }
+                if ok {
+                    Self.dvTrail("direct sample engine started")
+                    // Attach the engine's layer view: PlayerVideoView only
+                    // re-reads activeVideoView when this ID changes — without
+                    // the bump the engine rendered into a view nobody ever
+                    // put on screen (black picture over a running clock, no
+                    // error anywhere, maiden-flight bug).
+                    self.videoRefreshID = UUID()
+                    self.decisionLog.record("Dolby Vision",
+                                            "Native DV (direct sample feed, Profile \(profile))",
+                                            because: "compressed samples fed straight to the display pipeline — no remux, no server")
+                    self.decisionLog.record("Engine", "DV Sample Feed",
+                                            because: "AVSampleBufferDisplayLayer owns rendering for this session")
+                    self.requestDVDisplayMode(fps: engine.videoFPS)
+                    self.trailMem("direct start")
+                } else {
+                    Self.dvTrail("direct engine declined (\(reason)) — remux path")
+                    self.fallBackFromDirect(entry: entry, reason: reason, toRemux: true,
+                                            profile: profile, probeDuration: probe.durationSeconds,
+                                            resume: resume)
+                }
+            }
             // Direct start has no engine underneath to keep playing — if the
             // remux can't produce a playable playlist in 45s, fall back to
             // the normal path rather than leaving a spinner forever.
@@ -735,6 +801,50 @@ final class PlayerViewModel: ObservableObject {
                 stillSelf.load(entry: entry)
             }
         }
+    }
+
+    /// Direct-engine failure: tear it down and continue on the next tier —
+    /// the remux+AVPlayer DV path when the file qualifies, else the plain
+    /// FFmpeg load.
+    private func fallBackFromDirect(
+        entry: StreamEntry, reason: String, toRemux: Bool = false,
+        profile: Int = 0, probeDuration: Double = 0, resume: Double = 0
+    ) {
+        dvDirectEngine?.stop()
+        dvDirectEngine = nil
+        videoRefreshID = UUID()   // detach the dead engine's layer view
+        if toRemux, profile > 0 {
+            decisionLog.record("Dolby Vision",
+                               "Native DV (remux, Profile \(profile))",
+                               because: "direct sample feed declined: \(reason)")
+            usingNativeDV = true
+            dvRestarting = true
+            duration = probeDuration
+            clock.duration = probeDuration
+            dvFullDuration = probeDuration
+            startDVRemux(from: max(resume - 2, 0), isRestart: true)
+        } else {
+            usingNativeDV = false
+            dvRestarting = false
+            load(entry: entry)
+        }
+    }
+
+    /// Ask the display for its Dolby Vision mode on behalf of the direct
+    /// engine (which has no KSOptions.updateVideo hook). Same de-dup-free,
+    /// capability-gated request the options path makes for native sessions.
+    private func requestDVDisplayMode(fps: Float) {
+        guard let displayManager = UIApplication.shared.ks_keyWindow?.avDisplayManager,
+              displayManager.isDisplayCriteriaMatchingEnabled else { return }
+        var rate = Float(UIScreen.main.maximumFramesPerSecond)
+        if settings.matchFrameRate, fps > 0 {
+            rate = fps
+            if (23.5...24.2).contains(rate) { rate = 23.976 }
+        }
+        displayManager.preferredDisplayCriteria = AVDisplayCriteria(
+            refreshRate: rate, videoDynamicRange: DynamicRange.dolbyVision.rawValue
+        )
+        displayCriteriaApplied = true
     }
 
     /// Where a native remux must START so it covers what the viewer is
@@ -1028,7 +1138,8 @@ final class PlayerViewModel: ObservableObject {
             }
         }
         let phase: String
-        if usingNativeDV { phase = "nativeDV" }
+        if usingDVDirect { phase = "dvDirect" }
+        else if usingNativeDV { phase = "nativeDV" }
         else if dvRemuxer != nil { phase = "ffmpeg+remuxing" }
         else if vlcEngine != nil { phase = "vlc" }
         else { phase = "ffmpeg" }
@@ -4352,6 +4463,7 @@ final class PlayerViewModel: ObservableObject {
         dvPauseHeartbeat?.cancel()
         dvFirstTask?.cancel()
         dvRemuxer?.cancel()   // stop the DV remux's network reads immediately
+        dvDirectEngine?.stop()
         enginePause()
         // Drop any overlay so the wait shows the bare (paused) video, not a
         // half-dead confirm dialog.
@@ -4441,6 +4553,8 @@ final class PlayerViewModel: ObservableObject {
         playerLayer = nil
         vlcEngine?.stop()
         vlcEngine = nil
+        dvDirectEngine?.stop()
+        dvDirectEngine = nil
         // Grab the live remuxer BEFORE resetNativeDV() retires it, so the
         // final purge actually has something to delete.
         let liveRemuxer = dvRemuxer

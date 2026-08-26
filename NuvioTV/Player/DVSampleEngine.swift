@@ -1,0 +1,565 @@
+import AVFoundation
+import CoreMedia
+import Foundation
+import Libavcodec
+import Libavformat
+import Libavutil
+import UIKit
+
+/// Direct Dolby Vision sample feed — the Infuse/SenPlayer architecture.
+///
+/// The remux→loopback-HLS→AVPlayer pipeline produces true DV output, but it
+/// rents Apple's HLS machinery, and CoreMedia retains every byte it fetches
+/// over that path — process-scoped, unreleasable, measured live at the fetch
+/// rate until jetsam. This engine bypasses all of it: demux the source with
+/// FFmpeg, convert the RPU when the file is Profile 7, wrap each compressed
+/// HEVC access unit in a CMSampleBuffer tagged with a Dolby Vision format
+/// description, and enqueue it straight into AVSampleBufferDisplayLayer.
+/// tvOS decodes via VideoToolbox and drives the display into genuine DV mode
+/// — and the only buffer in the app is OUR bounded queue, which clears
+/// behind the playhead by construction. No server, no playlist, no AVPlayer,
+/// no retention.
+///
+/// v1 scope: video + one audio track (E-AC3/AC3/AAC), play/pause/seek/rate,
+/// position callbacks. Track menus and embedded subtitles are not wired —
+/// any failure to start reports out so the caller can fall back to the
+/// remux path (which stays intact behind this).
+final class DVSampleEngine {
+    // MARK: Public surface
+
+    /// Hosts the AVSampleBufferDisplayLayer; hand this to PlayerVideoView.
+    let videoView = DVSampleLayerView()
+
+    /// Fired on main ~2×/s with the current position (absolute source secs).
+    var onTime: ((Double) -> Void)?
+    /// The demuxer reached EOF and both renderers drained.
+    var onEnded: (() -> Void)?
+    /// Terminal failure after a successful start (decode/enqueue/network).
+    var onError: ((String) -> Void)?
+
+    private(set) var duration: Double = 0
+    private(set) var videoFPS: Float = 0
+
+    var position: Double {
+        CMTimeGetSeconds(synchronizer.currentTime())
+    }
+
+    var isPlaying: Bool { synchronizer.rate > 0 }
+
+    // MARK: Internals
+
+    private let inputURLString: String
+    private let startAt: Double
+    private let preferredAudioLanguage: String
+    private let convertProfile7: Bool
+
+    private let synchronizer = AVSampleBufferRenderSynchronizer()
+    private var displayLayer: AVSampleBufferDisplayLayer { videoView.displayLayer }
+    private let audioRenderer = AVSampleBufferAudioRenderer()
+
+    private var videoFormat: CMFormatDescription?
+    private var audioFormat: CMFormatDescription?
+
+    /// Bounded sample queues — the "buffer that clears used stuff". The
+    /// demux thread blocks when they're full; the renderers drain them.
+    /// ~48 video AUs ≈ 2s at 24fps ≈ ≤40 MB at heavy-remux bitrates.
+    private let queueLock = NSCondition()
+    private var videoQueue: [CMSampleBuffer] = []
+    private var audioQueue: [CMSampleBuffer] = []
+    private let videoQueueCap = 48
+    private let audioQueueCap = 96
+    private var demuxEOF = false
+
+    @Atomic private var cancelled = false
+    /// Seek generation: bumping it makes the demux thread restart its read
+    /// loop at `pendingSeekTo` and the feeders drop stale samples.
+    @Atomic private var seekGeneration = 0
+    @Atomic private var pendingSeekTo: Double = -1
+
+    private var demuxThread: Thread?
+    private var timeTimer: Timer?
+    private let feedQueue = DispatchQueue(label: "dv-sample-feed")
+
+    init(input: String, startAt: Double,
+         preferredAudioLanguage: String, convertProfile7: Bool) {
+        inputURLString = input
+        self.startAt = max(startAt, 0)
+        self.preferredAudioLanguage = preferredAudioLanguage
+        self.convertProfile7 = convertProfile7
+    }
+
+    // MARK: Lifecycle
+
+    /// Open the source and start feeding. Returns false (with a reason via
+    /// the completion) when the file can't ride this pipeline — the caller
+    /// falls back to the remux path. Runs its blocking probe OFF the caller.
+    func start(completion: @escaping (Bool, String) -> Void) {
+        synchronizer.addRenderer(displayLayer)
+        synchronizer.addRenderer(audioRenderer)
+        let thread = Thread { [weak self] in
+            guard let self else { return }
+            let failReason = self.run()
+            if let failReason {
+                DispatchQueue.main.async { completion(false, failReason) }
+            }
+        }
+        thread.name = "DVSampleEngine"
+        thread.qualityOfService = .userInitiated
+        demuxThread = thread
+        startCompletion = completion
+        thread.start()
+    }
+    private var startCompletion: ((Bool, String) -> Void)?
+    private var reportedLayerFailure = false
+    private var reportedAudioFailure = false
+
+    func play() {
+        synchronizer.setRate(1, time: synchronizer.currentTime())
+    }
+
+    func pause() {
+        synchronizer.setRate(0, time: synchronizer.currentTime())
+    }
+
+    var rate: Float {
+        get { synchronizer.rate }
+        set { synchronizer.setRate(newValue, time: synchronizer.currentTime()) }
+    }
+
+    /// Seek: flush the renderers, point the demuxer at the target, restart
+    /// the clock there. The demux thread notices the generation bump at its
+    /// next loop iteration (or wakes from a full-queue wait).
+    func seek(to seconds: Double) {
+        let target = max(0, min(seconds, duration > 1 ? duration - 2 : seconds))
+        pendingSeekTo = target
+        seekGeneration += 1
+        queueLock.lock()
+        videoQueue.removeAll()
+        audioQueue.removeAll()
+        queueLock.signal()
+        queueLock.unlock()
+        displayLayer.flush()
+        audioRenderer.flush()
+        synchronizer.setRate(synchronizer.rate == 0 ? 0 : 1,
+                             time: CMTime(seconds: target, preferredTimescale: 90000))
+    }
+
+    func stop() {
+        cancelled = true
+        queueLock.lock(); queueLock.broadcast(); queueLock.unlock()
+        displayLayer.stopRequestingMediaData()
+        audioRenderer.stopRequestingMediaData()
+        displayLayer.flushAndRemoveImage()
+        audioRenderer.flush()
+        synchronizer.setRate(0, time: .zero)
+        timeTimer?.invalidate()
+        timeTimer = nil
+    }
+
+    // MARK: Demux worker
+
+    /// Returns a failure reason for a PRE-start failure, nil once streaming.
+    private func run() -> String? {
+        var ictx: UnsafeMutablePointer<AVFormatContext>? = avformat_alloc_context()
+        guard let inCtx = ictx else { return "alloc failed" }
+        var interruptCB = AVIOInterruptCB()
+        interruptCB.opaque = Unmanaged.passUnretained(self).toOpaque()
+        interruptCB.callback = { opaque -> Int32 in
+            guard let opaque else { return 0 }
+            return Unmanaged<DVSampleEngine>.fromOpaque(opaque).takeUnretainedValue().cancelled ? 1 : 0
+        }
+        inCtx.pointee.interrupt_callback = interruptCB
+        var opts: OpaquePointer?
+        av_dict_set(&opts, "rw_timeout", "20000000", 0)
+        av_dict_set(&opts, "reconnect", "1", 0)
+        av_dict_set(&opts, "reconnect_streamed", "1", 0)
+        defer { av_dict_free(&opts) }
+        guard avformat_open_input(&ictx, inputURLString, nil, &opts) == 0, ictx != nil else {
+            return "couldn't open source"
+        }
+        defer { avformat_close_input(&ictx) }
+        ictx!.pointee.probesize = 2 << 20
+        ictx!.pointee.max_analyze_duration = 1_000_000
+        guard avformat_find_stream_info(ictx, nil) >= 0 else { return "couldn't probe source" }
+
+        // ---- Stream selection ----
+        var videoIndex: Int32 = -1
+        var audioIndex: Int32 = -1
+        var dvProfile = 0
+        var dvLevel = 0
+        var nalLengthSize = 4
+        for i in 0 ..< Int(ictx!.pointee.nb_streams) {
+            guard let stream = ictx!.pointee.streams[i], let par = stream.pointee.codecpar else { continue }
+            if par.pointee.codec_type == AVMEDIA_TYPE_VIDEO, videoIndex < 0,
+               par.pointee.codec_id == AV_CODEC_ID_HEVC,
+               (stream.pointee.disposition & AV_DISPOSITION_ATTACHED_PIC) == 0 {
+                videoIndex = Int32(i)
+                if par.pointee.nb_coded_side_data > 0, let sideDatas = par.pointee.coded_side_data {
+                    for j in 0 ..< Int(par.pointee.nb_coded_side_data) {
+                        let sd = sideDatas[j]
+                        if sd.type == AV_PKT_DATA_DOVI_CONF, let data = sd.data {
+                            let record = data.withMemoryRebound(
+                                to: AVDOVIDecoderConfigurationRecord.self, capacity: 1
+                            ) { $0 }.pointee
+                            dvProfile = Int(record.dv_profile)
+                            dvLevel = Int(record.dv_level)
+                        }
+                    }
+                }
+                if let extra = par.pointee.extradata, par.pointee.extradata_size > 22, extra[0] == 1 {
+                    nalLengthSize = Int(extra[21] & 0x03) + 1
+                }
+                let fr = stream.pointee.avg_frame_rate
+                if fr.den > 0 { videoFPS = Float(av_q2d(fr)) }
+            }
+            if par.pointee.codec_type == AVMEDIA_TYPE_AUDIO {
+                let id = par.pointee.codec_id
+                let eligible = id == AV_CODEC_ID_EAC3 || id == AV_CODEC_ID_AC3 || id == AV_CODEC_ID_AAC
+                if eligible, audioIndex < 0 { audioIndex = Int32(i) }
+                // Preferred language wins among eligible tracks.
+                if eligible, !preferredAudioLanguage.isEmpty {
+                    var langTag: UnsafeMutablePointer<AVDictionaryEntry>?
+                    langTag = av_dict_get(stream.pointee.metadata, "language", nil, 0)
+                    if let lang = langTag?.pointee.value,
+                       String(cString: lang).hasPrefix(preferredAudioLanguage) {
+                        audioIndex = Int32(i)
+                    }
+                }
+            }
+        }
+        guard videoIndex >= 0 else { return "no HEVC video track" }
+        guard audioIndex >= 0 else { return "no E-AC3/AC3/AAC audio track" }
+        guard dvProfile == 5 || dvProfile == 8 || (dvProfile == 7 && convertProfile7) else {
+            return "Dolby Vision profile \(dvProfile) not supported here"
+        }
+        let needsP7 = dvProfile == 7
+        if ictx!.pointee.duration > 0 {
+            duration = Double(ictx!.pointee.duration) / Double(AV_TIME_BASE)
+        }
+
+        // ---- Format descriptions ----
+        guard let vStream = ictx!.pointee.streams[Int(videoIndex)],
+              let vPar = vStream.pointee.codecpar,
+              let extra = vPar.pointee.extradata, vPar.pointee.extradata_size > 0 else {
+            return "video track carries no hvcC"
+        }
+        let hvcC = Data(bytes: extra, count: Int(vPar.pointee.extradata_size))
+        // The dvvC the display pipeline sees: a converted P7 declares itself
+        // 8.1 single-layer (the same contract the remux path writes).
+        let outProfile = needsP7 ? 8 : dvProfile
+        let compatID = outProfile == 5 ? 0 : 1   // 8.x rides an HDR10 base
+        let dvvC = Self.doviConfigurationBox(
+            profile: outProfile, level: max(dvLevel, 1), compatibilityID: compatID
+        )
+        guard let vFormat = Self.makeDVVideoFormat(
+            width: Int32(vPar.pointee.width), height: Int32(vPar.pointee.height),
+            hvcC: hvcC, dvvC: dvvC
+        ) else { return "couldn't build the DV format description" }
+        videoFormat = vFormat
+
+        guard let aStream = ictx!.pointee.streams[Int(audioIndex)],
+              let aPar = aStream.pointee.codecpar,
+              let aFormat = Self.makeAudioFormat(par: aPar.pointee) else {
+            return "couldn't build the audio format description"
+        }
+        audioFormat = aFormat
+
+        // ---- Start position + clock ----
+        if startAt > 1 {
+            let ts = Int64(startAt * Double(AV_TIME_BASE))
+            av_seek_frame(ictx, -1, ts, 1 /* BACKWARD */)
+        }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.startCompletion?(true, "")
+            self.startCompletion = nil
+            self.synchronizer.setRate(1, time: CMTime(seconds: self.startAt, preferredTimescale: 90000))
+            self.installFeeders()
+            self.timeTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+                guard let self else { return }
+                self.onTime?(self.position)
+                // The layer fails SILENTLY — the clock keeps running while
+                // nothing renders. Ask it, and report the real reason out.
+                if self.displayLayer.status == .failed, !self.reportedLayerFailure {
+                    self.reportedLayerFailure = true
+                    let detail = self.displayLayer.error.map(String.init(describing:)) ?? "unknown"
+                    self.onError?("display layer failed: \(detail)")
+                }
+                if self.audioRenderer.status == .failed, !self.reportedAudioFailure {
+                    self.reportedAudioFailure = true
+                    let detail = self.audioRenderer.error.map(String.init(describing:)) ?? "unknown"
+                    NSLog("[DVSample] audio renderer failed: %@", detail)
+                }
+            }
+        }
+
+        // ---- Read loop ----
+        let vTB = vStream.pointee.time_base
+        let aTB = aStream.pointee.time_base
+        guard let packet = av_packet_alloc() else { return "packet alloc failed" }
+        var pkt: UnsafeMutablePointer<AVPacket>? = packet
+        defer { av_packet_free(&pkt) }
+        var myGeneration = seekGeneration
+
+        while !cancelled {
+            // A seek moved the goalposts: reposition and keep reading.
+            if seekGeneration != myGeneration {
+                myGeneration = seekGeneration
+                let target = pendingSeekTo
+                if target >= 0 {
+                    let ts = Int64(target * Double(AV_TIME_BASE))
+                    av_seek_frame(ictx, -1, ts, 1)
+                }
+            }
+            let readResult = av_read_frame(ictx, packet)
+            if readResult < 0 {
+                queueLock.lock(); demuxEOF = true; queueLock.broadcast(); queueLock.unlock()
+                break
+            }
+            defer { av_packet_unref(packet) }
+            let index = packet.pointee.stream_index
+            guard index == videoIndex || index == audioIndex else { continue }
+            guard packet.pointee.pts != Int64.min, let data = packet.pointee.data,
+                  packet.pointee.size > 0 else { continue }
+
+            let isVideo = index == videoIndex
+            let tb = isVideo ? vTB : aTB
+            let pts = Double(packet.pointee.pts) * av_q2d(tb)
+            let dur = packet.pointee.duration > 0
+                ? Double(packet.pointee.duration) * av_q2d(tb) : 0
+
+            var bytes = [UInt8](UnsafeBufferPointer(start: data, count: Int(packet.pointee.size)))
+            if isVideo, needsP7 {
+                if let converted = Self.convertP7AccessUnit(bytes, nalLengthSize: nalLengthSize) {
+                    if converted.isEmpty { continue }   // pure-EL packet: drop
+                    bytes = converted
+                }
+            }
+            guard let sample = Self.makeSample(
+                bytes: bytes,
+                format: isVideo ? vFormat : aFormat,
+                ptsSeconds: pts, durationSeconds: dur,
+                keyframe: (packet.pointee.flags & 0x0001) != 0
+            ) else { continue }
+
+            // Bounded enqueue — blocks (self-clearing buffer) until the
+            // renderers have consumed room, a seek clears the queues, or stop.
+            queueLock.lock()
+            while !cancelled, seekGeneration == myGeneration,
+                  (isVideo ? videoQueue.count >= videoQueueCap
+                           : audioQueue.count >= audioQueueCap) {
+                queueLock.wait(until: Date().addingTimeInterval(0.25))
+            }
+            if !cancelled, seekGeneration == myGeneration {
+                if isVideo { videoQueue.append(sample) } else { audioQueue.append(sample) }
+                queueLock.broadcast()
+            }
+            queueLock.unlock()
+        }
+        return nil
+    }
+
+    // MARK: Feeders
+
+    private func installFeeders() {
+        displayLayer.requestMediaDataWhenReady(on: feedQueue) { [weak self] in
+            self?.feed(video: true)
+        }
+        audioRenderer.requestMediaDataWhenReady(on: feedQueue) { [weak self] in
+            self?.feed(video: false)
+        }
+    }
+
+    private func feed(video: Bool) {
+        while !cancelled,
+              video ? displayLayer.isReadyForMoreMediaData
+                    : audioRenderer.isReadyForMoreMediaData {
+            queueLock.lock()
+            let sample: CMSampleBuffer?
+            if video {
+                sample = videoQueue.isEmpty ? nil : videoQueue.removeFirst()
+            } else {
+                sample = audioQueue.isEmpty ? nil : audioQueue.removeFirst()
+            }
+            let ended = demuxEOF && videoQueue.isEmpty && audioQueue.isEmpty
+            queueLock.broadcast()
+            queueLock.unlock()
+            guard let sample else {
+                if ended { DispatchQueue.main.async { [weak self] in self?.onEnded?() } }
+                return
+            }
+            if video { displayLayer.enqueue(sample) } else { audioRenderer.enqueue(sample) }
+        }
+    }
+
+    // MARK: Sample construction
+
+    private static func makeSample(
+        bytes: [UInt8], format: CMFormatDescription?,
+        ptsSeconds: Double, durationSeconds: Double, keyframe: Bool
+    ) -> CMSampleBuffer? {
+        guard let format else { return nil }
+        var block: CMBlockBuffer?
+        guard CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault, memoryBlock: nil,
+            blockLength: bytes.count, blockAllocator: kCFAllocatorDefault,
+            customBlockSource: nil, offsetToData: 0, dataLength: bytes.count,
+            flags: 0, blockBufferOut: &block
+        ) == noErr, let block else { return nil }
+        guard bytes.withUnsafeBytes({ raw in
+            CMBlockBufferReplaceDataBytes(
+                with: raw.baseAddress!, blockBuffer: block,
+                offsetIntoDestination: 0, dataLength: bytes.count
+            )
+        }) == noErr else { return nil }
+
+        var timing = CMSampleTimingInfo(
+            duration: durationSeconds > 0
+                ? CMTime(seconds: durationSeconds, preferredTimescale: 90000) : .invalid,
+            presentationTimeStamp: CMTime(seconds: ptsSeconds, preferredTimescale: 90000),
+            decodeTimeStamp: .invalid
+        )
+        var size = bytes.count
+        var sample: CMSampleBuffer?
+        guard CMSampleBufferCreateReady(
+            allocator: kCFAllocatorDefault, dataBuffer: block,
+            formatDescription: format, sampleCount: 1,
+            sampleTimingEntryCount: 1, sampleTimingArray: &timing,
+            sampleSizeEntryCount: 1, sampleSizeArray: &size,
+            sampleBufferOut: &sample
+        ) == noErr, let sample else { return nil }
+        if !keyframe, CMFormatDescriptionGetMediaType(format) == kCMMediaType_Video,
+           let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true) as? [CFMutableDictionary],
+           let first = attachments.first {
+            CFDictionarySetValue(
+                first,
+                Unmanaged.passUnretained(kCMSampleAttachmentKey_NotSync).toOpaque(),
+                Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
+            )
+        }
+        return sample
+    }
+
+    /// DV format description: HEVC dimensions + hvcC, tagged 'dvh1' with the
+    /// dvvC atom so VideoToolbox and the display pipeline treat the stream as
+    /// Dolby Vision rather than plain HEVC.
+    private static func makeDVVideoFormat(
+        width: Int32, height: Int32, hvcC: Data, dvvC: Data
+    ) -> CMFormatDescription? {
+        let atoms: [String: Any] = ["hvcC": hvcC, "dvvC": dvvC]
+        let extensions: [String: Any] = [
+            kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms as String: atoms
+        ]
+        var format: CMFormatDescription?
+        let status = CMVideoFormatDescriptionCreate(
+            allocator: kCFAllocatorDefault,
+            codecType: kCMVideoCodecType_DolbyVisionHEVC,
+            width: width, height: height,
+            extensions: extensions as CFDictionary,
+            formatDescriptionOut: &format
+        )
+        return status == noErr ? format : nil
+    }
+
+    /// The 24-byte dv decoder configuration record (ISO/IEC layout) —
+    /// version 1.0, single layer, RPU+BL present.
+    private static func doviConfigurationBox(
+        profile: Int, level: Int, compatibilityID: Int
+    ) -> Data {
+        var b = [UInt8](repeating: 0, count: 24)
+        b[0] = 1   // version major
+        b[1] = 0   // version minor
+        b[2] = UInt8((profile << 1) | ((level >> 5) & 0x01))
+        b[3] = UInt8(((level & 0x1F) << 3) | (1 << 2) /* rpu */ | (0 << 1) /* el */ | 1 /* bl */)
+        b[4] = UInt8((compatibilityID & 0x0F) << 4)
+        return Data(b)
+    }
+
+    private static func makeAudioFormat(par: AVCodecParameters) -> CMFormatDescription? {
+        var asbd = AudioStreamBasicDescription()
+        switch par.codec_id {
+        case AV_CODEC_ID_EAC3: asbd.mFormatID = kAudioFormatEnhancedAC3
+        case AV_CODEC_ID_AC3: asbd.mFormatID = kAudioFormatAC3
+        case AV_CODEC_ID_AAC: asbd.mFormatID = kAudioFormatMPEG4AAC
+        default: return nil
+        }
+        asbd.mSampleRate = Float64(par.sample_rate)
+        asbd.mChannelsPerFrame = UInt32(max(par.ch_layout.nb_channels, 2))
+        asbd.mFramesPerPacket = par.codec_id == AV_CODEC_ID_AAC ? 1024 : 1536
+        var format: CMFormatDescription?
+        // AAC cannot decode without its AudioSpecificConfig — the codec
+        // extradata IS that cookie. AC3/E-AC3 are self-describing.
+        var cookie: UnsafeRawPointer?
+        var cookieSize = 0
+        if par.codec_id == AV_CODEC_ID_AAC, let extra = par.extradata, par.extradata_size > 0 {
+            cookie = UnsafeRawPointer(extra)
+            cookieSize = Int(par.extradata_size)
+        }
+        let status = CMAudioFormatDescriptionCreate(
+            allocator: kCFAllocatorDefault, asbd: &asbd,
+            layoutSize: 0, layout: nil,
+            magicCookieSize: cookieSize, magicCookie: cookie,
+            extensions: nil, formatDescriptionOut: &format
+        )
+        return status == noErr ? format : nil
+    }
+
+    // MARK: P7 → 8.1 access-unit conversion
+
+    /// Walk length-prefixed NALs: drop EL carriage (type 63), convert RPUs
+    /// (type 62) via libdovi. Returns nil to keep the original packet, an
+    /// empty array when the whole AU was enhancement layer.
+    private static func convertP7AccessUnit(_ au: [UInt8], nalLengthSize: Int) -> [UInt8]? {
+        var out = [UInt8]()
+        out.reserveCapacity(au.count)
+        var i = 0
+        var changed = false
+        var kept = 0
+        while i + nalLengthSize <= au.count {
+            var len = 0
+            for k in 0 ..< nalLengthSize { len = (len << 8) | Int(au[i + k]) }
+            let start = i + nalLengthSize
+            guard len > 0, start + len <= au.count else { return nil }
+            let nalType = (au[start] >> 1) & 0x3F
+            let nal = Array(au[start ..< start + len])
+            if nalType == 63 {
+                changed = true   // EL: drop
+            } else if nalType == 62 {
+                if let converted = DoviConverter.convertRPU7to81(Data(nal)) {
+                    appendPrefixed(&out, [UInt8](converted), nalLengthSize)
+                    changed = true
+                } else {
+                    appendPrefixed(&out, nal, nalLengthSize)
+                }
+                kept += 1
+            } else {
+                appendPrefixed(&out, nal, nalLengthSize)
+                kept += 1
+            }
+            i = start + len
+        }
+        if kept == 0 { return [] }
+        return changed ? out : nil
+    }
+
+    private static func appendPrefixed(_ out: inout [UInt8], _ nal: [UInt8], _ lengthSize: Int) {
+        let len = nal.count
+        for shift in stride(from: (lengthSize - 1) * 8, through: 0, by: -8) {
+            out.append(UInt8((len >> shift) & 0xFF))
+        }
+        out.append(contentsOf: nal)
+    }
+}
+
+/// UIView whose backing layer IS the sample display layer, so the video
+/// scales with the view like every other engine's output.
+final class DVSampleLayerView: UIView {
+    override class var layerClass: AnyClass { AVSampleBufferDisplayLayer.self }
+    var displayLayer: AVSampleBufferDisplayLayer { layer as! AVSampleBufferDisplayLayer }
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        displayLayer.videoGravity = .resizeAspect
+        backgroundColor = .black
+    }
+    required init?(coder: NSCoder) { fatalError("unavailable") }
+}

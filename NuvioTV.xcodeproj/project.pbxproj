@@ -21,6 +21,7 @@
 		13920A373FF2E5D7BB06F939 /* NuvioSyncModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4E68E4D03BAF629A2694A011 /* NuvioSyncModels.swift */; };
 		14112BEF124289B4FC2A911A /* SettingsTraktView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1EC4C10B5219C8C94F5868AA /* SettingsTraktView.swift */; };
 		14C76B28C6CFAB66591F7FEB /* AddonManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = EDBD5D6D83637232496C5D02 /* AddonManager.swift */; };
+		1AAF42D71042267B89E916FF /* DVSampleEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAB2EDAF3951B63EA5348D33 /* DVSampleEngine.swift */; };
 		1D5290072980FEA7079EEE83 /* StremioSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 15F9845B52B3861155DAAD4D /* StremioSettings.swift */; };
 		2072F1BAB7047F8207172DA4 /* CollectionsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A901073E967FB097E347259 /* CollectionsStore.swift */; };
 		21DF981C8F7FCF69FA6358DB /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A77D0DFF73779D6393DDF7A /* SettingsView.swift */; };
@@ -271,6 +272,7 @@
 		C26E3B4C279900B78470C667 /* PlayerSettingsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerSettingsStore.swift; sourceTree = "<group>"; };
 		C34BF835101EA7DC519880C9 /* SettingsIntegrationsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsIntegrationsView.swift; sourceTree = "<group>"; };
 		C7A87DC8E901E5E1AF4A2826 /* MaxRootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaxRootView.swift; sourceTree = "<group>"; };
+		CAB2EDAF3951B63EA5348D33 /* DVSampleEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DVSampleEngine.swift; sourceTree = "<group>"; };
 		CB57AA419192D7276E5E56DC /* CloudLibraryService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudLibraryService.swift; sourceTree = "<group>"; };
 		CB84CD5358005AFCBA81FA25 /* QRCode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QRCode.swift; sourceTree = "<group>"; };
 		CC1F21596FDC55C0A5520D38 /* HuluSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HuluSettings.swift; sourceTree = "<group>"; };
@@ -558,6 +560,7 @@
 			children = (
 				B6DB589DC0A8FBFAF5AE8C3F /* DoviConverter.swift */,
 				48D4225F2EA78DACA1350421 /* DVRemuxer.swift */,
+				CAB2EDAF3951B63EA5348D33 /* DVSampleEngine.swift */,
 				F31DD8C5D22DF53DCD150CB9 /* NativePlayerControlsOverlay.swift */,
 				E2B5622602D0586649B04485 /* PauseOverlayView.swift */,
 				82AD39946AE7E3EF48EA6F19 /* PlaybackDecision.swift */,
@@ -765,6 +768,7 @@
 				E2CFF35E41DBA1ED383BD452 /* CommunityCollectionsView.swift in Sources */,
 				BF6961891F5345E7DBE28277 /* Components.swift in Sources */,
 				C7A329FA86460E8FE3DFCA59 /* DVRemuxer.swift in Sources */,
+				1AAF42D71042267B89E916FF /* DVSampleEngine.swift in Sources */,
 				0DFE89CB6E0C80C4497E341F /* DebridService.swift in Sources */,
 				9B3FA2260743150105A9D5B4 /* DeepLinkService.swift in Sources */,
 				E5B79A409AAB47A1AC1155D8 /* DetailView.swift in Sources */,
