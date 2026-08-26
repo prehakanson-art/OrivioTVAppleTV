@@ -250,13 +250,6 @@ struct PlaybackSettingsDetail: View {
                 }
 
                 PlaybackToggleRow(
-                    icon: "arrow.uturn.backward.square",
-                    title: "Restore display mode on exit",
-                    subtitle: "When a video switched the TV into its HDR/Dolby Vision mode, switch back on the way out. Leave this ON unless your TV goes grey or the wrong colour when you close the player and only a power-cycle fixes it — some panels mis-handshake the switch back no matter how gently it's done, and not switching at all is the only reliable cure. Off means the Apple TV stays in the video's mode until tvOS moves it itself.",
-                    isOn: s.restoreDisplayModeOnExit
-                )
-
-                PlaybackToggleRow(
                     icon: "rectangle.on.rectangle.badge.gearshape",
                     title: "HDR10+ passthrough",
                     subtitle: "Send HDR10+ dynamic metadata to the TV instead of the plain HDR10 base layer, so brightness is mapped scene by scene. The metadata lives inside the video, and only Apple's own pipeline carries it through — so a matching file is remuxed on-device the same way Dolby Vision is, and falls back to HDR10 if anything fails. Needs an Apple TV 4K (3rd gen) or newer on tvOS 18.4+, an HDR10+ TV, and an HDR10+ file; Dolby Vision always wins when a file has both.",

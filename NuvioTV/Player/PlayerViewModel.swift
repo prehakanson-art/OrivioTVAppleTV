@@ -131,6 +131,29 @@ struct TrackOption: Identifiable, Equatable {
 enum SessionDisplayMode {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var pinned = false
+    nonisolated(unsafe) private static var observing = false
+
+    /// The pin is per FOREGROUND STINT, not per process: when the app
+    /// backgrounds, tvOS has already put the display back in its home format
+    /// on its own terms, so clearing `preferredDisplayCriteria` there is
+    /// invisible — no renegotiation happens on a backgrounded app. Clearing
+    /// the flag lets the next foreground session negotiate its mode fresh
+    /// instead of inheriting a stale pin that no longer matches the panel.
+    private static func installBackgroundReleaseIfNeeded() {
+        lock.lock()
+        let install = !observing
+        if install { observing = true }
+        lock.unlock()
+        guard install else { return }
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil, queue: .main
+        ) { _ in
+            UIApplication.shared.ks_keyWindow?.avDisplayManager.preferredDisplayCriteria = nil
+            lock.lock(); pinned = false; lock.unlock()
+            NSLog("[OrivioDisplay] backgrounded — pin cleared (display already reverted by tvOS)")
+        }
+    }
 
     /// Apply `criteria` only if nothing was pinned this launch. Lock-based
     /// (not actor-isolated): callers arrive from KSPlayer's setup thread AND
@@ -142,6 +165,7 @@ enum SessionDisplayMode {
         if first { pinned = true }
         lock.unlock()
         guard first else { return false }
+        installBackgroundReleaseIfNeeded()
         if Thread.isMainThread {
             manager.preferredDisplayCriteria = criteria
         } else {
@@ -251,14 +275,15 @@ final class NuvioPlayerOptions: KSOptions {
         // A mismatched panel (or Match Frame Rate off) stays at its home rate
         // (typically 60Hz): keep the pulldown softening on.
         pulldown60Hz = true
-        // STRICT opt-in — the Infuse/VLC discipline. The old `|| nativeDV`
-        // bypass made DV sessions request the display's DV mode even with
-        // matching OFF, so the app kept rolling the HDMI-renegotiation dice
-        // no other app on this TV ever rolls (the grey-wedge screen). With
-        // matching off the app now NEVER touches the display; DV output is
-        // achieved wedge-free by setting the tvOS Format itself to 4K Dolby
-        // Vision (the mode then never changes for anything).
-        guard matchDisplayCriteria,
+        // THE INFUSE POLICY. Dolby Vision sessions may request the DV mode by
+        // default (`nativeDV`) — that's the point of playing DV. Everything
+        // else (HDR10/SDR via this path) stays hands-off unless the user opts
+        // in with "Match content display mode". The grey-screen wedge is
+        // prevented not by refusing the switch IN but by never switching BACK
+        // while the app is alive: the pin holds for the whole foreground
+        // stint (releaseDisplayForExit is a no-op) and tvOS performs the one
+        // unavoidable revert invisibly when the app backgrounds.
+        guard matchDisplayCriteria || nativeDV,
               refreshRate > 0,
               let displayManager = UIApplication.shared.ks_keyWindow?.avDisplayManager,
               displayManager.isDisplayCriteriaMatchingEnabled,
@@ -947,10 +972,10 @@ final class PlayerViewModel: ObservableObject {
     /// engine (which has no KSOptions.updateVideo hook). Same de-dup-free,
     /// capability-gated request the options path makes for native sessions.
     private func requestDVDisplayMode(fps: Float) {
-        // Same strict opt-in as updateVideo: with matching off, the app
-        // never initiates an HDMI renegotiation for any reason.
-        guard settings.matchContentDisplayMode,
-              let displayManager = UIApplication.shared.ks_keyWindow?.avDisplayManager,
+        // DV sessions request their mode by DEFAULT (the Infuse policy) —
+        // range-only unless Match Frame Rate is on, pinned once per foreground
+        // stint, and never reverted while the app is alive.
+        guard let displayManager = UIApplication.shared.ks_keyWindow?.avDisplayManager,
               displayManager.isDisplayCriteriaMatchingEnabled else { return }
         var rate = Float(UIScreen.main.maximumFramesPerSecond)
         if settings.matchFrameRate, fps > 0 {
@@ -4638,19 +4663,14 @@ final class PlayerViewModel: ObservableObject {
         // mis-handshake no matter how gently the switch is sequenced, and not
         // switching back at all is the only thing that always works. tvOS
         // returns the display to its home-screen format on its own terms.
-        if displayCriteriaApplied {
-            if settings.restoreDisplayModeOnExit {
-                UIApplication.shared.ks_keyWindow?.avDisplayManager.preferredDisplayCriteria = nil
-            }
-            // OFF: deliberately release NOTHING. tvOS reverts the display
-            // mode on its own a few seconds after video playback ends — the
-            // user's panel wedges grey on that revert (recovers only via an
-            // input toggle), and it happens with or without the app's
-            // involvement. An app-scheduled release in the same window meant
-            // TWO overlapping renegotiations and twice the wedge odds; the
-            // best this app can do for a chain like that is add zero extra
-            // handshakes and let the OS's single revert be the only one.
-        }
+        // Deliberately releases NOTHING, ever (the Infuse policy). A revert
+        // is a full HDMI renegotiation landing seconds after the player
+        // closes — exactly when this user's panel wedges grey. The display
+        // holds the video's mode for the rest of the foreground stint (the
+        // SDR UI is tone-mapped into it, same as running the tvOS Format at
+        // 4K Dolby Vision), and tvOS performs the single unavoidable revert
+        // invisibly when the app backgrounds — where SessionDisplayMode also
+        // clears the pin so the next stint negotiates fresh.
     }
 
     /// Seconds the exit must hold its black cover before tearing the player
@@ -4658,7 +4678,7 @@ final class PlayerViewModel: ObservableObject {
     /// instead of a disappearing video surface. Zero when no switch was made
     /// this session (the common case — exits stay instant).
     var exitDisplaySettleDelay: Double {
-        displayCriteriaApplied && settings.restoreDisplayModeOnExit ? 1.6 : 0
+        0   // no in-app switch-back exists anymore, so there is no handshake to wait out
     }
 
     func teardown() {
