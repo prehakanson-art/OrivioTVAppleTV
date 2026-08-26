@@ -1156,6 +1156,8 @@ final class DVSampleEngine {
     /// (type 62) via libdovi. Returns nil to keep the original packet, an
     /// empty array when the whole AU was enhancement layer.
     nonisolated(unsafe) private static var rpuConversionFailures = 0
+    nonisolated(unsafe) private static var elNalCount = 0
+    nonisolated(unsafe) private static var elNalBytes = 0
 
     private static func convertP7AccessUnit(_ au: [UInt8], nalLengthSize: Int) -> [UInt8]? {
         var out = [UInt8]()
@@ -1172,6 +1174,17 @@ final class DVSampleEngine {
             let nal = Array(au[start ..< start + len])
             if nalType == 63 {
                 changed = true   // EL: drop
+                // FEL-vs-MEL diagnosis: MEL enhancement layers are ~100-byte
+                // shells (lossless to drop); FEL ELs are a real 12-bit
+                // residual stream, and converted-8.1 metadata over a dropped
+                // FEL is an approximation the composer may stumble on.
+                elNalCount += 1
+                elNalBytes += len
+                if elNalCount == 240 {
+                    NSLog("[DVSample] P7 enhancement layer: avg %d bytes/NAL over %d NALs — %@",
+                          elNalBytes / elNalCount, elNalCount,
+                          elNalBytes / elNalCount > 1000 ? "FEL (full residual layer)" : "MEL (empty shell)")
+                }
             } else if nalType == 62 {
                 if let converted = DoviConverter.convertRPU7to81(Data(nal)) {
                     appendPrefixed(&out, [UInt8](converted), nalLengthSize)
