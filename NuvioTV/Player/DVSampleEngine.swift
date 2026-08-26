@@ -172,6 +172,11 @@ final class DVSampleEngine {
     private var ptsSeen = 0
     private var ptsIrregular = 0
     private var ptsWorstOff: Double = 0
+    // Decode-cost profile per census window: AU sizes reveal complexity
+    // spikes (a frame that busts the 41.7ms decode budget repeats on
+    // screen with every other metric clean).
+    private var auBytesWindow = 0
+    private var auMaxWindow = 0
 
     private func snapVideoPTS(_ pts: Double, dts: Double) -> Double {
         let frameDur = gridFrameDuration
@@ -186,8 +191,11 @@ final class DVSampleEngine {
             if off > ptsWorstOff { ptsWorstOff = off }
         }
         if ptsSeen % 480 == 0 {
-            NSLog("[DVSample] pts census: %d frames, %d off-grid (worst %.1fms)",
-                  ptsSeen, ptsIrregular, ptsWorstOff * 1000)
+            NSLog("[DVSample] pts census: %d frames, %d off-grid (worst %.1fms) | AU avg=%dKB max=%dKB",
+                  ptsSeen, ptsIrregular, ptsWorstOff * 1000,
+                  auBytesWindow / 480 / 1024, auMaxWindow / 1024)
+            auBytesWindow = 0
+            auMaxWindow = 0
         }
         guard off < 0.002 else { return pts }
         return max(snapped, dts)
@@ -450,7 +458,8 @@ final class DVSampleEngine {
                 if fr.den > 0 { videoFPS = Float(av_q2d(fr)) }
                 // The A/B datum the jitter hunt needs: exact rate + bitrate.
                 let rfr = stream.pointee.r_frame_rate
-                NSLog("[DVSample] video: avg_fps=%d/%d (%.5f) r_fps=%d/%d container_bitrate=%.1f Mbps",
+                NSLog("[DVSample] video: %dx%d avg_fps=%d/%d (%.5f) r_fps=%d/%d container_bitrate=%.1f Mbps",
+                      par.pointee.width, par.pointee.height,
                       fr.num, fr.den, fr.den > 0 ? av_q2d(fr) : 0,
                       rfr.num, rfr.den,
                       Double(inCtx.pointee.bit_rate) / 1_000_000)
@@ -739,6 +748,10 @@ final class DVSampleEngine {
                 ? Double(packet.pointee.duration) * av_q2d(tb) : 0
 
             bytesDemuxed += Int64(packet.pointee.size)
+            if isVideo {
+                auBytesWindow += Int(packet.pointee.size)
+                auMaxWindow = max(auMaxWindow, Int(packet.pointee.size))
+            }
             var bytes = [UInt8](UnsafeBufferPointer(start: data, count: Int(packet.pointee.size)))
             if isVideo, forceHDR10, dvProfile > 0 {
                 if let stripped = Self.stripDVAccessUnit(bytes, nalLengthSize: nalLengthSize) {
