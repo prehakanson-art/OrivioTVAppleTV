@@ -29,7 +29,12 @@ struct PlayerVideoView: UIViewRepresentable {
     private func attach(to container: UIView) {
         // The active engine's render view (KSPlayer's player view or VLC's
         // drawable) — bumped via videoRefreshID when the engine changes.
-        guard let videoView = viewModel.activeVideoView else { return }
+        guard let videoView = viewModel.activeVideoView else {
+            for subview in container.subviews {
+                subview.removeFromSuperview()
+            }
+            return
+        }
         for subview in container.subviews where subview !== videoView {
             subview.removeFromSuperview()
         }

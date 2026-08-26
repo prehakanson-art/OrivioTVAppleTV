@@ -7,6 +7,10 @@ struct PlayerScreen: View {
     @EnvironmentObject private var watched: WatchedStore
     @StateObject private var viewModel: PlayerViewModel
     @FocusState private var catcherFocused: Bool
+    /// Focus on the "Skip Intro" pill. Kept in sync both ways with
+    /// `viewModel.skipIntroFocused` so the trackpad gesture layer and the
+    /// focus engine can each move it and neither ends up lying about it.
+    @FocusState private var skipIntroFocused: Bool
     /// Opaque cover held over the last frame while the display-mode handshake
     /// settles on exit. See exitPlayer().
     @State private var exitCoverVisible = false
@@ -239,29 +243,7 @@ struct PlayerScreen: View {
             }
 
             // "Skip Intro" pill while inside an intro-like chapter.
-            if viewModel.skipIntroActive, !viewModel.isScrubbing,
-               viewModel.overlay == .none || viewModel.overlay == .controls {
-                VStack {
-                    Spacer()
-                    HStack {
-                        Spacer()
-                        HStack(spacing: 10) {
-                            Image(systemName: "playpause.fill")
-                                .font(.system(size: 18, weight: .bold))
-                            Text("Skip Intro")
-                                .font(.system(size: 23, weight: .semibold))
-                        }
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, NuvioSpacing.lg)
-                        .padding(.vertical, NuvioSpacing.sm)
-                        .playerChrome(in: Capsule())
-                        .overlay(Capsule().strokeBorder(.white.opacity(0.25), lineWidth: 1))
-                    }
-                    .padding(.trailing, NuvioSpacing.huge)
-                    .padding(.bottom, viewModel.overlay == .controls ? 320 : NuvioSpacing.huge)
-                }
-                .transition(.opacity)
-            }
+            skipIntroPill
         }
         .animation(.easeOut(duration: 0.18), value: viewModel.overlay)
         .animation(.easeOut(duration: 0.2), value: viewModel.isResyncing)
@@ -301,8 +283,28 @@ struct PlayerScreen: View {
             // the very next click REOPENS the menu instead of landing on the
             // stale play button (which read as "trying to hide the menu").
             if newValue == .none || newValue == .pauseInfo || newValue == .info {
+                // ...unless the Skip Intro pill is the thing that should hold
+                // it, in which case stealing focus back would un-highlight it.
+                guard !viewModel.skipIntroFocused else { return }
                 DispatchQueue.main.async { catcherFocused = true }
             }
+        }
+        .animation(.easeOut(duration: 0.18), value: viewModel.skipIntroActive)
+        // View model → focus engine.
+        .onChange(of: viewModel.skipIntroFocused) { _, focused in
+            if focused {
+                skipIntroFocused = true
+            } else if viewModel.overlay == .none || viewModel.overlay == .pauseInfo
+                        || viewModel.overlay == .info {
+                // The pill let go — the invisible catcher has to take focus
+                // back or the remote goes dead over bare video.
+                DispatchQueue.main.async { catcherFocused = true }
+            }
+        }
+        // Focus engine → view model (a swipe can land focus on the pill on its
+        // own; the model must not go on believing the catcher still has it).
+        .onChange(of: skipIntroFocused) { _, focused in
+            if viewModel.skipIntroFocused != focused { viewModel.skipIntroFocused = focused }
         }
         .onDisappear {
             viewModel.teardown()
@@ -378,9 +380,9 @@ struct PlayerScreen: View {
 
     /// Exit is immediate UNLESS a display-mode switch happened this session.
     ///
-    /// When one did, prepareForExit releases the mode and this holds the black
-    /// cover for a beat before dismissing, so the HDMI handshake completes
-    /// over a static screen rather than over a video surface being destroyed —
+    /// When one did, prepareForExit detaches the video surface, then this holds
+    /// the black cover while the mode is released a beat later, so the HDMI
+    /// handshake completes over a static screen rather than over a video surface being destroyed —
     /// the overlap that leaves some TVs grey until they are power-cycled. The
     /// wait is zero for every ordinary (SDR / no-switch) exit, so nothing gets
     /// slower for the common case.
@@ -390,6 +392,7 @@ struct PlayerScreen: View {
         viewModel.prepareForExit()
         let settle = viewModel.exitDisplaySettleDelay
         guard settle > 0 else {
+            viewModel.releaseDisplayForExit()
             var transaction = Transaction()
             transaction.disablesAnimations = true
             withTransaction(transaction) { dismiss() }
@@ -399,6 +402,8 @@ struct PlayerScreen: View {
         // runs — a Back press during the wait can't re-enter the exit flow.
         exitCoverVisible = true
         Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            viewModel.releaseDisplayForExit()
             try? await Task.sleep(nanoseconds: UInt64(settle * 1_000_000_000))
             var transaction = Transaction()
             transaction.disablesAnimations = true
@@ -458,9 +463,60 @@ struct PlayerScreen: View {
             switch direction {
             case .left: viewModel.nudgeSeek(-Double(viewModel.settings.skipSeconds))
             case .right: viewModel.nudgeSeek(Double(viewModel.settings.skipSeconds))
-            case .up, .down: viewModel.showControls()
+            // Up/down normally opens the controls — but while the pill is up
+            // it is the FIRST stop, and a second press carries on to the menu.
+            case .up, .down:
+                if !viewModel.focusSkipIntro() { viewModel.showControls() }
             @unknown default: break
             }
+        }
+    }
+
+    /// "Skip Intro" pill.
+    ///
+    /// Over bare video it is a REAL focusable button — it highlights, Select
+    /// skips, and the gesture layer hands it focus on the first nudge of the
+    /// trackpad (see `focusSkipIntro`). Once the transport controls are up
+    /// they own focus, so there it degrades to a static hint and ⏯ skips.
+    @ViewBuilder
+    private var skipIntroPill: some View {
+        if viewModel.skipIntroActive, !viewModel.isScrubbing,
+           viewModel.overlay == .none || viewModel.overlay == .controls {
+            VStack {
+                Spacer()
+                HStack {
+                    Spacer()
+                    if viewModel.overlay == .none {
+                        Button { viewModel.skipIntro() } label: {
+                            SkipIntroPillLabel()
+                        }
+                        .buttonStyle(PlainCardButtonStyle())
+                        .focused($skipIntroFocused)
+                        .onMoveCommand { direction in
+                            viewModel.noteInput("move \(direction) (skip)")
+                            if viewModel.moveSuppressed { return }
+                            switch direction {
+                            // Keep going past the pill → the transport controls.
+                            case .up, .down:
+                                viewModel.skipIntroFocused = false
+                                viewModel.showControls()
+                            // Left/right still seek, same as over bare video —
+                            // the pill isn't a mode you have to escape first.
+                            case .left:
+                                viewModel.nudgeSeek(-Double(viewModel.settings.skipSeconds))
+                            case .right:
+                                viewModel.nudgeSeek(Double(viewModel.settings.skipSeconds))
+                            @unknown default: break
+                            }
+                        }
+                    } else {
+                        SkipIntroPillLabel()
+                    }
+                }
+                .padding(.trailing, NuvioSpacing.huge)
+                .padding(.bottom, viewModel.overlay == .controls ? 320 : NuvioSpacing.huge)
+            }
+            .transition(.opacity)
         }
     }
 
@@ -1191,5 +1247,40 @@ struct PlayerErrorOverlay: View {
                 }
             }
         }
+    }
+}
+
+/// The "Skip Intro" capsule. Reads its own focus out of the environment so the
+/// same label works both as the focusable button over bare video and as the
+/// static hint under the transport controls — focused it goes solid white with
+/// a Select glyph, unfocused it's the dim chrome pill with the ⏯ hint.
+private struct SkipIntroPillLabel: View {
+    @Environment(\.isFocused) private var isFocused
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: isFocused ? "forward.end.fill" : "playpause.fill")
+                .font(.system(size: 18, weight: .bold))
+            Text("Skip Intro")
+                .font(.system(size: 23, weight: .semibold))
+        }
+        .foregroundStyle(isFocused ? .black : .white)
+        .padding(.horizontal, NuvioSpacing.lg)
+        .padding(.vertical, NuvioSpacing.sm)
+        .background {
+            if isFocused {
+                Capsule().fill(.white)
+                    .shadow(color: .black.opacity(0.5), radius: 18, y: 8)
+            }
+        }
+        .playerChrome(in: Capsule())
+        .overlay(
+            Capsule().strokeBorder(
+                .white.opacity(isFocused ? 0 : 0.25),
+                lineWidth: 1
+            )
+        )
+        .scaleEffect(isFocused ? 1.06 : 1)
+        .animation(.spring(response: 0.26, dampingFraction: 0.82), value: isFocused)
     }
 }

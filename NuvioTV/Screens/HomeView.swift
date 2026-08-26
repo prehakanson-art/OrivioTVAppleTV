@@ -246,6 +246,46 @@ final class HomeViewModel: ObservableObject {
             return true
         }
 
+        // Rows painted from the on-disk cache, by key. These are REAL content
+        // already on screen, so every republish below composes against them:
+        // a row that hasn't come back from the network yet keeps showing its
+        // cached items rather than disappearing.
+        var staleByKey: [String: HomeEntry] = [:]
+
+        /// The published row list: fresh where we have it, cached where we
+        /// don't, collections always.
+        ///
+        /// Everything that assigns `entries` during a refresh goes through
+        /// this. The old code assigned raw partial results instead — first the
+        /// collection markers alone (wiping every cached row the moment a
+        /// refresh started), then each progressive batch (a screen of cached
+        /// rows collapsing to the one or two that had answered so far). That
+        /// is the "categories flash for a split second and vanish" on a cold
+        /// start: the rows were never lost, they were being republished a few
+        /// at a time over a full screen that had already painted.
+        func compose(fresh: [String: HomeEntry]) -> [HomeEntry] {
+            orderedKeys.compactMap { key in
+                if let collection = collectionByKey[key] { return .collection(collection) }
+                return fresh[key] ?? staleByKey[key]
+            }
+        }
+
+        // A refresh over an already-populated Home (coming back to the tab, a
+        // settings change, a manual refresh) has to be protected the same way
+        // — seed the fallback from what is currently on screen, or the
+        // progressive republish blanks those rows exactly like a cold start.
+        if !entries.isEmpty {
+            var keyByRowID: [String: String] = [:]
+            for key in orderedKeys {
+                if let request = catalogByKey[key] { keyByRowID[Self.rowID(request)] = key }
+            }
+            for entry in entries {
+                if case .catalog(let row) = entry, let key = keyByRowID[row.id] {
+                    staleByKey[key] = entry
+                }
+            }
+        }
+
         // STALE: on a cold start, paint the last-saved catalog items instantly
         // (paired with the live addon/catalog so "See All" still works), then
         // refresh below.
@@ -273,11 +313,15 @@ final class HomeViewModel: ObservableObject {
                         staleItems = staleItems.filter { !$0.isUnreleased }
                     }
                     guard !staleItems.isEmpty else { continue }
-                    stale.append(.catalog(HomeRow(
+                    let staleRow = HomeEntry.catalog(HomeRow(
                         id: Self.rowID(request),
                         title: Self.rowTitle(key: key, request: request, settings: settings),
                         items: staleItems, addon: request.addon, catalog: request.catalog
-                    )))
+                    ))
+                    // Remembered by key so the refresh below can fall back to
+                    // it PER ROW instead of blanking the screen.
+                    staleByKey[key] = staleRow
+                    stale.append(staleRow)
                 }
             }
             if !stale.isEmpty {
@@ -301,6 +345,8 @@ final class HomeViewModel: ObservableObject {
         // folder/collection's discover page, so Home never eagerly fetches
         // collection content.
         var fetched: [(index: Int, key: String?, entry: HomeEntry)] = []
+        /// Fresh rows by key, for `compose`.
+        var freshByKey: [String: HomeEntry] = [:]
         // The catalog rows still to fetch, paired with their slot in
         // orderedKeys. Titles and row ids are resolved HERE, on the main actor,
         // so the fetch loop below needs no isolated state of its own.
@@ -318,7 +364,9 @@ final class HomeViewModel: ObservableObject {
                 ))
             }
         }
-        if !fetched.isEmpty { entries = fetched.sorted { $0.index < $1.index }.map(\.entry) }
+        // Collections resolve instantly; publish them WITH the cached rows
+        // still in place (compose keeps them) rather than in place of them.
+        if !fetched.isEmpty { entries = compose(fresh: [:]) }
 
         await withTaskGroup(of: (Int, String, HomeEntry?).self) { group in
             // Keep at most `catalogs` requests outstanding. Unbounded, a large
@@ -362,20 +410,21 @@ final class HomeViewModel: ObservableObject {
                 startNext()
                 guard let entry else { continue }
                 fetched.append((index: index, key: String?.some(key), entry: entry))
+                freshByKey[key] = entry
                 if Date().timeIntervalSince(lastFlush) > 0.4 {
-                    entries = fetched.sorted { $0.index < $1.index }.map(\.entry)
+                    entries = compose(fresh: freshByKey)
                     lastFlush = Date()
                 }
             }
-            entries = fetched.sorted { $0.index < $1.index }.map(\.entry)
+            entries = compose(fresh: freshByKey)
         }
 
         if isLoading { loadingStep = "Loading artwork…" }
 
         let ordered = fetched.sorted { $0.index < $1.index }
-        let freshEntries = ordered.map(\.entry)
-        // Keep stale rows on screen if the refresh came back empty (offline).
-        if !freshEntries.isEmpty { entries = freshEntries }
+        // Per-row fallback, so one dead catalog can't blank its row and an
+        // offline refresh can't blank the screen.
+        entries = compose(fresh: freshByKey)
 
         // Persist fresh catalog items for the next cold start. Only real
         // add-on catalog rows (whose key maps back to a live catalog) are
@@ -385,6 +434,12 @@ final class HomeViewModel: ObservableObject {
             if let key = row.key, catalogByKey[key] != nil, case .catalog(let r) = row.entry {
                 toCache[key] = r.items
             }
+        }
+        // A row that didn't answer this run is still on screen from cache —
+        // carry its items forward, or saving here would drop it and the next
+        // cold start would have nothing to paint for it.
+        for (key, entry) in staleByKey where toCache[key] == nil {
+            if catalogByKey[key] != nil, case .catalog(let r) = entry { toCache[key] = r.items }
         }
         if !toCache.isEmpty { HomeCatalogCache.save(toCache) }
 

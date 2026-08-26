@@ -9,6 +9,16 @@ struct StreamProbeResult {
     var hasStyledASS = false
     /// HDR10+ dynamic metadata present in the video bitstream.
     var hasHDR10Plus = false
+    /// Dolby Vision profile from the container's dvcC/dvvC record (nil when
+    /// the stream carries none). Read from the header — no packet scan.
+    var dvProfile: Int?
+    /// Container duration in seconds (0 when unknown). Free with the header,
+    /// and the DV-first path needs it — a session that never opens the FFmpeg
+    /// engine has no other duration source until AVPlayer reports one.
+    var durationSeconds: Double = 0
+    /// The video stream carries an eligible audio sibling for the remux
+    /// (E-AC3/AC3/AAC — TrueHD/DTS can't ride the native pipeline).
+    var hasEligibleAudio = false
 }
 
 /// Cheap "what is actually in this stream?" check, run once per title.
@@ -26,9 +36,10 @@ enum StreamProbe {
         url: String,
         needsStyledASS: Bool,
         needsHDR10Plus: Bool,
+        needsDolbyVision: Bool = false,
         timeoutSeconds: Double = 8
     ) async -> StreamProbeResult {
-        guard needsStyledASS || needsHDR10Plus else { return StreamProbeResult() }
+        guard needsStyledASS || needsHDR10Plus || needsDolbyVision else { return StreamProbeResult() }
         return await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 continuation.resume(returning: probe(
@@ -82,9 +93,30 @@ enum StreamProbe {
                 if !isAttachedPic, videoIndex < 0, par.pointee.codec_id == AV_CODEC_ID_HEVC {
                     videoIndex = Int32(i)
                     isPQ = par.pointee.color_trc == AVCOL_TRC_SMPTE2084
+                    // Dolby Vision configuration rides the header as coded
+                    // side data — same source KSPlayer's track parser uses.
+                    if par.pointee.nb_coded_side_data > 0, let sideDatas = par.pointee.coded_side_data {
+                        for j in 0 ..< Int(par.pointee.nb_coded_side_data) {
+                            let sideData = sideDatas[j]
+                            if sideData.type == AV_PKT_DATA_DOVI_CONF, let data = sideData.data {
+                                let record = data.withMemoryRebound(
+                                    to: AVDOVIDecoderConfigurationRecord.self, capacity: 1
+                                ) { $0 }.pointee
+                                result.dvProfile = Int(record.dv_profile)
+                            }
+                        }
+                    }
+                }
+            case AVMEDIA_TYPE_AUDIO:
+                let id = par.pointee.codec_id
+                if id == AV_CODEC_ID_EAC3 || id == AV_CODEC_ID_AC3 || id == AV_CODEC_ID_AAC {
+                    result.hasEligibleAudio = true
                 }
             default: break
             }
+        }
+        if ctx.pointee.duration > 0 {
+            result.durationSeconds = Double(ctx.pointee.duration) / Double(AV_TIME_BASE)
         }
 
         // HDR10+ rides in the HEVC bitstream as a per-frame SEI, so it can't be

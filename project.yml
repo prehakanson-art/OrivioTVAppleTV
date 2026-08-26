@@ -4,9 +4,13 @@ options:
     tvOS: "17.0"
   createIntermediateGroups: true
 packages:
+  # VENDORED with two Nuvio patches (see "NUVIO PATCH" comments): a
+  # lost-wakeup fix in MEPlayerItem's reader teardown and a display-link
+  # invalidation on engine swap in KSPlayerLayer — together they stop a dead
+  # engine leaking ~400-500 MB per swap (jetsam killer on the 3 GB boxes).
+  # Base revision: 10a40a1c0001d75307ad5922d1d1bc0cb01c89b4.
   KSPlayer:
-    url: https://github.com/kingslay/KSPlayer
-    revision: 10a40a1c0001d75307ad5922d1d1bc0cb01c89b4
+    path: Vendor/KSPlayer
   # Pure-Swift YouTube stream extractor — the only way to play trailer
   # YouTube keys on tvOS (no WebKit/WKWebView, so no iframe embed).
   YouTubeKit:

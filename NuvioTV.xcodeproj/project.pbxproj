@@ -135,6 +135,7 @@
 		DDDEA206F0D4A9A48B5C421C /* FocusTour.swift in Sources */ = {isa = PBXBuildFile; fileRef = B453879DDCDBBC1441013D02 /* FocusTour.swift */; };
 		DE12BE6F70FBD7F478A5C1C9 /* NuvioSyncDiagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = A98645467AE5A622E980295E /* NuvioSyncDiagnostics.swift */; };
 		DE74561D221C4C25B60C7E41 /* CloudLibraryService.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB57AA419192D7276E5E56DC /* CloudLibraryService.swift */; };
+		DEBAD856757DC233DB8C0D71 /* PlayerTempSweep.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E6FF8EBA83078F27EEBA5D5 /* PlayerTempSweep.swift */; };
 		E2CFF35E41DBA1ED383BD452 /* CommunityCollectionsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = EDFA7EC018CBBC0C2C165D94 /* CommunityCollectionsView.swift */; };
 		E373E2BFA1CA4BC70051A3AA /* ThemedDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B70422822F30616E5627F138 /* ThemedDetailView.swift */; };
 		E443BC9DF49F9CC79A5971CD /* AddonCatalogService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16C3CC132C8AA81FEAD97A0F /* AddonCatalogService.swift */; };
@@ -209,6 +210,7 @@
 		44180118E0397498DE32CF39 /* NuvioDropdown.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioDropdown.swift; sourceTree = "<group>"; };
 		4581D56301494EB1525328EA /* AccountView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountView.swift; sourceTree = "<group>"; };
 		45C310E078DDD7CF6D7F8D36 /* PlayerDiagnosticsHUD.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerDiagnosticsHUD.swift; sourceTree = "<group>"; };
+		4851E3EBD2CB353BA336DAFE /* KSPlayer */ = {isa = PBXFileReference; lastKnownFileType = folder; name = KSPlayer; path = Vendor/KSPlayer; sourceTree = SOURCE_ROOT; };
 		48C7489E80217819FDE6A04B /* FPSOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FPSOverlay.swift; sourceTree = "<group>"; };
 		48D4225F2EA78DACA1350421 /* DVRemuxer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DVRemuxer.swift; sourceTree = "<group>"; };
 		49ACEE6593ADFC9EDFE63DCD /* StremioAddons.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StremioAddons.swift; sourceTree = "<group>"; };
@@ -225,6 +227,7 @@
 		58966C984048950D4CC82520 /* MaxUI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaxUI.swift; sourceTree = "<group>"; };
 		5A4673E1B7D459A5D46DBC42 /* HuluComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HuluComponents.swift; sourceTree = "<group>"; };
 		5D89B97FD2C452C0137A911D /* StreamsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamsView.swift; sourceTree = "<group>"; };
+		5E6FF8EBA83078F27EEBA5D5 /* PlayerTempSweep.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerTempSweep.swift; sourceTree = "<group>"; };
 		6451F0795E2EBBA900505F52 /* PlusJakartaSans-Medium.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; path = "PlusJakartaSans-Medium.ttf"; sourceTree = "<group>"; };
 		676CA4D59378C69F96C9C2EF /* CinemaHome.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CinemaHome.swift; sourceTree = "<group>"; };
 		67C3D9E5D44C2B237BF0AE30 /* StremioDiscover.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StremioDiscover.swift; sourceTree = "<group>"; };
@@ -354,6 +357,7 @@
 			children = (
 				F0405325CCAAB6FF26CF4B39 /* NuvioTV */,
 				3EA5B435AE268C74F95CE0BA /* NuvioTVUITests */,
+				4E260F32D20D77D66C7CA83E /* Packages */,
 				CADE00B5C8D12F6DC679137C /* Frameworks */,
 				E2F0067E16BDF3AD90CAE3F8 /* Products */,
 			);
@@ -375,6 +379,14 @@
 				B453879DDCDBBC1441013D02 /* FocusTour.swift */,
 			);
 			path = NuvioTVUITests;
+			sourceTree = "<group>";
+		};
+		4E260F32D20D77D66C7CA83E /* Packages */ = {
+			isa = PBXGroup;
+			children = (
+				4851E3EBD2CB353BA336DAFE /* KSPlayer */,
+			);
+			name = Packages;
 			sourceTree = "<group>";
 		};
 		502AC6FA40CD9F47BE851581 /* NuvioAccount */ = {
@@ -553,6 +565,7 @@
 				57C4A723527A06C009FCB68A /* PlayerControlsOverlay.swift */,
 				45C310E078DDD7CF6D7F8D36 /* PlayerDiagnosticsHUD.swift */,
 				75C74274D8317A3EC634F256 /* PlayerScreen.swift */,
+				5E6FF8EBA83078F27EEBA5D5 /* PlayerTempSweep.swift */,
 				88808D61D06962DC1E8D8598 /* PlayerVideoView.swift */,
 				824B17483732A7F2EBB5F81D /* PlayerViewModel.swift */,
 				33E98DE3FF2BD0DC102D80F4 /* RemoteInput.swift */,
@@ -665,9 +678,9 @@
 			mainGroup = 2199874BE4896082F0696835;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
-				74AED560936523C71E4F680A /* XCRemoteSwiftPackageReference "KSPlayer" */,
 				FDB52EABAB443FA27592BF55 /* XCRemoteSwiftPackageReference "vlckit-spm" */,
 				B9B90AA85856439021043215 /* XCRemoteSwiftPackageReference "YouTubeKit" */,
+				A18192318FD4D25AF4490A17 /* XCLocalSwiftPackageReference "Vendor/KSPlayer" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = E2F0067E16BDF3AD90CAE3F8 /* Products */;
@@ -810,6 +823,7 @@
 				6690F24A9D9728CB59330407 /* PlayerDiagnosticsHUD.swift in Sources */,
 				9AD59B3BF5A0C489ADD1AA58 /* PlayerScreen.swift in Sources */,
 				3980DE34DE34E597267BC6A3 /* PlayerSettingsStore.swift in Sources */,
+				DEBAD856757DC233DB8C0D71 /* PlayerTempSweep.swift in Sources */,
 				117B56AA7E177A2635031B9D /* PlayerVideoView.swift in Sources */,
 				4412060276D57FF1BBE56C30 /* PlayerViewModel.swift in Sources */,
 				4ECEDFD89EDCFD7403B1E488 /* PluginModels.swift in Sources */,
@@ -1117,15 +1131,14 @@
 		};
 /* End XCConfigurationList section */
 
-/* Begin XCRemoteSwiftPackageReference section */
-		74AED560936523C71E4F680A /* XCRemoteSwiftPackageReference "KSPlayer" */ = {
-			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/kingslay/KSPlayer";
-			requirement = {
-				kind = revision;
-				revision = 10a40a1c0001d75307ad5922d1d1bc0cb01c89b4;
-			};
+/* Begin XCLocalSwiftPackageReference section */
+		A18192318FD4D25AF4490A17 /* XCLocalSwiftPackageReference "Vendor/KSPlayer" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = Vendor/KSPlayer;
 		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCRemoteSwiftPackageReference section */
 		B9B90AA85856439021043215 /* XCRemoteSwiftPackageReference "YouTubeKit" */ = {
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/alexeichhorn/YouTubeKit";
@@ -1157,7 +1170,6 @@
 		};
 		6F247E3DA7201162C0D31072 /* KSPlayer */ = {
 			isa = XCSwiftPackageProductDependency;
-			package = 74AED560936523C71E4F680A /* XCRemoteSwiftPackageReference "KSPlayer" */;
 			productName = KSPlayer;
 		};
 /* End XCSwiftPackageProductDependency section */

@@ -17,85 +17,239 @@ import Libavutil
 /// Minimal by intent: GET only, loopback only, serves exactly one directory,
 /// supports Range (AVPlayer uses it), closes after each response.
 final class DVSegmentServer {
-    private var listener: NWListener?
+    // POSIX sockets, deliberately. This server went through three
+    // Network.framework incarnations, and in every one the process gained
+    // compressed anonymous memory 1:1 with bytes served until jetsam killed
+    // it — with full-body sends, with 256 KB chunked sends, with weak-
+    // captured connections owned by an explicit registry. Whatever retains
+    // sent content lives inside NWConnection's send path and survives
+    // cancel; it was measured live three times (cmp tracking srv exactly)
+    // and it is not controllable from API level. write(2) has no such
+    // behavior: bytes are copied into the kernel socket buffer (or the call
+    // blocks until they can be), and nothing is retained in-process. Memory
+    // per connection is ONE 256 KB chunk buffer on a short-lived thread.
+    private var listenFD: Int32 = -1
     private let directory: URL
     private(set) var port: UInt16 = 0
+
+    /// Live connection count — the cap guards against an AVPlayer rebuffer
+    /// storm spawning unbounded handler threads.
+    private let lock = NSLock()
+    private var liveConnections = 0
+    private static let maxConcurrent = 8
+    private var stopped = false
+
+    /// Diagnostics for the memory tracer.
+    nonisolated(unsafe) private static var totalRequests = 0
+    nonisolated(unsafe) private static var totalBytesServed: Int64 = 0
+    private static let statsLock = NSLock()
+    /// Global serve-rate cap. CoreMedia retains every byte AVPlayer fetches
+    /// over loopback HLS (process-scoped, unfixable) — so the FETCH RATE is
+    /// the memory-growth rate, and AVPlayer left alone fills at 2-3× content
+    /// speed (15-20 MB/s on a fast link), fast enough to outrun a 12-second
+    /// memory guard straight into jetsam. AVPlayer cannot fetch faster than
+    /// this server serves: capping here bounds the growth slope to something
+    /// the guard always beats, trading a slower initial buffer fill for a
+    /// session that can never lose the race.
+    private static let paceLock = NSLock()
+    nonisolated(unsafe) private static var paceWindowStart = Date()
+    nonisolated(unsafe) private static var paceWindowBytes = 0
+    private static let maxBytesPerSecond = 9 << 20   // 9 MB/s ≈ 2× a heavy remux
+
+    static func paceServe(bytes: Int) {
+        while true {
+            paceLock.lock()
+            let now = Date()
+            let elapsed = now.timeIntervalSince(paceWindowStart)
+            if elapsed > 1 {
+                paceWindowStart = now
+                paceWindowBytes = 0
+            }
+            let allowed = paceWindowBytes + bytes <= maxBytesPerSecond
+            if allowed { paceWindowBytes += bytes }
+            paceLock.unlock()
+            if allowed { return }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+    }
+
+    static func noteServed(bytes: Int) {
+        statsLock.lock(); totalRequests += 1; totalBytesServed += Int64(bytes); statsLock.unlock()
+    }
+    static func statsLine() -> String {
+        statsLock.lock(); defer { statsLock.unlock() }
+        return "srv=\(totalRequests)r/\(totalBytesServed >> 20)MB"
+    }
 
     init(directory: URL) { self.directory = directory }
 
     func start() -> Bool {
-        let params = NWParameters.tcp
-        params.requiredLocalEndpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: .any)
-        guard let listener = try? NWListener(using: params) else { return false }
-        self.listener = listener
-        let ready = DispatchSemaphore(value: 0)
-        listener.stateUpdateHandler = { state in
-            if case .ready = state { ready.signal() }
-            if case .failed = state { ready.signal() }
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        var yes: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = 0                                   // ephemeral
+        addr.sin_addr.s_addr = CFSwapInt32HostToBig(0x7F000001)  // 127.0.0.1
+        let bound = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
         }
-        listener.newConnectionHandler = { [weak self] conn in self?.serve(conn) }
-        listener.start(queue: DispatchQueue(label: "dv-http"))
-        _ = ready.wait(timeout: .now() + 2)
-        port = listener.port?.rawValue ?? 0
-        return port != 0
+        guard bound == 0, listen(fd, 16) == 0 else { close(fd); return false }
+        var out = sockaddr_in(); var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        withUnsafeMutablePointer(to: &out) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                _ = getsockname(fd, $0, &len)
+            }
+        }
+        port = UInt16(bigEndian: out.sin_port)
+        guard port != 0 else { close(fd); return false }
+        listenFD = fd
+        let acceptor = Thread { [weak self] in self?.acceptLoop(fd) }
+        acceptor.name = "dv-http-accept"
+        acceptor.qualityOfService = .userInitiated
+        acceptor.start()
+        return true
     }
 
     func stop() {
-        listener?.cancel()
-        listener = nil
+        lock.lock(); stopped = true; let fd = listenFD; listenFD = -1; lock.unlock()
+        if fd >= 0 { close(fd) }   // unblocks accept(); handlers exit on their own
     }
 
     var playlistURL: URL? {
         port == 0 ? nil : URL(string: "http://127.0.0.1:\(port)/dv.m3u8")
     }
 
-    private func serve(_ conn: NWConnection) {
-        conn.start(queue: DispatchQueue.global(qos: .userInitiated))
-        conn.receive(minimumIncompleteLength: 1, maximumLength: 16384) { [weak self] data, _, _, _ in
-            guard let self, let data, let head = String(data: data, encoding: .utf8) else {
-                conn.cancel(); return
+    private func acceptLoop(_ fd: Int32) {
+        while true {
+            let conn = accept(fd, nil, nil)
+            guard conn >= 0 else { return }   // listener closed → done
+            lock.lock()
+            let refuse = stopped || liveConnections >= Self.maxConcurrent
+            if !refuse { liveConnections += 1 }
+            lock.unlock()
+            if refuse { close(conn); continue }
+            let worker = Thread { [weak self] in
+                self?.handle(conn)
+                self?.lock.lock(); self?.liveConnections -= 1; self?.lock.unlock()
             }
-            let lines = head.components(separatedBy: "\r\n")
-            let parts = (lines.first ?? "").split(separator: " ")
-            guard parts.count >= 2, parts[0] == "GET" else {
-                self.respond(conn, status: "405 Method Not Allowed", body: Data()); return
-            }
-            // Strict: last path component only — no traversal, one directory.
-            let name = String(parts[1]).components(separatedBy: "/").last ?? ""
-            let file = self.directory.appendingPathComponent(name)
-            guard !name.isEmpty, !name.contains(".."),
-                  let payload = try? Data(contentsOf: file) else {
-                self.respond(conn, status: "404 Not Found", body: Data()); return
-            }
-            let type = name.hasSuffix(".m3u8") ? "application/vnd.apple.mpegurl" : "video/mp4"
-            // Range support: AVPlayer asks for ranges on segments.
-            var body = payload
-            var status = "200 OK"
-            var extra = ""
-            if let rangeLine = lines.first(where: { $0.lowercased().hasPrefix("range:") }),
-               let spec = rangeLine.split(separator: "=").last {
-                let bounds = spec.split(separator: "-", omittingEmptySubsequences: false)
-                let from = Int(bounds.first ?? "") ?? 0
-                let to = bounds.count > 1 ? (Int(bounds[1] ) ?? payload.count - 1) : payload.count - 1
-                if from >= 0, from < payload.count, to >= from {
-                    let upper = min(to, payload.count - 1)
-                    body = payload.subdata(in: from ..< upper + 1)
-                    status = "206 Partial Content"
-                    extra = "Content-Range: bytes \(from)-\(upper)/\(payload.count)\r\n"
-                }
-            }
-            self.respond(conn, status: status, body: body,
-                         headers: "Content-Type: \(type)\r\nCache-Control: no-cache\r\n" + extra)
+            worker.name = "dv-http-conn"
+            worker.qualityOfService = .userInitiated
+            worker.start()
         }
     }
 
-    private func respond(_ conn: NWConnection, status: String, body: Data, headers: String = "") {
-        var head = "HTTP/1.1 \(status)\r\n"
-        head += headers
-        head += "Content-Length: \(body.count)\r\nConnection: close\r\n\r\n"
-        var out = Data(head.utf8)
-        out.append(body)
-        conn.send(content: out, completion: .contentProcessed { _ in conn.cancel() })
+    /// One request per connection (Connection: close), fully synchronous.
+    private func handle(_ conn: Int32) {
+        defer { close(conn) }
+        // A dead peer must never wedge a handler thread.
+        var tv = timeval(tv_sec: 8, tv_usec: 0)
+        setsockopt(conn, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(conn, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        var sigpipe: Int32 = 1
+        setsockopt(conn, SOL_SOCKET, SO_NOSIGPIPE, &sigpipe, socklen_t(MemoryLayout<Int32>.size))
+
+        // Read until the header terminator — a GET with a Range header can
+        // arrive split across TCP segments, and parsing a partial head turned
+        // a valid request into a 404/ignored-Range.
+        var reqBuf = [UInt8](repeating: 0, count: 16384)
+        var total = 0
+        while total < reqBuf.count {
+            let n = reqBuf.withUnsafeMutableBytes { raw in
+                read(conn, raw.baseAddress! + total, raw.count - total)
+            }
+            guard n > 0 else { break }
+            total += n
+            if total >= 4, reqBuf[..<total].suffix(4).elementsEqual([13, 10, 13, 10]) { break }
+            // Cheap containment check for a terminator that isn't at the end.
+            if String(bytes: reqBuf[0..<total], encoding: .utf8)?.contains("\r\n\r\n") == true { break }
+        }
+        guard total > 0, let head = String(bytes: reqBuf[0..<total], encoding: .utf8) else { return }
+        let lines = head.components(separatedBy: "\r\n")
+        let parts = (lines.first ?? "").split(separator: " ")
+        guard parts.count >= 2, parts[0] == "GET" else {
+            writeAll(conn, Array("HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8))
+            return
+        }
+        // Strict: last path component only — no traversal, one directory.
+        let name = String(parts[1]).components(separatedBy: "/").last ?? ""
+        let path = directory.appendingPathComponent(name).path
+        var st = stat()
+        guard !name.isEmpty, !name.contains(".."), stat(path, &st) == 0, st.st_size >= 0 else {
+            writeAll(conn, Array("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8))
+            return
+        }
+        let size = Int(st.st_size)
+        let type = name.hasSuffix(".m3u8") ? "application/vnd.apple.mpegurl" : "video/mp4"
+
+        // Range support: AVPlayer asks for ranges on segments.
+        var from = 0, to = size - 1
+        var status = "200 OK", extra = ""
+        if let rangeLine = lines.first(where: { $0.lowercased().hasPrefix("range:") }),
+           let spec = rangeLine.split(separator: "=").last {
+            let bounds = spec.split(separator: "-", omittingEmptySubsequences: false)
+            let f = Int(bounds.first ?? "") ?? 0
+            let t = bounds.count > 1 ? (Int(bounds[1]) ?? size - 1) : size - 1
+            if f >= 0, f < size, t >= f {
+                from = f; to = min(t, size - 1)
+                status = "206 Partial Content"
+                extra = "Content-Range: bytes \(from)-\(to)/\(size)\r\n"
+            }
+        }
+        let length = to - from + 1
+        // Accept-Ranges matters: without it AVPlayer assumes ranged requests
+        // are unsupported and re-fetches segments whole and repeatedly —
+        // measured at ~3× the content rate (299 requests / 150 segments,
+        // 1 GB served for ~350 MB of media). Every re-fetched byte lands in
+        // CoreMedia's process-scoped retention, so serve volume IS the DV
+        // session's lifespan.
+        let header = "HTTP/1.1 \(status)\r\nContent-Type: \(type)\r\nAccept-Ranges: bytes\r\nCache-Control: no-cache\r\n\(extra)Content-Length: \(length)\r\nConnection: close\r\n\r\n"
+        guard writeAll(conn, Array(header.utf8)) else { return }
+
+        // Stream the file in 256 KB pread chunks — the only buffer this
+        // response ever holds. A peer that stops reading blocks write() and
+        // trips SO_SNDTIMEO; a peer that closes makes write() fail. Either
+        // way the handler exits and the buffer dies with the thread.
+        let file = open(path, O_RDONLY)
+        guard file >= 0 else { return }
+        defer { close(file) }
+        var chunk = [UInt8](repeating: 0, count: 256 << 10)
+        var offset = from
+        var served = 0
+        while offset <= to {
+            let want = min(chunk.count, to - offset + 1)
+            let got = pread(file, &chunk, want, off_t(offset))
+            guard got > 0 else { break }
+            Self.paceServe(bytes: got)
+            let ok = chunk.withUnsafeBytes { raw in
+                writeAll(conn, UnsafeRawBufferPointer(rebasing: raw.prefix(got)))
+            }
+            guard ok else { break }
+            offset += got
+            served += got
+        }
+        Self.noteServed(bytes: served)
+    }
+
+    @discardableResult
+    private func writeAll(_ fd: Int32, _ bytes: [UInt8]) -> Bool {
+        bytes.withUnsafeBytes { writeAll(fd, $0) }
+    }
+
+    @discardableResult
+    private func writeAll(_ fd: Int32, _ bytes: UnsafeRawBufferPointer) -> Bool {
+        var sent = 0
+        while sent < bytes.count {
+            guard let base = bytes.baseAddress else { return false }
+            let n = write(fd, base + sent, bytes.count - sent)
+            guard n > 0 else { return false }
+            sent += n
+        }
+        return true
     }
 }
 
@@ -122,11 +276,31 @@ enum FFmpegLogCapture {
         lock.lock(); defer { lock.unlock() }
         guard !installed else { return }
         installed = true
+        // This callback is GLOBAL and permanent: once installed it sees every
+        // av_log line the process ever emits — KSPlayer's playback, probes,
+        // thumbnailing, not just the remux. So it has to be cheap and it has
+        // to be safe on EVERY line, not just the ones we care about.
+        //
+        // Level first. Formatting is the expensive and dangerous part, and
+        // FFmpeg emits debug/verbose lines by the thousand; there is no reason
+        // to format one before knowing it's an error we'll keep.
+        //
+        // Then format with FFmpeg's OWN formatter, never NSString's. FFmpeg's
+        // format strings use C99 specifiers that CFString does not implement
+        // (`%td`, `%zd`, `%ju`, the PRI* macros); handed one of those,
+        // NSString(format:arguments:) mis-walks the va_list and dereferences
+        // whatever it reads next — a genuine EXC_BAD_ACCESS on a log line, on
+        // a background FFmpeg thread, from ordinary playback.
         av_log_set_callback { ptr, level, format, args in
-            guard let format else { return }
-            var line = String(cString: format)
-            if let args { line = NSString(format: line, arguments: args) as String }
-            guard level <= AV_LOG_ERROR else { return }
+            guard level <= AV_LOG_ERROR, let format, let args else { return }
+            var buffer = [CChar](repeating: 0, count: 1024)
+            var printPrefix: Int32 = 1
+            let written = buffer.withUnsafeMutableBufferPointer { out -> Int32 in
+                av_log_format_line2(ptr, level, format, args,
+                                    out.baseAddress, Int32(out.count), &printPrefix)
+            }
+            guard written > 0 else { return }
+            let line = String(cString: buffer)
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return }
             FFmpegLogCapture.append(trimmed)
@@ -241,10 +415,145 @@ final class DVRemuxer {
     /// the wall-clock rule so a silent player can never wedge the worker.
     @Atomic var playheadUpdatedAt: Date = .distantPast
 
+    /// The viewer's position in ABSOLUTE source seconds, fed the whole time
+    /// the remux exists — including BEFORE the switch, while the FFmpeg
+    /// engine is still the one playing. Pre-switch the worker used to be
+    /// blind: it couldn't prune behind the viewer (so a long cushion build
+    /// hit the disk budget with no playhead and was killed), couldn't pace
+    /// itself relative to the viewer, and the ready gate measured its cushion
+    /// from the REMUX START while the viewer kept moving past it.
+    @Atomic var viewerAbsolutePTS: Double = -1
+    @Atomic var viewerAbsoluteUpdatedAt: Date = .distantPast
+
+    /// Best available viewer position relative to the remux origin, with its
+    /// freshness. Post-switch the engine-relative feed wins; pre-switch the
+    /// absolute feed converts through firstWrittenPTS. (-1, distantPast) when
+    /// nothing has ever been reported.
+    private func viewerHeadRel() -> (head: Double, updatedAt: Date) {
+        let direct: (Double, Date) = (playheadSeconds, playheadUpdatedAt)
+        var absolute: (Double, Date) = (-1, .distantPast)
+        let abs = viewerAbsolutePTS
+        if abs >= 0, !firstWrittenPTS.isNaN {
+            absolute = (abs - firstWrittenPTS, viewerAbsoluteUpdatedAt)
+        }
+        return direct.1 >= absolute.1 ? direct : absolute
+    }
+
     /// Seconds of already-watched content kept on disk behind the playhead.
     /// Anything older is deleted; the player is told, and turns a seek that
     /// far back into a re-remux rather than a request for a deleted file.
     var retentionSeconds: Double = 150
+
+    /// Hard ceiling on what one remux session may hold in `tmp/`.
+    ///
+    /// Pacing bounds the RATE, and pruning reclaims what's been watched — but
+    /// pruning only runs while a fresh playhead is being reported, so a
+    /// session the player never switched to (or one whose playhead went
+    /// stale) prunes NOTHING and keeps writing at the paced rate for the
+    /// whole movie. That is how single sessions reached ~1.3 GB / 460
+    /// segments on a real box. This is the backstop that makes the on-disk
+    /// footprint bounded no matter what the player does.
+    var diskBudgetBytes: Int64 = 1_200 << 20   // 1.2 GB
+
+    /// Bytes currently on disk for this session: added on each segment write,
+    /// subtracted on each prune. Worker thread only.
+    private var bytesOnDisk: Int64 = 0
+
+    /// Content the worker must be AHEAD before the initial switch is offered.
+    ///
+    /// The old gate was "3 segments written" (~6 s) with no throughput check
+    /// at all — the player switched onto the remux long before anyone knew
+    /// whether it could keep up. On a source whose bitrate (or P7-conversion
+    /// CPU cost) exceeds what this box sustains, the deficit then grows at a
+    /// CONSTANT rate until AVPlayer starves: ~6 s of playlist + its ~12 s
+    /// buffer ÷ a ~0.92× pipeline ≈ the reproducible "always dies about 3½
+    /// minutes in" failure — which no amount of lead can fix, because a
+    /// sub-realtime worker never accumulates the lead in the first place.
+    /// Requiring a real cushion FIRST doubles as the capacity proof: only a
+    /// >1× pipeline can ever build it. Seek-restarts set 0 to stay snappy —
+    /// a capacity-proven session already passed this gate once.
+    var minReadySecondsAhead: Double = 0
+
+    /// Reads are held until this instant (see PlayerViewModel's switch).
+    ///
+    /// The engine SWITCH is the process's memory peak: the old FFmpeg
+    /// engine's caches are still allocated until its async teardown runs,
+    /// AVPlayer is spinning up and slurping its initial buffer, and the
+    /// remux worker — whose pacing budget is far ahead of the viewer — is
+    /// sprinting at full network rate. Live tracing put the working set at
+    /// ~760 MB BEFORE the last two piled on, and the jetsam kill landed in
+    /// exactly this window. Holding the worker's reads for a few seconds
+    /// flattens the one spike contributor we control; AVPlayer's initial
+    /// fetches come from segments already on disk, so nothing stalls.
+    @Atomic var pauseReadsUntil: Date = .distantPast
+
+    /// Sub-realtime detection while the cushion builds (see closeSegment).
+    private var capacityBailed = false
+
+    /// Last DTS handed to the muxer, per output stream (output timebase).
+    /// movenc answers a non-monotonic or missing DTS with EINVAL (-22) and
+    /// the whole session dies — and mid-file starts (Continue Watching
+    /// resumes seek the source before remuxing, which is exactly where MKV
+    /// audio interleave produces these) made that a deterministic failure on
+    /// some titles. Worker thread only.
+    private var lastMuxedDTSVideo = Int64.min
+    private var lastMuxedDTSAudio = Int64.min
+
+    /// Make a rescaled packet safe for movenc: fill a missing DTS from PTS,
+    /// keep DTS ≤ PTS, and force strict per-stream DTS monotonicity by
+    /// nudging forward — a 1-tick nudge on a duplicate timestamp is
+    /// inaudible/invisible; an EINVAL kills the whole native-DV session.
+    private func sanitizeForMux(_ pkt: UnsafeMutablePointer<AVPacket>, isVideo: Bool) {
+        let noPTS = Int64.min   // AV_NOPTS_VALUE
+        if pkt.pointee.dts == noPTS { pkt.pointee.dts = pkt.pointee.pts }
+        if pkt.pointee.pts != noPTS, pkt.pointee.dts != noPTS,
+           pkt.pointee.dts > pkt.pointee.pts {
+            pkt.pointee.dts = pkt.pointee.pts
+        }
+        let last = isVideo ? lastMuxedDTSVideo : lastMuxedDTSAudio
+        if last != Int64.min, pkt.pointee.dts != noPTS, pkt.pointee.dts <= last {
+            let bumped = last + 1
+            if pkt.pointee.pts != noPTS, pkt.pointee.pts < bumped { pkt.pointee.pts = bumped }
+            pkt.pointee.dts = bumped
+        }
+        if pkt.pointee.dts != noPTS {
+            if isVideo { lastMuxedDTSVideo = pkt.pointee.dts }
+            else { lastMuxedDTSAudio = pkt.pointee.dts }
+        }
+    }
+
+    /// Write a segment WITHOUT the unified buffer cache (F_NOCACHE).
+    ///
+    /// Plain `Data.write` leaves every written byte as a dirty page-cache
+    /// page, counted against the process until the kernel writes it back —
+    /// and this worker writes at ~1.5× the content byterate, faster than an
+    /// A10X under load flushes. The tracer showed the result directly:
+    /// +5 MB/s of footprint for exactly as long as the remux ran (632 →
+    /// 1476 MB over one 3-minute native-DV session), until the box thrashed
+    /// and playback stalled. F_NOCACHE keeps the data coherent for the
+    /// segment server's reads but never parks it dirty in RAM.
+    private func writeNoCache(_ data: Data, to url: URL) {
+        let fd = open(url.path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+        guard fd >= 0 else { return }
+        defer { close(fd) }
+        _ = fcntl(fd, F_NOCACHE, 1)
+        data.withUnsafeBytes { raw in
+            var offset = 0
+            while offset < raw.count {
+                let n = write(fd, raw.baseAddress! + offset, raw.count - offset)
+                if n <= 0 { return }
+                offset += n
+            }
+        }
+    }
+
+    /// The bare errno plus FFmpeg's own log lines — "-22" alone says nothing;
+    /// the av_log line ("non monotonically increasing dts…", "Invalid packet
+    /// stream index…") is the actual diagnosis.
+    private func muxErrorDetail(_ code: Int32) -> String {
+        let lines = FFmpegLogCapture.drainRecent()
+        return lines.isEmpty ? "(\(code))" : "(\(code)) — \(lines.joined(separator: " | "))"
+    }
 
     /// Content seconds pruned from the front so far (the window start).
     private var prunedThrough: Double = 0
@@ -490,6 +799,17 @@ final class DVRemuxer {
         guard let outCtx = octx else { report { self.onError?("mp4 muxer unavailable") }; return }
         outCtx.pointee.strict_std_compliance = -2   // experimental: DV tags
         outCtx.pointee.avoid_negative_ts = 2        // MAKE_ZERO: playlist t=0
+        // HARD BOUND on the interleaver queue. av_interleaved_write_frame
+        // buffers packets to sort streams by dts, and its limit is a DURATION
+        // (default 10 s) — a limit that never triggers when the skew it's
+        // watching for can't be computed, at which point it hoards packets at
+        // the full input rate. Measured live on-device: the process gained
+        // memory at exactly the remux rate, hundreds of MB compressed and
+        // untouched, unreachable by malloc pressure relief — the profile of
+        // the interleaver's C-side queue. Half a second of interleave is
+        // plenty for a 2-stream remux whose demuxer already delivers roughly
+        // interleaved packets; at these bitrates it caps the queue at ~5 MB.
+        outCtx.pointee.max_interleave_delta = 500_000   // 0.5 s (µs)
 
         let ioBufSize: Int32 = 1 << 16
         guard let ioBuf = av_malloc(Int(ioBufSize))?.assumingMemoryBound(to: UInt8.self) else {
@@ -620,6 +940,7 @@ final class DVRemuxer {
             outPkt.pointee.stream_index = outVideo.pointee.index
             av_packet_rescale_ts(outPkt, inVideoTB, outVideo.pointee.time_base)
             outPkt.pointee.pos = -1
+            sanitizeForMux(outPkt, isVideo: true)
             return av_interleaved_write_frame(octx, outPkt)
         }
 
@@ -651,7 +972,8 @@ final class DVRemuxer {
                 av_packet_free(&dead)
                 blPending.removeFirst()
                 if result < 0 {
-                    report { self.onError?("mux write failed (\(result)) during dual-track merge") }
+                    let detail = self.muxErrorDetail(result)
+                    report { self.onError?("mux write failed \(detail) during dual-track merge") }
                     return false
                 }
             }
@@ -659,6 +981,9 @@ final class DVRemuxer {
         }
 
         while !cancelled {
+            while !cancelled, Date() < pauseReadsUntil {
+                Thread.sleep(forTimeInterval: 0.15)
+            }
             let readResult = av_read_frame(ictx, packet)
             if readResult < 0 { break }   // EOF or error → finalize what we have
             defer { av_packet_unref(packet) }
@@ -743,6 +1068,7 @@ final class DVRemuxer {
                     outPkt.pointee.stream_index = outStream.pointee.index
                     av_packet_rescale_ts(outPkt, inTB, outStream.pointee.time_base)
                     outPkt.pointee.pos = -1
+                    sanitizeForMux(outPkt, isVideo: true)
                     writeResult = av_interleaved_write_frame(octx, outPkt)
                 } else {
                     writeResult = -1
@@ -751,10 +1077,12 @@ final class DVRemuxer {
                 packet.pointee.stream_index = outStream.pointee.index
                 av_packet_rescale_ts(packet, inTB, outStream.pointee.time_base)
                 packet.pointee.pos = -1
+                sanitizeForMux(packet, isVideo: isVideo)
                 writeResult = av_interleaved_write_frame(octx, packet)
             }
             if writeResult < 0 {
-                report { self.onError?("mux write failed (\(writeResult))") }
+                let detail = muxErrorDetail(writeResult)
+                report { self.onError?("mux write failed \(detail)") }
                 return
             }
 
@@ -785,12 +1113,63 @@ final class DVRemuxer {
                     // is stalled (position frozen while it rebuffers) still
                     // gets a full head-start of new content — so this throttle
                     // cannot deadlock the thing it is feeding.
-                    let head = playheadSeconds
-                    let playheadFresh = Date().timeIntervalSince(playheadUpdatedAt) < 10
-                    let playheadBudget = (head >= 0 && playheadFresh)
-                        ? head + paceLeadSeconds
+                    let (head, headUpdatedAt) = viewerHeadRel()
+                    let staleFor = Date().timeIntervalSince(headUpdatedAt)
+                    // A STALE playhead is not an UNKNOWN playhead, and the two
+                    // must not share a fallback.
+                    //
+                    // Falling back to .infinity removed the throttle at exactly
+                    // the moment it was needed most: a stalled player stops
+                    // reporting position, so a rebuffer made the worker race
+                    // ahead at the full wall-clock rate and starve the playback
+                    // it feeds — pulling ~71 Mbps while the player was trying
+                    // to recover, until AVPlayer gave up ("Playback stalled for
+                    // 20s") after ~4 minutes. Anchoring on the LAST KNOWN
+                    // position still hands a stalled player a full head-start
+                    // of new content, so it cannot deadlock, but it stops the
+                    // runaway. Only a playhead that was NEVER reported (< 0,
+                    // i.e. the player hasn't switched in yet) leaves the wall
+                    // clock in charge.
+                    //
+                    // But anchoring on a FROZEN head is its own trap. Position
+                    // reports only arrive while the native-DV layer is calling
+                    // back; the moment they stop, a fixed anchor starves the
+                    // remux PERMANENTLY — the EVENT playlist stops growing,
+                    // AVPlayer runs off the end of it and reports played-to-end,
+                    // and the player shows "Finished" in the middle of a movie.
+                    // So while the playhead is stale, assume the viewer keeps
+                    // advancing at 1x from where they were last seen: that can
+                    // never wedge, and still never runs away the way .infinity
+                    // did.
+                    let assumedHead = head + max(staleFor - 10, 0)
+                    let playheadBudget = head >= 0
+                        ? assumedHead + paceLeadSeconds
                         : Double.infinity
-                    if contentAhead <= min(wallBudget, playheadBudget) { break }
+                    if contentAhead <= min(wallBudget, playheadBudget),
+                       bytesOnDisk < diskBudgetBytes { break }
+                    // CRITICAL while blocked on the disk budget: pruning used
+                    // to run only from closeSegment — i.e. only when WRITING,
+                    // which is exactly what's blocked here. On a high-bitrate
+                    // remux the steady window (150 s retention + the lead)
+                    // overflows the budget, so the worker slept waiting for
+                    // space that nothing would ever free: the playlist froze
+                    // ~2 minutes in, AVPlayer drained its buffer, and every
+                    // session died around the 3:30 mark. Prune from inside
+                    // the wait so watched segments keep freeing space.
+                    if bytesOnDisk >= diskBudgetBytes { pruneWatchedSegments() }
+                    // Over the disk ceiling with nobody watching: this session
+                    // is writing GB nothing will ever read (the player never
+                    // switched to it, or it stopped reporting). Waiting can't
+                    // help — only pruning frees space and pruning needs a
+                    // fresh playhead — so stop, and let the caller clean up.
+                    // Long-stale only: a routine rebuffer makes the playhead
+                    // stale for a few seconds, and that must not kill a session
+                    // that is simply waiting for the player to catch up.
+                    if bytesOnDisk >= diskBudgetBytes, staleFor > 60 {
+                        report { self.onError?("remux exceeded its disk budget with no active playhead") }
+                        cancelled = true
+                        return
+                    }
                     Thread.sleep(forTimeInterval: 0.2)
                 }
             }
@@ -843,7 +1222,7 @@ final class DVRemuxer {
         if initPhase {
             if type == "moof" {
                 // Init segment complete — write it, open the first segment.
-                try? initData.write(to: directory.appendingPathComponent("init.mp4"))
+                writeNoCache(initData, to: directory.appendingPathComponent("init.mp4"))
                 initPhase = false
                 segmentData = box
                 segmentOpen = true
@@ -864,7 +1243,8 @@ final class DVRemuxer {
 
     private func closeSegment() {
         let name = String(format: "seg%05d.m4s", segmentIndex)
-        try? segmentData.write(to: directory.appendingPathComponent(name))
+        writeNoCache(segmentData, to: directory.appendingPathComponent(name))
+        bytesOnDisk += Int64(segmentData.count)
         segmentData = Data()
         segmentOpen = false
 
@@ -883,6 +1263,38 @@ final class DVRemuxer {
         pruneWatchedSegments()
 
         writePlaylist(ended: false)
+        // Capacity check, while the switch is still on offer: measure the
+        // worker's real rate over the wall clock. This window is UNTHROTTLED
+        // (pacing only engages past leadSeconds, and the ready gate is well
+        // under it), so the rate here is the pipeline's true capacity —
+        // network pull + P7 conversion combined. A pipeline that can't beat
+        // realtime must never be switched to: it plays fine for exactly
+        // (cushion ÷ deficit-rate) seconds and then dies mid-movie, which is
+        // strictly worse than staying on the HDR10 decode that is already
+        // playing underneath.
+        // NOTE the measurement bias: this runs while the FFmpeg engine is
+        // still PLAYING the same source, so the worker only sees the leftover
+        // bandwidth (roughly link − 1× bitrate). A link at 1.5× the movie's
+        // bitrate therefore measures ~0.5× here and would be wrongly denied
+        // by any realtime threshold — so there is no rate threshold and no
+        // deadline. The cushion gate alone decides: the switch is offered
+        // when 30 s of finished playlist actually exists, whenever that is,
+        // and a session that never builds it simply never switches (playback
+        // continues on the HDR10 decode underneath — the graceful outcome).
+        // Only a pipeline making essentially NO progress is cut loose.
+        if !readySignalled, !capacityBailed, minReadySecondsAhead > 0,
+           let startWall = paceStartWall, !firstWrittenPTS.isNaN {
+            let wall = Date().timeIntervalSince(startWall)
+            let ahead = lastVideoPTS - firstWrittenPTS
+            if wall > 60, ahead / wall < 0.05 {
+                capacityBailed = true
+                cancelled = true
+                report { self.onIneligible?(String(
+                    format: "remux made no real progress (%.02fx over %.0fs)", ahead / wall, wall
+                )) }
+                return
+            }
+        }
         if segmentIndex >= 3 { signalReadyIfNeeded() }
         let available = keyframes.indices.contains(segmentIndex) ? keyframes[segmentIndex]
             : max(lastVideoPTS - (firstWrittenPTS.isNaN ? 0 : firstWrittenPTS), 0)
@@ -907,9 +1319,19 @@ final class DVRemuxer {
     /// new window start and turns a seek behind it into a re-remux, so nobody
     /// ever requests a file that isn't there.
     private func pruneWatchedSegments() {
-        let head = playheadSeconds
-        guard head >= 0, Date().timeIntervalSince(playheadUpdatedAt) < 30 else { return }
-        let cutoff = head - retentionSeconds
+        let (head, headUpdatedAt) = viewerHeadRel()
+        guard head >= 0, Date().timeIntervalSince(headUpdatedAt) < 30 else { return }
+        // Retention YIELDS to the disk budget. 150 s of rewind buffer is a
+        // nicety; at high bitrates it plus the lead simply doesn't fit in the
+        // budget, and keeping it would starve the forward window (the thing
+        // playback actually needs). Under pressure, shrink toward a 20 s
+        // minimum — a rewind past that already falls into the re-remux path
+        // the window seek logic handles.
+        var effectiveRetention = retentionSeconds
+        if bytesOnDisk >= (diskBudgetBytes * 3) / 4 {
+            effectiveRetention = bytesOnDisk >= diskBudgetBytes ? 20 : retentionSeconds / 3
+        }
+        let cutoff = head - effectiveRetention
         guard cutoff > 0 else { return }
         var pruned = false
         while firstRetainedSegment < segmentIndex,
@@ -918,7 +1340,11 @@ final class DVRemuxer {
                   + (segmentDurations.indices.contains(firstRetainedSegment)
                      ? segmentDurations[firstRetainedSegment] : 0) < cutoff {
             let name = String(format: "seg%05d.m4s", firstRetainedSegment)
-            try? FileManager.default.removeItem(at: directory.appendingPathComponent(name))
+            let file = directory.appendingPathComponent(name)
+            let size = (try? file.resourceValues(forKeys: [.totalFileAllocatedSizeKey]))?
+                .totalFileAllocatedSize ?? 0
+            try? FileManager.default.removeItem(at: file)
+            bytesOnDisk = max(bytesOnDisk - Int64(size), 0)
             prunedThrough = segmentStarts[firstRetainedSegment]
             firstRetainedSegment += 1
             pruned = true
@@ -930,27 +1356,61 @@ final class DVRemuxer {
     }
 
     private func writePlaylist(ended: Bool) {
+        // SLIDING WINDOW, not EVENT. An EVENT playlist promises AVPlayer that
+        // everything since sequence 0 is seekable forever — and CoreMedia
+        // honors that by CACHING THE PLAYED HISTORY IN-PROCESS, without
+        // bound: live tracing showed the app's footprint growing at almost
+        // exactly the serve rate for the whole session, on two completely
+        // different server implementations, until the box thrashed or the
+        // guard fired. A live-style window (advancing MEDIA-SEQUENCE, only
+        // the retained segments listed, no PLAYLIST-TYPE) tells AVPlayer the
+        // truth this remux already lives by: behind the window is GONE — the
+        // files are pruned from disk anyway, and a seek behind the window
+        // already goes through the re-remux path. AVPlayer then buffers like
+        // live TV: a bounded forward window, history discarded.
         var lines = [
             "#EXTM3U",
             "#EXT-X-VERSION:7",
             "#EXT-X-TARGETDURATION:\(Int((segmentDurations.max() ?? 6).rounded(.up)) + 1)",
-            "#EXT-X-MEDIA-SEQUENCE:0",
-            "#EXT-X-PLAYLIST-TYPE:\(ended ? "VOD" : "EVENT")",
+            "#EXT-X-MEDIA-SEQUENCE:\(ended ? 0 : firstRetainedSegment)",
             "#EXT-X-INDEPENDENT-SEGMENTS",
             "#EXT-X-MAP:URI=\"init.mp4\"",
         ]
-        for (i, duration) in segmentDurations.enumerated() {
-            lines.append(String(format: "#EXTINF:%.5f,", duration))
+        // A FINISHED remux is a plain VOD of everything (nothing prunes once
+        // the whole file is on disk and playback owns pacing).
+        if ended { lines.insert("#EXT-X-PLAYLIST-TYPE:VOD", at: 4) }
+        let start = ended ? 0 : firstRetainedSegment
+        for i in start ..< segmentDurations.count {
+            lines.append(String(format: "#EXTINF:%.5f,", segmentDurations[i]))
             lines.append(String(format: "seg%05d.m4s", i))
         }
         if ended { lines.append("#EXT-X-ENDLIST") }
         let content = lines.joined(separator: "\n") + "\n"
-        // Atomic: AVPlayer polls the EVENT playlist — it must never read half.
+        // Atomic: AVPlayer polls the live playlist — it must never read half.
         try? content.data(using: .utf8)?.write(to: playlistURL, options: .atomic)
     }
 
+    /// Shut the loopback server down without touching the files. Called when
+    /// the session is retired (abandon/teardown): nothing will ever request a
+    /// segment again, and a retired session used to keep its listener — and
+    /// whatever its in-flight responses held — alive until the directory
+    /// purge minutes later.
+    func stopServer() {
+        server?.stop()
+        server = nil
+    }
+
     private func signalReadyIfNeeded() {
-        guard !readySignalled, segmentIndex > 0 else { return }
+        guard !readySignalled, !cancelled, segmentIndex > 0 else { return }
+        // Initial switch: require the cushion AHEAD OF THE VIEWER — they kept
+        // watching (on the FFmpeg engine) while this built, so cushion from
+        // the remux start overstates what actually stands between them and
+        // the live edge. A FINISHED remux bypasses it — the whole file is on
+        // disk, there is nothing left to sustain.
+        if !finished, minReadySecondsAhead > 0, !firstWrittenPTS.isNaN {
+            let viewerRel = max(viewerHeadRel().head, 0)
+            if lastVideoPTS - firstWrittenPTS - viewerRel < minReadySecondsAhead { return }
+        }
         let srv = server ?? DVSegmentServer(directory: directory)
         server = srv
         guard srv.port != 0 || srv.start(), let url = srv.playlistURL else {

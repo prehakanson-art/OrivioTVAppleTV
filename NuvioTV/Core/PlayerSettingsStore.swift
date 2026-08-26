@@ -86,12 +86,23 @@ enum DolbyVisionRemuxPace: String, Codable, CaseIterable {
         }
     }
 
-    /// Seconds of content the worker may get ahead before pacing kicks in — the
-    /// initial burst that lets playback start quickly.
+    /// Seconds of content the worker may get ahead before pacing kicks in —
+    /// the initial burst that lets playback start quickly, and thereafter the
+    /// STALL CUSHION: how much finished playlist stands between the viewer
+    /// and a dry AVPlayer when the network dips or the P7 conversion hiccups.
+    ///
+    /// 20s proved far too thin on the A10X: AVPlayer itself keeps ~12s
+    /// buffered, so ~8s of real margin separated "playing" from "stalled →
+    /// native DV abandoned" — real sessions died at the ~4-minute mark on a
+    /// perfectly adequate connection. The cushion lives on DISK (segments,
+    /// separately capped by the remuxer's disk budget), not in RAM, so a
+    /// deep one costs nothing the jetsam killer cares about. 90s at a 70 Mbps
+    /// remux is ~790 MB on disk — inside the budget — and rides out dips
+    /// an order of magnitude longer.
     var leadSeconds: Double {
         switch self {
-        case .smooth:   return 20
-        case .balanced: return 45
+        case .smooth:   return 90
+        case .balanced: return 90
         case .fast:     return 0
         }
     }

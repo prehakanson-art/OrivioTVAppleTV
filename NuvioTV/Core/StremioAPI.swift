@@ -91,7 +91,9 @@ enum StremioAPI {
 
     /// `ttl` = how long a cached body stays fresh (0 disables caching for this
     /// request — used for streams, whose links can be short-lived).
-    private static func get<T: Decodable>(_ urlString: String, ttl: TimeInterval = 0) async throws -> T {
+    private static func get<T: Decodable>(
+        _ urlString: String, ttl: TimeInterval = 0, timeout: TimeInterval = 0
+    ) async throws -> T {
         if ttl > 0, let cached = cache.data(for: urlString, ttl: ttl) {
             return try JSONDecoder().decode(T.self, from: cached)
         }
@@ -101,6 +103,7 @@ enum StremioAPI {
         let data = try await coalescer.data(for: urlString) {
             guard let url = URL(string: urlString) else { throw StremioAPIError.badURL(urlString) }
             var request = URLRequest(url: url)
+            if timeout > 0 { request.timeoutInterval = timeout }
             request.setValue("application/json", forHTTPHeaderField: "Accept")
             let (data, response) = try await session.data(for: request)
             if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
@@ -163,7 +166,16 @@ enum StremioAPI {
 
     static func streams(addon: InstalledAddon, type: String, id: String) async throws -> [Stream] {
         let url = "\(addon.baseURL)/stream/\(encodePathComponent(type))/\(encodePathComponent(id)).json"
-        let response: StreamsResponse = try await get(url)
+        // Stream searches get a LONGER deadline than the session's 20s
+        // default. Live torrent scrapers (Comet with cachedOnly=false,
+        // Torrentio under load) legitimately compute for 15-20s before
+        // sending their first byte — measured 16.2s for a healthy Comet
+        // answer that then delivered 2,000+ streams. Under the 20s idle
+        // timeout those addons "didn't work" on exactly the titles with the
+        // most sources, while fast addons masked the problem. The sources
+        // sweep is parallel and reveals results per addon as they land, so a
+        // slow scraper arriving late costs nothing but its own lateness.
+        let response: StreamsResponse = try await get(url, timeout: 45)
         return response.streams ?? []
     }
 

@@ -322,6 +322,60 @@ final class CollectionsStore: ObservableObject {
     /// Account-wide library key (no profile suffix).
     private static let libraryKey = "nuvio.collections.library.v1"
 
+    /// The collection library lives in a FILE, not in NSUserDefaults.
+    ///
+    /// It is ~700 KB of nested JSON (493 folders). NSUserDefaults is a
+    /// preferences store, and a domain that size gets the whole app aborted:
+    /// CFPreferences answers an oversized write with
+    /// `__CFPREFERENCES_HAS_DETECTED_THIS_APP_TRYING_TO_STORE_TOO_MUCH_DATA__`
+    /// and calls abort(). On a real Apple TV this key alone was 902 KB of a
+    /// 984 KB domain, and every crash report pulled off that box had exactly
+    /// that signature. A blob this size belongs on disk.
+    ///
+    /// Caches, because on tvOS that is the only choice. tvOS gives an app
+    /// `Caches` and `tmp` and nothing else — there is no Application Support
+    /// and no Documents (verified on the device: writing there fails silently
+    /// and the directory is never created). Caches is purgeable in principle,
+    /// which is acceptable here precisely because the library also lives in
+    /// the user's account and is re-pulled by the collections sync, so the
+    /// worst case is a re-download rather than data loss.
+    nonisolated static var libraryFileURL: URL {
+        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("OrivioCache", isDirectory: true)
+        try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        return base.appendingPathComponent("collections-library.json")
+    }
+
+    /// Read the library, preferring the file and falling back to the legacy
+    /// NSUserDefaults key so an existing install keeps its collections.
+    /// Returns nil when neither holds anything decodable.
+    nonisolated static func readPersistedLibrary() -> [NuvioCollection]? {
+        if let data = try? Data(contentsOf: libraryFileURL),
+           let decoded = try? JSONDecoder().decode([NuvioCollection].self, from: data) {
+            return decoded
+        }
+        if let data = UserDefaults.standard.data(forKey: libraryKey),
+           let decoded = try? JSONDecoder().decode([NuvioCollection].self, from: data) {
+            NSLog("[OrivioCollections] migrating %d collections out of NSUserDefaults into a file", decoded.count)
+            // Move it: write the file first, and only then drop the defaults
+            // key, so a failure here can never lose the library. Report a
+            // failed move loudly — swallowing it is how the first attempt at
+            // this silently left the oversized key in place.
+            do {
+                let encoded = try JSONEncoder().encode(decoded)
+                try encoded.write(to: libraryFileURL, options: .atomic)
+                UserDefaults.standard.removeObject(forKey: libraryKey)
+                NSLog("[OrivioCollections] moved %d KB of collections out of NSUserDefaults",
+                      encoded.count / 1024)
+            } catch {
+                NSLog("[OrivioCollections] MIGRATION FAILED, key left in place: %@",
+                      String(describing: error))
+            }
+            return decoded
+        }
+        return nil
+    }
+
     /// Legacy per-profile key, still read once during migration.
     private var legacyStorageKey: String {
         profileID == 1 ? Self.baseKey : "\(Self.baseKey).p\(profileID)"
@@ -612,22 +666,17 @@ final class CollectionsStore: ObservableObject {
         // it could draw anything or accept a sign-in. Decode off-thread and
         // publish when it lands; the UI simply has no collections for the first
         // moment, which is how every other store behaves anyway.
-        Task.detached(priority: .userInitiated) { [libraryKey = Self.libraryKey] in
-            let decoded: [NuvioCollection]
-            if let data = UserDefaults.standard.data(forKey: libraryKey),
-               let d = try? JSONDecoder().decode([NuvioCollection].self, from: data) {
-                decoded = d
-            } else {
-                decoded = Self.migrateLegacyProfileCollections()
-            }
+        Task.detached(priority: .userInitiated) {
+            let persisted = Self.readPersistedLibrary()
+            let decoded = persisted ?? Self.migrateLegacyProfileCollections()
             await MainActor.run { [weak self] in
                 guard let self, self.library.isEmpty else { return }
                 self.library = decoded
                 self.recomputeVisible()
-                // Persist only if this came from the legacy migration.
-                if UserDefaults.standard.data(forKey: libraryKey) == nil, !decoded.isEmpty {
-                    self.saveLibrary()
-                }
+                // Persist only if this came from the legacy per-profile
+                // migration (readPersistedLibrary already wrote the file for
+                // the defaults-key migration).
+                if persisted == nil, !decoded.isEmpty { self.saveLibrary() }
             }
         }
     }
@@ -681,6 +730,7 @@ final class CollectionsStore: ObservableObject {
     private func saveLibrary() {
         if library.isEmpty {
             UserDefaults.standard.removeObject(forKey: Self.libraryKey)
+            try? FileManager.default.removeItem(at: Self.libraryFileURL)
             return
         }
         // Encode + write OFF the main thread. The merged library is ~700 KB of
@@ -691,7 +741,9 @@ final class CollectionsStore: ObservableObject {
         let snapshot = library
         Task.detached(priority: .utility) {
             guard let data = try? JSONEncoder().encode(snapshot) else { return }
-            UserDefaults.standard.set(data, forKey: Self.libraryKey)
+            try? data.write(to: Self.libraryFileURL, options: .atomic)
+            // Make sure the old oversized key can never come back.
+            UserDefaults.standard.removeObject(forKey: Self.libraryKey)
         }
     }
 

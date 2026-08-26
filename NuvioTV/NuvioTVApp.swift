@@ -2,6 +2,12 @@ import SwiftUI
 
 @main
 struct NuvioTVApp: App {
+    /// Reclaim orphaned player scratch space before anything else runs. A
+    /// remux session that got jetsammed leaves its segment directory behind
+    /// with no owner left to delete it, and nothing else in the app ever
+    /// swept them — launch is the one moment we know none of them are live.
+    init() { PlayerTempSweep.sweepAtLaunch() }
+
     @StateObject private var theme = ThemeManager()
     @StateObject private var addonManager = AddonManager()
     @StateObject private var progressStore = ProgressStore()

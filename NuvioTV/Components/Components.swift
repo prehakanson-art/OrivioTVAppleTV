@@ -136,6 +136,18 @@ final class ImageCache: @unchecked Sendable {
         ioQueue.async { try? payload.write(to: fileURL, options: .atomic) }
     }
 
+    /// Release every decoded image held in RAM.
+    ///
+    /// Invisible: anything still on screen re-decodes from the disk layer,
+    /// which is the whole reason that layer exists. Called when playback
+    /// starts, because the player's peak is the app's peak — a read-ahead
+    /// buffer (up to 400 MB on a 3 GB box), the decoder, and the Metal
+    /// surfaces all arrive at once, and until now a browsing session's worth
+    /// of decoded posters (up to 160 MB) was still being held underneath it.
+    /// tvOS does not reliably deliver a memory warning before jetsam on a
+    /// spike that fast, so waiting for one is not a strategy.
+    func dropDecoded() { memory.removeAllObjects() }
+
     private func insertMemory(_ image: UIImage, for key: String) {
         let cost = Int(image.size.width * image.size.height * image.scale * image.scale) * 4
         memory.setObject(image, forKey: key as NSString, cost: cost)
