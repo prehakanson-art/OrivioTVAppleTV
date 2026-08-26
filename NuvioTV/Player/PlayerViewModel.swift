@@ -251,7 +251,14 @@ final class NuvioPlayerOptions: KSOptions {
         // A mismatched panel (or Match Frame Rate off) stays at its home rate
         // (typically 60Hz): keep the pulldown softening on.
         pulldown60Hz = true
-        guard matchDisplayCriteria || nativeDV,
+        // STRICT opt-in — the Infuse/VLC discipline. The old `|| nativeDV`
+        // bypass made DV sessions request the display's DV mode even with
+        // matching OFF, so the app kept rolling the HDMI-renegotiation dice
+        // no other app on this TV ever rolls (the grey-wedge screen). With
+        // matching off the app now NEVER touches the display; DV output is
+        // achieved wedge-free by setting the tvOS Format itself to 4K Dolby
+        // Vision (the mode then never changes for anything).
+        guard matchDisplayCriteria,
               refreshRate > 0,
               let displayManager = UIApplication.shared.ks_keyWindow?.avDisplayManager,
               displayManager.isDisplayCriteriaMatchingEnabled,
@@ -940,7 +947,10 @@ final class PlayerViewModel: ObservableObject {
     /// engine (which has no KSOptions.updateVideo hook). Same de-dup-free,
     /// capability-gated request the options path makes for native sessions.
     private func requestDVDisplayMode(fps: Float) {
-        guard let displayManager = UIApplication.shared.ks_keyWindow?.avDisplayManager,
+        // Same strict opt-in as updateVideo: with matching off, the app
+        // never initiates an HDMI renegotiation for any reason.
+        guard settings.matchContentDisplayMode,
+              let displayManager = UIApplication.shared.ks_keyWindow?.avDisplayManager,
               displayManager.isDisplayCriteriaMatchingEnabled else { return }
         var rate = Float(UIScreen.main.maximumFramesPerSecond)
         if settings.matchFrameRate, fps > 0 {
@@ -957,9 +967,9 @@ final class PlayerViewModel: ObservableObject {
 
     /// HDR10-range request for non-DV direct sessions, same pin discipline.
     private func requestHDR10DisplayMode(fps: Float) {
-        guard let displayManager = UIApplication.shared.ks_keyWindow?.avDisplayManager,
-              displayManager.isDisplayCriteriaMatchingEnabled,
-              settings.matchContentDisplayMode || settings.matchFrameRate else { return }
+        guard settings.matchContentDisplayMode,
+              let displayManager = UIApplication.shared.ks_keyWindow?.avDisplayManager,
+              displayManager.isDisplayCriteriaMatchingEnabled else { return }
         var rate = Float(UIScreen.main.maximumFramesPerSecond)
         if settings.matchFrameRate, fps > 0 {
             rate = fps
