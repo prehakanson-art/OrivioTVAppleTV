@@ -137,6 +137,39 @@ final class DVSampleEngine {
     private var audioQueue: [CMSampleBuffer] = []
     private let videoQueueCap = 48
     private let audioQueueCap = 96
+
+    /// MKV timestamps are in MILLISECONDS; a 23.976fps frame lasts 41.708ms.
+    /// Stamped raw, every frame's PTS lands up to 0.5ms off the panel's frame
+    /// grid, so the display periodically repeats one frame and skips the next
+    /// — visible cadence judder with a perfectly healthy clock and full
+    /// queues (the live probe proved the rest of the pipeline clean). Snap
+    /// each video PTS to the exact NTSC grid, anchored at the first frame:
+    /// only sub-2ms corrections are applied (rounding noise), so true-24.000
+    /// or PAL material never gets re-timed, and the result is clamped to DTS
+    /// so sample creation can never fail (the old jitter-chase regression).
+    private var ptsGridAnchor: Double = -1   // demux-thread only
+
+    private func snapVideoPTS(_ pts: Double, dts: Double) -> Double {
+        let fps = Double(videoFPS)
+        guard fps > 10 else { return pts }
+        let frameDur: Double
+        switch fps {
+        case 23.5...24.2: frameDur = 1001.0 / 24000.0
+        case 29.5...30.2: frameDur = 1001.0 / 30000.0
+        case 59.5...60.2: frameDur = 1001.0 / 60000.0
+        default: frameDur = 1.0 / fps
+        }
+        if ptsGridAnchor < 0 { ptsGridAnchor = pts; return pts }
+        let idx = ((pts - ptsGridAnchor) / frameDur).rounded()
+        let snapped = ptsGridAnchor + idx * frameDur
+        guard abs(snapped - pts) < 0.002 else { return pts }
+        return max(snapped, dts)
+    }
+
+    // Live jitter probe (diagnostic): clock ratio + queue depths every 2s.
+    private var probeTick = 0
+    private var lastProbeWall: CFAbsoluteTime = 0
+    private var lastProbeMedia: Double = 0
     private var demuxEOF = false
 
     @Atomic private var cancelled = false
@@ -456,6 +489,29 @@ final class DVSampleEngine {
             self.timeTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
                 guard let self else { return }
                 self.onTime?(self.position)
+                // Jitter probe: if the synchronizer's clock ratio wanders off
+                // 1.000 the whole presentation timeline is breathing (both
+                // renderers follow this clock); if the ratio is clean but the
+                // picture stutters, the fault is per-frame (decode/enqueue).
+                self.probeTick += 1
+                if self.probeTick % 4 == 0 {
+                    let wall = CFAbsoluteTimeGetCurrent()
+                    let media = CMTimeGetSeconds(self.synchronizer.currentTime())
+                    if self.lastProbeWall > 0, self.synchronizer.rate > 0 {
+                        let ratio = (media - self.lastProbeMedia) / max(wall - self.lastProbeWall, 0.001)
+                        self.queueLock.lock()
+                        let vq = self.videoQueue.count
+                        let aq = self.audioQueue.count
+                        self.queueLock.unlock()
+                        NSLog("[DVSample] probe clock=%.4f vq=%d aq=%d vReady=%d aReady=%d rate=%.2f",
+                              ratio, vq, aq,
+                              self.displayLayer.isReadyForMoreMediaData ? 1 : 0,
+                              self.audioRenderer.isReadyForMoreMediaData ? 1 : 0,
+                              self.synchronizer.rate)
+                    }
+                    self.lastProbeWall = wall
+                    self.lastProbeMedia = media
+                }
                 // The layer fails SILENTLY — the clock keeps running while
                 // nothing renders. Ask it, and report the real reason out.
                 if self.displayLayer.status == .failed {
@@ -545,6 +601,7 @@ final class DVSampleEngine {
                     // and lead-in audio is dropped outright, so playback
                     // resumes exactly where the viewer aimed.
                     trimBefore = target - 0.05
+                    ptsGridAnchor = -1   // re-anchor the PTS grid at the seek target
                 }
                 if let decoder = audioDecoder { avcodec_flush_buffers(decoder) }
                 pcmBatch.removeAll(keepingCapacity: true)
@@ -598,7 +655,8 @@ final class DVSampleEngine {
             guard let sample = Self.makeSample(
                 bytes: bytes,
                 format: isVideo ? vFormat : audioFormats[index],
-                ptsSeconds: pts, dtsSeconds: dts, durationSeconds: dur,
+                ptsSeconds: isVideo ? snapVideoPTS(pts, dts: dts) : pts,
+                dtsSeconds: dts, durationSeconds: dur,
                 keyframe: (packet.pointee.flags & 0x0001) != 0
             ) else { continue }
             if displaySuppressed { Self.markDoNotDisplay(sample) }
