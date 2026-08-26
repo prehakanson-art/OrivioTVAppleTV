@@ -982,8 +982,21 @@ final class PlayerViewModel: ObservableObject {
             rate = fps
             if (23.5...24.2).contains(rate) { rate = 23.976 }
         }
+        // Clamp to what the TV actually advertises, same as updateVideo: a
+        // non-DV HDR TV gets the HDR10 (or HLG) mode instead — the DV video
+        // is tone-mapped into it by the system — and an SDR-only TV is left
+        // entirely alone (no request, no handshake, content tone-maps to
+        // SDR). Requesting a mode the display never advertised is exactly
+        // the malformed-handshake bait this app no longer offers.
+        var target = DynamicRange.dolbyVision
+        let available = DynamicRange.availableHDRModes   // [.sdr] when none
+        if !available.contains(target) {
+            if available.contains(.hdr10) { target = .hdr10 }
+            else if available.contains(.hlg) { target = .hlg }
+            else { return }
+        }
         guard let criteria = AVDisplayCriteria(
-            refreshRate: rate, videoDynamicRange: DynamicRange.dolbyVision.rawValue
+            refreshRate: rate, videoDynamicRange: target.rawValue
         ) else { return }
         if SessionDisplayMode.applyOnce(criteria, via: displayManager) {
             displayCriteriaApplied = true
