@@ -872,12 +872,6 @@ final class PlayerViewModel: ObservableObject {
                 guard let self, self.dvDirectEngine === engine else { return }
                 if ok {
                     Self.dvTrail("direct sample engine started")
-                    // Attach the engine's layer view: PlayerVideoView only
-                    // re-reads activeVideoView when this ID changes — without
-                    // the bump the engine rendered into a view nobody ever
-                    // put on screen (black picture over a running clock, no
-                    // error anywhere, maiden-flight bug).
-                    self.videoRefreshID = UUID()
                     // Report what the ENGINE found in the stream itself, not
                     // the preflight's guess — and name a converted P7 as the
                     // conversion it is, the same honesty the remux path kept.
@@ -892,10 +886,45 @@ final class PlayerViewModel: ObservableObject {
                                             because: "compressed samples fed straight to the display pipeline — no remux, no server")
                     self.decisionLog.record("Engine", "DV Sample Feed",
                                             because: "AVSampleBufferDisplayLayer owns rendering for this session")
+                    // SEQUENCE THE SWITCH LIKE INFUSE. Requesting the display
+                    // mode right after attaching a live video surface put the
+                    // HDMI renegotiation on top of a surface coming alive —
+                    // the overlap that wedged this panel grey ON ENTRY. So:
+                    // switch FIRST, while the loading screen is static and the
+                    // engine is held paused with its view unattached; attach
+                    // and roll only once the panel has settled (UIScreen's
+                    // fps changing is the ground truth that the mode took).
+                    var switching = false
                     if profile > 0 {
-                        self.requestDVDisplayMode(fps: engine.videoFPS)
+                        switching = self.requestDVDisplayMode(fps: engine.videoFPS)
                     } else if probe.isPQ {
-                        self.requestHDR10DisplayMode(fps: engine.videoFPS)
+                        switching = self.requestHDR10DisplayMode(fps: engine.videoFPS)
+                    }
+                    if switching {
+                        engine.pause()
+                        let before = UIScreen.main.maximumFramesPerSecond
+                        Task { @MainActor in
+                            for _ in 0 ..< 14 {   // up to 3.5s
+                                try? await Task.sleep(nanoseconds: 250_000_000)
+                                if UIScreen.main.maximumFramesPerSecond != before { break }
+                            }
+                            // One extra beat for the panel to finish syncing
+                            // after the mode reports in.
+                            try? await Task.sleep(nanoseconds: 750_000_000)
+                            guard self.dvDirectEngine === engine, !self.isExiting else { return }
+                            Self.dvTrail("display settled at \(UIScreen.main.maximumFramesPerSecond)fps — attaching video")
+                            // Attach the engine's layer view: PlayerVideoView
+                            // only re-reads activeVideoView when this ID
+                            // changes — without the bump the engine rendered
+                            // into a view nobody ever put on screen.
+                            self.videoRefreshID = UUID()
+                            engine.play()
+                        }
+                    } else {
+                        // No switch this session — attach immediately (the
+                        // maiden-flight rule: without the bump the engine
+                        // renders into a view nobody ever put on screen).
+                        self.videoRefreshID = UUID()
                     }
                     if self.playbackSpeed != 1 {
                         engine.rate = self.playbackSpeed
@@ -970,12 +999,15 @@ final class PlayerViewModel: ObservableObject {
     /// Ask the display for its Dolby Vision mode on behalf of the direct
     /// engine (which has no KSOptions.updateVideo hook). Same de-dup-free,
     /// capability-gated request the options path makes for native sessions.
-    private func requestDVDisplayMode(fps: Float) {
+    /// Returns true when a display switch was actually initiated this call
+    /// (the caller then holds video attach until the handshake settles).
+    @discardableResult
+    private func requestDVDisplayMode(fps: Float) -> Bool {
         // DV sessions request their mode by DEFAULT (the Infuse policy) —
         // range-only unless Match Frame Rate is on, pinned once per foreground
         // stint, and never reverted while the app is alive.
         guard let displayManager = UIApplication.shared.ks_keyWindow?.avDisplayManager,
-              displayManager.isDisplayCriteriaMatchingEnabled else { return }
+              displayManager.isDisplayCriteriaMatchingEnabled else { return false }
         var rate = Float(UIScreen.main.maximumFramesPerSecond)
         if fps > 0 {   // always match the content rate — the revert that made this risky is gone
             rate = fps
@@ -992,21 +1024,24 @@ final class PlayerViewModel: ObservableObject {
         if !available.contains(target) {
             if available.contains(.hdr10) { target = .hdr10 }
             else if available.contains(.hlg) { target = .hlg }
-            else { return }
+            else { return false }
         }
         guard let criteria = AVDisplayCriteria(
             refreshRate: rate, videoDynamicRange: target.rawValue
-        ) else { return }
+        ) else { return false }
         if SessionDisplayMode.applyOnce(criteria, via: displayManager) {
             displayCriteriaApplied = true
+            return true
         }
+        return false
     }
 
     /// HDR10-range request for non-DV direct sessions, same pin discipline.
-    private func requestHDR10DisplayMode(fps: Float) {
+    @discardableResult
+    private func requestHDR10DisplayMode(fps: Float) -> Bool {
         guard settings.matchContentDisplayMode,
               let displayManager = UIApplication.shared.ks_keyWindow?.avDisplayManager,
-              displayManager.isDisplayCriteriaMatchingEnabled else { return }
+              displayManager.isDisplayCriteriaMatchingEnabled else { return false }
         var rate = Float(UIScreen.main.maximumFramesPerSecond)
         if fps > 0 {   // always match the content rate — the revert that made this risky is gone
             rate = fps
@@ -1015,10 +1050,12 @@ final class PlayerViewModel: ObservableObject {
         guard DynamicRange.availableHDRModes.contains(.hdr10),
               let criteria = AVDisplayCriteria(
                 refreshRate: rate, videoDynamicRange: DynamicRange.hdr10.rawValue
-              ) else { return }
+              ) else { return false }
         if SessionDisplayMode.applyOnce(criteria, via: displayManager) {
             displayCriteriaApplied = true
+            return true
         }
+        return false
     }
 
     /// Where a native remux must START so it covers what the viewer is
