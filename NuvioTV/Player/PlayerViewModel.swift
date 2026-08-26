@@ -3080,10 +3080,37 @@ final class PlayerViewModel: ObservableObject {
     /// buffered, so nothing has to reload.
     private let staleResumeThreshold: TimeInterval = 12
 
+    // Blind display re-sync: three Play/Pause presses within 1.5s. Exists
+    // because the HDMI-handshake wedge leaves the WHOLE screen grey — no
+    // menu is visible, so the recovery has to work by feel. It performs the
+    // electronic equivalent of the TV input toggle that recovers the panel:
+    // drop the display criteria, let the TV fall back to its home mode, then
+    // re-request the pinned mode fresh.
+    private var playPausePressTimes: [Date] = []
+
+    func resyncDisplay() {
+        overlay = .none
+        guard let manager = UIApplication.shared.ks_keyWindow?.avDisplayManager else { return }
+        let held = manager.preferredDisplayCriteria
+        manager.preferredDisplayCriteria = nil
+        showToast("Re-syncing display…")
+        NSLog("[OrivioDisplay] manual display re-sync — dropping and re-requesting the mode")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+            manager.preferredDisplayCriteria = held
+        }
+    }
+
     func togglePlayPause() {
         // Ignore input while exiting, or during the sub-second post-background
         // resync (a play press then would race the in-flight flush-seek).
         guard !isExiting, !isResyncing else { return }
+        playPausePressTimes.append(Date())
+        playPausePressTimes.removeAll { Date().timeIntervalSince($0) > 1.5 }
+        if playPausePressTimes.count >= 3 {
+            playPausePressTimes.removeAll()
+            resyncDisplay()
+            return
+        }
         // If a fast-forward/rewind preview is up, Play commits it (seek + resume).
         if scanPreview != nil { scanCommit(); return }
         if isPlaying {

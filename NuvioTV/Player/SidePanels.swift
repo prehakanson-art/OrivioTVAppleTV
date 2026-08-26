@@ -401,6 +401,16 @@ struct EnginePanelContent: View {
                 .buttonStyle(PlainCardButtonStyle())
                 .focused($focused, equals: engine)
             }
+            Button {
+                viewModel.resyncDisplay()
+            } label: {
+                PanelRow(
+                    title: "Re-sync display",
+                    subtitle: "If the TV shows grey or wrong colors, renegotiate the connection (also: triple-press Play/Pause)",
+                    selected: false
+                )
+            }
+            .buttonStyle(PlainCardButtonStyle())
         }
         .defaultFocus($focused, viewModel.effectiveEngine)
     }
