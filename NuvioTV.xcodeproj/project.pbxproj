@@ -142,6 +142,7 @@
 		E49DA432855CAADA04F61C1A /* StreamProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3AFF7295F1567705FF1F5B5D /* StreamProbe.swift */; };
 		E5B79A409AAB47A1AC1155D8 /* DetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 243ACB41C793BA410B49B210 /* DetailView.swift */; };
 		E70E13C52AD92FE35CBC2E4C /* CatalogSeeAllView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 09C3A6238099830333C1A60E /* CatalogSeeAllView.swift */; };
+		E7968FD724F0443BE2AC6D9E /* Atomic.swift in Sources */ = {isa = PBXBuildFile; fileRef = 102204A34654D2AF11EB4BFA /* Atomic.swift */; };
 		E7D11030D6A9778E46F942EB /* PerformanceSettingsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 378BD17D8C6352257471571D /* PerformanceSettingsStore.swift */; };
 		E7D40B8A1E4CA7F29FDC7253 /* OnyxHome.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9D3C6F762FE150F2A7E353A /* OnyxHome.swift */; };
 		E9F427CC46D1D7C9E4D65EBE /* AppGroupResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F886347A1FAA3C2686A4A49 /* AppGroupResolver.swift */; };
@@ -170,6 +171,7 @@
 		0AABBCDB9DAA6E74AB201B6E /* SidePanels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SidePanels.swift; sourceTree = "<group>"; };
 		0BC906D3D943CBF695266313 /* PerformanceProfile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PerformanceProfile.swift; sourceTree = "<group>"; };
 		0CEDB85725047F73A8229A81 /* DeepLinkService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeepLinkService.swift; sourceTree = "<group>"; };
+		102204A34654D2AF11EB4BFA /* Atomic.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Atomic.swift; sourceTree = "<group>"; };
 		102BA7D7815453677A6A8EB5 /* PluginModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PluginModels.swift; sourceTree = "<group>"; };
 		11754AD2FDC70C869EC871BC /* ProfileStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileStore.swift; sourceTree = "<group>"; };
 		13F14405A1BC5A41FC21B2E4 /* CollectionResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CollectionResolver.swift; sourceTree = "<group>"; };
@@ -556,6 +558,7 @@
 		D68D84295084526EF7FBE853 /* Player */ = {
 			isa = PBXGroup;
 			children = (
+				102204A34654D2AF11EB4BFA /* Atomic.swift */,
 				B6DB589DC0A8FBFAF5AE8C3F /* DoviConverter.swift */,
 				CAB2EDAF3951B63EA5348D33 /* DVSampleEngine.swift */,
 				F31DD8C5D22DF53DCD150CB9 /* NativePlayerControlsOverlay.swift */,
@@ -751,6 +754,7 @@
 				B93CF80ADD1404E1ED522216 /* AnimatedGIFView.swift in Sources */,
 				D93146472B6B7BF5F92096A7 /* AnimeSkipService.swift in Sources */,
 				E9F427CC46D1D7C9E4D65EBE /* AppGroupResolver.swift in Sources */,
+				E7968FD724F0443BE2AC6D9E /* Atomic.swift in Sources */,
 				97189F552A08D00D804936BA /* BoundedConcurrency.swift in Sources */,
 				8C3C2D551DB191D562E74637 /* CastDetailView.swift in Sources */,
 				E70E13C52AD92FE35CBC2E4C /* CatalogSeeAllView.swift in Sources */,
