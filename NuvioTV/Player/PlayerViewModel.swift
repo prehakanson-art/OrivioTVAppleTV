@@ -832,15 +832,12 @@ final class PlayerViewModel: ObservableObject {
             // see DVSampleEngine.downmixToStereo.
             let spatial = AVAudioSession.sharedInstance().currentRoute.outputs
                 .contains { $0.isSpatialAudioEnabled }
-            // FEL POLICY. A Profile 7 FEL file carries a real residual
-            // enhancement layer that the converted-8.1 path throws away; the
-            // approximate per-frame metadata left behind is the standing
-            // suspect for composer-level judder (every measurable layer —
-            // clock, buffers, panel rate, feed — probed clean while FEL
-            // titles stuttered and P8/MEL titles played perfectly). Play the
-            // HDR10 base layer instead — smooth and honest, and what
-            // SenPlayer-class players effectively ship.
-            let felHDR10 = profile == 7 && probe.isFEL
+            // FEL titles keep true DV (user's choice). The HDR10-base-layer
+            // experiment ran and EXONERATED the converted metadata: the one
+            // stuttering FEL title stuttered identically as pure HDR10, and
+            // a heavier FEL twin plays smooth as converted DV. forceHDR10
+            // stays available as a diagnostic lever.
+            let felHDR10 = false
             let engine = DVSampleEngine(
                 input: url.absoluteString, startAt: resume,
                 preferredAudioLanguage: self.settings.preferredAudioLanguage,
