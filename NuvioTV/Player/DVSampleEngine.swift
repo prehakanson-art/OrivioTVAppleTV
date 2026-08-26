@@ -40,6 +40,21 @@ final class DVSampleEngine {
     private(set) var duration: Double = 0
     private(set) var videoFPS: Float = 0
 
+    /// Eligible audio tracks discovered at open, for the picker.
+    struct AudioTrack { let index: Int32; let label: String }
+    private(set) var audioTracks: [AudioTrack] = []
+    var currentAudioIndex: Int32 { desiredAudioIndex }
+
+    /// Switch audio live: the demux loop starts forwarding the new stream at
+    /// its next packet; the renderer is flushed so the old track doesn't
+    /// finish its buffered tail first.
+    func selectAudio(index: Int32) {
+        guard audioFormats[index] != nil || decodeAudioIndices.contains(index) else { return }
+        desiredAudioIndex = index
+        queueLock.lock(); audioQueue.removeAll(); queueLock.broadcast(); queueLock.unlock()
+        audioRenderer.flush()
+    }
+
     var position: Double {
         CMTimeGetSeconds(synchronizer.currentTime())
     }
@@ -58,7 +73,22 @@ final class DVSampleEngine {
     private let audioRenderer = AVSampleBufferAudioRenderer()
 
     private var videoFormat: CMFormatDescription?
-    private var audioFormat: CMFormatDescription?
+    /// Passthrough format descriptions per audio stream index (E-AC3/AC3/AAC
+    /// — codecs AVSampleBufferAudioRenderer decodes itself).
+    private var audioFormats: [Int32: CMFormatDescription] = [:]
+    /// Streams that need the FFmpeg decode→LPCM path (TrueHD, DTS, FLAC,
+    /// Opus, PCM variants — anything the renderer can't take compressed).
+    private var decodeAudioIndices: Set<Int32> = []
+    @Atomic private var desiredAudioIndex: Int32 = -1
+
+    // ---- FFmpeg audio decoder (worker thread only) ----
+    private var audioDecoder: UnsafeMutablePointer<AVCodecContext>?
+    private var audioDecoderIndex: Int32 = -1
+    private var decodedFrame: UnsafeMutablePointer<AVFrame>?
+    /// LPCM format cache, rebuilt when rate/channel layout changes.
+    private var pcmFormat: CMFormatDescription?
+    private var pcmRate: Int32 = 0
+    private var pcmChannels: Int32 = 0
 
     /// Bounded sample queues — the "buffer that clears used stuff". The
     /// demux thread blocks when they're full; the renderers drain them.
@@ -76,6 +106,8 @@ final class DVSampleEngine {
     @Atomic private var seekGeneration = 0
     @Atomic private var pendingSeekTo: Double = -1
 
+    /// The open input, for the audio decoder's stream lookups (worker only).
+    private var liveFormatCtx: UnsafeMutablePointer<AVFormatContext>?
     private var demuxThread: Thread?
     private var timeTimer: Timer?
     private let feedQueue = DispatchQueue(label: "dv-sample-feed")
@@ -112,6 +144,8 @@ final class DVSampleEngine {
     private var startCompletion: ((Bool, String) -> Void)?
     private var reportedLayerFailure = false
     private var reportedAudioFailure = false
+    private var lastLayerRecoveryAt = Date.distantPast
+    private var layerRecoveryCount = 0
 
     func play() {
         synchronizer.setRate(1, time: synchronizer.currentTime())
@@ -181,6 +215,7 @@ final class DVSampleEngine {
         ictx!.pointee.probesize = 2 << 20
         ictx!.pointee.max_analyze_duration = 1_000_000
         guard avformat_find_stream_info(ictx, nil) >= 0 else { return "couldn't probe source" }
+        liveFormatCtx = ictx
 
         // ---- Stream selection ----
         var videoIndex: Int32 = -1
@@ -214,16 +249,30 @@ final class DVSampleEngine {
             }
             if par.pointee.codec_type == AVMEDIA_TYPE_AUDIO {
                 let id = par.pointee.codec_id
-                let eligible = id == AV_CODEC_ID_EAC3 || id == AV_CODEC_ID_AC3 || id == AV_CODEC_ID_AAC
-                if eligible, audioIndex < 0 { audioIndex = Int32(i) }
-                // Preferred language wins among eligible tracks.
-                if eligible, !preferredAudioLanguage.isEmpty {
-                    var langTag: UnsafeMutablePointer<AVDictionaryEntry>?
-                    langTag = av_dict_get(stream.pointee.metadata, "language", nil, 0)
-                    if let lang = langTag?.pointee.value,
-                       String(cString: lang).hasPrefix(preferredAudioLanguage) {
-                        audioIndex = Int32(i)
-                    }
+                // Passthrough for what the renderer decodes itself; the
+                // FFmpeg decode→LPCM path for EVERYTHING else (TrueHD, DTS,
+                // FLAC, Opus…) — every audio track is eligible now.
+                let passthrough = id == AV_CODEC_ID_EAC3 || id == AV_CODEC_ID_AC3 || id == AV_CODEC_ID_AAC
+                if passthrough, let format = Self.makeAudioFormat(par: par.pointee) {
+                    audioFormats[Int32(i)] = format
+                } else if avcodec_find_decoder(id) != nil {
+                    decodeAudioIndices.insert(Int32(i))
+                } else {
+                    continue   // no decoder for this codec — skip the track
+                }
+                var lang = ""
+                if let tag = av_dict_get(stream.pointee.metadata, "language", nil, 0)?.pointee.value {
+                    lang = String(cString: tag)
+                }
+                let codecName = avcodec_get_name(id).map { String(cString: $0).uppercased() } ?? "?"
+                let channels = Int(par.pointee.ch_layout.nb_channels)
+                let language = Locale.current.localizedString(forLanguageCode: lang) ?? lang
+                let label = [language, codecName, channels > 0 ? "\(channels)ch" : ""]
+                    .filter { !$0.isEmpty }.joined(separator: " · ")
+                audioTracks.append(AudioTrack(index: Int32(i), label: label.isEmpty ? "Track \(i)" : label))
+                if audioIndex < 0 { audioIndex = Int32(i) }
+                if !preferredAudioLanguage.isEmpty, lang.hasPrefix(preferredAudioLanguage) {
+                    audioIndex = Int32(i)
                 }
             }
         }
@@ -257,12 +306,10 @@ final class DVSampleEngine {
         ) else { return "couldn't build the DV format description" }
         videoFormat = vFormat
 
-        guard let aStream = ictx!.pointee.streams[Int(audioIndex)],
-              let aPar = aStream.pointee.codecpar,
-              let aFormat = Self.makeAudioFormat(par: aPar.pointee) else {
-            return "couldn't build the audio format description"
+        guard audioFormats[audioIndex] != nil || decodeAudioIndices.contains(audioIndex) else {
+            return "no playable audio track"
         }
-        audioFormat = aFormat
+        desiredAudioIndex = audioIndex
 
         // ---- Start position + clock ----
         if startAt > 1 {
@@ -280,10 +327,28 @@ final class DVSampleEngine {
                 self.onTime?(self.position)
                 // The layer fails SILENTLY — the clock keeps running while
                 // nothing renders. Ask it, and report the real reason out.
-                if self.displayLayer.status == .failed, !self.reportedLayerFailure {
-                    self.reportedLayerFailure = true
-                    let detail = self.displayLayer.error.map(String.init(describing:)) ?? "unknown"
-                    self.onError?("display layer failed: \(detail)")
+                if self.displayLayer.status == .failed {
+                    // -11847 "Operation Interrupted" and friends are decode-
+                    // session interruptions, not verdicts — the documented
+                    // recovery is flush + re-prime from a keyframe, which is
+                    // exactly what a seek to the current position does. Only
+                    // repeated failures in quick succession fall back.
+                    let now = Date()
+                    if now.timeIntervalSince(self.lastLayerRecoveryAt) > 8,
+                       self.layerRecoveryCount < 3 {
+                        self.lastLayerRecoveryAt = now
+                        self.layerRecoveryCount += 1
+                        NSLog("[DVSample] display layer interrupted — recovering in place (attempt %d)",
+                              self.layerRecoveryCount)
+                        let resumeAt = self.position
+                        self.displayLayer.flush()
+                        self.seek(to: resumeAt)
+                        self.installFeeders()
+                    } else if !self.reportedLayerFailure {
+                        self.reportedLayerFailure = true
+                        let detail = self.displayLayer.error.map(String.init(describing:)) ?? "unknown"
+                        self.onError?("display layer failed: \(detail)")
+                    }
                 }
                 if self.audioRenderer.status == .failed, !self.reportedAudioFailure {
                     self.reportedAudioFailure = true
@@ -295,7 +360,8 @@ final class DVSampleEngine {
 
         // ---- Read loop ----
         let vTB = vStream.pointee.time_base
-        let aTB = aStream.pointee.time_base
+        // Audio timebase resolved per-packet (the active track can change).
+        let aTB = AVRational(num: 1, den: 1000)
         guard let packet = av_packet_alloc() else { return "packet alloc failed" }
         var pkt: UnsafeMutablePointer<AVPacket>? = packet
         defer { av_packet_free(&pkt) }
@@ -310,6 +376,7 @@ final class DVSampleEngine {
                     let ts = Int64(target * Double(AV_TIME_BASE))
                     av_seek_frame(ictx, -1, ts, 1)
                 }
+                if let decoder = audioDecoder { avcodec_flush_buffers(decoder) }
             }
             let readResult = av_read_frame(ictx, packet)
             if readResult < 0 {
@@ -318,12 +385,14 @@ final class DVSampleEngine {
             }
             defer { av_packet_unref(packet) }
             let index = packet.pointee.stream_index
-            guard index == videoIndex || index == audioIndex else { continue }
+            let activeAudio = desiredAudioIndex
+            guard index == videoIndex || index == activeAudio else { continue }
             guard packet.pointee.pts != Int64.min, let data = packet.pointee.data,
                   packet.pointee.size > 0 else { continue }
 
             let isVideo = index == videoIndex
-            let tb = isVideo ? vTB : aTB
+            let tb = isVideo ? vTB
+                : (ictx!.pointee.streams[Int(index)]?.pointee.time_base ?? aTB)
             let pts = Double(packet.pointee.pts) * av_q2d(tb)
             let dur = packet.pointee.duration > 0
                 ? Double(packet.pointee.duration) * av_q2d(tb) : 0
@@ -335,28 +404,192 @@ final class DVSampleEngine {
                     bytes = converted
                 }
             }
+            // Non-passthrough audio: FFmpeg-decode to interleaved Float32 PCM
+            // and enqueue the LPCM samples — this is what makes TrueHD, DTS,
+            // FLAC and friends playable on this engine.
+            if !isVideo, decodeAudioIndices.contains(index) {
+                for pcm in decodeAudioPacket(packet, streamIndex: index, tb: tb) {
+                    enqueueBounded(pcm, isVideo: false, generation: myGeneration)
+                }
+                continue
+            }
             guard let sample = Self.makeSample(
                 bytes: bytes,
-                format: isVideo ? vFormat : aFormat,
+                format: isVideo ? vFormat : audioFormats[index],
                 ptsSeconds: pts, durationSeconds: dur,
                 keyframe: (packet.pointee.flags & 0x0001) != 0
             ) else { continue }
 
-            // Bounded enqueue — blocks (self-clearing buffer) until the
-            // renderers have consumed room, a seek clears the queues, or stop.
-            queueLock.lock()
-            while !cancelled, seekGeneration == myGeneration,
-                  (isVideo ? videoQueue.count >= videoQueueCap
-                           : audioQueue.count >= audioQueueCap) {
-                queueLock.wait(until: Date().addingTimeInterval(0.25))
-            }
-            if !cancelled, seekGeneration == myGeneration {
-                if isVideo { videoQueue.append(sample) } else { audioQueue.append(sample) }
-                queueLock.broadcast()
-            }
-            queueLock.unlock()
+            enqueueBounded(sample, isVideo: isVideo, generation: myGeneration)
         }
+        closeAudioDecoder()
         return nil
+    }
+
+    /// Bounded enqueue — blocks (self-clearing buffer) until the renderers
+    /// have consumed room, a seek clears the queues, or stop.
+    private func enqueueBounded(_ sample: CMSampleBuffer, isVideo: Bool, generation: Int) {
+        queueLock.lock()
+        while !cancelled, seekGeneration == generation,
+              (isVideo ? videoQueue.count >= videoQueueCap
+                       : audioQueue.count >= audioQueueCap) {
+            queueLock.wait(until: Date().addingTimeInterval(0.25))
+        }
+        if !cancelled, seekGeneration == generation {
+            if isVideo { videoQueue.append(sample) } else { audioQueue.append(sample) }
+            queueLock.broadcast()
+        }
+        queueLock.unlock()
+    }
+
+    // MARK: FFmpeg audio decode → LPCM
+
+    private func closeAudioDecoder() {
+        if audioDecoder != nil { avcodec_free_context(&audioDecoder) }
+        if decodedFrame != nil { av_frame_free(&decodedFrame) }
+        audioDecoderIndex = -1
+    }
+
+    /// Decode one compressed packet into zero or more LPCM sample buffers.
+    /// Worker thread only. The decoder is (re)built when the active stream
+    /// changes; a seek flushes it via `flushAudioDecoderOnSeek`.
+    private func decodeAudioPacket(
+        _ packet: UnsafeMutablePointer<AVPacket>, streamIndex: Int32, tb: AVRational
+    ) -> [CMSampleBuffer] {
+        if audioDecoderIndex != streamIndex {
+            closeAudioDecoder()
+            guard let ictxLocal = liveFormatCtx,
+                  let stream = ictxLocal.pointee.streams[Int(streamIndex)],
+                  let par = stream.pointee.codecpar,
+                  let codec = avcodec_find_decoder(par.pointee.codec_id),
+                  let ctx = avcodec_alloc_context3(codec) else { return [] }
+            avcodec_parameters_to_context(ctx, par)
+            guard avcodec_open2(ctx, codec, nil) >= 0 else {
+                var dead: UnsafeMutablePointer<AVCodecContext>? = ctx
+                avcodec_free_context(&dead)
+                return []
+            }
+            audioDecoder = ctx
+            audioDecoderIndex = streamIndex
+            decodedFrame = av_frame_alloc()
+        }
+        guard let decoder = audioDecoder, let frame = decodedFrame else { return [] }
+        guard avcodec_send_packet(decoder, packet) >= 0 else { return [] }
+
+        var out: [CMSampleBuffer] = []
+        while avcodec_receive_frame(decoder, frame) >= 0 {
+            defer { av_frame_unref(frame) }
+            let channels = Int(frame.pointee.ch_layout.nb_channels)
+            let samples = Int(frame.pointee.nb_samples)
+            let rate = frame.pointee.sample_rate
+            guard channels > 0, samples > 0, rate > 0 else { continue }
+            guard let pcm = Self.interleaveToFloat32(frame: frame.pointee,
+                                                    channels: channels, samples: samples)
+            else { continue }
+            if pcmFormat == nil || pcmRate != rate || pcmChannels != Int32(channels) {
+                pcmFormat = Self.makeLPCMFormat(rate: rate, channels: Int32(channels))
+                pcmRate = rate
+                pcmChannels = Int32(channels)
+            }
+            guard let format = pcmFormat else { continue }
+            let pts = frame.pointee.pts != Int64.min
+                ? Double(frame.pointee.pts) * av_q2d(tb)
+                : Double(packet.pointee.pts) * av_q2d(tb)
+            if let sample = Self.makePCMSample(
+                pcm: pcm, format: format, frames: samples,
+                bytesPerFrame: channels * 4, ptsSeconds: pts,
+                rate: rate
+            ) { out.append(sample) }
+        }
+        return out
+    }
+
+    /// Any planar/packed float or integer layout → packed interleaved Float32.
+    private static func interleaveToFloat32(
+        frame: AVFrame, channels: Int, samples: Int
+    ) -> [Float]? {
+        var out = [Float](repeating: 0, count: channels * samples)
+        let fmt = AVSampleFormat(rawValue: frame.format)
+        func planar<T>(_: T.Type, _ convert: (T) -> Float) -> Bool {
+            var data = frame.data
+            return withUnsafeBytes(of: &data) { raw -> Bool in
+                let planes = raw.bindMemory(to: UnsafeMutablePointer<UInt8>?.self)
+                for ch in 0 ..< channels {
+                    guard ch < 8, let plane = planes[ch] else { return false }
+                    let typed = UnsafeRawPointer(plane).bindMemory(to: T.self, capacity: samples)
+                    for i in 0 ..< samples { out[i * channels + ch] = convert(typed[i]) }
+                }
+                return true
+            }
+        }
+        func packed<T>(_: T.Type, _ convert: (T) -> Float) -> Bool {
+            guard let base = frame.data.0 else { return false }
+            let typed = UnsafeRawPointer(base).bindMemory(to: T.self, capacity: channels * samples)
+            for i in 0 ..< channels * samples { out[i] = convert(typed[i]) }
+            return true
+        }
+        let ok: Bool
+        switch fmt {
+        case AV_SAMPLE_FMT_FLTP: ok = planar(Float.self) { $0 }
+        case AV_SAMPLE_FMT_FLT: ok = packed(Float.self) { $0 }
+        case AV_SAMPLE_FMT_S16P: ok = planar(Int16.self) { Float($0) / 32768 }
+        case AV_SAMPLE_FMT_S16: ok = packed(Int16.self) { Float($0) / 32768 }
+        case AV_SAMPLE_FMT_S32P: ok = planar(Int32.self) { Float($0) / 2147483648 }
+        case AV_SAMPLE_FMT_S32: ok = packed(Int32.self) { Float($0) / 2147483648 }
+        case AV_SAMPLE_FMT_DBLP: ok = planar(Double.self) { Float($0) }
+        case AV_SAMPLE_FMT_DBL: ok = packed(Double.self) { Float($0) }
+        default: ok = false
+        }
+        return ok ? out : nil
+    }
+
+    private static func makeLPCMFormat(rate: Int32, channels: Int32) -> CMFormatDescription? {
+        var asbd = AudioStreamBasicDescription(
+            mSampleRate: Float64(rate),
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: UInt32(channels * 4),
+            mFramesPerPacket: 1,
+            mBytesPerFrame: UInt32(channels * 4),
+            mChannelsPerFrame: UInt32(channels),
+            mBitsPerChannel: 32,
+            mReserved: 0
+        )
+        var format: CMFormatDescription?
+        let status = CMAudioFormatDescriptionCreate(
+            allocator: kCFAllocatorDefault, asbd: &asbd,
+            layoutSize: 0, layout: nil, magicCookieSize: 0, magicCookie: nil,
+            extensions: nil, formatDescriptionOut: &format
+        )
+        return status == noErr ? format : nil
+    }
+
+    private static func makePCMSample(
+        pcm: [Float], format: CMFormatDescription, frames: Int,
+        bytesPerFrame: Int, ptsSeconds: Double, rate: Int32
+    ) -> CMSampleBuffer? {
+        let byteCount = pcm.count * 4
+        var block: CMBlockBuffer?
+        guard CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault, memoryBlock: nil,
+            blockLength: byteCount, blockAllocator: kCFAllocatorDefault,
+            customBlockSource: nil, offsetToData: 0, dataLength: byteCount,
+            flags: 0, blockBufferOut: &block
+        ) == noErr, let block else { return nil }
+        guard pcm.withUnsafeBytes({ raw in
+            CMBlockBufferReplaceDataBytes(
+                with: raw.baseAddress!, blockBuffer: block,
+                offsetIntoDestination: 0, dataLength: byteCount
+            )
+        }) == noErr else { return nil }
+        var sample: CMSampleBuffer?
+        guard CMAudioSampleBufferCreateReadyWithPacketDescriptions(
+            allocator: kCFAllocatorDefault, dataBuffer: block,
+            formatDescription: format, sampleCount: frames,
+            presentationTimeStamp: CMTime(seconds: ptsSeconds, preferredTimescale: CMTimeScale(rate)),
+            packetDescriptions: nil, sampleBufferOut: &sample
+        ) == noErr else { return nil }
+        return sample
     }
 
     // MARK: Feeders

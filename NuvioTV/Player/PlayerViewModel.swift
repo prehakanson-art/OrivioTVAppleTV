@@ -1,4 +1,5 @@
 import AVFoundation
+import AVKit
 import Combine
 import GameController
 import KSPlayer
@@ -95,6 +96,7 @@ struct TrackOption: Identifiable, Equatable {
         case subtitle(any SubtitleInfo)
         case vlcAudio(Int32)      // VLC audio track index
         case vlcSubtitle(Int32)   // VLC subtitle track index (-1 = off)
+        case dvDirectAudio(Int32) // DVSampleEngine audio stream index
     }
 
     let id: String
@@ -115,6 +117,41 @@ struct TrackOption: Identifiable, Equatable {
 ///   motion), keeping 1 drop in 3 so the clock still catches up. Emergency
 ///   recovery (flush / seek / GOP drops for seriously-behind video) passes
 ///   through untouched.
+/// One display-mode switch per app launch — first wins, held for the app's
+/// lifetime, never renegotiated.
+///
+/// Every HDMI renegotiation is a fresh chance for a wedge-prone panel to
+/// mis-handshake into the solid-grey state (recoverable only by an input
+/// toggle on this user's chain). Titles used to flip the mode in, out, and
+/// between rates several times a session. Pinning the first successful
+/// criteria removes every subsequent switch: later playbacks reuse the
+/// negotiated mode, exits hold it, and the UI simply renders inside it.
+/// The OS still reverts when the app backgrounds or dies — that single
+/// unavoidable event is the only remaining exposure.
+enum SessionDisplayMode {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var pinned = false
+
+    /// Apply `criteria` only if nothing was pinned this launch. Lock-based
+    /// (not actor-isolated): callers arrive from KSPlayer's setup thread AND
+    /// from the main actor, and a main.sync hop from main would deadlock.
+    static func applyOnce(_ criteria: AVDisplayCriteria,
+                          via manager: AVDisplayManager) -> Bool {
+        lock.lock()
+        let first = !pinned
+        if first { pinned = true }
+        lock.unlock()
+        guard first else { return false }
+        if Thread.isMainThread {
+            manager.preferredDisplayCriteria = criteria
+        } else {
+            DispatchQueue.main.async { manager.preferredDisplayCriteria = criteria }
+        }
+        NSLog("[OrivioDisplay] session display mode pinned (first and only switch this launch)")
+        return true
+    }
+}
+
 final class NuvioPlayerOptions: KSOptions {
     /// Decoded-frame queue depth, budgeted in BYTES instead of frames.
     ///
@@ -242,9 +279,9 @@ final class NuvioPlayerOptions: KSOptions {
             || lastAppliedRefreshRate != rate else { return }
         lastAppliedDynamicRange = target.rawValue
         lastAppliedRefreshRate = rate
-        displayManager.preferredDisplayCriteria = AVDisplayCriteria(
-            refreshRate: rate, videoDynamicRange: target.rawValue
-        )
+        guard let criteria = AVDisplayCriteria(refreshRate: rate, videoDynamicRange: target.rawValue)
+        else { return }
+        guard SessionDisplayMode.applyOnce(criteria, via: displayManager) else { return }
         // The exit sequencing needs to know a real switch was requested this
         // SESSION (not just whether the toggle is on — native-DV sessions
         // switch with the toggle off), so it can wait out the switch-back
@@ -751,6 +788,10 @@ final class PlayerViewModel: ObservableObject {
                 self.markPlaybackProgressed(currentTime: seconds)
                 self.saveProgressThrottled()
                 self.updateSkipIntro()
+                // Addon subtitles: the model picks the cue for this instant;
+                // the overlay renders it. KSPlayer normally drives this from
+                // its own clock — the direct engine drives it from its ticks.
+                _ = self.subtitleModel.subtitle(currentTime: seconds + self.subtitleDelay)
             }
             engine.onEnded = { [weak self] in
                 guard let self, self.dvDirectEngine === engine else { return }
@@ -777,6 +818,16 @@ final class PlayerViewModel: ObservableObject {
                     self.decisionLog.record("Engine", "DV Sample Feed",
                                             because: "AVSampleBufferDisplayLayer owns rendering for this session")
                     self.requestDVDisplayMode(fps: engine.videoFPS)
+                    // Pickers: audio from the engine's own track list;
+                    // subtitles via the addon search — SubtitleOverlayView
+                    // renders from SubtitleModel above any engine.
+                    self.audioOptions = engine.audioTracks.map {
+                        TrackOption(id: "dvda-\($0.index)", displayName: $0.label,
+                                    payload: .dvDirectAudio($0.index))
+                    }
+                    self.selectedAudioID = "dvda-\(engine.currentAudioIndex)"
+                    self.fetchAddonSubtitles()
+                    self.rebuildSubtitleOptions()
                     self.trailMem("direct start")
                 } else {
                     Self.dvTrail("direct engine declined (\(reason)) — remux path")
@@ -841,10 +892,12 @@ final class PlayerViewModel: ObservableObject {
             rate = fps
             if (23.5...24.2).contains(rate) { rate = 23.976 }
         }
-        displayManager.preferredDisplayCriteria = AVDisplayCriteria(
+        guard let criteria = AVDisplayCriteria(
             refreshRate: rate, videoDynamicRange: DynamicRange.dolbyVision.rawValue
-        )
-        displayCriteriaApplied = true
+        ) else { return }
+        if SessionDisplayMode.applyOnce(criteria, via: displayManager) {
+            displayCriteriaApplied = true
+        }
     }
 
     /// Where a native remux must START so it covers what the viewer is
@@ -3390,6 +3443,8 @@ final class PlayerViewModel: ObservableObject {
             }
         case .vlcAudio(let id):
             vlcEngine?.selectAudio(id)
+        case .dvDirectAudio(let index):
+            dvDirectEngine?.selectAudio(index: index)
         default:
             break
         }

@@ -16,8 +16,9 @@ struct StreamProbeResult {
     /// and the DV-first path needs it — a session that never opens the FFmpeg
     /// engine has no other duration source until AVPlayer reports one.
     var durationSeconds: Double = 0
-    /// The video stream carries an eligible audio sibling for the remux
-    /// (E-AC3/AC3/AAC — TrueHD/DTS can't ride the native pipeline).
+    /// The file carries at least one audio track. (Formerly restricted to
+    /// E-AC3/AC3/AAC for the remux path; the direct sample engine decodes
+    /// everything else to LPCM, so ANY audio is now eligible.)
     var hasEligibleAudio = false
 }
 
@@ -108,10 +109,7 @@ enum StreamProbe {
                     }
                 }
             case AVMEDIA_TYPE_AUDIO:
-                let id = par.pointee.codec_id
-                if id == AV_CODEC_ID_EAC3 || id == AV_CODEC_ID_AC3 || id == AV_CODEC_ID_AAC {
-                    result.hasEligibleAudio = true
-                }
+                result.hasEligibleAudio = true
             default: break
             }
         }
