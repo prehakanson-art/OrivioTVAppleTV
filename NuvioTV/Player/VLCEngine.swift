@@ -61,7 +61,17 @@ final class VLCEngine: NSObject {
     func stop() { player.stop() }
 
     func seek(to seconds: TimeInterval) {
-        player.time = VLCTime(int: Int32(max(seconds, 0) * 1000))
+        let target = max(seconds, 0)
+        // The time setter is silently ignored on many network streams (VLC
+        // played from 0 after every engine switch); the POSITION-fraction
+        // setter is what VLCKit honors reliably for HTTP input. Use it when
+        // the media length is known, keeping the time setter as the fallback
+        // for local/parsed media and as a best-effort first shot.
+        player.time = VLCTime(int: Int32(target * 1000))
+        let lengthMs = player.media?.length.intValue ?? 0
+        if lengthMs > 0 {
+            player.position = Float(min(max(target * 1000 / Double(lengthMs), 0), 0.999))
+        }
     }
 
     var currentTime: TimeInterval { Double(player.time.intValue) / 1000 }
