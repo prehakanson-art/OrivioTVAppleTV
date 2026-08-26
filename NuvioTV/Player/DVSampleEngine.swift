@@ -52,7 +52,7 @@ final class DVSampleEngine {
     private(set) var detectedDVProfile = 0
 
     /// Eligible audio tracks discovered at open, for the picker.
-    struct AudioTrack { let index: Int32; let label: String }
+    struct AudioTrack { let index: Int32; let label: String; let lang: String }
     private(set) var audioTracks: [AudioTrack] = []
 
     struct SubtitleTrack { let index: Int32; let label: String; let isBitmap: Bool }
@@ -499,7 +499,7 @@ final class DVSampleEngine {
                 let language = Locale.current.localizedString(forLanguageCode: lang) ?? lang
                 let label = [language, codecName, channels > 0 ? "\(channels)ch" : ""]
                     .filter { !$0.isEmpty }.joined(separator: " · ")
-                audioTracks.append(AudioTrack(index: Int32(i), label: label.isEmpty ? "Track \(i)" : label))
+                audioTracks.append(AudioTrack(index: Int32(i), label: label.isEmpty ? "Track \(i)" : label, lang: lang))
                 // RANKED default, not first-wins: remuxes routinely put a 2ch
                 // commentary first, and taking it made "native" sessions open
                 // on the director track. Same policy as the FFmpeg engine:

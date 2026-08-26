@@ -755,7 +755,10 @@ final class PlayerViewModel: ObservableObject {
             let felHDR10 = false
             let engine = DVSampleEngine(
                 input: url.absoluteString, startAt: resume,
-                preferredAudioLanguage: self.settings.preferredAudioLanguage,
+                // Per-title memory outranks the global preference: the track you
+                // picked for this movie/show is what you meant for it.
+                preferredAudioLanguage: PlaybackMemory.memory(for: self.meta.id)?.audioLanguage
+                    ?? self.settings.preferredAudioLanguage,
                 convertProfile7: p7ok,
                 requestHeaders: entry.stream.behaviorHints?.proxyHeaders?.requestHeaders,
                 downmixToStereo: !spatial,
@@ -3261,6 +3264,12 @@ final class PlayerViewModel: ObservableObject {
             vlcEngine?.selectAudio(id)
         case .dvDirectAudio(let index):
             dvDirectEngine?.selectAudio(index: index)
+            // Same language memory the KSPlayer path keeps: the language
+            // carries to every episode; ids don't.
+            if let lang = dvDirectEngine?.audioTracks.first(where: { $0.index == index })?.lang,
+               !lang.isEmpty {
+                PlaybackMemory.update(meta.id) { $0.audioLanguage = lang }
+            }
         default:
             break
         }
