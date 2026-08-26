@@ -154,14 +154,25 @@ final class DVSampleEngine {
     private var timeTimer: Timer?
     private let feedQueue = DispatchQueue(label: "dv-sample-feed")
 
+    /// Fold decoded multichannel down to stereo IN THE ENGINE. tvOS cannot
+    /// bitstream TrueHD/DTS — they always decode to PCM — and on a route
+    /// with no spatial support the renderer must live-downmix 8ch→2ch on
+    /// every buffer, on an A10X. That real-time mixer load is the prime
+    /// suspect for the crackly TrueHD sound AND the video judder (the
+    /// synchronizer slaves video to the audio renderer's clock). On a
+    /// stereo route this fold is what the listener would hear anyway.
+    let downmixToStereo: Bool
+
     init(input: String, startAt: Double,
          preferredAudioLanguage: String, convertProfile7: Bool,
-         requestHeaders: [String: String]? = nil) {
+         requestHeaders: [String: String]? = nil,
+         downmixToStereo: Bool = false) {
         inputURLString = input
         self.startAt = max(startAt, 0)
         self.preferredAudioLanguage = preferredAudioLanguage
         self.convertProfile7 = convertProfile7
         self.requestHeaders = requestHeaders
+        self.downmixToStereo = downmixToStereo
     }
 
     // MARK: Lifecycle
@@ -195,10 +206,14 @@ final class DVSampleEngine {
     /// deliberate pause, and refill must not resume one.
     private var userRate: Float = 1
     private var autoPaused = false
+    private var playbackClockStarted = false
+    private let startupVideoPreroll = 18
 
     func play() {
-        userRate = 1
-        synchronizer.setRate(1, time: synchronizer.currentTime())
+        if userRate <= 0 { userRate = 1 }
+        if playbackClockStarted, !autoPaused {
+            synchronizer.setRate(userRate, time: synchronizer.currentTime())
+        }
     }
 
     func pause() {
@@ -208,7 +223,12 @@ final class DVSampleEngine {
 
     var rate: Float {
         get { synchronizer.rate }
-        set { synchronizer.setRate(newValue, time: synchronizer.currentTime()) }
+        set {
+            userRate = newValue
+            if playbackClockStarted, !autoPaused {
+                synchronizer.setRate(newValue, time: synchronizer.currentTime())
+            }
+        }
     }
 
     /// Seek: flush the renderers, point the demuxer at the target, restart
@@ -225,7 +245,8 @@ final class DVSampleEngine {
         queueLock.unlock()
         displayLayer.flush()
         audioRenderer.flush()
-        synchronizer.setRate(synchronizer.rate == 0 ? 0 : 1,
+        let targetRate = playbackClockStarted && !autoPaused && userRate > 0 ? userRate : 0
+        synchronizer.setRate(targetRate,
                              time: CMTime(seconds: target, preferredTimescale: 90000))
     }
 
@@ -429,8 +450,9 @@ final class DVSampleEngine {
             guard let self else { return }
             self.startCompletion?(true, "")
             self.startCompletion = nil
-            self.synchronizer.setRate(1, time: CMTime(seconds: self.startAt, preferredTimescale: 90000))
+            self.synchronizer.setRate(0, time: CMTime(seconds: self.startAt, preferredTimescale: 90000))
             self.installFeeders()
+            self.onBuffering?(true)
             self.timeTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
                 guard let self else { return }
                 self.onTime?(self.position)
@@ -468,6 +490,17 @@ final class DVSampleEngine {
                 let depth = self.videoQueue.count
                 let eof = self.demuxEOF
                 self.queueLock.unlock()
+                if !self.playbackClockStarted {
+                    if depth >= self.startupVideoPreroll || eof {
+                        self.playbackClockStarted = true
+                        self.autoPaused = false
+                        if self.userRate > 0 {
+                            self.synchronizer.setRate(self.userRate, time: self.synchronizer.currentTime())
+                        }
+                        self.onBuffering?(false)
+                    }
+                    return
+                }
                 if !eof {
                     if depth == 0, !self.autoPaused, self.userRate > 0, self.synchronizer.rate > 0 {
                         self.autoPaused = true
@@ -476,7 +509,7 @@ final class DVSampleEngine {
                     } else if self.autoPaused, depth >= 16 {
                         self.autoPaused = false
                         if self.userRate > 0 {
-                            self.synchronizer.setRate(1, time: self.synchronizer.currentTime())
+                            self.synchronizer.setRate(self.userRate, time: self.synchronizer.currentTime())
                         }
                         self.onBuffering?(false)
                     }
@@ -534,6 +567,8 @@ final class DVSampleEngine {
             let tb = isVideo ? vTB
                 : (ictx!.pointee.streams[Int(index)]?.pointee.time_base ?? aTB)
             let pts = Double(packet.pointee.pts) * av_q2d(tb)
+            let dts = packet.pointee.dts != Int64.min
+                ? Double(packet.pointee.dts) * av_q2d(tb) : pts
             let dur = packet.pointee.duration > 0
                 ? Double(packet.pointee.duration) * av_q2d(tb) : 0
 
@@ -563,7 +598,7 @@ final class DVSampleEngine {
             guard let sample = Self.makeSample(
                 bytes: bytes,
                 format: isVideo ? vFormat : audioFormats[index],
-                ptsSeconds: pts, durationSeconds: dur,
+                ptsSeconds: pts, dtsSeconds: dts, durationSeconds: dur,
                 keyframe: (packet.pointee.flags & 0x0001) != 0
             ) else { continue }
             if displaySuppressed { Self.markDoNotDisplay(sample) }
@@ -644,7 +679,7 @@ final class DVSampleEngine {
             let samples = Int(frame.pointee.nb_samples)
             let rate = frame.pointee.sample_rate
             guard channels > 0, samples > 0, rate > 0 else { continue }
-            guard let pcm = Self.interleaveToFloat32(frame: frame.pointee,
+            guard var pcm = Self.interleaveToFloat32(frame: frame.pointee,
                                                     channels: channels, samples: samples)
             else {
                 if !loggedAudioDecodeFailure {
@@ -658,10 +693,15 @@ final class DVSampleEngine {
                 NSLog("[DVSample] first PCM out: %dch %dHz %d samples fmt=%d",
                       channels, rate, samples, frame.pointee.format)
             }
-            if pcmFormat == nil || pcmRate != rate || pcmChannels != Int32(channels) {
-                pcmFormat = Self.makeLPCMFormat(rate: rate, channels: Int32(channels))
+            var outChannels = channels
+            if downmixToStereo, channels > 2 {
+                pcm = Self.downmix(pcm, channels: channels, samples: samples)
+                outChannels = 2
+            }
+            if pcmFormat == nil || pcmRate != rate || pcmChannels != Int32(outChannels) {
+                pcmFormat = Self.makeLPCMFormat(rate: rate, channels: Int32(outChannels))
                 pcmRate = rate
-                pcmChannels = Int32(channels)
+                pcmChannels = Int32(outChannels)
             }
             guard pcmFormat != nil else { continue }
             let pts = frame.pointee.pts != Int64.min
@@ -674,6 +714,26 @@ final class DVSampleEngine {
             if pcmBatchFrames >= Int(rate) / 4 {
                 flushPCMBatch(into: &out)
             }
+        }
+        return out
+    }
+
+    /// ITU-style stereo fold for FFmpeg's native channel order
+    /// (FL FR FC LFE BL BR [SL SR]): center/surrounds at -3 dB, LFE -6 dB,
+    /// the sum scaled to keep peaks out of clipping.
+    private static func downmix(_ pcm: [Float], channels: Int, samples: Int) -> [Float] {
+        var out = [Float](repeating: 0, count: samples * 2)
+        let c: Float = 0.7071
+        for i in 0 ..< samples {
+            let base = i * channels
+            var left = pcm[base]
+            var right = pcm[base + 1]
+            if channels > 2 { left += c * pcm[base + 2]; right += c * pcm[base + 2] }        // FC
+            if channels > 3 { left += 0.5 * pcm[base + 3]; right += 0.5 * pcm[base + 3] }    // LFE
+            if channels > 5 { left += c * pcm[base + 4]; right += c * pcm[base + 5] }        // BL/BR
+            if channels > 7 { left += c * pcm[base + 6]; right += c * pcm[base + 7] }        // SL/SR
+            out[i * 2] = left * 0.5
+            out[i * 2 + 1] = right * 0.5
         }
         return out
     }
@@ -824,7 +884,7 @@ final class DVSampleEngine {
 
     private static func makeSample(
         bytes: [UInt8], format: CMFormatDescription?,
-        ptsSeconds: Double, durationSeconds: Double, keyframe: Bool
+        ptsSeconds: Double, dtsSeconds: Double, durationSeconds: Double, keyframe: Bool
     ) -> CMSampleBuffer? {
         guard let format else { return nil }
         var block: CMBlockBuffer?
@@ -845,7 +905,7 @@ final class DVSampleEngine {
             duration: durationSeconds > 0
                 ? CMTime(seconds: durationSeconds, preferredTimescale: 90000) : .invalid,
             presentationTimeStamp: CMTime(seconds: ptsSeconds, preferredTimescale: 90000),
-            decodeTimeStamp: .invalid
+            decodeTimeStamp: CMTime(seconds: dtsSeconds, preferredTimescale: 90000)
         )
         var size = bytes.count
         var sample: CMSampleBuffer?

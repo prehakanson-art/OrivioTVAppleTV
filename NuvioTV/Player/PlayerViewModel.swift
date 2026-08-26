@@ -783,11 +783,16 @@ final class PlayerViewModel: ObservableObject {
             // TIER 1: the sample-feed engine — no AVPlayer, no HLS, no
             // CoreMedia retention; the app owns (and bounds) every buffer.
             // Its failure falls to TIER 2, the remux+AVPlayer path.
+            // Downmix in-engine when the route can't use multichannel —
+            // see DVSampleEngine.downmixToStereo.
+            let spatial = AVAudioSession.sharedInstance().currentRoute.outputs
+                .contains { $0.isSpatialAudioEnabled }
             let engine = DVSampleEngine(
                 input: url.absoluteString, startAt: resume,
                 preferredAudioLanguage: self.settings.preferredAudioLanguage,
                 convertProfile7: p7ok,
-                requestHeaders: entry.stream.behaviorHints?.proxyHeaders?.requestHeaders
+                requestHeaders: entry.stream.behaviorHints?.proxyHeaders?.requestHeaders,
+                downmixToStereo: !spatial
             )
             self.dvDirectEngine = engine
             self.duration = probe.durationSeconds
@@ -860,6 +865,9 @@ final class PlayerViewModel: ObservableObject {
                         self.requestDVDisplayMode(fps: engine.videoFPS)
                     } else if probe.isPQ {
                         self.requestHDR10DisplayMode(fps: engine.videoFPS)
+                    }
+                    if self.playbackSpeed != 1 {
+                        engine.rate = self.playbackSpeed
                     }
                     // Pickers: audio from the engine's own track list;
                     // subtitles via the addon search — SubtitleOverlayView
@@ -2556,7 +2564,10 @@ final class PlayerViewModel: ObservableObject {
                 vlcEngine?.seek(to: resume)
             }
             pendingResume = nil
-            if playbackSpeed != 1 { vlcEngine?.rate = playbackSpeed }
+            if playbackSpeed != 1 {
+                if let dvDirectEngine { dvDirectEngine.rate = playbackSpeed }
+                else { vlcEngine?.rate = playbackSpeed }
+            }
             fetchAddonSubtitles()
             startThumbnailsIfNeeded()
             if overlay == .none { showControls() }
@@ -3542,7 +3553,8 @@ final class PlayerViewModel: ObservableObject {
     func setSpeed(_ speed: Float) {
         playbackSpeed = speed
         PlaybackMemory.update(meta.id) { $0.speed = speed == 1 ? nil : speed }
-        if let vlcEngine { vlcEngine.rate = speed }
+        if let dvDirectEngine { dvDirectEngine.rate = speed }
+        else if let vlcEngine { vlcEngine.rate = speed }
         else { playerLayer?.player.playbackRate = speed }
         showToast("Speed \(speed == 1 ? "Normal" : String(format: "%gx", speed))")
     }
