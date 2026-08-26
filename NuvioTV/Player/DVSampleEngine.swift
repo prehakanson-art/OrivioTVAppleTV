@@ -155,16 +155,20 @@ final class DVSampleEngine {
     /// so sample creation can never fail (the old jitter-chase regression).
     private var ptsGridAnchor: Double = -1   // demux-thread only
 
-    private func snapVideoPTS(_ pts: Double, dts: Double) -> Double {
+    private var gridFrameDuration: Double {
         let fps = Double(videoFPS)
-        guard fps > 10 else { return pts }
-        let frameDur: Double
+        guard fps > 10 else { return 0 }
         switch fps {
-        case 23.5...24.2: frameDur = 1001.0 / 24000.0
-        case 29.5...30.2: frameDur = 1001.0 / 30000.0
-        case 59.5...60.2: frameDur = 1001.0 / 60000.0
-        default: frameDur = 1.0 / fps
+        case 23.5...24.2: return 1001.0 / 24000.0
+        case 29.5...30.2: return 1001.0 / 30000.0
+        case 59.5...60.2: return 1001.0 / 60000.0
+        default: return 1.0 / fps
         }
+    }
+
+    private func snapVideoPTS(_ pts: Double, dts: Double) -> Double {
+        let frameDur = gridFrameDuration
+        guard frameDur > 0 else { return pts }
         if ptsGridAnchor < 0 { ptsGridAnchor = pts; return pts }
         let idx = ((pts - ptsGridAnchor) / frameDur).rounded()
         let snapped = ptsGridAnchor + idx * frameDur
@@ -707,11 +711,19 @@ final class DVSampleEngine {
                 }
                 continue
             }
+            // Duration rides the same grid as the PTS: the container's
+            // ms-rounded 41/42ms durations feed straight into the display
+            // layer's scheduling; hand it the exact cadence instead.
+            var sampleDur = dur
+            if isVideo {
+                let frameDur = gridFrameDuration
+                if frameDur > 0, abs(dur - frameDur) < 0.002 { sampleDur = frameDur }
+            }
             guard let sample = Self.makeSample(
                 bytes: bytes,
                 format: isVideo ? vFormat : audioFormats[index],
                 ptsSeconds: isVideo ? snapVideoPTS(pts, dts: dts) : pts,
-                dtsSeconds: dts, durationSeconds: dur,
+                dtsSeconds: dts, durationSeconds: sampleDur,
                 keyframe: (packet.pointee.flags & 0x0001) != 0
             ) else { continue }
             if displaySuppressed { Self.markDoNotDisplay(sample) }
