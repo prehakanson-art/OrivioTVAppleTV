@@ -153,7 +153,13 @@ final class DVSampleEngine {
     /// and each drain was a visible hitch ("kind of jittery"). ~8s absorbs
     /// them for ~50 MB, pocket change at this engine's footprint.
     private let videoQueueCap = 192
-    private let audioQueueCap = 96
+    /// COUNT-based cap, so it must track batch duration: at 21 ms LPCM
+    /// batches, the old 96 held only ~2 s — and because the demuxer BLOCKS
+    /// on a full audio queue, video could never buffer past ~2 s either,
+    /// silently gutting the 8 s video cushion. 384 restores ~8 s for the
+    /// decode path (passthrough packets are ~32 ms, so ~12 s there — fine,
+    /// they're small).
+    private let audioQueueCap = 384
     private var demuxEOF = false
 
     @Atomic private var cancelled = false
@@ -789,9 +795,13 @@ final class DVSampleEngine {
             if pcmClockAnchor.isNaN || abs(pts - (pcmClockAnchor + Double(pcmClockFrames + pcmBatchFrames) / Double(rate))) > 0.1 {
                 // (Re)anchor: first audio after open/seek/switch, or a real
                 // discontinuity — never for the container's 1 ms rounding.
+                // FLUSH FIRST: the pending batch belongs to the OLD anchor,
+                // and flushing bumps the frame counter — zeroing the counter
+                // before the flush credited the old batch's frames to the
+                // new anchor, offsetting every later batch by up to 21 ms.
+                flushPCMBatch(into: &out)   // don't blend across the jump
                 pcmClockAnchor = pts
                 pcmClockFrames = 0
-                flushPCMBatch(into: &out)   // don't blend across the jump
             }
             if pcmBatchStartPTS < 0 {
                 pcmBatchStartPTS = pcmClockAnchor + Double(pcmClockFrames) / Double(rate)
