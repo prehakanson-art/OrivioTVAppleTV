@@ -582,7 +582,7 @@ final class PlayerViewModel: ObservableObject {
             let windowEnd = dvRemuxFinished ? .infinity : dvTimeOffset + dvWrittenSeconds
             let windowStart = dvTimeOffset + dvPrunedThrough
             if seconds < windowStart - 2 || seconds > windowEnd + 4 {
-                restartNativeDV(at: seconds)
+                // legacy remux tier retired — unreachable (usingNativeDV is never set)
                 return
             }
             playerLayer?.seek(time: max(seconds - dvTimeOffset, 0), autoPlay: autoPlay) { _ in }
@@ -621,7 +621,6 @@ final class PlayerViewModel: ObservableObject {
 
     /// HDR10+ dynamic metadata found in the source by the header probe.
     @Published private(set) var hasHDR10Plus = false
-    private var dvRemuxer: DVRemuxer?
     /// Absolute source time (seconds) that the local playlist's t=0 maps to.
     private var dvTimeOffset: Double = 0
     /// The loopback playlist the native session is playing — kept so the
@@ -657,101 +656,14 @@ final class PlayerViewModel: ObservableObject {
     }
     private var dvAttempted = false
     private var dvRestarting = false
-    /// Old remuxers kept alive until teardown so their segment dirs survive
-    /// while AVPlayer may still be reading from them mid-restart.
-    private var dvRetiredRemuxers: [DVRemuxer] = []
 
-    /// Called from readyToPlay on the FFmpeg engine. Starts a background
-    /// remux when every gate passes; playback continues undisturbed until the
-    /// playlist is ready, then switches in place.
-    private func maybeStartNativeDV() {
-        // Compatibility mode: never leave the plain decode path. The HDR10-
-        // mapped Metal output is the most forgiving pipeline this player has.
-        if activeMode == .compatibility {
-            if playerLayer?.player.tracks(mediaType: .video)
-                .first(where: \.isEnabled)?.dovi != nil, !dvAttempted {
-                dvAttempted = true
-                decisionLog.record("Dolby Vision", "HDR10-mapped decode",
-                                   because: "Compatibility mode skips the native-DV remux")
-            }
-            return
-        }
-        // MEMORY PRECONDITION. The native pipeline needs ~400-500 MB of
-        // headroom, and the in-process retention it accrues is PROCESS-scoped
-        // (survives AVPlayerItem recycling — proven live). Without this gate,
-        // a memory-guard step-down was immediately followed by a fresh DV
-        // attempt on the same ballasted process: an infinite DV/HDR10
-        // alternation that ratcheted the footprint up each cycle until
-        // jetsam. Starting only from a lean process makes the guard's
-        // step-down stick for the session while leaving DV fully available
-        // to the next fresh launch — and self-heals if memory ever comes
-        // back down.
-        guard Self.memoryFootprintMB() < 850 else {
-            if !dvAttempted {
-                dvAttempted = true
-                decisionLog.record("Dolby Vision", "HDR10-mapped decode",
-                                   because: "not enough free memory for the native pipeline this session")
-                // Tell the viewer HOW to get DV back — the ballast a spent DV
-                // session leaves behind survives exiting the player (it's
-                // process-scoped), so without this hint DV just silently
-                // never returns until the next app launch and it reads as
-                // broken rather than recoverable.
-                showToast("Dolby Vision off — restart the app to re-enable")
-            }
-            return
-        }
-        guard settings.nativeDolbyVision,
-              !usingNativeDV, !dvAttempted, dvRemuxer == nil, !isExiting,
-              // Auto or explicit FFmpeg: both decode DV as HDR10-mapped Metal
-              // output, so the native remux is an upgrade for either. (VLC and
-              // explicit-native sessions never reach a KSMEPlayer DV probe.)
-              effectiveEngine == .auto || effectiveEngine == .ffmpeg,
-              let player = playerLayer?.player, player is KSMEPlayer,
-              let urlString = currentEntry.stream.url,
-              !dvFailedURLs.contains(urlString),
-              currentURL?.isFileURL != true,
-              DynamicRange.availableHDRModes.contains(.dolbyVision)
-        else { return }
-        let track = player.tracks(mediaType: .video).first(where: \.isEnabled)
-            ?? player.tracks(mediaType: .video).first
-        // Profile 5/8 always; Profile 7 only with the libdovi 7→8.1 conversion
-        // enabled. Fidelity mode turns the conversion on regardless of the
-        // tier default — its contract is "never silently downgrade".
-        let p7ok = activeMode == .fidelity || settings.dolbyVisionProfile7
-        guard let profile = track?.dovi?.dv_profile else { return }
-        guard profile == 5 || profile == 8 || (profile == 7 && p7ok) else {
-            if profile == 7, !dvAttempted {
-                dvAttempted = true
-                decisionLog.record("Dolby Vision", "HDR10 base layer",
-                                   because: "Profile 7 conversion is off (Settings → Playback)")
-            }
-            return
-        }
+    // maybeStartNativeDV removed with the legacy remux tier. DV files get
+    // the direct sample engine via DV-first; everything else plays the
+    // HDR10-mapped FFmpeg path.
+    private func maybeStartNativeDV() {}
 
-        dvAttempted = true
-        decisionLog.record(
-            "Dolby Vision",
-            profile == 7 ? "Native DV (Profile 7 → 8.1)" : "Native DV (Profile \(Int(profile)))",
-            because: profile == 7
-                ? (activeMode == .fidelity && !settings.dolbyVisionProfile7
-                    ? "Fidelity mode converts Profile 7 even where the tier default is off"
-                    : "dual-layer P7 converted so Apple's pipeline accepts it")
-                : "display supports Dolby Vision; remuxing for Apple's pipeline"
-        )
-        NSLog("[OrivioDV] DV profile %d detected — starting background remux", Int(profile))
-        // Persisted, so "was this title actually the heavy dual-layer P7
-        // path?" is answerable after the fact instead of needing a live log.
-        Self.dvTrail("DV profile \(Int(profile)) detected — P7 conversion \(p7ok ? "enabled" : "off")")
-        startDVRemux(from: max(nativeRemuxStartTarget - 2, 0), isRestart: false)
-    }
-
-    /// Called from readyToPlay right after the DV attempt. If the probe already
-    /// found HDR10+ and DV declined this title, this is where HDR10+ picks it
-    /// up — the tracks are real by now, which is what the decision needs.
-    private func maybeStartNativeHDR10PlusAfterTracks() {
-        guard hasHDR10Plus, !usingNativeDV, dvRemuxer == nil else { return }
-        maybeStartNativeHDR10Plus()
-    }
+    // HDR10+ remux starter removed: the direct engine passes HDR10+ SEIs
+    // through natively.
 
     /// What playback actually falls back TO when the native path fails —
     /// different payloads degrade to different things, and the panel must not
@@ -999,10 +911,6 @@ final class PlayerViewModel: ObservableObject {
             guard !Task.isCancelled, let stillSelf = self as PlayerViewModel?, !stillSelf.isExiting else { return }
             if !stillSelf.hasStartedPlayback, stillSelf.usingNativeDV, stillSelf.playerLayer == nil {
                 Self.dvTrail("DV-first: no playable playlist after 45s — falling back")
-                stillSelf.dvRemuxer?.cancel()
-                stillSelf.dvRemuxer?.stopServer()
-                stillSelf.dvRemuxer?.cleanup()
-                stillSelf.dvRemuxer = nil
                 stillSelf.usingNativeDV = false
                 stillSelf.dvRestarting = false
                 stillSelf.load(entry: entry)
@@ -1029,7 +937,7 @@ final class PlayerViewModel: ObservableObject {
             duration = probeDuration
             clock.duration = probeDuration
             dvFullDuration = probeDuration
-            startDVRemux(from: max(resume - 2, 0), isRestart: true)
+            // legacy remux restart retired
         } else {
             usingNativeDV = false
             dvRestarting = false
@@ -1117,148 +1025,12 @@ final class PlayerViewModel: ObservableObject {
         max(max(position, pendingResume ?? 0), sessionResumeFloor)
     }
 
-    private func startDVRemux(from startAt: Double, isRestart: Bool) {
-        guard let urlString = currentEntry.stream.url else { return }
-        if let old = dvRemuxer {
-            old.cancel()
-            dvRetiredRemuxers.append(old)
-        }
-        let remuxer = DVRemuxer(
-            input: urlString, startAt: startAt,
-            preferredAudioLanguage: settings.preferredAudioLanguage,
-            convertProfile7: settings.dolbyVisionProfile7,
-            allowHDR10Only: nativeKind == .hdr10Plus
-        )
-        dvRemuxer = remuxer
-        remuxer.onIneligible = { [weak self] reason in
-            guard let self, self.dvRemuxer === remuxer else { return }
-            NSLog("[OrivioDV] ineligible: %@", reason)
-            Self.dvTrail("ineligible — \(reason)")
-            self.decisionLog.record(self.nativeKind.stage, self.nativeFallbackLabel,
-                                    because: "remux ineligible: \(reason)")
-            self.dvFailedURLs.insert(urlString)
-            if self.usingNativeDV { self.abandonNativeDV(reason: "became ineligible mid-play: \(reason)") }
-            // Cleanup AFTER the abandon forensics have read the directory.
-            self.dvRemuxer?.cleanup()
-            self.dvRemuxer = nil
-        }
-        remuxer.onError = { [weak self] message in
-            guard let self, self.dvRemuxer === remuxer else { return }
-            NSLog("[OrivioDV] remux error: %@", message)
-            // Persisted so the failure is readable AFTER the fact (the console
-            // attach keeps dying with the app lifecycle) — same pattern as the
-            // other diagnostics. Newest failure wins; success clears it.
-            Self.dvTrail("remux error — \(message)")
-            // The panel said "Native DV" the moment the remux STARTED; a
-            // failure must correct it or the info panel lies about the output.
-            self.decisionLog.record(self.nativeKind.stage, self.nativeFallbackLabel,
-                                    because: "native \(self.nativeKind.label) remux failed: \(message)")
-            self.dvFailedURLs.insert(urlString)
-            if self.usingNativeDV { self.abandonNativeDV(reason: "remux error mid-play: \(message)") }
-            // Cleanup AFTER the abandon forensics have read the directory —
-            // and always cleanup, or failed remuxers leak their segment dirs
-            // in tmp (found five of them during the P7 investigation).
-            self.dvRemuxer?.cleanup()
-            self.dvRemuxer = nil
-        }
-        remuxer.onProgress = { [weak self] written in
-            guard let self, self.dvRemuxer === remuxer else { return }
-            self.dvWrittenSeconds = max(self.dvWrittenSeconds, written)
-            // PRE-SWITCH DRAIN. Once the remux has clearly taken (10s+
-            // written), this session is headed for the engine swap — and the
-            // FFmpeg engine's read-ahead cache is the largest thing that gets
-            // stranded when the old engine fails to deinit (a KSPlayer bug
-            // patched but, per live measurement, not fully cured). KSPlayer
-            // reads maxBufferDuration LIVE, so shrinking it here lets the
-            // cache drain to a few seconds during the remaining cushion
-            // build: ~100 MB less alive at the swap, ~100 MB less stranded
-            // after it. If the remux dies instead of switching, a 6s cap on
-            // an actively-refilling stream is a shallower cushion, not a
-            // stall — the same cap the 2 GB tier always runs with.
-            if !self.usingNativeDV, written > 10,
-               let options = self.currentOptions, options.maxBufferDuration > 6 {
-                options.maxBufferDuration = 6
-                NSLog("[OrivioDV] pre-switch drain: engine cache capped at 6s")
-            }
-        }
-        remuxer.onWindowStart = { [weak self] pruned in
-            guard let self, self.dvRemuxer === remuxer else { return }
-            self.dvPrunedThrough = max(self.dvPrunedThrough, pruned)
-        }
-        remuxer.onFinished = { [weak self] in
-            guard let self, self.dvRemuxer === remuxer else { return }
-            self.dvRemuxFinished = true
-        }
-        remuxer.onReady = { [weak self] playlist, actualStart in
-            guard let self, self.dvRemuxer === remuxer, !self.isExiting else { return }
-            self.dvTimeOffset = actualStart
-            self.dvRestarting = false
-            if isRestart {
-                self.load(entry: self.currentEntry, overrideURL: playlist)
-            } else {
-                self.switchToNativeDV(playlist: playlist)
-            }
-        }
-        let pace = settings.dolbyVisionProfile7Pace
-        // Initial switch waits for a 20s cushion ahead of the viewer (see
-        // minReadySecondsAhead) — enough for AVPlayer's ~12s forward buffer
-        // plus margin, and once the switch happens the FFmpeg engine stops
-        // pulling the source, so the worker's available bandwidth roughly
-        // doubles. A seek-restart of an already-proven session keeps the
-        // fast 3-segment gate so seeks stay snappy.
-        remuxer.minReadySecondsAhead = isRestart ? 0 : 20
-        remuxer.qos = pace.qos
-        remuxer.paceSpeedFactor = pace.speedFactor
-        remuxer.paceLeadSeconds = pace.leadSeconds
-        remuxer.start()
-    }
+    // startDVRemux removed with the legacy remux tier: the direct sample
+    // engine is the only native pipeline; its failures fall to FFmpeg.
 
-    /// The playlist is playable — swap engines in place, keeping position.
-    private func switchToNativeDV(playlist: URL) {
-        guard !usingNativeDV, !isExiting else { return }
-        dvFullDuration = duration
-        dvRemuxFinished = dvRemuxFinished || false
-        usingNativeDV = true
-        sessionResumeFloor = max(sessionResumeFloor, dvTimeOffset)
-        // Resume the playlist AT THE CURRENT POSITION, not at its start.
-        // The playlist's t=0 is where the REMUX started — which is where the
-        // viewer was when the background remux kicked off, minutes ago by the
-        // time the cushion gate lets the switch happen. The old
-        // `pendingResume = nil` played the playlist from 0, silently throwing
-        // the viewer back to the remux start on every switch: barely a
-        // stutter under the old 6-second ready gate, a jump back of MINUTES
-        // under the cushion gate — the "turning on DV restarts the stream"
-        // and "takes forever to load" reports. readyToPlay translates this
-        // absolute time into the playlist's local timeline (− dvTimeOffset),
-        // and everything from dvTimeOffset forward is on disk by definition.
-        pendingResume = position > dvTimeOffset + 5 ? position : nil
-        // Flatten the switch-window memory spike: hold the remux worker's
-        // network sprint while the old engine tears down and AVPlayer fills
-        // its first buffer (both from disk, unaffected by the hold).
-        dvRemuxer?.pauseReadsUntil = Date().addingTimeInterval(6)
-        ImageCache.shared.dropDecoded()
-        showToast("\(nativeKind.label) — native output")
-        Self.dvTrail("switched to native \(nativeKind.label) OK")
-        trailMem("at switch")
-        NSLog("[OrivioDV] switching to native playlist (offset %.1fs)", dvTimeOffset)
-        dvPlaylistURL = playlist
-        load(entry: currentEntry, overrideURL: playlist)
-    }
+    // switchToNativeDV removed with the legacy remux tier.
 
-    /// A seek landed outside the remuxed window — re-remux from the target.
-    private func restartNativeDV(at target: Double) {
-        guard usingNativeDV, !dvRestarting else { return }
-        dvRestarting = true
-        isBuffering = true
-        let clamped = max(min(target, duration > 0 ? duration - 5 : target), 0)
-        position = clamped
-        clock.position = clamped
-        dvWrittenSeconds = 0
-        dvPrunedThrough = 0
-        dvRemuxFinished = false
-        NSLog("[OrivioDV] out-of-window seek → re-remux from %.1fs", clamped)
-        startDVRemux(from: max(clamped - 2, 0), isRestart: true)
-    }
+    // restartNativeDV removed with the legacy remux tier.
 
     /// Longest single trail entry, and the total budget for the whole array.
     ///
@@ -1345,26 +1117,7 @@ final class PlayerViewModel: ObservableObject {
                             format: "memory guard: %.0fMB, +%.0f/tick, projected %.0f — stepping down",
                             mb, rate, projected
                         ))
-                        self.abandonNativeDV(reason: String(format: "memory guard at %.0fMB", mb))
-                    }
-                } else if self.dvRemuxer != nil {
-                    self.lastGuardSample = 0
-                    // PRE-switch guard. The P7 remux phase accrues memory too
-                    // (~10 MB/s observed) and used to run unprotected — a
-                    // session could balloon to jetsam before the switch ever
-                    // happened. Cancelling the remux is even gentler than the
-                    // post-switch abandon: playback never changes engines, the
-                    // viewer just stays on the HDR10 decode they're already
-                    // watching.
-                    let mb = Self.memoryFootprintMB()
-                    if mb > 1250 {
-                        Self.dvTrail(String(format: "pre-switch memory guard at %.0fMB — cancelling remux", mb))
-                        self.decisionLog.record(self.nativeKind.stage, self.nativeFallbackLabel,
-                                                because: String(format: "remux cancelled by memory guard at %.0f MB", mb))
-                        self.dvRemuxer?.cancel()
-                        self.dvRemuxer?.stopServer()
-                        self.dvRemuxer?.cleanup()
-                        self.dvRemuxer = nil
+                        // legacy remux tier retired: nothing to abandon
                     }
                 }
             }
@@ -1392,7 +1145,6 @@ final class PlayerViewModel: ObservableObject {
         let phase: String
         if usingDVDirect { phase = "dvDirect" }
         else if usingNativeDV { phase = "nativeDV" }
-        else if dvRemuxer != nil { phase = "ffmpeg+remuxing" }
         else if vlcEngine != nil { phase = "vlc" }
         else { phase = "ffmpeg" }
         guard result == KERN_SUCCESS else {
@@ -1446,110 +1198,7 @@ final class PlayerViewModel: ObservableObject {
         UserDefaults.standard.set(trail, forKey: "dev.dvTrail")
     }
 
-    /// Any DV failure: return to the FFmpeg engine at the same position —
-    /// i.e. exactly the pre-DV behavior (decoded HDR10).
-    private func abandonNativeDV(reason: String = "unspecified") {
-        guard usingNativeDV else { resetNativeDV(); return }
-        NSLog("[OrivioDV] abandoning native %@ (%@) — falling back to FFmpeg engine",
-              nativeKind.label, reason)
-        Self.dvTrail("abandoned after switch — \(reason)")
-        trailMem("at abandon")
-        // MEMORY-GUARD abandons keep this LIGHT and halt the growth sources
-        // FIRST: the forensic directory walk, playlist read, and preserve
-        // copies all allocate at the exact moment memory is critical — the
-        // step-down must never lose its own race to jetsam.
-        if reason.hasPrefix("memory guard") {
-            dvRemuxer?.cancel()
-            dvRemuxer?.stopServer()
-            decisionLog.record(nativeKind.stage, nativeFallbackLabel,
-                               because: "native \(nativeKind.label) abandoned: \(reason)")
-            showToast("\(nativeKind.label) paused to protect playback — using HDR10")
-            pendingResume = position > 10 ? position : nil
-            sessionResumeFloor = max(sessionResumeFloor, position)
-            load(entry: currentEntry)
-            return
-        }
-        // Forensics: what did the remux directory actually hold when AVPlayer
-        // gave up on it? This is the difference between "playlist never
-        // existed" and "playlist existed and AVPlayer rejected the media".
-        if let dir = dvRemuxer?.directory {
-            let names = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
-            let sizes = names.prefix(8).map { name -> String in
-                let attrs = try? FileManager.default.attributesOfItem(atPath: dir.appendingPathComponent(name).path)
-                return "\(name)=\((attrs?[.size] as? Int) ?? -1)b"
-            }
-            Self.dvTrail("dir at abandon: \(names.count) files [\(sizes.joined(separator: ", "))]")
-            if let playlist = try? String(contentsOf: dir.appendingPathComponent("dv.m3u8"), encoding: .utf8) {
-                // The HEAD of the playlist plus its length — that is what the
-                // forensics actually need (does it have EXT-X-MAP, does it
-                // have segments). Dumping every EXTINF line is what grew this
-                // key until CFPreferences killed the app.
-                let lines = playlist.split(separator: "\n", omittingEmptySubsequences: true)
-                let head = lines.prefix(6).joined(separator: " | ")
-                Self.dvTrail("playlist: \(lines.count) lines — \(head)")
-            }
-            // PRESERVE the rejected output for offline analysis — teardown
-            // cleans the tmp dir minutes later, which is how the first three
-            // captured failures evaporated before they could be pulled off the
-            // device. COPY the analysis-critical files individually rather
-            // than moving the whole directory: the remuxer is still writing
-            // into it at abandon time, and the earlier moveItem failed
-            // silently behind a try?. Every failure is trailed this time.
-            let fm = FileManager.default
-            // Caches, not Documents: tvOS gives apps no writable Documents
-            // directory — the previous attempt failed with a permission error
-            // straight from the platform.
-            let keep = fm.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-                .appendingPathComponent("dv-failed-output", isDirectory: true)
-            try? fm.removeItem(at: keep)
-            do {
-                try fm.createDirectory(at: keep, withIntermediateDirectories: true)
-                var kept: [String] = []
-                for name in ["init.mp4", "dv.m3u8", "seg00000.m4s", "seg00001.m4s"] {
-                    do {
-                        try fm.copyItem(at: dir.appendingPathComponent(name),
-                                        to: keep.appendingPathComponent(name))
-                        kept.append(name)
-                    } catch {
-                        Self.dvTrail("preserve \(name) failed: \(error.localizedDescription)")
-                    }
-                }
-                Self.dvTrail("preserved \(kept.joined(separator: ", ")) in Caches/dv-failed-output")
-            } catch {
-                Self.dvTrail("preserve dir failed: \(error.localizedDescription)")
-            }
-        } else {
-            Self.dvTrail("dir at abandon: remuxer already gone")
-        }
-        decisionLog.record(nativeKind.stage, nativeFallbackLabel,
-                           because: "native \(nativeKind.label) abandoned: \(reason)")
-        // Blacklist the URL only for REAL failures. A memory-guard step-down
-        // or a live-edge catch is a controlled trade on a healthy title — but
-        // blacklisting those meant every replay of that title in the same app
-        // session silently skipped DV entirely: after one guard trip, "DV not
-        // working at all" until the app was relaunched.
-        let controlledStepDown = reason.hasPrefix("memory guard")
-            || reason.hasPrefix("caught the live edge")
-            || reason.contains("stalled")
-        if !controlledStepDown, let urlString = currentEntry.stream.url {
-            dvFailedURLs.insert(urlString)
-        }
-        // The guard step-down is a controlled trade, not a failure — saying
-        // "failed" made a working protection read like a broken feature.
-        showToast(reason.hasPrefix("memory guard")
-            ? "\(nativeKind.label) paused to protect playback — using HDR10"
-            : "Native \(nativeKind.label) failed — using HDR10")
-        pendingResume = position > 10 ? position : nil
-        // Raise the session floor to WHERE THE ABANDON HAPPENED, not where
-        // the session started. load() zeroes `position` and readyToPlay
-        // consumes `pendingResume` — so if the fallback open then hiccups
-        // into a failover, its resume target fell through to the floor, which
-        // still held the ORIGINAL Continue Watching position. That was the
-        // "sometimes it goes back to the resume time" jump: the viewer lost
-        // everything watched since opening the player.
-        sessionResumeFloor = max(sessionResumeFloor, position)
-        load(entry: currentEntry)   // overrideURL nil → resetNativeDV() runs
-    }
+    // abandonNativeDV removed with the legacy remux tier.
 
     /// Tear down DV state (normal loads, teardown). Keeps dvFailedURLs.
     private func resetNativeDV() {
@@ -1563,12 +1212,6 @@ final class PlayerViewModel: ObservableObject {
             dvDirectEngine = nil
             videoRefreshID = UUID()   // make PlayerVideoView re-read activeVideoView
         }
-        dvRemuxer?.cancel()
-        // Nothing will request another segment from a retired session — kill
-        // its loopback server now, not at the directory purge minutes later.
-        dvRemuxer?.stopServer()
-        if let remuxer = dvRemuxer { dvRetiredRemuxers.append(remuxer) }
-        dvRemuxer = nil
         dvPlaylistURL = nil
         usingNativeDV = false
         dvAttempted = false
@@ -1583,41 +1226,9 @@ final class PlayerViewModel: ObservableObject {
         nativeKind = .dolbyVision
     }
 
-    /// Delete every remux directory. Only safe once playback is done.
-    ///
-    /// SYNCHRONOUS, unlike the retired-directory purge: this is the player's
-    /// last moment of life. The old version handed the work to a utility-
-    /// priority detached Task and returned — and a detached low-priority task
-    /// spawned while the player is being dismissed routinely never ran, which
-    /// is how ~1 GB segment directories ended up orphaned in tmp. Blocking
-    /// teardown on the unlinks is cheap next to leaking the disk.
-    ///
-    /// `live` is passed in because `resetNativeDV()` has already retired the
-    /// active remuxer and nil'd `dvRemuxer` by the time teardown gets here —
-    /// reading the property again (as this used to) is always nil, so the
-    /// live session's own directory was never the one being deleted.
-    private func purgeDVDirectories(live: DVRemuxer?) {
-        let retired = dvRetiredRemuxers
-        dvRetiredRemuxers = []
-        for remuxer in retired { remuxer.cleanup() }
-        live?.cleanup()
-    }
-
-    /// Delete the segment directories of RETIRED remuxers only — the live one
-    /// is left alone. Safe to call once playback has settled on the current
-    /// source (see markPlaybackProgressed): the retired dirs were kept around
-    /// solely to cover the window where AVPlayer might still be reading the old
-    /// playlist mid-restart.
-    private func purgeRetiredDVDirectories() {
-        guard !dvRetiredRemuxers.isEmpty else { return }
-        let retired = dvRetiredRemuxers
-        dvRetiredRemuxers = []
-        // Off the main actor: removing a directory of fMP4 segments is real
-        // filesystem work and this runs from the playback clock callback.
-        Task.detached(priority: .utility) {
-            for remuxer in retired { remuxer.cleanup() }
-        }
-    }
+    // Legacy remux tier retired: its segment directories no longer exist,
+    // so there is nothing to purge. PlayerTempSweep still clears any
+    // leftovers from older builds at launch.
 
     // Post-play / auto-next
     let settings: PlayerSettings
@@ -1900,7 +1511,6 @@ final class PlayerViewModel: ObservableObject {
             guard let self, !self.isExiting,
                   self.currentEntry.stream.url == url else { return }
             self.hasHDR10Plus = result.hasHDR10Plus
-            if result.hasHDR10Plus { self.maybeStartNativeHDR10Plus() }
             guard result.hasStyledASS, !self.usingNativeDV,
                   self.effectiveEngine != .vlc else { return }
             NSLog("[OrivioSubs] styled ASS detected — routing to VLC for full rendering")
@@ -1908,45 +1518,7 @@ final class PlayerViewModel: ObservableObject {
         }
     }
 
-    /// HDR10+ found and this Apple TV can output it: take the same native
-    /// remux the DV path uses, for the same reason — only AVPlayer hands the
-    /// bitstream to the display pipeline with its per-frame metadata intact.
-    ///
-    /// Deliberately yields to Dolby Vision: a file carrying both is a DV file
-    /// with an HDR10+ base, and DV is the better output. This only runs when
-    /// no DV session is running or pending.
-    private func maybeStartNativeHDR10Plus() {
-        guard PerformanceProfile.supportsHDR10Plus, settings.hdr10PlusPassthrough,
-              activeMode != .compatibility,
-              !usingNativeDV, !dvAttempted, dvRemuxer == nil, !isExiting,
-              effectiveEngine == .auto || effectiveEngine == .ffmpeg,
-              let player = playerLayer?.player, player is KSMEPlayer,
-              let urlString = currentEntry.stream.url,
-              !dvFailedURLs.contains(urlString),
-              currentURL?.isFileURL != true
-        else { return }
-        // A DV track means the DV path owns this title (it may not have run
-        // yet — readyToPlay fires it — so check the track, not just the flags).
-        //
-        // The probe can finish BEFORE the tracks exist, and an empty track list
-        // would read as "no DV" and let HDR10+ claim a Dolby Vision file. So
-        // bail while the list is empty; readyToPlay calls this again once the
-        // tracks are real, and whichever call arrives second does the work.
-        let videoTracks = player.tracks(mediaType: .video)
-        guard !videoTracks.isEmpty else { return }
-        let track = videoTracks.first(where: \.isEnabled) ?? videoTracks.first
-        if track?.dovi != nil {
-            decisionLog.record("HDR10+", "Dolby Vision instead",
-                               because: "the file also carries DV, which is the better output")
-            return
-        }
-        dvAttempted = true
-        nativeKind = .hdr10Plus
-        decisionLog.record("HDR10+", "Native HDR10+",
-                           because: "remuxing so the per-frame metadata survives to the TV")
-        NSLog("[OrivioHDR] HDR10+ detected — starting background remux")
-        startDVRemux(from: max(nativeRemuxStartTarget - 2, 0), isRestart: false)
-    }
+    // HDR10+ remux path retired: the direct engine passes HDR10+ SEIs through.
 
     // MARK: - App background / foreground
 
@@ -3042,29 +2614,7 @@ final class PlayerViewModel: ObservableObject {
     /// free — the worker builds exactly its lead over the paused position,
     /// then holds, and pruning stays alive.
     private var dvPauseHeartbeat: Task<Void, Never>?
-    private func keepDVPlayheadFreshWhilePaused() {
-        // Pre-switch too: a pause during the cushion build stops the position
-        // callbacks just the same, and a stale viewer feed there re-opens the
-        // disk-budget kill this heartbeat exists to prevent.
-        guard dvRemuxer != nil, dvPauseHeartbeat == nil else { return }
-        dvPauseHeartbeat = Task { [weak self] in
-            defer { self?.dvPauseHeartbeat = nil }
-            while !Task.isCancelled {
-                guard let self, let remuxer = self.dvRemuxer else { return }
-                // Only while actually paused — once playing, the position
-                // callback owns the feed again and this task retires.
-                guard !self.isPlaying else { return }
-                if self.usingNativeDV {
-                    remuxer.playheadSeconds = max(self.position - self.dvTimeOffset, 0)
-                    remuxer.playheadUpdatedAt = Date()
-                } else {
-                    remuxer.viewerAbsolutePTS = max(self.position, 0)
-                    remuxer.viewerAbsoluteUpdatedAt = Date()
-                }
-                try? await Task.sleep(nanoseconds: 5_000_000_000)
-            }
-        }
-    }
+    private func keepDVPlayheadFreshWhilePaused() {}   // legacy remux tier retired
 
     /// Resume via a tiny in-place rewind whenever the stream can seek. That
     /// flushes stale decoder/network state and avoids the pause-resume freeze
@@ -4161,7 +3711,7 @@ final class PlayerViewModel: ObservableObject {
             // A stuck DV playlist load falls back to the FFmpeg engine, not
             // to a different source — the source itself is fine.
             if self.usingNativeDV {
-                self.abandonNativeDV(reason: "DV playlist never started (load watchdog)")
+                // legacy remux tier retired
                 return
             }
             self.showToast("Source didn't load — trying another")
@@ -4227,7 +3777,7 @@ final class PlayerViewModel: ObservableObject {
         // COPY of the source — tens of GB on a 4K DV remux — and every
         // out-of-window seek retires another one, so holding them all for the
         // whole session could fill the box's storage mid-movie.
-        purgeRetiredDVDirectories()
+        // legacy remux tier retired — no segment directories exist
     }
 
     // MARK: - Automatic source failover
@@ -4265,7 +3815,7 @@ final class PlayerViewModel: ObservableObject {
         // Native-DV playback died → the remux/playlist is the suspect, not
         // the source. Fall back to the FFmpeg engine on the same source.
         if usingNativeDV {
-            abandonNativeDV(reason: "playback error on the DV playlist: \(error.localizedDescription)")
+            // legacy remux tier retired
             return
         }
         guard !isFailingOver else { return }
@@ -4780,7 +4330,6 @@ final class PlayerViewModel: ObservableObject {
         countdownTask?.cancel()
         dvPauseHeartbeat?.cancel()
         dvFirstTask?.cancel()
-        dvRemuxer?.cancel()   // stop the DV remux's network reads immediately
         dvDirectEngine?.stop()
         enginePause()
         // Drop any overlay so the wait shows the bare (paused) video, not a
@@ -4886,11 +4435,7 @@ final class PlayerViewModel: ObservableObject {
                   probeVideoView == nil ? "freed" : "ALIVE",
                   pvc.map { String(describing: type(of: $0)) } ?? "nil")
         }
-        // Grab the live remuxer BEFORE resetNativeDV() retires it, so the
-        // final purge actually has something to delete.
-        let liveRemuxer = dvRemuxer
         resetNativeDV()
-        purgeDVDirectories(live: liveRemuxer)
     }
 
     /// The next-episode line shown on the Up Next / Still Watching cards.
@@ -5460,7 +5005,7 @@ extension PlayerViewModel: KSPlayerLayerDelegate {
             if !usingNativeDV { chapters = layer.player.chapters }
             applyNativeDisplayCriteria()
             maybeStartNativeDV()
-            maybeStartNativeHDR10PlusAfterTracks()
+            // HDR10+ remux starter retired (direct engine passes SEIs through)
             if playbackSpeed != 1 {
                 layer.player.playbackRate = playbackSpeed
             }
@@ -5584,7 +5129,7 @@ extension PlayerViewModel: KSPlayerLayerDelegate {
             // the same position and keep the movie going.
             if usingNativeDV, !dvRemuxFinished,
                dvFullDuration <= 0 || position < dvFullDuration - 30 {
-                abandonNativeDV(reason: "caught the live edge of the remux mid-movie")
+                // legacy remux tier retired
                 return
             }
             // Post-play: queue next episode or show the end overlay instead of
@@ -5599,21 +5144,6 @@ extension PlayerViewModel: KSPlayerLayerDelegate {
     }
 
     func player(layer: KSPlayerLayer, currentTime: TimeInterval, totalTime: TimeInterval) {
-        // Feed the remuxer the viewer's position BEFORE the offset is applied:
-        // the engine-relative time is already measured from the remux origin,
-        // which is what pacing and pruning compare against. This is the signal
-        // that keeps the worker from running away from the player.
-        if usingNativeDV, let remuxer = dvRemuxer, currentTime.isFinite {
-            remuxer.playheadSeconds = currentTime
-            remuxer.playheadUpdatedAt = Date()
-        } else if let remuxer = dvRemuxer, currentTime.isFinite {
-            // PRE-switch: the FFmpeg engine is playing the source, so its
-            // currentTime is absolute source time. Feeding it lets the worker
-            // prune behind the viewer, pace itself relative to them, and gate
-            // the switch on the cushion that actually matters.
-            remuxer.viewerAbsolutePTS = currentTime
-            remuxer.viewerAbsoluteUpdatedAt = Date()
-        }
         // Native-DV: the playlist timeline starts at dvTimeOffset — map every
         // engine-relative time back to the absolute source timeline so
         // position/progress/subtitles/auto-next all keep working unchanged.

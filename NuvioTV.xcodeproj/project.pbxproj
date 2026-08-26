@@ -124,7 +124,6 @@
 		C4A89B31BA169E57A828C8A5 /* PlayerControlsOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = 57C4A723527A06C009FCB68A /* PlayerControlsOverlay.swift */; };
 		C5645FFFF564BFED04BDB619 /* StremioAddons.swift in Sources */ = {isa = PBXBuildFile; fileRef = 49ACEE6593ADFC9EDFE63DCD /* StremioAddons.swift */; };
 		C600249401D4B97C5E980D06 /* StremioSyncManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = E3460A9075F4147E89F4C69D /* StremioSyncManager.swift */; };
-		C7A329FA86460E8FE3DFCA59 /* DVRemuxer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 48D4225F2EA78DACA1350421 /* DVRemuxer.swift */; };
 		C876273DA65835A43BDBFFD9 /* PosterHoldMenu.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC411FD781EFBC41A09ECCFB /* PosterHoldMenu.swift */; };
 		CB4FE6DE4F4A2038847E8042 /* KSPlayer in Frameworks */ = {isa = PBXBuildFile; productRef = 6F247E3DA7201162C0D31072 /* KSPlayer */; };
 		CC4A6D4DD45D75EFED96839E /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79E6F3DF03C6701BE4587833 /* Models.swift */; };
@@ -213,7 +212,6 @@
 		45C310E078DDD7CF6D7F8D36 /* PlayerDiagnosticsHUD.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerDiagnosticsHUD.swift; sourceTree = "<group>"; };
 		4851E3EBD2CB353BA336DAFE /* KSPlayer */ = {isa = PBXFileReference; lastKnownFileType = folder; name = KSPlayer; path = Vendor/KSPlayer; sourceTree = SOURCE_ROOT; };
 		48C7489E80217819FDE6A04B /* FPSOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FPSOverlay.swift; sourceTree = "<group>"; };
-		48D4225F2EA78DACA1350421 /* DVRemuxer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DVRemuxer.swift; sourceTree = "<group>"; };
 		49ACEE6593ADFC9EDFE63DCD /* StremioAddons.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StremioAddons.swift; sourceTree = "<group>"; };
 		49BAA0E54FBA5A8CFE9473FA /* Components.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Components.swift; sourceTree = "<group>"; };
 		4A3C4FDE58EE3F41168633F4 /* MaxSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaxSettings.swift; sourceTree = "<group>"; };
@@ -309,7 +307,7 @@
 		F5F58759EFC8800E97CDAD28 /* MaxSidebar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaxSidebar.swift; sourceTree = "<group>"; };
 		F6445656DB7DCAD1E90A05A4 /* FusionTokens.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FusionTokens.swift; sourceTree = "<group>"; };
 		F9033005E03573788ECC97D1 /* PluginStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PluginStore.swift; sourceTree = "<group>"; };
-		F927A2D709889D55514CB41C /* NuvioTVUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = NuvioTVUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		F927A2D709889D55514CB41C /* NuvioTVUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = NuvioTVUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		F96730C97830E457BF3C64FE /* HuluSidebar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HuluSidebar.swift; sourceTree = "<group>"; };
 		F9D3C6F762FE150F2A7E353A /* OnyxHome.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnyxHome.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -559,7 +557,6 @@
 			isa = PBXGroup;
 			children = (
 				B6DB589DC0A8FBFAF5AE8C3F /* DoviConverter.swift */,
-				48D4225F2EA78DACA1350421 /* DVRemuxer.swift */,
 				CAB2EDAF3951B63EA5348D33 /* DVSampleEngine.swift */,
 				F31DD8C5D22DF53DCD150CB9 /* NativePlayerControlsOverlay.swift */,
 				E2B5622602D0586649B04485 /* PauseOverlayView.swift */,
@@ -767,7 +764,6 @@
 				2072F1BAB7047F8207172DA4 /* CollectionsStore.swift in Sources */,
 				E2CFF35E41DBA1ED383BD452 /* CommunityCollectionsView.swift in Sources */,
 				BF6961891F5345E7DBE28277 /* Components.swift in Sources */,
-				C7A329FA86460E8FE3DFCA59 /* DVRemuxer.swift in Sources */,
 				1AAF42D71042267B89E916FF /* DVSampleEngine.swift in Sources */,
 				0DFE89CB6E0C80C4497E341F /* DebridService.swift in Sources */,
 				9B3FA2260743150105A9D5B4 /* DeepLinkService.swift in Sources */,
@@ -927,7 +923,6 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGNING_ALLOWED = NO;
-				DEVELOPMENT_TEAM = CYCSPZ5MTR;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -1002,7 +997,6 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGNING_ALLOWED = NO;
-				DEVELOPMENT_TEAM = CYCSPZ5MTR;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
