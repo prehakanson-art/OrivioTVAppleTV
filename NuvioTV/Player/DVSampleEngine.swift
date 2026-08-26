@@ -115,6 +115,9 @@ final class DVSampleEngine {
     /// loop at `pendingSeekTo` and the feeders drop stale samples.
     @Atomic private var seekGeneration = 0
     @Atomic private var pendingSeekTo: Double = -1
+    /// Post-seek trim point (worker thread): video before this decodes
+    /// without displaying; audio before it is dropped.
+    private var trimBefore: Double = -1
 
     /// The open input, for the audio decoder's stream lookups (worker only).
     private var liveFormatCtx: UnsafeMutablePointer<AVFormatContext>?
@@ -450,6 +453,12 @@ final class DVSampleEngine {
                 if target >= 0 {
                     let ts = Int64(target * Double(AV_TIME_BASE))
                     av_seek_frame(ictx, -1, ts, 1)
+                    // Seeks land on the KEYFRAME BEFORE the target, so left
+                    // alone every skip jumped back a few seconds. Trim: the
+                    // lead-in video is decoded but flagged do-not-display,
+                    // and lead-in audio is dropped outright, so playback
+                    // resumes exactly where the viewer aimed.
+                    trimBefore = target - 0.05
                 }
                 if let decoder = audioDecoder { avcodec_flush_buffers(decoder) }
             }
@@ -479,6 +488,13 @@ final class DVSampleEngine {
                     bytes = converted
                 }
             }
+            // Post-seek trim (see the seek branch above).
+            if trimBefore > 0 {
+                if !isVideo, pts < trimBefore { continue }
+                if isVideo, pts >= trimBefore { trimBefore = -1 }
+            }
+            let displaySuppressed = isVideo && trimBefore > 0 && pts < trimBefore
+
             // Non-passthrough audio: FFmpeg-decode to interleaved Float32 PCM
             // and enqueue the LPCM samples — this is what makes TrueHD, DTS,
             // FLAC and friends playable on this engine.
@@ -494,6 +510,7 @@ final class DVSampleEngine {
                 ptsSeconds: pts, durationSeconds: dur,
                 keyframe: (packet.pointee.flags & 0x0001) != 0
             ) else { continue }
+            if displaySuppressed { Self.markDoNotDisplay(sample) }
 
             enqueueBounded(sample, isVideo: isVideo, generation: myGeneration)
         }
@@ -767,6 +784,18 @@ final class DVSampleEngine {
             formatDescriptionOut: &format
         )
         return status == noErr ? format : nil
+    }
+
+    /// Decode-but-don't-display, for post-seek lead-in frames.
+    private static func markDoNotDisplay(_ sample: CMSampleBuffer) {
+        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(
+            sample, createIfNecessary: true
+        ) as? [CFMutableDictionary], let first = attachments.first else { return }
+        CFDictionarySetValue(
+            first,
+            Unmanaged.passUnretained(kCMSampleAttachmentKey_DoNotDisplay).toOpaque(),
+            Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
+        )
     }
 
     /// Plain HEVC (HDR10/HDR10+/SDR): hvc1 + hvcC, nothing else — every SEI
