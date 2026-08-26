@@ -105,6 +105,9 @@ final class DVSampleEngine {
     private var pcmChannels: Int32 = 0
     private var loggedAudioDecodeFailure = false
     private var loggedFirstPCM = false
+    private var depthMin = Int.max
+    private var depthTicks = 0
+    private var depthWindowGen = 0
 
     // ---- PCM batching (worker thread) ----
     // TrueHD decodes in ~40-sample crumbs: unbatched, that is 1,200 sample
@@ -135,7 +138,11 @@ final class DVSampleEngine {
     private let queueLock = NSCondition()
     private var videoQueue: [CMSampleBuffer] = []
     private var audioQueue: [CMSampleBuffer] = []
-    private let videoQueueCap = 48
+    /// ~8s of video: the pacing forensics showed the source CDN delivering
+    /// in bursts with 1-2s silences — a 2s queue drained on every burst gap
+    /// and each drain was a visible hitch ("kind of jittery"). ~8s absorbs
+    /// them for ~50 MB, pocket change at this engine's footprint.
+    private let videoQueueCap = 192
     private let audioQueueCap = 96
     private var demuxEOF = false
 
@@ -147,6 +154,8 @@ final class DVSampleEngine {
     /// Post-seek trim point (worker thread): video before this decodes
     /// without displaying; audio before it is dropped.
     private var trimBefore: Double = -1
+    /// Anchor for the smoothed video timestamp grid (worker thread).
+    private var videoPTSEpoch: Double = -1
 
     /// The open input, for the audio decoder's stream lookups (worker only).
     private var liveFormatCtx: UnsafeMutablePointer<AVFormatContext>?
@@ -301,8 +310,17 @@ final class DVSampleEngine {
                 if let extra = par.pointee.extradata, par.pointee.extradata_size > 22, extra[0] == 1 {
                     nalLengthSize = Int(extra[21] & 0x03) + 1
                 }
-                let fr = stream.pointee.avg_frame_rate
-                if fr.den > 0 { videoFPS = Float(av_q2d(fr)) }
+                // Frame rate with fallbacks: avg_frame_rate is unset on some
+                // MKVs, and a zero here made the display-mode request fall
+                // back to 60 Hz — 3:2 judder on every 24fps film. r_frame_rate
+                // is the container's nominal rate and nearly always present.
+                var fr = stream.pointee.avg_frame_rate
+                if fr.den <= 0 || fr.num <= 0 { fr = stream.pointee.r_frame_rate }
+                if fr.den > 0, fr.num > 0 { videoFPS = Float(av_q2d(fr)) }
+                NSLog("[DVSample] video fps=%.3f (avg=%d/%d r=%d/%d)",
+                      videoFPS,
+                      stream.pointee.avg_frame_rate.num, stream.pointee.avg_frame_rate.den,
+                      stream.pointee.r_frame_rate.num, stream.pointee.r_frame_rate.den)
             }
             if par.pointee.codec_type == AVMEDIA_TYPE_AUDIO {
                 let id = par.pointee.codec_id
@@ -468,6 +486,21 @@ final class DVSampleEngine {
                 let depth = self.videoQueue.count
                 let eof = self.demuxEOF
                 self.queueLock.unlock()
+                // Pacing forensics: the minimum queue depth over each 10s
+                // window says whether frames are DELIVERED on time. A healthy
+                // floor (>8) with visible judder exonerates the pipeline and
+                // convicts the display side; a floor that kisses zero is
+                // starvation and the judder is ours.
+                self.depthMin = min(self.depthMin, depth)
+                self.depthTicks += 1
+                if self.depthTicks >= 20 {
+                    let seeked = self.seekGeneration != self.depthWindowGen
+                    NSLog("[DVSample] pacing: videoQueue floor=%d over 10s (now %d)%@",
+                          self.depthMin, depth, seeked ? " [seek in window]" : "")
+                    self.depthMin = Int.max
+                    self.depthTicks = 0
+                    self.depthWindowGen = self.seekGeneration
+                }
                 if !eof {
                     if depth == 0, !self.autoPaused, self.userRate > 0, self.synchronizer.rate > 0 {
                         self.autoPaused = true
@@ -514,6 +547,7 @@ final class DVSampleEngine {
                     trimBefore = target - 0.05
                 }
                 if let decoder = audioDecoder { avcodec_flush_buffers(decoder) }
+                videoPTSEpoch = -1
                 pcmBatch.removeAll(keepingCapacity: true)
                 pcmBatchFrames = 0
                 pcmBatchStartPTS = -1
@@ -537,6 +571,21 @@ final class DVSampleEngine {
             let dur = packet.pointee.duration > 0
                 ? Double(packet.pointee.duration) * av_q2d(tb) : 0
 
+            var snappedPTS = pts
+            if isVideo, videoFPS > 1 {
+                // SNAP video PTS to the frame-rate grid. MKV timestamps are
+                // quantized to 1 ms, but 23.976 fps frames are 41.708 ms
+                // apart — playing the container's rounded stamps verbatim
+                // makes intervals alternate 41/42 ms against the vsync, a
+                // visible periodic judder on an otherwise perfect pipeline.
+                // Snapping to the nearest grid point (anchored at the first
+                // frame after open/seek) restores the true cadence; edits and
+                // discontinuities merely re-phase by <half a frame.
+                let grid = 1.0 / Double(videoFPS)
+                if videoPTSEpoch < 0 { videoPTSEpoch = pts }
+                let n = ((pts - videoPTSEpoch) / grid).rounded()
+                snappedPTS = videoPTSEpoch + n * grid
+            }
             var bytes = [UInt8](UnsafeBufferPointer(start: data, count: Int(packet.pointee.size)))
             if isVideo, needsP7 {
                 if let converted = Self.convertP7AccessUnit(bytes, nalLengthSize: nalLengthSize) {
@@ -563,7 +612,8 @@ final class DVSampleEngine {
             guard let sample = Self.makeSample(
                 bytes: bytes,
                 format: isVideo ? vFormat : audioFormats[index],
-                ptsSeconds: pts, durationSeconds: dur,
+                ptsSeconds: isVideo ? snappedPTS : pts,
+                durationSeconds: (isVideo && videoFPS > 1) ? 1.0 / Double(videoFPS) : dur,
                 keyframe: (packet.pointee.flags & 0x0001) != 0
             ) else { continue }
             if displaySuppressed { Self.markDoNotDisplay(sample) }

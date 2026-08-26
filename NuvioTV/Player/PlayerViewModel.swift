@@ -148,6 +148,19 @@ enum SessionDisplayMode {
             DispatchQueue.main.async { manager.preferredDisplayCriteria = criteria }
         }
         NSLog("[OrivioDisplay] session display mode pinned (first and only switch this launch)")
+        // GROUND TRUTH: preferredDisplayCriteria is a request; whether the
+        // display actually changed is only readable from UIScreen once the
+        // handshake settles. 24 here proves the 23.976 mode took; 60 proves
+        // the request is being ignored — the decisive datum for the judder
+        // investigation, gathered without the TV's menus.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            NSLog("[OrivioDisplay] UIScreen reports %ld fps after the switch",
+                  UIScreen.main.maximumFramesPerSecond)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+            NSLog("[OrivioDisplay] UIScreen reports %ld fps (settled)",
+                  UIScreen.main.maximumFramesPerSecond)
+        }
         return true
     }
 }
