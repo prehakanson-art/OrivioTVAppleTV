@@ -311,8 +311,17 @@ final class DVSampleEngine {
         displayLayer.flushAndRemoveImage()
         audioRenderer.flush()
         synchronizer.setRate(0, time: .zero)
+        // Detach the renderers: the synchronizer retains them, and a video
+        // renderer holds its hardware decode session (tens of MB of
+        // compressed-memory decoder state) for as long as it's attached.
+        synchronizer.removeRenderer(displayLayer, at: .invalid)
+        synchronizer.removeRenderer(audioRenderer, at: .invalid)
         timeTimer?.invalidate()
         timeTimer = nil
+    }
+
+    deinit {
+        NSLog("[DVSample] engine deinit")
     }
 
     // MARK: Demux worker

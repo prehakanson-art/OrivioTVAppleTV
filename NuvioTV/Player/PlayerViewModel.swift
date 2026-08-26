@@ -639,6 +639,7 @@ final class PlayerViewModel: ObservableObject {
     private var notificationTokens: [NSObjectProtocol] = []
 
     deinit {
+        NSLog("[OrivioPlayer] PlayerViewModel deinit")
         for token in notificationTokens { NotificationCenter.default.removeObserver(token) }
     }
     private var dvAttempted = false
