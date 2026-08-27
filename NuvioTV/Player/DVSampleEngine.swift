@@ -284,8 +284,11 @@ final class DVSampleEngine {
         if wall >= 10 {
             let mediaAdv = media - dlWindowStartMedia
             let ppm = (mediaAdv / wall - 1) * 1_000_000
-            NSLog("[DVSample] vsync probe: %d refreshes, %d repeats, %d skips, clock %+.0fppm, avSkew=%.2fs",
-                  dlTicks, dlRepeats, dlSkips, ppm, lastQueuedVideoPTS - lastQueuedAudioPTS)
+            NSLog("[DVSample] vsync probe: %d refreshes, %d repeats, %d skips, clock %+.0fppm, avSkew=%.2fs, decodeStalls=%d (worst %dms)",
+                  dlTicks, dlRepeats, dlSkips, ppm, lastQueuedVideoPTS - lastQueuedAudioPTS,
+                  pullGapCount, pullGapWorstMs)
+            pullGapCount = 0
+            pullGapWorstMs = 0
             dlTicks = 0; dlRepeats = 0; dlSkips = 0
             dlWindowStartWall = link.timestamp
             dlWindowStartMedia = media
@@ -1433,7 +1436,28 @@ final class DVSampleEngine {
         }
     }
 
+    // Decode-pacing probe (feedQueue thread): the display layer pulls a new
+    // sample only when its internal decoder has room — the pull cadence IS
+    // the decoder's pacing. A pull gap much longer than a frame while our
+    // queue is full means the DECODER fell behind and the layer repeated a
+    // frame on screen: the one stutter mechanism invisible to every clock/
+    // queue/vsync probe. Reported per ~10s through the vsync probe line.
+    private var lastVideoPullAt: CFAbsoluteTime = 0
+    @Atomic private var pullGapCount = 0        // gaps > 100ms this window
+    @Atomic private var pullGapWorstMs = 0      // worst gap this window
+
     private func feed(video: Bool) {
+        if video {
+            let now = CFAbsoluteTimeGetCurrent()
+            if lastVideoPullAt > 0, synchronizer.rate > 0 {
+                let gapMs = Int((now - lastVideoPullAt) * 1000)
+                if gapMs > 100 {
+                    pullGapCount += 1
+                    if gapMs > pullGapWorstMs { pullGapWorstMs = gapMs }
+                }
+            }
+            lastVideoPullAt = now
+        }
         while !cancelled,
               video ? displayLayer.isReadyForMoreMediaData
                     : audioRenderer.isReadyForMoreMediaData {
