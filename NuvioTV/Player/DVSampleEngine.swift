@@ -70,6 +70,34 @@ final class DVSampleEngine {
     var onSubtitleEvent: ((Double, Double, String?, UIImage?) -> Void)?
     private var subDecoder: UnsafeMutablePointer<AVCodecContext>?
     private var subDecoderIndex: Int32 = -1
+    /// Rolling raw-packet buffer for EVERY subtitle stream (demux thread
+    /// only). The demuxer runs ~10s ahead of the playhead, so a track
+    /// selected mid-play would otherwise stay silent until the read head's
+    /// next cue. Replaying this backlog on selection makes subs immediate.
+    private struct StoredSubPacket {
+        let stream: Int32
+        let pts: Int64
+        let duration: Int64
+        let ptsSeconds: Double
+        let bytes: [UInt8]
+    }
+    private var subPacketBuffer: [StoredSubPacket] = []
+    private var subStreamSet: Set<Int32> = []
+    private var lastServedSubIndex: Int32 = -1
+
+    /// Decode one stored packet by rebuilding a real AVPacket around it.
+    private func replayStoredSubPacket(_ stored: StoredSubPacket, tb: AVRational) {
+        guard let pkt = av_packet_alloc() else { return }
+        defer { var pp: UnsafeMutablePointer<AVPacket>? = pkt; av_packet_free(&pp) }
+        guard av_new_packet(pkt, Int32(stored.bytes.count)) >= 0 else { return }
+        stored.bytes.withUnsafeBufferPointer { src in
+            pkt.pointee.data.update(from: src.baseAddress!, count: src.count)
+        }
+        pkt.pointee.pts = stored.pts
+        pkt.pointee.duration = stored.duration
+        pkt.pointee.stream_index = stored.stream
+        decodeSubtitlePacket(pkt, streamIndex: stored.stream, tb: tb, ptsSeconds: stored.ptsSeconds)
+    }
     var currentAudioIndex: Int32 { desiredAudioIndex }
 
     /// Switch audio live: the demux loop starts forwarding the new stream at
@@ -585,6 +613,7 @@ final class DVSampleEngine {
             if label.isEmpty { label = "Track \(i)" }
             if (stream.pointee.disposition & AV_DISPOSITION_FORCED) != 0 { label += " · Forced" }
             subtitleTracks.append(SubtitleTrack(index: Int32(i), label: label, isBitmap: bitmapCodec))
+            subStreamSet.insert(Int32(i))
         }
         if !subtitleTracks.isEmpty {
             NSLog("[DVSample] embedded subtitles: %@",
@@ -772,6 +801,7 @@ final class DVSampleEngine {
                 }
                 if let decoder = audioDecoder { avcodec_flush_buffers(decoder) }
                 if let sdec = subDecoder { avcodec_flush_buffers(sdec) }
+                subPacketBuffer.removeAll(keepingCapacity: true)
                 pcmBatch.removeAll(keepingCapacity: true)
                 pcmBatchFrames = 0
                 pcmBatchStartPTS = -1
@@ -785,7 +815,20 @@ final class DVSampleEngine {
             let index = packet.pointee.stream_index
             let activeAudio = desiredAudioIndex
             let activeSub = activeSubtitleIndex
-            guard index == videoIndex || index == activeAudio || index == activeSub else { continue }
+            // Selection changed since the last loop: serve the buffered
+            // backlog so the track starts NOW, not when the read head (which
+            // runs a full buffer ahead) reaches its next cue.
+            if activeSub != lastServedSubIndex {
+                lastServedSubIndex = activeSub
+                if activeSub >= 0, let ictxL = liveFormatCtx,
+                   let stream = ictxL.pointee.streams[Int(activeSub)] {
+                    let stb = stream.pointee.time_base
+                    for stored in subPacketBuffer where stored.stream == activeSub {
+                        replayStoredSubPacket(stored, tb: stb)
+                    }
+                }
+            }
+            guard index == videoIndex || index == activeAudio || subStreamSet.contains(index) else { continue }
             guard packet.pointee.pts != Int64.min, let data = packet.pointee.data,
                   packet.pointee.size > 0 else { continue }
 
@@ -822,8 +865,27 @@ final class DVSampleEngine {
             }
             let displaySuppressed = isVideo && trimBefore > 0 && pts < trimBefore
 
-            if !isVideo, index == activeSub {
-                decodeSubtitlePacket(packet, streamIndex: index, tb: tb, ptsSeconds: pts)
+            if !isVideo, subStreamSet.contains(index) {
+                subPacketBuffer.append(StoredSubPacket(
+                    stream: index,
+                    pts: packet.pointee.pts,
+                    duration: packet.pointee.duration,
+                    ptsSeconds: pts,
+                    bytes: [UInt8](UnsafeBufferPointer(start: packet.pointee.data,
+                                                       count: Int(packet.pointee.size)))
+                ))
+                // Bound the backlog: keep ~90s of events (subtitle packets are
+                // tiny; even 20 PGS tracks stay a few MB).
+                if subPacketBuffer.count > 800 {
+                    subPacketBuffer.removeFirst(subPacketBuffer.count - 800)
+                }
+                let cutoff = pts - 90
+                if let first = subPacketBuffer.first, first.ptsSeconds < cutoff - 30 {
+                    subPacketBuffer.removeAll { $0.ptsSeconds < cutoff }
+                }
+                if index == activeSub {
+                    decodeSubtitlePacket(packet, streamIndex: index, tb: tb, ptsSeconds: pts)
+                }
                 continue
             }
             // Non-passthrough audio: FFmpeg-decode to interleaved Float32 PCM
