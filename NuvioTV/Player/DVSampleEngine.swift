@@ -259,6 +259,18 @@ final class DVSampleEngine {
     private var dlRepeats = 0
     private var dlSkips = 0
 
+    // Phase steering: slo-mo footage of the panel proved real repeat+catch-up
+    // pairs (~3/s) with a mathematically perfect clock — the signature of
+    // frame PTS riding the refresh boundary, so the layer flips a hair early
+    // or late, alternating. The boundary phase is a per-session lottery
+    // (wherever the clock got anchored), which is why the same file played
+    // smooth one session and stuttered the next. Measure the phase at each
+    // refresh; if the median sits within 6ms of the boundary, shift the
+    // anchor a quarter-frame once — invisible, and every flip moves to
+    // mid-cycle.
+    private var phaseSamples: [Double] = []
+    private var phaseNudged = false
+
     @objc private func displayLinkTick(_ link: CADisplayLink) {
         guard synchronizer.rate > 0 else {
             dlLastIndex = -1
@@ -268,6 +280,27 @@ final class DVSampleEngine {
         let media = CMTimeGetSeconds(synchronizer.currentTime())
         let frameDur = gridFrameDuration
         guard frameDur > 0 else { return }
+        let phase = media.truncatingRemainder(dividingBy: frameDur)
+        phaseSamples.append(phase)
+        if phaseSamples.count == 48, !phaseNudged {   // ~2s settled
+            let sorted = phaseSamples.sorted()
+            let medianPhase = sorted[sorted.count / 2]
+            let edge = min(medianPhase, frameDur - medianPhase)
+            NSLog("[DVSample] frame-boundary phase: median %.1fms of %.1fms (edge distance %.1fms)",
+                  medianPhase * 1000, frameDur * 1000, edge * 1000)
+            if edge < 0.006 {
+                phaseNudged = true
+                let shift = frameDur / 4
+                let t = synchronizer.currentTime()
+                synchronizer.setRate(synchronizer.rate,
+                                     time: CMTime(seconds: CMTimeGetSeconds(t) + shift,
+                                                  preferredTimescale: 90000))
+                NSLog("[DVSample] phase riding the refresh boundary — nudged anchor +%.1fms", shift * 1000)
+            }
+            phaseSamples.removeAll()
+        } else if phaseSamples.count > 48 {
+            phaseSamples.removeAll()
+        }
         let index = Int64((media / frameDur).rounded(.down))
         if dlLastIndex >= 0 {
             let advance = index - dlLastIndex
