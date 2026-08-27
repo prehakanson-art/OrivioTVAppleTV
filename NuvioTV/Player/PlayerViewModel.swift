@@ -3752,6 +3752,20 @@ final class PlayerViewModel: ObservableObject {
                 // legacy remux tier retired
                 return
             }
+            // A FORCED engine that never starts is the likelier corpse than
+            // the source: a remembered "Native (AVPlayer)" pick dead-ended
+            // every MKV link for a title (AVPlayer can't open them), and
+            // failing over just marched through sources on the same broken
+            // engine. Retry the SAME source on Auto first, and clear the
+            // per-title engine memory so the trap doesn't re-arm next time.
+            if self.effectiveEngine != .auto, self.sessionEngine != nil || PlaybackMemory.memory(for: self.meta.id)?.engine != nil {
+                self.showToast("\(self.effectiveEngine.label) engine didn't start — retrying on Auto")
+                Self.dvTrail("forced engine \(self.effectiveEngine.label) never started — clearing memory, retrying on Auto")
+                self.sessionEngine = nil
+                PlaybackMemory.update(self.meta.id) { $0.engine = nil }
+                self.load(entry: self.currentEntry)
+                return
+            }
             self.showToast("Source didn't load — trying another")
             self.attemptFailover(
                 afterError: NSError(
