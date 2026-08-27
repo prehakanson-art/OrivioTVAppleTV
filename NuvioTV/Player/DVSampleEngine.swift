@@ -6,6 +6,7 @@ import Libavcodec
 import Libavformat
 import Libavutil
 import UIKit
+import VideoToolbox
 
 /// Direct Dolby Vision sample feed — the Infuse/SenPlayer architecture.
 ///
@@ -185,7 +186,7 @@ final class DVSampleEngine {
     /// of 48 (two seconds!) made every multi-second network dip an underrun,
     /// and the live probe showed exactly that: vq sawtoothing 48→0 with the
     /// clock flapping 0.22↔1.00 (the reported stop-go).
-    private let videoQueueCap = 240
+    private var videoQueueCap: Int { vtDecodeAhead ? 120 : 240 }
     private let audioQueueCap = 96
 
     /// MKV timestamps are in MILLISECONDS; a 23.976fps frame lasts 41.708ms.
@@ -502,6 +503,7 @@ final class DVSampleEngine {
         audioQueue.removeAll()
         queueLock.signal()
         queueLock.unlock()
+        vtFlush()
         displayLayer.flush()
         audioRenderer.flush()
         let targetRate = playbackClockStarted && !autoPaused && userRate > 0 ? userRate : 0
@@ -526,6 +528,7 @@ final class DVSampleEngine {
         timeTimer = nil
         displayLink?.invalidate()
         displayLink = nil
+        vtTearDown()
         // Drop the queued samples NOW. The queues held up to 240 compressed
         // AUs (~80MB at UHD-remux bitrates) and stop() never cleared them —
         // combined with the callback retain cycle below, that WAS the
@@ -1466,6 +1469,164 @@ final class DVSampleEngine {
         return sample
     }
 
+    // MARK: VT decode-ahead renderer
+    //
+    // WHY THIS EXISTS. Obsession-class encodes use runs of 7 consecutive
+    // B-frames (83% B, reorder depth ~8) where Michel-class encodes use
+    // shallow IPBPB structure. On the A10X the display layer's just-in-time
+    // decoder emits such groups in BURSTS — ~3 group boundaries per second —
+    // and 240fps slo-mo of the panel proved exactly ~3 repeat/catch-up pairs
+    // per second while every clock/queue probe read perfect. So the engine
+    // decodes AHEAD itself: compressed samples go through a
+    // VTDecompressionSession, decoded frames wait in a display-order heap,
+    // and the layer receives finished, ordered pixel buffers it merely
+    // flips — burst decoding can never reach the glass again.
+    private let vtDecodeAhead = true
+    private var vtSession: VTDecompressionSession?
+    private struct DecodedFrame {
+        let pts: CMTime
+        let duration: CMTime
+        let image: CVImageBuffer
+    }
+    private var decodedHeap: [DecodedFrame] = []   // sorted by pts, small (≤12)
+    private let decodedLock = NSLock()
+    /// Display-order safety margin: never release a frame until this many
+    /// are decoded and waiting (covers reorder depth 8) — except at EOF.
+    private let reorderHoldback = 8
+    private let decodedCap = 12
+    private var displayFormatCache: CMFormatDescription?
+
+    private func ensureVTSession() -> VTDecompressionSession? {
+        if let vtSession { return vtSession }
+        guard let format = videoFormat else { return nil }
+        var session: VTDecompressionSession?
+        let status = VTDecompressionSessionCreate(
+            allocator: kCFAllocatorDefault,
+            formatDescription: format,
+            decoderSpecification: nil,
+            imageBufferAttributes: nil,
+            outputCallback: nil,
+            decompressionSessionOut: &session
+        )
+        guard status == noErr, let session else {
+            NSLog("[DVSample] VT session create failed (%d) — falling back to compressed feed", status)
+            return nil
+        }
+        vtSession = session
+        NSLog("[DVSample] VT decode-ahead session created")
+        return session
+    }
+
+    private func vtFlush() {
+        if let vtSession {
+            VTDecompressionSessionWaitForAsynchronousFrames(vtSession)
+        }
+        decodedLock.lock()
+        decodedHeap.removeAll(keepingCapacity: true)
+        decodedLock.unlock()
+    }
+
+    private func vtTearDown() {
+        if let vtSession {
+            VTDecompressionSessionWaitForAsynchronousFrames(vtSession)
+            VTDecompressionSessionInvalidate(vtSession)
+        }
+        vtSession = nil
+        decodedLock.lock()
+        decodedHeap.removeAll()
+        decodedLock.unlock()
+        displayFormatCache = nil
+    }
+
+    private static func isDoNotDisplay(_ sample: CMSampleBuffer) -> Bool {
+        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(
+            sample, createIfNecessary: false
+        ) as? [CFDictionary], let first = attachments.first else { return false }
+        let key = Unmanaged.passUnretained(kCMSampleAttachmentKey_DoNotDisplay).toOpaque()
+        return CFDictionaryContainsKey(first, key)
+    }
+
+    /// Decode ONE compressed sample synchronously into the heap (display
+    /// suppressed frames decode for their references but are not kept).
+    private func vtDecodeOne(_ sample: CMSampleBuffer) {
+        guard let session = ensureVTSession() else { return }
+        let suppress = Self.isDoNotDisplay(sample)
+        let status = VTDecompressionSessionDecodeFrame(
+            session, sampleBuffer: sample, flags: [], infoFlagsOut: nil
+        ) { [weak self] st, _, image, pts, duration in
+            guard let self, st == noErr, let image, !suppress else { return }
+            self.decodedLock.lock()
+            let frame = DecodedFrame(pts: pts, duration: duration, image: image)
+            let idx = self.decodedHeap.firstIndex { CMTimeCompare($0.pts, pts) > 0 } ?? self.decodedHeap.count
+            self.decodedHeap.insert(frame, at: idx)
+            self.decodedLock.unlock()
+        }
+        if status == kVTInvalidSessionErr {
+            // Session died (backgrounding etc.) — rebuild on the next frame.
+            vtTearDown()
+        }
+    }
+
+    /// Wrap a decoded image buffer as a display-order sample for the layer.
+    private func makeDisplaySample(_ frame: DecodedFrame) -> CMSampleBuffer? {
+        if displayFormatCache == nil ||
+            !CMVideoFormatDescriptionMatchesImageBuffer(displayFormatCache!, imageBuffer: frame.image) {
+            var fmt: CMFormatDescription?
+            CMVideoFormatDescriptionCreateForImageBuffer(
+                allocator: kCFAllocatorDefault, imageBuffer: frame.image, formatDescriptionOut: &fmt
+            )
+            displayFormatCache = fmt
+        }
+        guard let fmt = displayFormatCache else { return nil }
+        var timing = CMSampleTimingInfo(
+            duration: frame.duration, presentationTimeStamp: frame.pts, decodeTimeStamp: .invalid
+        )
+        var out: CMSampleBuffer?
+        CMSampleBufferCreateReadyWithImageBuffer(
+            allocator: kCFAllocatorDefault, imageBuffer: frame.image,
+            formatDescription: fmt, sampleTiming: &timing, sampleBufferOut: &out
+        )
+        return out
+    }
+
+    /// The decode-ahead video feeder: keep the heap topped up from the
+    /// compressed queue, release the lowest-PTS frame to the layer only when
+    /// the reorder holdback is satisfied (or the stream is draining).
+    private func vtFeedVideo() {
+        while !cancelled, displayLayer.isReadyForMoreMediaData {
+            // Top up the heap.
+            while true {
+                decodedLock.lock()
+                let depth = decodedHeap.count
+                decodedLock.unlock()
+                if depth >= decodedCap { break }
+                queueLock.lock()
+                let sample = videoQueue.isEmpty ? nil : videoQueue.removeFirst()
+                queueLock.broadcast()
+                queueLock.unlock()
+                guard let sample else { break }
+                vtDecodeOne(sample)
+            }
+            decodedLock.lock()
+            let depth = decodedHeap.count
+            queueLock.lock()
+            let compressedEmpty = videoQueue.isEmpty
+            let ended = demuxEOF && compressedEmpty && audioQueue.isEmpty && depth == 0
+            queueLock.unlock()
+            let draining = demuxEOF && compressedEmpty
+            guard depth > 0, draining || depth > reorderHoldback else {
+                decodedLock.unlock()
+                if ended { DispatchQueue.main.async { [weak self] in self?.onEnded?() } }
+                return
+            }
+            let frame = decodedHeap.removeFirst()
+            decodedLock.unlock()
+            if let display = makeDisplaySample(frame) {
+                displayLayer.enqueue(display)
+            }
+        }
+    }
+
     // MARK: Feeders
 
     private func installFeeders() {
@@ -1488,6 +1649,19 @@ final class DVSampleEngine {
     @Atomic private var pullGapWorstMs = 0      // worst gap this window
 
     private func feed(video: Bool) {
+        if video, vtDecodeAhead {
+            let now = CFAbsoluteTimeGetCurrent()
+            if lastVideoPullAt > 0, synchronizer.rate > 0 {
+                let gapMs = Int((now - lastVideoPullAt) * 1000)
+                if gapMs > 100 {
+                    pullGapCount += 1
+                    if gapMs > pullGapWorstMs { pullGapWorstMs = gapMs }
+                }
+            }
+            lastVideoPullAt = now
+            vtFeedVideo()
+            return
+        }
         if video {
             let now = CFAbsoluteTimeGetCurrent()
             if lastVideoPullAt > 0, synchronizer.rate > 0 {
