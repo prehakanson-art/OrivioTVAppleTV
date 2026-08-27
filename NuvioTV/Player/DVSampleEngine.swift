@@ -269,7 +269,7 @@ final class DVSampleEngine {
     // anchor a quarter-frame once — invisible, and every flip moves to
     // mid-cycle.
     private var phaseSamples: [Double] = []
-    private var phaseNudged = false
+    private var lastPhaseNudgeAt = Date.distantPast
 
     @objc private func displayLinkTick(_ link: CADisplayLink) {
         guard synchronizer.rate > 0 else {
@@ -282,24 +282,32 @@ final class DVSampleEngine {
         guard frameDur > 0 else { return }
         let phase = media.truncatingRemainder(dividingBy: frameDur)
         phaseSamples.append(phase)
-        if phaseSamples.count == 48, !phaseNudged {   // ~2s settled
+        if phaseSamples.count >= 48 {   // ~2s of refreshes
             let sorted = phaseSamples.sorted()
             let medianPhase = sorted[sorted.count / 2]
+            phaseSamples.removeAll()
             let edge = min(medianPhase, frameDur - medianPhase)
-            NSLog("[DVSample] frame-boundary phase: median %.1fms of %.1fms (edge distance %.1fms)",
-                  medianPhase * 1000, frameDur * 1000, edge * 1000)
-            if edge < 0.006 {
-                phaseNudged = true
-                let shift = frameDur / 4
-                let t = synchronizer.currentTime()
+            // Continuous servo, not a one-shot: every hold/resume/seek
+            // re-anchors the clock and re-rolls the phase lottery, so keep
+            // measuring forever and steer back to MID-CYCLE whenever the
+            // median strays toward an edge. Exact correction (error to
+            // mid), rate-limited so the ≤21ms clock step stays rare.
+            let mid = frameDur / 2
+            var error = medianPhase - mid
+            if error > mid { error -= frameDur }
+            if edge < 0.008, Date().timeIntervalSince(lastPhaseNudgeAt) > 15,
+               !autoPaused, synchronizer.rate > 0 {
+                lastPhaseNudgeAt = Date()
+                let t = CMTimeGetSeconds(synchronizer.currentTime())
                 synchronizer.setRate(synchronizer.rate,
-                                     time: CMTime(seconds: CMTimeGetSeconds(t) + shift,
+                                     time: CMTime(seconds: t - error,
                                                   preferredTimescale: 90000))
-                NSLog("[DVSample] phase riding the refresh boundary — nudged anchor +%.1fms", shift * 1000)
+                NSLog("[DVSample] phase %.1fms (edge %.1fms) — steered %+.1fms to mid-cycle",
+                      medianPhase * 1000, edge * 1000, -error * 1000)
+            } else if edge < 0.010 {
+                NSLog("[DVSample] frame-boundary phase: median %.1fms (edge %.1fms)",
+                      medianPhase * 1000, edge * 1000)
             }
-            phaseSamples.removeAll()
-        } else if phaseSamples.count > 48 {
-            phaseSamples.removeAll()
         }
         let index = Int64((media / frameDur).rounded(.down))
         if dlLastIndex >= 0 {
