@@ -245,6 +245,53 @@ final class DVSampleEngine {
         return max(snapped, dts)
     }
 
+    // Vsync-level ground truth: a CADisplayLink at the panel's native rate
+    // samples the synchronizer each refresh. Per ~10s window it reports how
+    // many refreshes REPEATED a frame (media index unchanged) or SKIPPED
+    // one (index advanced by 2+), plus the playback-vs-display clock ratio
+    // in ppm and the queued A/V PTS skew. If the stutter is real, it must
+    // appear here as repeats+skips.
+    private var displayLink: CADisplayLink?
+    private var dlLastIndex: Int64 = -1
+    private var dlWindowStartMedia: Double = -1
+    private var dlWindowStartWall: Double = -1
+    private var dlTicks = 0
+    private var dlRepeats = 0
+    private var dlSkips = 0
+
+    @objc private func displayLinkTick(_ link: CADisplayLink) {
+        guard synchronizer.rate > 0 else {
+            dlLastIndex = -1
+            dlWindowStartWall = -1
+            return
+        }
+        let media = CMTimeGetSeconds(synchronizer.currentTime())
+        let frameDur = gridFrameDuration
+        guard frameDur > 0 else { return }
+        let index = Int64((media / frameDur).rounded(.down))
+        if dlLastIndex >= 0 {
+            let advance = index - dlLastIndex
+            dlTicks += 1
+            if advance == 0 { dlRepeats += 1 }
+            else if advance >= 2 { dlSkips += Int(advance - 1) }
+        }
+        dlLastIndex = index
+        if dlWindowStartWall < 0 {
+            dlWindowStartWall = link.timestamp
+            dlWindowStartMedia = media
+        }
+        let wall = link.timestamp - dlWindowStartWall
+        if wall >= 10 {
+            let mediaAdv = media - dlWindowStartMedia
+            let ppm = (mediaAdv / wall - 1) * 1_000_000
+            NSLog("[DVSample] vsync probe: %d refreshes, %d repeats, %d skips, clock %+.0fppm, avSkew=%.2fs",
+                  dlTicks, dlRepeats, dlSkips, ppm, lastQueuedVideoPTS - lastQueuedAudioPTS)
+            dlTicks = 0; dlRepeats = 0; dlSkips = 0
+            dlWindowStartWall = link.timestamp
+            dlWindowStartMedia = media
+        }
+    }
+
     // Live jitter probe (diagnostic): clock ratio + queue depths every 2s.
     private var probeTick = 0
     private var lastProbeWall: CFAbsoluteTime = 0
@@ -433,6 +480,8 @@ final class DVSampleEngine {
         synchronizer.removeRenderer(audioRenderer, at: .invalid)
         timeTimer?.invalidate()
         timeTimer = nil
+        displayLink?.invalidate()
+        displayLink = nil
         // Drop the queued samples NOW. The queues held up to 240 compressed
         // AUs (~80MB at UHD-remux bitrates) and stop() never cleared them —
         // combined with the callback retain cycle below, that WAS the
@@ -690,6 +739,9 @@ final class DVSampleEngine {
             self.synchronizer.setRate(0, time: CMTime(seconds: self.startAt, preferredTimescale: 90000))
             self.installFeeders()
             self.onBuffering?(true)
+            let link = CADisplayLink(target: self, selector: #selector(self.displayLinkTick(_:)))
+            link.add(to: .main, forMode: .common)
+            self.displayLink = link
             self.timeTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
                 guard let self else { return }
                 self.onTime?(self.position)
@@ -823,6 +875,7 @@ final class DVSampleEngine {
                 if let decoder = audioDecoder { avcodec_flush_buffers(decoder) }
                 if let sdec = subDecoder { avcodec_flush_buffers(sdec) }
                 subPacketBuffer.removeAll(keepingCapacity: true)
+                lastAudioEndPTS = -1
                 pcmBatch.removeAll(keepingCapacity: true)
                 pcmBatchFrames = 0
                 pcmBatchStartPTS = -1
@@ -945,7 +998,43 @@ final class DVSampleEngine {
 
     /// Bounded enqueue — blocks (self-clearing buffer) until the renderers
     /// have consumed room, a seek clears the queues, or stop.
+    // Audio PTS continuity census: the synchronizer slaves VIDEO to the
+    // AUDIO renderer's clock, so a gap or overlap in audio timestamps makes
+    // the whole presentation lurch — visible stutter with every other probe
+    // clean. Expected next PTS = last PTS + last duration; any mismatch
+    // beyond 2ms is counted and the worst offender kept.
+    private var lastAudioEndPTS: Double = -1
+    private var audioPTSSeen = 0
+    private var audioPTSGaps = 0
+    private var audioPTSWorstGap: Double = 0
+    private var lastQueuedVideoPTS: Double = 0
+    private var lastQueuedAudioPTS: Double = 0
+
+    private func censusAudioPTS(_ sample: CMSampleBuffer) {
+        let pts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample))
+        let dur = CMTimeGetSeconds(CMSampleBufferGetDuration(sample))
+        lastQueuedAudioPTS = pts
+        if lastAudioEndPTS >= 0 {
+            let gap = pts - lastAudioEndPTS
+            audioPTSSeen += 1
+            if abs(gap) > 0.002 {
+                audioPTSGaps += 1
+                if abs(gap) > abs(audioPTSWorstGap) { audioPTSWorstGap = gap }
+            }
+            if audioPTSSeen % 120 == 0 {   // ~30s of quarter-second batches
+                NSLog("[DVSample] audio pts census: %d buffers, %d discontinuities (worst %+.1fms)",
+                      audioPTSSeen, audioPTSGaps, audioPTSWorstGap * 1000)
+            }
+        }
+        lastAudioEndPTS = dur.isFinite && dur > 0 ? pts + dur : pts
+    }
+
     private func enqueueBounded(_ sample: CMSampleBuffer, isVideo: Bool, generation: Int) {
+        if isVideo {
+            lastQueuedVideoPTS = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample))
+        } else {
+            censusAudioPTS(sample)
+        }
         queueLock.lock()
         while !cancelled, seekGeneration == generation,
               (isVideo ? videoQueue.count >= videoQueueCap
