@@ -4477,6 +4477,7 @@ final class PlayerViewModel: ObservableObject {
         dvDirectEngine?.stop()
         // Leak probes: 5s after teardown everything below should be freed.
         // Whichever line still prints ALIVE names the retention layer.
+        #if DEBUG
         weak var probeVM: PlayerViewModel? = self
         weak var probeEngine: DVSampleEngine? = dvDirectEngine
         weak var probeVideoView: UIView? = dvDirectEngine?.videoView
@@ -4494,6 +4495,7 @@ final class PlayerViewModel: ObservableObject {
                   probeVideoView == nil ? "freed" : "ALIVE",
                   pvc.map { String(describing: type(of: $0)) } ?? "nil")
         }
+        #endif
         resetNativeDV()
     }
 

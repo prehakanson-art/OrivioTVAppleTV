@@ -8,6 +8,17 @@ import Libavutil
 import UIKit
 import VideoToolbox
 
+/// Diagnostic instrumentation logger. The probe suite (vsync frame
+/// progression, PTS censuses, clock/queue/feed telemetry, phase steering)
+/// is what found the decode-burst stutter and stays in the source — but it
+/// is noise in a shipping build, so it compiles to nothing in Release.
+@inline(__always)
+func dvDiag(_ format: String, _ args: CVarArg...) {
+    #if DEBUG
+    withVaList(args) { NSLogv("[DVSample] " + format, $0) }
+    #endif
+}
+
 /// Direct Dolby Vision sample feed — the Infuse/SenPlayer architecture.
 ///
 /// The remux→loopback-HLS→AVPlayer pipeline produces true DV output, but it
@@ -236,7 +247,7 @@ final class DVSampleEngine {
             if off > ptsWorstOff { ptsWorstOff = off }
         }
         if ptsSeen % 480 == 0 {
-            NSLog("[DVSample] pts census: %d frames, %d off-grid (worst %.1fms) | AU avg=%dKB max=%dKB",
+            dvDiag("pts census: %d frames, %d off-grid (worst %.1fms) | AU avg=%dKB max=%dKB",
                   ptsSeen, ptsIrregular, ptsWorstOff * 1000,
                   auBytesWindow / 480 / 1024, auMaxWindow / 1024)
             auBytesWindow = 0
@@ -303,10 +314,10 @@ final class DVSampleEngine {
                 synchronizer.setRate(synchronizer.rate,
                                      time: CMTime(seconds: t - error,
                                                   preferredTimescale: 90000))
-                NSLog("[DVSample] phase %.1fms (edge %.1fms) — steered %+.1fms to mid-cycle",
+                dvDiag("phase %.1fms (edge %.1fms) — steered %+.1fms to mid-cycle",
                       medianPhase * 1000, edge * 1000, -error * 1000)
             } else if edge < 0.010 {
-                NSLog("[DVSample] frame-boundary phase: median %.1fms (edge %.1fms)",
+                dvDiag("frame-boundary phase: median %.1fms (edge %.1fms)",
                       medianPhase * 1000, edge * 1000)
             }
         }
@@ -326,7 +337,7 @@ final class DVSampleEngine {
         if wall >= 10 {
             let mediaAdv = media - dlWindowStartMedia
             let ppm = (mediaAdv / wall - 1) * 1_000_000
-            NSLog("[DVSample] vsync probe: %d refreshes, %d repeats, %d skips, clock %+.0fppm, avSkew=%.2fs, decodeStalls=%d (worst %dms)",
+            dvDiag("vsync probe: %d refreshes, %d repeats, %d skips, clock %+.0fppm, avSkew=%.2fs, decodeStalls=%d (worst %dms)",
                   dlTicks, dlRepeats, dlSkips, ppm, lastQueuedVideoPTS - lastQueuedAudioPTS,
                   pullGapCount, pullGapWorstMs)
             pullGapCount = 0
@@ -607,7 +618,7 @@ final class DVSampleEngine {
                             dvLevel = Int(record.dv_level)
                             dvCompatibilityID = Int(record.dv_bl_signal_compatibility_id)
                             detectedDVProfile = dvProfile
-                            NSLog("[DVSample] dovi conf: profile %d.%d level %d (bl compat %d)",
+                            dvDiag("dovi conf: profile %d.%d level %d (bl compat %d)",
                                   dvProfile, dvCompatibilityID, dvLevel, dvCompatibilityID)
                         }
                     }
@@ -622,7 +633,7 @@ final class DVSampleEngine {
                 containerMbps = Double(inCtx.pointee.bit_rate) / 1_000_000
                 // The A/B datum the jitter hunt needs: exact rate + bitrate.
                 let rfr = stream.pointee.r_frame_rate
-                NSLog("[DVSample] video: %dx%d avg_fps=%d/%d (%.5f) r_fps=%d/%d container_bitrate=%.1f Mbps",
+                dvDiag("video: %dx%d avg_fps=%d/%d (%.5f) r_fps=%d/%d container_bitrate=%.1f Mbps",
                       par.pointee.width, par.pointee.height,
                       fr.num, fr.den, fr.den > 0 ? av_q2d(fr) : 0,
                       rfr.num, rfr.den,
@@ -820,7 +831,7 @@ final class DVSampleEngine {
                         let feedMbps = Double(nowBytes - self.lastProbeBytes) * 8
                             / max(wall - self.lastProbeWall, 0.001) / 1_000_000
                         self.lastProbeBytes = nowBytes
-                        NSLog("[DVSample] probe clock=%.4f vq=%d aq=%d vReady=%d aReady=%d rate=%.2f panel=%ldHz feed=%.1fMbps",
+                        dvDiag("probe clock=%.4f vq=%d aq=%d vReady=%d aReady=%d rate=%.2f panel=%ldHz feed=%.1fMbps",
                               ratio, vq, aq,
                               self.displayLayer.isReadyForMoreMediaData ? 1 : 0,
                               self.audioRenderer.isReadyForMoreMediaData ? 1 : 0,
@@ -1087,7 +1098,7 @@ final class DVSampleEngine {
                 if abs(gap) > abs(audioPTSWorstGap) { audioPTSWorstGap = gap }
             }
             if audioPTSSeen % 120 == 0 {   // ~30s of quarter-second batches
-                NSLog("[DVSample] audio pts census: %d buffers, %d discontinuities (worst %+.1fms)",
+                dvDiag("audio pts census: %d buffers, %d discontinuities (worst %+.1fms)",
                       audioPTSSeen, audioPTSGaps, audioPTSWorstGap * 1000)
             }
         }
@@ -1316,6 +1327,11 @@ final class DVSampleEngine {
                       channels, rate, samples, frame.pointee.format)
             }
             var outChannels = channels
+            // Downmix reads FFmpeg's native order, so remap only when the
+            // multichannel PCM is going out as-is.
+            if !downmixToStereo || channels <= 2 {
+                Self.remapToCoreAudioOrder(&pcm, channels: channels, samples: samples)
+            }
             if downmixToStereo, channels > 2 {
                 pcm = Self.downmix(pcm, channels: channels, samples: samples)
                 outChannels = 2
@@ -1358,6 +1374,36 @@ final class DVSampleEngine {
             out[i * 2 + 1] = right * 0.5
         }
         return out
+    }
+
+    /// FFmpeg channel order → the order the CoreAudio layout tag describes.
+    ///
+    /// FFmpeg 7.1 is FL FR FC LFE BL BR SL SR (back pair BEFORE side pair);
+    /// kAudioChannelLayoutTag_MPEG_7_1_C is L R C LFE Ls Rs Rls Rrs (side
+    /// pair BEFORE rear pair). Tagged without reordering, every 7.1 track
+    /// played its rear content out of the side speakers and vice versa —
+    /// audible as a rotated soundstage on a real surround system. 6.1 has
+    /// the same problem: FFmpeg FL FR FC LFE BC SL SR vs MPEG_6_1_A's
+    /// L R C LFE Ls Rs Cs. Stereo/mono/5.1 orders already match.
+    private static func remapToCoreAudioOrder(_ pcm: inout [Float], channels: Int, samples: Int) {
+        guard channels == 7 || channels == 8 else { return }
+        for i in 0 ..< samples {
+            let base = i * channels
+            if channels == 8 {
+                // BL BR SL SR  ->  SL SR BL BR
+                let bl = pcm[base + 4], br = pcm[base + 5]
+                pcm[base + 4] = pcm[base + 6]
+                pcm[base + 5] = pcm[base + 7]
+                pcm[base + 6] = bl
+                pcm[base + 7] = br
+            } else {
+                // BC SL SR  ->  SL SR BC
+                let bc = pcm[base + 4]
+                pcm[base + 4] = pcm[base + 5]
+                pcm[base + 5] = pcm[base + 6]
+                pcm[base + 6] = bc
+            }
+        }
     }
 
     /// Any planar/packed float or integer layout → packed interleaved Float32.
@@ -1425,6 +1471,9 @@ final class DVSampleEngine {
         case 4: layout.mChannelLayoutTag = kAudioChannelLayoutTag_Quadraphonic
         case 5: layout.mChannelLayoutTag = kAudioChannelLayoutTag_MPEG_5_0_A
         case 6: layout.mChannelLayoutTag = kAudioChannelLayoutTag_MPEG_5_1_A
+        // 6.1/7.1 need a REORDER as well as a tag (see remapToCoreAudioOrder):
+        // FFmpeg emits back-surrounds before side-surrounds, these tags
+        // expect the opposite, so the pairs are swapped before this point.
         case 7: layout.mChannelLayoutTag = kAudioChannelLayoutTag_MPEG_6_1_A
         case 8: layout.mChannelLayoutTag = kAudioChannelLayoutTag_MPEG_7_1_C
         default:
@@ -1902,7 +1951,7 @@ final class DVSampleEngine {
                 if elNalCount == 240 {
                     let avg = elNalBytes / elNalCount
                     let fel = avg > 1000
-                    NSLog("[DVSample] P7 enhancement layer: avg %d bytes/NAL over %d NALs — %@",
+                    dvDiag("P7 enhancement layer: avg %d bytes/NAL over %d NALs — %@",
                           avg, elNalCount, fel ? "FEL (full residual layer)" : "MEL (empty shell)")
                     let verdict = fel
                         ? "FEL — full enhancement layer (dropped; converted 8.1 metadata is approximate)"
