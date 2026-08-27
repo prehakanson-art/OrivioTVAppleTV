@@ -541,6 +541,7 @@ final class DVSampleEngine {
         var bestAudioScore = Int.min
         var dvProfile = 0
         var dvLevel = 0
+        var dvCompatibilityID = 1
         var nalLengthSize = 4
         for i in 0 ..< Int(ictx!.pointee.nb_streams) {
             guard let stream = ictx!.pointee.streams[i], let par = stream.pointee.codecpar else { continue }
@@ -557,7 +558,10 @@ final class DVSampleEngine {
                             ) { $0 }.pointee
                             dvProfile = Int(record.dv_profile)
                             dvLevel = Int(record.dv_level)
+                            dvCompatibilityID = Int(record.dv_bl_signal_compatibility_id)
                             detectedDVProfile = dvProfile
+                            NSLog("[DVSample] dovi conf: profile %d.%d level %d (bl compat %d)",
+                                  dvProfile, dvCompatibilityID, dvLevel, dvCompatibilityID)
                         }
                     }
                 }
@@ -701,7 +705,13 @@ final class DVSampleEngine {
             // The dvvC the display pipeline sees: a converted P7 declares
             // itself 8.1 single-layer (the remux path's exact contract).
             let outProfile = needsP7 ? 8 : dvProfile
-            let compatID = outProfile == 5 ? 0 : 1   // 8.x rides an HDR10 base
+            // The base-layer compatibility id comes from the FILE's own dovi
+            // config, not an assumption: Profile 8 exists as 8.1 (HDR10 base)
+            // AND 8.4 (HLG base) — hardcoding 1 told the display to decode
+            // PQ math against HLG pixels on 8.4 files: washed, wrong colors.
+            // P5 is its own IPT-PQ world (compat 0); a converted P7 emits an
+            // HDR10-base 8.1 by construction.
+            let compatID = outProfile == 5 ? 0 : (needsP7 ? 1 : dvCompatibilityID)
             let dvvC = Self.doviConfigurationBox(
                 profile: outProfile, level: max(dvLevel, 1), compatibilityID: compatID
             )
