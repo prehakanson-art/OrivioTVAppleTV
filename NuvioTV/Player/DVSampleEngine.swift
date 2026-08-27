@@ -270,6 +270,9 @@ final class DVSampleEngine {
     private var dlTicks = 0
     private var dlRepeats = 0
     private var dlSkips = 0
+    /// Repeats+skips from the last completed vsync window — the servo's
+    /// evidence gate (never steer a healthy presentation).
+    private var dlLastWindowDamage = 0
 
     // Phase steering: slo-mo footage of the panel proved real repeat+catch-up
     // pairs (~3/s) with a mathematically perfect clock — the signature of
@@ -307,7 +310,15 @@ final class DVSampleEngine {
             let mid = frameDur / 2
             var error = medianPhase - mid
             if error > mid { error -= frameDur }
-            if edge < 0.008, Date().timeIntervalSince(lastPhaseNudgeAt) > 15,
+            // STEER ONLY ON PROVEN DAMAGE. The correction is itself a clock
+            // discontinuity (~14-21ms, a third of a frame), so steering just
+            // because the phase sits near a boundary traded a hypothetical
+            // stutter for a guaranteed one every ~30s — on a title the VT
+            // renderer was already presenting flawlessly. With decode-ahead
+            // the layer flips finished frames and boundary phase rarely
+            // matters, so require measured repeats/skips first.
+            if dlLastWindowDamage >= 3, edge < 0.008,
+               Date().timeIntervalSince(lastPhaseNudgeAt) > 15,
                !autoPaused, synchronizer.rate > 0 {
                 lastPhaseNudgeAt = Date()
                 let t = CMTimeGetSeconds(synchronizer.currentTime())
@@ -317,8 +328,8 @@ final class DVSampleEngine {
                 dvDiag("phase %.1fms (edge %.1fms) — steered %+.1fms to mid-cycle",
                       medianPhase * 1000, edge * 1000, -error * 1000)
             } else if edge < 0.010 {
-                dvDiag("frame-boundary phase: median %.1fms (edge %.1fms)",
-                      medianPhase * 1000, edge * 1000)
+                dvDiag("frame-boundary phase: median %.1fms (edge %.1fms, damage %d)",
+                       medianPhase * 1000, edge * 1000, dlLastWindowDamage)
             }
         }
         let index = Int64((media / frameDur).rounded(.down))
@@ -342,6 +353,7 @@ final class DVSampleEngine {
                   pullGapCount, pullGapWorstMs)
             pullGapCount = 0
             pullGapWorstMs = 0
+            dlLastWindowDamage = dlRepeats + dlSkips
             dlTicks = 0; dlRepeats = 0; dlSkips = 0
             dlWindowStartWall = link.timestamp
             dlWindowStartMedia = media
