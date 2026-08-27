@@ -816,6 +816,7 @@ final class DVSampleEngine {
                 // exit at 16 AUs ≈ two-thirds of a second) prevents flapping.
                 self.queueLock.lock()
                 let depth = self.videoQueue.count
+                let aqDepth = self.audioQueue.count
                 let eof = self.demuxEOF
                 self.queueLock.unlock()
                 if !self.playbackClockStarted {
@@ -830,16 +831,23 @@ final class DVSampleEngine {
                     return
                 }
                 if !eof {
-                    if depth == 0, !self.autoPaused, self.userRate > 0, self.synchronizer.rate > 0 {
+                    // EITHER queue running dry means a hold: the vsync probe
+                    // caught the audio renderer starving (aq=0 while vq>0)
+                    // during feed micro-dips — its clock lurched ±1800ppm and
+                    // dragged video into visible repeats/skips, because the
+                    // synchronizer slaves everything to the audio clock. The
+                    // old check watched only video.
+                    if (depth == 0 || aqDepth == 0), !self.autoPaused, self.userRate > 0, self.synchronizer.rate > 0 {
                         self.autoPaused = true
                         self.autoPausedAt = Date()
                         if Date().timeIntervalSince(self.lastUnderrunAt) > 90 { self.recentUnderruns = 0 }
                         self.recentUnderruns += 1
                         self.lastUnderrunAt = Date()
-                        NSLog("[DVSample] underrun #%d — holding clock (vq=0)", self.recentUnderruns)
+                        NSLog("[DVSample] underrun #%d — holding clock (vq=%d aq=%d)",
+                              self.recentUnderruns, depth, aqDepth)
                         self.synchronizer.setRate(0, time: self.synchronizer.currentTime())
                         self.onBuffering?(true)
-                    } else if self.autoPaused, depth >= self.underrunResumeDepth(eof: eof) {
+                    } else if self.autoPaused, depth >= self.underrunResumeDepth(eof: eof), aqDepth >= 4 {
                         self.autoPaused = false
                         self.seekRefill = false
                         NSLog("[DVSample] underrun over — resuming with vq=%d", depth)
