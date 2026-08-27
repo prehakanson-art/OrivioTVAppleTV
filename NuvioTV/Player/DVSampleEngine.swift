@@ -346,9 +346,13 @@ final class DVSampleEngine {
     private var autoPausedAt = Date.distantPast
     private var recentUnderruns = 0
     private var lastUnderrunAt = Date.distantPast
+    /// True between a seek and its first resume: the refill after a seek is
+    /// a fresh start, not a stalled feed — take a 1s cushion and go.
+    private var seekRefill = false
 
     private func underrunResumeDepth(eof: Bool) -> Int {
         if eof { return 1 }
+        if seekRefill { return 24 }
         // A one-off hiccup resumes fast (time-boxed small cushion). REPEATED
         // underruns mean the feed is genuinely slower than the movie right
         // now (a debrid link warming up) — each one demands a deeper cushion,
@@ -389,6 +393,14 @@ final class DVSampleEngine {
         let target = max(0, min(seconds, duration > 1 ? duration - 2 : seconds))
         pendingSeekTo = target
         seekGeneration += 1
+        // A seek's refill is a fresh start, NOT a stalled feed. Without this,
+        // every scan-seek emptied the queues, registered as an "underrun",
+        // and stacked the escalation cushion until landing demanded a 10s
+        // refill — the "doesn't load when I get there" report. Reset the
+        // escalation and resume on a 1s cushion.
+        recentUnderruns = 0
+        lastUnderrunAt = .distantPast
+        seekRefill = true
         queueLock.lock()
         videoQueue.removeAll()
         audioQueue.removeAll()
@@ -759,6 +771,7 @@ final class DVSampleEngine {
                         self.onBuffering?(true)
                     } else if self.autoPaused, depth >= self.underrunResumeDepth(eof: eof) {
                         self.autoPaused = false
+                        self.seekRefill = false
                         NSLog("[DVSample] underrun over — resuming with vq=%d", depth)
                         if self.userRate > 0 {
                             self.synchronizer.setRate(self.userRate, time: self.synchronizer.currentTime())
