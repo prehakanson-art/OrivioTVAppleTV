@@ -286,11 +286,15 @@ final class DVSampleEngine {
     /// judder no pipeline probe can see.
     let forceHDR10: Bool
 
+    /// Exact-label track memory ("English · AC3 · 6ch"): outranks language.
+    let preferredAudioLabel: String?
+
     init(input: String, startAt: Double,
          preferredAudioLanguage: String, convertProfile7: Bool,
          requestHeaders: [String: String]? = nil,
          downmixToStereo: Bool = false,
-         forceHDR10: Bool = false) {
+         forceHDR10: Bool = false,
+         preferredAudioLabel: String? = nil) {
         inputURLString = input
         self.startAt = max(startAt, 0)
         self.preferredAudioLanguage = preferredAudioLanguage
@@ -298,6 +302,7 @@ final class DVSampleEngine {
         self.requestHeaders = requestHeaders
         self.downmixToStereo = downmixToStereo
         self.forceHDR10 = forceHDR10
+        self.preferredAudioLabel = preferredAudioLabel
     }
 
     // MARK: Lifecycle
@@ -559,6 +564,9 @@ final class DVSampleEngine {
                 var score = channels * 10
                 if (disposition & AV_DISPOSITION_DEFAULT) != 0 { score += 5 }
                 if !preferredAudioLanguage.isEmpty, lang.hasPrefix(preferredAudioLanguage) { score += 200 }
+                // The user's remembered pick for THIS title wins outright.
+                if let want = preferredAudioLabel, !want.isEmpty,
+                   audioTracks.last?.label == want { score += 100_000 }
                 if (disposition & (AV_DISPOSITION_COMMENT | AV_DISPOSITION_VISUAL_IMPAIRED
                                    | AV_DISPOSITION_HEARING_IMPAIRED)) != 0
                     || title.contains("commentary") || title.contains("description") {

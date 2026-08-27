@@ -75,6 +75,10 @@ enum ContainerSniffer {
 struct TitleMemory: Codable {
     var engine: String?
     var audioLanguage: String?
+    /// Exact track label ("English · AC3 · 6ch") — languages alone can't
+    /// distinguish the AC3 pick from the TrueHD default on an all-English
+    /// remux. Label match outranks language match on restore.
+    var audioTrackLabel: String?
     /// Subtitle language, or "off" for an explicit off choice.
     var subtitleLanguage: String?
     var speed: Float?

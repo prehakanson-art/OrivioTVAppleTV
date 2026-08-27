@@ -762,7 +762,8 @@ final class PlayerViewModel: ObservableObject {
                 convertProfile7: p7ok,
                 requestHeaders: entry.stream.behaviorHints?.proxyHeaders?.requestHeaders,
                 downmixToStereo: !spatial,
-                forceHDR10: felHDR10
+                forceHDR10: felHDR10,
+                preferredAudioLabel: PlaybackMemory.memory(for: self.meta.id)?.audioTrackLabel
             )
             self.dvDirectEngine = engine
             self.duration = probe.durationSeconds
@@ -3264,11 +3265,14 @@ final class PlayerViewModel: ObservableObject {
             vlcEngine?.selectAudio(id)
         case .dvDirectAudio(let index):
             dvDirectEngine?.selectAudio(index: index)
-            // Same language memory the KSPlayer path keeps: the language
-            // carries to every episode; ids don't.
-            if let lang = dvDirectEngine?.audioTracks.first(where: { $0.index == index })?.lang,
-               !lang.isEmpty {
-                PlaybackMemory.update(meta.id) { $0.audioLanguage = lang }
+            // Remember BOTH: the exact label (distinguishes AC3-6ch from the
+            // TrueHD default on an all-English remux) and the language (which
+            // carries across episodes/releases where labels differ).
+            if let track = dvDirectEngine?.audioTracks.first(where: { $0.index == index }) {
+                PlaybackMemory.update(meta.id) {
+                    $0.audioTrackLabel = track.label
+                    if !track.lang.isEmpty { $0.audioLanguage = track.lang }
+                }
             }
         default:
             break
