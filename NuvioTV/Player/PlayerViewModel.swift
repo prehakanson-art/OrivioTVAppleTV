@@ -653,8 +653,14 @@ final class PlayerViewModel: ObservableObject {
     /// background/foreground/controller event.
     private var notificationTokens: [NSObjectProtocol] = []
 
+    /// Live instance census: the question isn't whether ONE view model
+    /// lingers a few seconds after dismissal (SwiftUI releases lazily), it's
+    /// whether they ACCUMULATE across sessions. This counter answers it.
+    nonisolated(unsafe) static var liveInstances = 0
+
     deinit {
-        NSLog("[OrivioPlayer] PlayerViewModel deinit")
+        Self.liveInstances -= 1
+        NSLog("[OrivioPlayer] PlayerViewModel deinit (live=%d)", Self.liveInstances)
         for token in notificationTokens { NotificationCenter.default.removeObserver(token) }
     }
     private var dvAttempted = false
@@ -1403,6 +1409,7 @@ final class PlayerViewModel: ObservableObject {
         settings: PlayerSettings = .default,
         allowUnairedNextUp: Bool = true
     ) {
+        Self.liveInstances += 1
         // Hand the poster cache's RAM back before the player allocates its
         // own. See ImageCache.dropDecoded().
         ImageCache.shared.dropDecoded()
@@ -4481,7 +4488,7 @@ final class PlayerViewModel: ObservableObject {
             // keeps compositing would explain both the re-entry stutter and
             // the corrupted-strip glitch.
             let pvc = UIApplication.shared.ks_keyWindow?.rootViewController?.presentedViewController
-            NSLog("[OrivioLeak] +5s: vm=%@ engine=%@ videoView=%@ presentedVC=%@",
+            NSLog("[OrivioLeak] +5s: vm=%@ engine=%@ videoView=%@ presentedVC=%@ liveVMs=\(PlayerViewModel.liveInstances)",
                   probeVM == nil ? "freed" : "ALIVE",
                   probeEngine == nil ? "freed" : "ALIVE",
                   probeVideoView == nil ? "freed" : "ALIVE",
