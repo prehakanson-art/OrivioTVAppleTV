@@ -1,5 +1,4 @@
 {
-  "originHash" : "857169685180d5e0e3fb39428f5b7372fc454c64dd246597fe95855eef2fdb92",
   "pins" : [
     {
       "identity" : "ffmpegkit",
@@ -24,10 +23,10 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/alexeichhorn/YouTubeKit",
       "state" : {
-        "revision" : "65be95dbb1dbd749499e0638871568c823822276",
-        "version" : "0.4.8"
+        "revision" : "e5b7d0396ce12bf3444f0d209e8436c83373b7af",
+        "version" : "0.4.9"
       }
     }
   ],
-  "version" : 3
+  "version" : 2
 }

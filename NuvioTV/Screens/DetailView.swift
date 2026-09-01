@@ -187,6 +187,16 @@ struct DetailView: View {
     var onSelectPerson: (Int, String) -> Void = { _, _ in }
     var onSelectCompany: (Int, String) -> Void = { _, _ in }
     @State private var activeTrailer: TMDBService.Trailer?
+    /// The action row's controls, for the enter-lands-on-Play redirect.
+    private enum ActionControl: Hashable {
+        case play, startOver, library, watched, rate, trailer
+    }
+    /// Entering the action row from ANY direction lands on the Play button:
+    /// when focus arrives on any other control while the row didn't previously
+    /// hold focus, it's immediately redirected to Play. (The declarative
+    /// routes — `.defaultFocus` / `.focusScope` — both BROKE directional entry
+    /// into the row's focusSection on tvOS 26; this manual redirect doesn't.)
+    @FocusState private var actionFocus: ActionControl?
     @State private var showRatingPicker = false
     /// Trailer playing silently in the backdrop after the idle delay.
     @State private var backdropPlayer: AVPlayer?
@@ -195,6 +205,18 @@ struct DetailView: View {
     /// every Detail visit leaves a dead block registered with the notification
     /// center forever.
     @State private var backdropLoopToken: NSObjectProtocol?
+    /// Netflix-style: once the muted backdrop trailer has been playing and the
+    /// user stays idle a beat longer, the page chrome fades away and the
+    /// trailer takes the full screen (with sound). Any press/move restores.
+    @State private var trailerFullscreen = false
+    @State private var teaserFocused = false
+    /// Bumped on any tracked focus change; re-arms (or cancels) the idle timer.
+    @State private var interactionCount = 0
+    /// Set when the user backs OUT of full-screen: the idle timer stays
+    /// disarmed until they actually move again, so exiting doesn't bounce
+    /// straight back into full-screen after the next 2 idle seconds.
+    @State private var fullscreenCooldown = false
+    @FocusState private var fullscreenTrailerFocus: Bool
 
     init(
         item: MetaItem,
@@ -222,7 +244,7 @@ struct DetailView: View {
 
     var body: some View {
         ZStack {
-            theme.palette.background.ignoresSafeArea()
+            ATVBackground()
             backdrop
             ScrollView(.vertical) {
                 VStack(alignment: .leading, spacing: NuvioSpacing.xl) {
@@ -239,6 +261,69 @@ struct DetailView: View {
                 .padding(.bottom, NuvioSpacing.huge)
             }
             .scrollClipDisabled()
+            .opacity(trailerFullscreen ? 0 : 1)
+            // Hidden is NOT unfocusable: without this, focus could stay on the
+            // invisible synopsis during full-screen — whose move-handler then
+            // swallowed every press, locking full-screen mode in.
+            .disabled(trailerFullscreen)
+
+            // Full-screen trailer mode: an invisible focusable overlay holds
+            // focus; ANY input — move, Select, Menu, ⏯ — restores the page.
+            // NOT a Button: one with a fully transparent label never becomes
+            // focusable, so nothing held focus and full-screen locked in.
+            if trailerFullscreen {
+                Color.black.opacity(0.001)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .ignoresSafeArea()
+                    .focusable()
+                    .focused($fullscreenTrailerFocus)
+                    .onMoveCommand { _ in exitTrailerFullscreen() }
+                    .onExitCommand { exitTrailerFullscreen() }
+                    .onPlayPauseCommand { exitTrailerFullscreen() }
+                    .onTapGesture { exitTrailerFullscreen() }
+            }
+        }
+        // Arm the idle → full-screen countdown whenever the trailer is up and
+        // the user is resting in the header; any tracked interaction re-arms.
+        .task(id: "\(showBackdropTrailer)#\(interactionCount)#\(trailerFullscreen)") {
+            guard showBackdropTrailer, !trailerFullscreen, !fullscreenCooldown,
+                  activeTrailer == nil, !showRatingPicker,
+                  actionFocus != nil || teaserFocused else { return }
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled, showBackdropTrailer, !trailerFullscreen,
+                  activeTrailer == nil, !showRatingPicker else { return }
+            // Un-muting needs a live audio session — the muted backdrop
+            // deliberately runs without one (a raw AVPlayer can stall on tvOS
+            // otherwise), so without this the full-screen trailer was SILENT.
+            try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
+            try? AVAudioSession.sharedInstance().setActive(true)
+            backdropPlayer?.isMuted = false
+            // A bare AVPlayerLayer doesn't suppress the tvOS screensaver the
+            // way AVPlayerViewController does — without this the Aerial saver
+            // rolled in over a full-screen trailer.
+            UIApplication.shared.isIdleTimerDisabled = true
+            withAnimation(.easeInOut(duration: 0.6)) { trailerFullscreen = true }
+            // Deferred: set in the same transaction as the button's insertion
+            // it can be ignored.
+            try? await Task.sleep(for: .milliseconds(120))
+            fullscreenTrailerFocus = true
+        }
+        .task {
+            // Dev: -focusLog prints the focused item every 2s (sim key
+            // delivery is flaky; this is the only reliable focus truth).
+            if ProcessInfo.processInfo.arguments.contains("-focusLog") {
+                while !Task.isCancelled {
+                    let env = (UIApplication.shared.connectedScenes.first as? UIWindowScene)?.keyWindow
+                    let item = env.flatMap { UIFocusSystem.focusSystem(for: $0)?.focusedItem }
+                    NSLog("[OrivioFocus] focused=%@ fs=%d captureFocus=%d teaser=%d action=%@",
+                          item.map { String(describing: $0).prefix(200) }.map(String.init) ?? "NONE",
+                          trailerFullscreen ? 1 : 0,
+                          fullscreenTrailerFocus ? 1 : 0,
+                          teaserFocused ? 1 : 0,
+                          actionFocus.map { String(describing: $0) } ?? "nil")
+                    try? await Task.sleep(for: .seconds(2))
+                }
+            }
         }
         .task { await viewModel.load(addonManager: addonManager, mdbSettings: mdblist.settings, tmdb: tmdbSettings.settings, parentalGuideEnabled: playerSettings.settings.parentalGuideEnabled) }
         // Auto-play the trailer in the backdrop after the configured idle
@@ -280,7 +365,8 @@ struct DetailView: View {
                         .frame(width: geo.size.width, height: geo.size.height)
                         .transition(.opacity)
                 }
-                HeroGradient(background: theme.palette.background, fullBleed: true)
+                HeroGradient(background: theme.stageBlend, fullBleed: true)
+                    .opacity(trailerFullscreen ? 0 : 1)
             }
         }
         .ignoresSafeArea()
@@ -295,11 +381,18 @@ struct DetailView: View {
     private func startBackdropTrailerIfEnabled() async {
         let delay = playerSettings.settings.autoPlayTrailerSeconds
         guard delay > 0, let trailer = viewModel.trailers.first else { return }
+        // Resolve WHILE the idle delay runs, not after it — extraction (and
+        // the remote fallback especially) can take several seconds, and
+        // serializing it behind the delay made the trailer feel like forever.
+        async let resolved = TrailerResolver.backdropItem(youtubeKey: trailer.youtubeKey)
         try? await Task.sleep(for: .seconds(delay))
         guard !Task.isCancelled else { return }
-        guard let url = await TrailerResolver.streamURL(youtubeKey: trailer.youtubeKey) else { return }
+        guard let item = await resolved else {
+            NSLog("[OrivioTrailer] backdrop resolve failed for %@", trailer.youtubeKey)
+            return
+        }
         guard !Task.isCancelled else { return }
-        let player = AVPlayer(url: url)
+        let player = AVPlayer(playerItem: item)
         // Silent hero preview (Netflix-style). Muting also means we don't need
         // an active audio session, which on tvOS can otherwise stall a raw
         // AVPlayer's playback entirely.
@@ -321,7 +414,31 @@ struct DetailView: View {
         withAnimation(.easeInOut(duration: 0.6)) { showBackdropTrailer = true }
     }
 
+    /// Restore the detail page from full-screen trailer mode and put focus
+    /// back on Play.
+    private func exitTrailerFullscreen() {
+        fullscreenCooldown = true
+        UIApplication.shared.isIdleTimerDisabled = false
+        backdropPlayer?.isMuted = true
+        // Give interrupted audio (another app's music) its shouldResume back —
+        // full-screen mode activated the session to un-mute.
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        withAnimation(.easeInOut(duration: 0.35)) { trailerFullscreen = false }
+        // AFTER the capture button leaves the tree and the focus engine's own
+        // re-resolve has settled — set too early it gets overridden by the
+        // geometrically nearest item (the synopsis).
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(150))
+            actionFocus = .play
+        }
+    }
+
     private func teardownBackdropTrailer() {
+        if trailerFullscreen {
+            UIApplication.shared.isIdleTimerDisabled = false
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        }
+        trailerFullscreen = false
         // Clear the item too, not just pause — otherwise the muted backdrop
         // player stays the system "Now Playing" item and the tvOS transport
         // overlay can pop up over Home when Play/Pause is pressed.
@@ -343,26 +460,15 @@ struct DetailView: View {
             if let logo = viewModel.meta.logo {
                 RemoteImage(url: logo, contentMode: .fit, alignment: .bottomLeading)
                     .frame(width: 520, height: 180)
+                    // Grounds a white logo on both a light frost and dark art.
+                    .shadow(color: .black.opacity(0.5), radius: 16, y: 6)
             } else {
                 Text(viewModel.meta.name)
-                    .font(.system(size: 62, weight: .heavy))
+                    .font(FusionType.heroTitle(theme.font))
                     .foregroundStyle(theme.palette.textPrimary)
                     .lineLimit(2)
                     .frame(maxWidth: 900, alignment: .leading)
-            }
-
-            actionRow
-
-            if let director = viewModel.director {
-                Text("Director: \(director)")
-                    .font(.system(size: 22))
-                    .foregroundStyle(theme.palette.textTertiary)
-            }
-
-            if let description = viewModel.meta.description {
-                // Clickable teaser → full-description overlay (the Android
-                // app's scrollable hero-description feature).
-                DescriptionTeaser(text: description, title: viewModel.meta.name)
+                    .shadow(color: .black.opacity(0.4), radius: 10, y: 4)
             }
 
             // Meta line 1: Genres • Full release date • IMDb.
@@ -372,6 +478,35 @@ struct DetailView: View {
                 MetaLine(segments: secondaryMetaSegments)
             }
 
+            if let description = viewModel.meta.description {
+                // Clickable teaser → full-description overlay (the Android
+                // app's scrollable hero-description feature).
+                DescriptionTeaser(
+                    text: description,
+                    title: viewModel.meta.name,
+                    onFocusChanged: { focused in
+                        teaserFocused = focused
+                        // NOT clearing fullscreenCooldown here: focus falls
+                        // back onto the teaser as part of exiting full-screen.
+                        interactionCount += 1
+                    },
+                    // Down goes STRAIGHT to Play. Left to the engine, the
+                    // nearest control below the teaser's center is one of the
+                    // circle icons, and the entry redirect then hops focus to
+                    // Play a frame later — a visible double-jump.
+                    onMoveDown: { actionFocus = .play }
+                )
+            }
+
+            actionRow
+
+            if let director = viewModel.director {
+                Text("Director: \(director)")
+                    .font(FusionType.metadata(theme.font))
+                    .foregroundStyle(theme.palette.textTertiary)
+            }
+
+            // Fact chips grouped on one tight block under the actions.
             if let contentRating = viewModel.contentRating {
                 ContentRatingBadge(rating: contentRating)
             }
@@ -400,6 +535,7 @@ struct DetailView: View {
                         PlayActionButton(title: seriesPlayTitle(target)) {
                             onPlay(viewModel.meta, target)
                         }
+                        .focused($actionFocus, equals: .play)
                         // Auto Link Selector on: hold Play to pick a source
                         // manually instead of auto-playing the best match.
                         .playManuallyMenu(
@@ -413,12 +549,15 @@ struct DetailView: View {
                             CircleIconButton(systemName: "gobackward", active: false) {
                                 onPlayFromBeginning(viewModel.meta, target)
                             }
+                            .focused($actionFocus, equals: .startOver)
+                .focusable(actionFocus != nil)
                         }
                     }
                 } else {
                     PlayActionButton(title: playButtonTitle) {
                         onPlay(viewModel.meta, nil)
                     }
+                    .focused($actionFocus, equals: .play)
                     .playManuallyMenu(
                         enabled: autoLinkOn,
                         action: { onPlayManually(viewModel.meta, nil) },
@@ -429,6 +568,8 @@ struct DetailView: View {
                         CircleIconButton(systemName: "gobackward", active: false) {
                             onPlayFromBeginning(viewModel.meta, nil)
                         }
+                        .focused($actionFocus, equals: .startOver)
+                .focusable(actionFocus != nil)
                     }
                 }
                 CircleIconButton(
@@ -440,6 +581,8 @@ struct DetailView: View {
                     ToastCenter.shared.show(wasSaved ? "Removed from Library" : "Added to Library",
                                             icon: wasSaved ? "bookmark.slash" : "checkmark")
                 }
+                .focused($actionFocus, equals: .library)
+                .focusable(actionFocus != nil)
                 if !viewModel.meta.isSeries {
                     // Eye = seen. Filled + accent when watched, outline when not.
                     CircleIconButton(
@@ -451,16 +594,22 @@ struct DetailView: View {
                         ToastCenter.shared.show(wasWatched ? "Marked Unwatched" : "Marked Watched",
                                                 icon: "eye.fill")
                     }
+                    .focused($actionFocus, equals: .watched)
+                .focusable(actionFocus != nil)
                 }
                 // Rate (Trakt) — star fills when you've rated; opens a 1–10 picker.
                 CircleIconButton(
                     systemName: ratings.rating(for: viewModel.meta.id) != nil ? "star.fill" : "star",
                     active: ratings.rating(for: viewModel.meta.id) != nil
                 ) { showRatingPicker = true }
+                .focused($actionFocus, equals: .rate)
+                .focusable(actionFocus != nil)
                 if layout.detailPageTrailerButtonEnabled, let trailer = viewModel.trailers.first {
                     CircleIconButton(systemName: "play.rectangle.fill", active: false) {
                         activeTrailer = trailer
                     }
+                    .focused($actionFocus, equals: .trailer)
+                .focusable(actionFocus != nil)
                 }
                 Spacer(minLength: 0)
             }
@@ -470,7 +619,20 @@ struct DetailView: View {
             // card still lands here (a narrow left-only section is missed when
             // the card below is scrolled far right).
             .frame(maxWidth: .infinity, alignment: .leading)
-            .focusSection()
+            // NO .focusSection() here: a programmatic `actionFocus = .play`
+            // from OUTSIDE a focus section is silently ignored on tvOS 26,
+            // which broke the teaser's direct Down-to-Play jump. Reachability
+            // from below is covered by the entry redirect instead.
+            // The enter-lands-on-Play redirect: focus arriving on any control
+            // while the row previously held NOTHING gets moved to Play. Moves
+            // WITHIN the row (old != nil) are left alone.
+            .onChange(of: actionFocus) { old, new in
+                interactionCount += 1
+                fullscreenCooldown = false
+                if old == nil, let new, new != .play {
+                    actionFocus = .play
+                }
+            }
     }
 
     private var primaryMetaSegments: [String] {
@@ -712,7 +874,7 @@ struct DetailView: View {
                             } label: {
                                 PosterCard(item: item)
                             }
-                            .buttonStyle(PlainCardButtonStyle())
+                            .mediaCardButtonStyle()
                         }
                     }
                     .padding(.horizontal, NuvioSpacing.huge)
@@ -739,7 +901,7 @@ struct DetailView: View {
                             } label: {
                                 PosterCard(item: item)
                             }
-                            .buttonStyle(PlainCardButtonStyle())
+                            .mediaCardButtonStyle()
                         }
                     }
                     .padding(.horizontal, NuvioSpacing.huge)
@@ -799,6 +961,12 @@ struct DetailView: View {
             .focusSection()
         }
     }
+}
+
+/// A button style with NO chrome at all — used by the full-screen trailer's
+/// invisible input-capture button.
+private struct InertButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View { configuration.label }
 }
 
 /// Circular cast headshot with name + character, focusable and clickable
@@ -942,20 +1110,26 @@ private struct CircleIconLabel: View {
             .font(.system(size: 30, weight: .semibold))
             .foregroundStyle(isFocused || active ? theme.palette.onSecondary : theme.palette.textPrimary)
             .frame(width: 78, height: 78)
-            .background(
-                Circle().fill(
-                    isFocused ? theme.palette.secondary
-                    : (active ? theme.palette.secondary.opacity(0.85) : Color.white.opacity(0.14))
-                )
-            )
-            .overlay(Circle().strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 3))
-            // Fusion accent focus glow.
+            .background {
+                if isFocused || active {
+                    Circle().fill(active && !isFocused
+                                  ? theme.palette.secondary.opacity(0.85)
+                                  : theme.palette.secondary)
+                }
+            }
+            // Glass circle at rest, matching the rail.
+            .liquidGlassIf(!isFocused && !active, in: Circle())
+            .overlay(Circle().strokeBorder(isFocused ? Color.white.opacity(0.95) : .clear, lineWidth: 3))
+            // Accent focus glow.
             .shadow(color: isFocused ? theme.effectiveFocusGlow : .clear,
-                    radius: theme.isAppleTVTheme && isFocused ? 22 : 0)
+                    radius: isFocused ? 22 : 0)
             .focusLift(NuvioFocus.control, isFocused)
     }
 }
 
+/// Primary Play/Resume pill — the SAME chrome as the home hero's button
+/// (white pill at rest, accent fill + white ring + accent glow on focus), so
+/// the app's main action reads identically everywhere.
 struct PlayActionButton: View {
     @EnvironmentObject private var theme: ThemeManager
 
@@ -964,31 +1138,40 @@ struct PlayActionButton: View {
 
     var body: some View {
         Button(action: action) {
-            Label(title, systemImage: "play.fill")
-                .font(.system(size: 28, weight: .bold))
-                .foregroundStyle(theme.palette.onSecondary)
-                .padding(.horizontal, NuvioSpacing.xxl)
-                .padding(.vertical, NuvioSpacing.md)
-                .background(FocusAwareCapsule())
+            HStack(spacing: 12) {
+                Image(systemName: "play.fill").font(.system(size: 24, weight: .bold))
+                Text(title).font(FusionType.button(theme.font))
+            }
         }
-        .buttonStyle(PlainCardButtonStyle())
+        .buttonStyle(DetailPillButtonStyle())
     }
 }
 
-/// Capsule background that brightens and rings while its button is focused.
-private struct FocusAwareCapsule: View {
-    @EnvironmentObject private var theme: ThemeManager
-    @Environment(\.isFocused) private var isFocused
+/// The hero pill chrome, shared by the detail page's primary action.
+struct DetailPillButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        Chrome(configuration: configuration)
+    }
 
-    var body: some View {
-        Capsule(style: .continuous)
-            .fill(isFocused ? theme.palette.secondary : theme.palette.secondary.opacity(0.75))
-            .overlay(
-                Capsule(style: .continuous)
-                    .strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 3)
-            )
-            .shadow(color: theme.palette.secondary.opacity(isFocused ? 0.55 : 0), radius: 22, y: 8)
-            .focusLift(NuvioFocus.card, isFocused)
+    private struct Chrome: View {
+        @EnvironmentObject private var theme: ThemeManager
+        @Environment(\.isFocused) private var isFocused
+        let configuration: ButtonStyle.Configuration
+
+        var body: some View {
+            configuration.label
+                .foregroundStyle(isFocused ? .white : .black)
+                .padding(.horizontal, 36)
+                .padding(.vertical, 16)
+                .background(Capsule().fill(isFocused ? theme.palette.secondary : Color.white.opacity(0.9)))
+                .overlay(
+                    Capsule().strokeBorder(isFocused ? Color.white.opacity(0.95) : .clear, lineWidth: 4)
+                )
+                .shadow(color: isFocused ? theme.palette.secondary.opacity(0.7) : .black.opacity(0.14),
+                        radius: isFocused ? 26 : 6, y: isFocused ? 12 : 6)
+                .focusLift(NuvioFocus.card, isFocused)
+                .cardPressDip(configuration.isPressed)
+        }
     }
 }
 
@@ -1002,16 +1185,22 @@ struct SeasonChip: View {
     var body: some View {
         Text(season == 0 ? "Specials" : "Season \(season)")
             .font(.system(size: 23, weight: .semibold))
-            .foregroundStyle(selected || isFocused ? theme.palette.textPrimary : theme.palette.textSecondary)
+            .foregroundStyle(isFocused ? .black
+                             : (selected ? theme.palette.textPrimary : theme.palette.textSecondary))
             .padding(.horizontal, NuvioSpacing.lg)
             .padding(.vertical, NuvioSpacing.sm)
-            .background(
-                Capsule(style: .continuous)
-                    .fill(selected ? theme.palette.focusBackground : Color.white.opacity(isFocused ? 0.18 : 0.08))
-            )
+            .background {
+                if isFocused {
+                    Capsule(style: .continuous).fill(Color.white.opacity(0.92))
+                } else if selected {
+                    Capsule(style: .continuous).fill(theme.palette.secondary.opacity(0.28))
+                }
+            }
+            .liquidGlassIf(!isFocused && !selected, in: Capsule(style: .continuous))
             .overlay(
                 Capsule(style: .continuous)
-                    .strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 2.5)
+                    .strokeBorder(selected && !isFocused ? theme.palette.secondary.opacity(0.8) : .clear,
+                                  lineWidth: 2.5)
             )
             .focusLift(NuvioFocus.card, isFocused)
     }
@@ -1067,13 +1256,21 @@ private struct DescriptionTeaser: View {
     @EnvironmentObject private var theme: ThemeManager
     let text: String
     let title: String
+    var onFocusChanged: (Bool) -> Void = { _ in }
+    var onMoveDown: () -> Void = {}
     @State private var showFull = false
 
     var body: some View {
         Button { showFull = true } label: {
-            TeaserLabel(text: text)
+            TeaserLabel(text: text, onFocusChanged: onFocusChanged)
         }
         .buttonStyle(PlainCardButtonStyle())
+        // Safe to consume every direction here: the teaser is top-most and
+        // horizontally alone, so only Down has anywhere real to go — and it
+        // must land on Play without the engine's nearest-neighbor detour.
+        .onMoveCommand { direction in
+            if direction == .down { onMoveDown() }
+        }
         .fullScreenCover(isPresented: $showFull) {
             DescriptionOverlay(title: title, text: text) { showFull = false }
                 .environmentObject(theme)
@@ -1085,6 +1282,7 @@ private struct TeaserLabel: View {
     @EnvironmentObject private var theme: ThemeManager
     @Environment(\.isFocused) private var isFocused
     let text: String
+    var onFocusChanged: (Bool) -> Void = { _ in }
 
     var body: some View {
         Text(text)
@@ -1094,11 +1292,15 @@ private struct TeaserLabel: View {
             .frame(maxWidth: 1000, alignment: .leading)
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
-            .background(
+            // Soft glass highlight on focus — reads as selectable without
+            // the old solid accent slab shouting over the art.
+            .liquidGlassIf(isFocused, in: RoundedRectangle(cornerRadius: NuvioRadius.md, style: .continuous))
+            .overlay(
                 RoundedRectangle(cornerRadius: NuvioRadius.md, style: .continuous)
-                    .fill(isFocused ? theme.palette.focusBackground : .clear)
+                    .strokeBorder(isFocused ? Color.white.opacity(0.35) : .clear, lineWidth: 2)
             )
             .padding(.horizontal, -14)   // keep the resting text aligned as before
+            .onChange(of: isFocused) { _, focused in onFocusChanged(focused) }
     }
 }
 
@@ -1119,7 +1321,7 @@ private struct DescriptionOverlay: View {
 
     var body: some View {
         ZStack {
-            theme.palette.background.ignoresSafeArea()
+            ATVBackground()
 
             VStack(alignment: .leading, spacing: NuvioSpacing.xl) {
                 Text(title)

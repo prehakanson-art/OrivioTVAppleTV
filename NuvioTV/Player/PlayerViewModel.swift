@@ -203,6 +203,16 @@ enum SessionDisplayMode {
 }
 
 final class NuvioPlayerOptions: KSOptions {
+    override init() {
+        super.init()
+        // The app renders its own transport; KSPlayer's MPRemoteCommandCenter
+        // handlers are only removed when the layer DEALLOCATES, which the
+        // leak probes show can lag teardown — leaving a Play/Pause press on
+        // the home screen able to restart the movie you just exited, with no
+        // UI. Never register them.
+        registerRemoteControll = false
+    }
+
     /// Decoded-frame queue depth, budgeted in BYTES instead of frames.
     ///
     /// KSPlayer's default is a flat 16 frames regardless of frame size. A
@@ -766,6 +776,13 @@ final class PlayerViewModel: ObservableObject {
             // TIER 1: the sample-feed engine — no AVPlayer, no HLS, no
             // CoreMedia retention; the app owns (and bounds) every buffer.
             // Its failure falls to TIER 2, the remux+AVPlayer path.
+            // The sample engine builds its own renderers, so no KSPlayer init
+            // runs to configure the audio session (the VLC path had this same
+            // gap). Configure BEFORE reading the route below — an inactive
+            // session reports no spatial outputs, which silently forced a
+            // stereo downmix on Atmos rigs for cold-launched DV titles.
+            try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
+            try? AVAudioSession.sharedInstance().setActive(true)
             // Downmix in-engine when the route can't use multichannel —
             // see DVSampleEngine.downmixToStereo.
             let spatial = AVAudioSession.sharedInstance().currentRoute.outputs
@@ -1224,21 +1241,29 @@ final class PlayerViewModel: ObservableObject {
     /// Append one line to the persisted DV trail (newest LAST — the previous
     /// overwrite-style key lost the interesting first error under the later
     /// abandon message).
+    /// Serializes the persisted-trail read/append/write off the main actor —
+    /// the periodic mem-trace called this every ~36s DURING playback, and a
+    /// synchronized UserDefaults write on the main thread is the same hiccup
+    /// class ProgressStore already moved off-main.
+    private static let trailQueue = DispatchQueue(label: "orivio.dvtrail", qos: .utility)
+
     static func dvTrail(_ line: String) {
         // Mirrored to the console so a live-attached session sees the trail
         // in real time, not only after the fact.
         NSLog("[OrivioTrail] %@", line)
         let entry = String("\(Date()): \(line)".prefix(maxTrailEntryChars))
-        var trail = UserDefaults.standard.stringArray(forKey: "dev.dvTrail") ?? []
-        trail.append(entry)
-        if trail.count > 30 { trail.removeFirst(trail.count - 30) }
-        // Belt as well as braces: bound the TOTAL, so no combination of long
-        // entries can ever grow the value without limit again.
-        while trail.count > 1,
-              trail.reduce(0, { $0 + $1.utf8.count }) > maxTrailBytes {
-            trail.removeFirst()
+        trailQueue.async {
+            var trail = UserDefaults.standard.stringArray(forKey: "dev.dvTrail") ?? []
+            trail.append(entry)
+            if trail.count > 30 { trail.removeFirst(trail.count - 30) }
+            // Belt as well as braces: bound the TOTAL, so no combination of
+            // long entries can ever grow the value without limit again.
+            while trail.count > 1,
+                  trail.reduce(0, { $0 + $1.utf8.count }) > maxTrailBytes {
+                trail.removeFirst()
+            }
+            UserDefaults.standard.set(trail, forKey: "dev.dvTrail")
         }
-        UserDefaults.standard.set(trail, forKey: "dev.dvTrail")
     }
 
     // abandonNativeDV removed with the legacy remux tier.
@@ -1626,6 +1651,20 @@ final class PlayerViewModel: ObservableObject {
             forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated { self?.handleBecomeActive() }
+        })
+        // Siri, FaceTime, another app seizing the audio session: only the
+        // KSPlayer engine observes interruptions itself — the VLC and DV
+        // engines would keep advancing video with dead audio. Route .began
+        // through the same clean-pause path as the app switcher; deliberately
+        // no auto-resume on .ended ("press play to continue" policy).
+        notificationTokens.append(nc.addObserver(
+            forName: AVAudioSession.interruptionNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            MainActor.assumeIsolated {
+                guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                      AVAudioSession.InterruptionType(rawValue: raw) == .began else { return }
+                self?.handleResignActive()
+            }
         })
     }
 
@@ -2267,8 +2306,10 @@ final class PlayerViewModel: ObservableObject {
         // both call KSOptions.setAudioSession on init). A VLC-only session
         // therefore ran on tvOS's default .soloAmbient category — the wrong
         // ducking, interruption and route policy for long-form video.
+        // Default route-sharing policy: tvOS then follows the user's Default
+        // Audio Output (HomePods). See KSOptions.setAudioSession.
         try? AVAudioSession.sharedInstance().setCategory(
-            .playback, mode: .moviePlayback, policy: .longFormAudio
+            .playback, mode: .moviePlayback
         )
         try? AVAudioSession.sharedInstance().setActive(true)
 
@@ -2715,7 +2756,11 @@ final class PlayerViewModel: ObservableObject {
         manager.preferredDisplayCriteria = nil
         showToast("Re-syncing display…")
         NSLog("[OrivioDisplay] manual display re-sync — dropping and re-requesting the mode")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+            // If the viewer bailed out during the blind re-sync, do NOT fire a
+            // fresh HDMI handshake over the browsing UI — that is the exact
+            // wedge this recovery gesture exists to escape.
+            guard let self, !self.isExiting else { return }
             manager.preferredDisplayCriteria = held
         }
     }
@@ -4738,6 +4783,9 @@ final class PlayerViewModel: ObservableObject {
         thumbnailTask?.cancel()
         thumbnailer?.cancel()   // aborts its FFmpeg session, even mid-read
         thumbnailer = nil
+        // The FINE pair too: exiting mid-scrub otherwise left an orphan
+        // 30s-budget FFmpeg decode running after the player was gone.
+        clearFineThumbnails()
         countdownTask?.cancel()
         dvPauseHeartbeat?.cancel()
         dvFirstTask?.cancel()
@@ -4795,6 +4843,9 @@ final class PlayerViewModel: ObservableObject {
         thumbnailTask?.cancel()
         thumbnailer?.cancel()   // aborts its FFmpeg session, even mid-read
         thumbnailer = nil
+        // The FINE pair too: exiting mid-scrub otherwise left an orphan
+        // 30s-budget FFmpeg decode running after the player was gone.
+        clearFineThumbnails()
         countdownTask?.cancel()
         dvPauseHeartbeat?.cancel()
         dvFirstTask?.cancel()
@@ -4804,6 +4855,11 @@ final class PlayerViewModel: ObservableObject {
         loadWatchdogTask?.cancel()
         stallWatchdogTask?.cancel()
         UIApplication.shared.isIdleTimerDisabled = false
+        // Hand the audio session back so whatever the player interrupted (music
+        // from another app, a HomePod group) gets its shouldResume — the app
+        // never called setActive(false) anywhere, so interrupted audio stayed
+        // dead until manually restarted.
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         // Release the Siri-remote trackpad stream. `configureWheelTracking()`
         // installs this handler on the SHARED GCController, which outlives the
         // player — left in place it keeps firing (and keeps owning the pad's

@@ -40,7 +40,7 @@ struct CastDetailView: View {
 
     var body: some View {
         ZStack {
-            theme.palette.background.ignoresSafeArea()
+            ATVBackground()
             if viewModel.isLoading {
                 NuvioLoadingView(label: "Loading filmography")
             } else if viewModel.items.isEmpty {

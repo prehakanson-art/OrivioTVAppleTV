@@ -500,7 +500,7 @@ private struct RenameRowView: View {
 
     var body: some View {
         ZStack {
-            theme.palette.background.ignoresSafeArea()
+            ATVBackground()
             VStack(spacing: NuvioSpacing.xl) {
                 Text("Rename \"\(title)\"")
                     .font(.system(size: 38, weight: .bold))
@@ -630,7 +630,7 @@ struct CollectionEditorView: View {
 
     var body: some View {
         ZStack {
-            theme.palette.background.ignoresSafeArea()
+            ATVBackground()
             ScrollView(.vertical) {
                 VStack(alignment: .leading, spacing: NuvioSpacing.xl) {
                     Text(isNew ? "New Collection" : "Edit Collection")
@@ -876,7 +876,7 @@ private struct FolderEditorView: View {
 
     var body: some View {
         ZStack {
-            theme.palette.background.ignoresSafeArea()
+            ATVBackground()
             ScrollView(.vertical) {
                 VStack(alignment: .leading, spacing: NuvioSpacing.xl) {
                     Text(folder == nil ? "New Folder" : "Edit Folder")

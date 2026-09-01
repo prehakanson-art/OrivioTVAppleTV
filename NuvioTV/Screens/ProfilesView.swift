@@ -82,7 +82,7 @@ struct ProfileGateView: View {
     @FocusState private var focusedProfile: Int?
     var body: some View {
         ZStack {
-            theme.palette.background.ignoresSafeArea()
+            ATVBackground()
             // PIN entry is rendered INLINE (not a nested fullScreenCover) so it
             // reliably appears every time a locked profile is entered — the
             // nested cover only presented on the first launch, so later profile
@@ -266,7 +266,7 @@ struct PinEntryView: View {
 
     var body: some View {
         ZStack {
-            theme.palette.background.ignoresSafeArea()
+            ATVBackground()
             VStack(spacing: NuvioSpacing.xl) {
                 Text(title)
                     .font(.system(size: 40, weight: .bold))
@@ -380,7 +380,7 @@ struct ProfileManageView: View {
 
     var body: some View {
         ZStack {
-            theme.palette.background.ignoresSafeArea()
+            ATVBackground()
             VStack(alignment: .leading, spacing: NuvioSpacing.xl) {
                 HStack {
                     Text("Manage Profiles")
@@ -448,7 +448,7 @@ struct ProfileEditView: View {
 
     var body: some View {
         ZStack {
-            theme.palette.background.ignoresSafeArea()
+            ATVBackground()
             ScrollView(.vertical) {
                 VStack(alignment: .leading, spacing: NuvioSpacing.xl) {
                     HStack {
@@ -843,7 +843,7 @@ struct ProfileCollectionFoldersView: View {
 
     var body: some View {
         ZStack {
-            theme.palette.background.ignoresSafeArea()
+            ATVBackground()
             ScrollView(.vertical) {
                 VStack(alignment: .leading, spacing: NuvioSpacing.lg) {
                     HStack {

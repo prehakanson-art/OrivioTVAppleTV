@@ -138,7 +138,7 @@ struct LiveTVView: View {
 
     var body: some View {
         ZStack {
-            theme.palette.background.ignoresSafeArea()
+            ATVBackground()
             content
         }
         .task { await viewModel.loadIfNeeded(addonManager: addonManager) }

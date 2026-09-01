@@ -499,6 +499,10 @@ final class ThemeManager: ObservableObject {
     /// Change the accent theme (keeps AMOLED state).
     func setPalette(_ palette: ThemePalette) { basePalette = palette }
 
+    /// The tone full-bleed hero/backdrop scrims fade toward, tracking the
+    /// stage: graphite normally, near-black in Black Background mode.
+    var stageBlend: Color { amoled ? Color(hex: 0x08080A) : ATVStage.blend }
+
     /// The focus glow, gated by the card-shadows performance switch — a
     /// colored `.shadow(radius: 24–36)` on a focused card is an offscreen blur
     /// pass recomputed through the whole zoom spring, the single most

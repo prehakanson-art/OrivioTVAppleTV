@@ -92,7 +92,7 @@ struct AccountView: View {
             .onChange(of: focusedControl, correctSkippedFocus)
             .fullScreenCover(isPresented: $showStremioConnect) {
                 ZStack {
-                    theme.palette.background.ignoresSafeArea()
+                    ATVBackground()
                     if let code = stremioLinkCode {
                         StremioConnectPage(code: code, status: stremioConnectStatus).id(code.code)
                     }
@@ -1131,7 +1131,7 @@ private struct AccountBackupExportView: View {
 
     var body: some View {
         ZStack {
-            theme.palette.background.ignoresSafeArea()
+            ATVBackground()
             VStack(alignment: .leading, spacing: NuvioSpacing.lg) {
                 Text("Local Backup")
                     .font(.system(size: 44, weight: .bold))
@@ -1174,7 +1174,7 @@ private struct AccountBackupImportView: View {
 
     var body: some View {
         ZStack {
-            theme.palette.background.ignoresSafeArea()
+            ATVBackground()
             VStack(alignment: .leading, spacing: NuvioSpacing.lg) {
                 Text("Import Backup")
                     .font(.system(size: 44, weight: .bold))

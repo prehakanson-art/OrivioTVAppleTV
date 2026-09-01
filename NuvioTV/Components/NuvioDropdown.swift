@@ -108,6 +108,15 @@ private struct DropdownTrigger: View {
         .frame(minHeight: compact ? nil : 74)
         .frame(maxWidth: width == nil ? .infinity : nil)
         .background(dropdownBackground)
+        .overlay {
+            if compact {
+                RoundedRectangle(cornerRadius: NuvioRadius.md, style: .continuous)
+                    .strokeBorder(isFocused ? Color.white.opacity(0.9) : .clear, lineWidth: 3)
+            }
+        }
+        .shadow(color: compact && isFocused ? .black.opacity(0.35) : .clear,
+                radius: compact && isFocused ? 18 : 0, y: 8)
+        .focusLift(compact ? NuvioFocus.row : 1.0, isFocused)
     }
 
     // Compact (player panels / Discover / Library) keeps a solid pill fill so it
@@ -116,12 +125,9 @@ private struct DropdownTrigger: View {
     @ViewBuilder
     private var dropdownBackground: some View {
         if compact {
-            RoundedRectangle(cornerRadius: NuvioRadius.md, style: .continuous)
-                .fill(isFocused ? theme.palette.focusBackground : theme.palette.backgroundCard.opacity(0.6))
-                .overlay(
-                    RoundedRectangle(cornerRadius: NuvioRadius.md, style: .continuous)
-                        .strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 4)
-                )
+            // Liquid Glass in every state; focus is the bright ring + lift.
+            Color.clear
+                .liquidGlass(in: RoundedRectangle(cornerRadius: NuvioRadius.md, style: .continuous))
         } else {
             SettingsRowBackground(isFocused: isFocused)
         }

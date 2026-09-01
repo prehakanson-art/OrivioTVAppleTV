@@ -50,7 +50,7 @@ struct CatalogSeeAllView: View {
 
     var body: some View {
         ZStack {
-            theme.palette.background.ignoresSafeArea()
+            ATVBackground()
             if viewModel.items.isEmpty && viewModel.isLoading {
                 NuvioLoadingView(label: "Loading \(title)")
             } else if viewModel.items.isEmpty {

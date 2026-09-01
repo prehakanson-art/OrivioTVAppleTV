@@ -500,7 +500,13 @@ public extension KSOptions {
             category = .playback
         }
         #if os(tvOS)
-        try? AVAudioSession.sharedInstance().setCategory(category, mode: .moviePlayback, policy: .longFormAudio)
+        // NO route-sharing policy on tvOS (and .longFormVideo is unavailable
+        // there): tvOS routes ALL default-policy audio to the user's chosen
+        // Default Audio Output (e.g. HomePods). The .longFormAudio policy this
+        // used to set is the AirPlay-2 audio-app picker policy — it DETACHED
+        // the session from that system default, so sound stayed on HDMI while
+        // other video apps followed the HomePods.
+        try? AVAudioSession.sharedInstance().setCategory(category, mode: .moviePlayback)
         #else
         try? AVAudioSession.sharedInstance().setCategory(category, mode: .moviePlayback, policy: .longFormVideo)
         #endif

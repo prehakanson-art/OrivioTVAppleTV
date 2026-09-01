@@ -641,7 +641,7 @@ struct CollectionView: View {
 
     private var collectionBody: some View {
         ZStack(alignment: .top) {
-            theme.palette.background.ignoresSafeArea()
+            ATVBackground()
             // A real backdrop photo fills edge-to-edge like before; the logo
             // fallback (every community category has one, no real backdrop)
             // is shown WHOLE via .fit instead of cropped/zoomed via .fill, at

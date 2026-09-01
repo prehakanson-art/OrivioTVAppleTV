@@ -23,7 +23,7 @@ struct CollectionSourcePickerView: View {
 
     var body: some View {
         ZStack(alignment: .top) {
-            theme.palette.background.ignoresSafeArea()
+            ATVBackground()
             VStack(alignment: .leading, spacing: NuvioSpacing.lg) {
                 HStack {
                     Text("Add TMDB / Trakt Source")

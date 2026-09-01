@@ -42,7 +42,7 @@ struct TraktDetail: View {
         // of squeezing into the settings pane.
         .fullScreenCover(isPresented: $showConnect) {
             ZStack {
-                theme.palette.background.ignoresSafeArea()
+                ATVBackground()
                 if let code = deviceCode {
                     TraktConnectPage(code: code, expiresAt: codeExpiresAt ?? Date())
                         // Rebuild when the code changes (auto-refresh) so the QR

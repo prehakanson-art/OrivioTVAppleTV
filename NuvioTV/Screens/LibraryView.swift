@@ -1,6 +1,10 @@
 import SwiftUI
 
-private enum LibraryTab: String, CaseIterable { case saved = "Saved", cloud = "Cloud" }
+/// One chip row drives the whole screen: All / Movies / Shows filter the one
+/// unified grid, Cloud swaps to the debrid cloud pane.
+private enum LibraryFilter: String, CaseIterable {
+    case all = "All", movies = "Movies", shows = "Shows", cloud = "Cloud"
+}
 
 struct LibraryView: View {
     @EnvironmentObject private var theme: ThemeManager
@@ -11,11 +15,10 @@ struct LibraryView: View {
     let onSelect: (MetaItem) -> Void
     /// Opens the full Cloud Library screen (debrid cloud files).
     var onOpenCloud: () -> Void = {}
-    /// Back pressed while already at the top of the grid: leave the screen
-    /// (Classic opens the sidebar; Fusion is a no-op so focus rises to the tab bar).
+    /// Back pressed while already at the top of the grid: leave the screen.
     var onBackAtRoot: () -> Void = {}
 
-    @State private var tab: LibraryTab = .saved
+    @State private var filter: LibraryFilter = .all
     @State private var sort = "Added"              // Added / Name / Recently Watched
     @FocusState private var focusedID: String?
 
@@ -47,49 +50,56 @@ struct LibraryView: View {
     private var savedMovies: [SavedLibraryItem] { sorted.filter { !$0.metaItem.isSeries } }
     private var savedShows: [SavedLibraryItem] { sorted.filter { $0.metaItem.isSeries } }
 
-    /// First focusable poster in the grid (Movies section leads, then Shows).
-    private var firstItemID: String? { savedMovies.first?.id ?? savedShows.first?.id }
+    /// The one grid's contents under the active filter.
+    private var visibleItems: [SavedLibraryItem] {
+        switch filter {
+        case .movies: return savedMovies
+        case .shows: return savedShows
+        default: return sorted
+        }
+    }
+
+    private var firstItemID: String? { visibleItems.first?.id }
+
+    /// "12 movies · 8 shows" beside the title.
+    private var countLine: String? {
+        guard !sorted.isEmpty else { return nil }
+        var parts: [String] = []
+        if !savedMovies.isEmpty { parts.append("\(savedMovies.count) movie\(savedMovies.count == 1 ? "" : "s")") }
+        if !savedShows.isEmpty { parts.append("\(savedShows.count) show\(savedShows.count == 1 ? "" : "s")") }
+        return parts.joined(separator: "  ·  ")
+    }
 
     var body: some View {
         ZStack {
-            theme.palette.background.ignoresSafeArea()
+            ATVBackground()
             ScrollViewReader { proxy in
             ScrollView(.vertical) {
                 VStack(alignment: .leading, spacing: NuvioSpacing.lg) {
                     header
-                    tabs
-                    if tab == .saved { filters }
-                    if tab == .cloud {
-                        VStack(alignment: .leading, spacing: NuvioSpacing.lg) {
-                            NuvioEmptyState(icon: "externaldrive.connected.to.line.below",
-                                            title: "Debrid cloud files",
-                                            message: "Browse and play the files already in your Real-Debrid / Premiumize / TorBox / AllDebrid cloud.")
-                                .frame(maxWidth: .infinity)
-                            // Left-aligned under the tabs so focus drops straight
-                            // down onto it (a centered button forces a sideways hop).
-                            Button(action: onOpenCloud) {
-                                SeeAllLabel(text: "Open Cloud Library")
-                            }
-                            .buttonStyle(PlainCardButtonStyle())
-                        }
-                        .frame(maxWidth: .infinity, minHeight: 460, alignment: .leading)
-                        .padding(.horizontal, NuvioSpacing.huge)
-                    } else if sorted.isEmpty {
+                    chipRow
+                    if filter == .cloud {
+                        cloudPane
+                    } else if visibleItems.isEmpty {
                         NuvioEmptyState(icon: "bookmark",
-                                        title: "Nothing saved yet",
-                                        message: "Start saving your favorites to see them here")
+                                        title: emptyTitle,
+                                        message: "Save titles with the + button on their page and they'll live here.")
                             .frame(height: 460)
                     } else {
-                        // Movies and Shows split into their own sections, like Search.
-                        VStack(alignment: .leading, spacing: NuvioSpacing.xl) {
-                            if !savedMovies.isEmpty {
-                                LibrarySection(title: "Movies") { savedGrid(savedMovies) }
-                            }
-                            if !savedShows.isEmpty {
-                                LibrarySection(title: "Shows") { savedGrid(savedShows) }
+                        LazyVGrid(columns: columns, alignment: .leading, spacing: NuvioSpacing.xl) {
+                            ForEach(visibleItems) { item in
+                                GridPosterCell(
+                                    item: item.metaItem,
+                                    captionWidth: posterLayout.posterSize.posterWidth,
+                                    onSelect: onSelect,
+                                    gridFocus: $focusedID
+                                )
+                                .id(item.id)
                             }
                         }
+                        .padding(.horizontal, NuvioSpacing.huge)
                         .padding(.bottom, NuvioSpacing.huge)
+                        .focusSection()
                     }
                 }
                 .padding(.top, NuvioSpacing.xl)
@@ -97,6 +107,14 @@ struct LibraryView: View {
             .scrollClipDisabled()
             .onExitCommand { backToTop(proxy) }
             }
+        }
+    }
+
+    private var emptyTitle: String {
+        switch filter {
+        case .movies: return "No saved movies"
+        case .shows: return "No saved shows"
+        default: return "Nothing saved yet"
         }
     }
 
@@ -111,10 +129,16 @@ struct LibraryView: View {
     }
 
     private var header: some View {
-        HStack {
+        HStack(alignment: .firstTextBaseline) {
             Text("Library")
-                .font(.system(size: 44, weight: .bold))
+                .font(FusionType.pageTitle(theme.font))
                 .foregroundStyle(theme.palette.textPrimary)
+            if let countLine {
+                Text(countLine)
+                    .font(FusionType.metadata(theme.font))
+                    .foregroundStyle(theme.palette.textTertiary)
+                    .padding(.leading, NuvioSpacing.sm)
+            }
             Spacer()
             Image("OrivioLogo")
                 .resizable()
@@ -125,51 +149,55 @@ struct LibraryView: View {
         .padding(.horizontal, NuvioSpacing.huge)
     }
 
-    private var tabs: some View {
+    /// One row drives everything: All / Movies / Shows / Cloud chips on the
+    /// left, the Sort pill on the right.
+    private var chipRow: some View {
         HStack(spacing: NuvioSpacing.md) {
-            ForEach(LibraryTab.allCases, id: \.self) { t in
-                Button { tab = t } label: {
-                    LibrarySegment(title: t.rawValue, selected: tab == t)
+            ForEach(LibraryFilter.allCases, id: \.self) { f in
+                Button { filter = f } label: {
+                    LibraryChip(title: f.rawValue, selected: filter == f)
                 }
                 .buttonStyle(PlainCardButtonStyle())
             }
-        }
-        .padding(.horizontal, NuvioSpacing.huge)
-    }
-
-    private var filters: some View {
-        HStack(spacing: NuvioSpacing.lg) {
-            NuvioDropdown(
-                title: "Sort",
-                selection: sort,
-                options: [
-                    NuvioDropdownOption("Added"),
-                    NuvioDropdownOption("Name"),
-                    NuvioDropdownOption("Recently Watched")
-                ],
-                triggerWidth: 460
-            ) { sort = $0 }
-        }
-        .padding(.horizontal, NuvioSpacing.huge)
-    }
-
-    private func savedGrid(_ items: [SavedLibraryItem]) -> some View {
-        LazyVGrid(columns: columns, alignment: .leading, spacing: NuvioSpacing.xl) {
-            ForEach(items) { item in
-                Button { onSelect(item.metaItem) } label: {
-                    PosterCard(item: item.metaItem)
-                }
-                .mediaCardButtonStyle()
-                .posterHoldMenu(item.metaItem) { onSelect(item.metaItem) }
-                .focused($focusedID, equals: item.id)
-                .id(item.id)
+            Spacer()
+            if filter != .cloud {
+                NuvioDropdown(
+                    title: "Sort",
+                    selection: sort,
+                    options: [
+                        NuvioDropdownOption("Added"),
+                        NuvioDropdownOption("Name"),
+                        NuvioDropdownOption("Recently Watched")
+                    ],
+                    triggerWidth: 380
+                ) { sort = $0 }
             }
         }
+        .padding(.horizontal, NuvioSpacing.huge)
+        .focusSection()
+    }
+
+    private var cloudPane: some View {
+        VStack(alignment: .leading, spacing: NuvioSpacing.lg) {
+            NuvioEmptyState(icon: "externaldrive.connected.to.line.below",
+                            title: "Debrid cloud files",
+                            message: "Browse and play the files already in your Real-Debrid / Premiumize / TorBox / AllDebrid cloud.")
+                .frame(maxWidth: .infinity)
+            // Left-aligned under the chips so focus drops straight down onto it
+            // (a centered button forces a sideways hop).
+            Button(action: onOpenCloud) {
+                SeeAllLabel(text: "Open Cloud Library")
+            }
+            .buttonStyle(PlainCardButtonStyle())
+        }
+        .frame(maxWidth: .infinity, minHeight: 460, alignment: .leading)
+        .padding(.horizontal, NuvioSpacing.huge)
     }
 }
 
-/// A Saved/Cloud style tab pill.
-private struct LibrarySegment: View {
+/// A Liquid Glass filter chip: glass in every state, accent tint + accent ring
+/// when selected, white ring + lift while focused.
+private struct LibraryChip: View {
     @EnvironmentObject private var theme: ThemeManager
     @Environment(\.isFocused) private var isFocused
     let title: String
@@ -178,17 +206,22 @@ private struct LibrarySegment: View {
     var body: some View {
         Text(title)
             .font(.system(size: 24, weight: .semibold))
-            .foregroundStyle(selected ? theme.palette.onSecondary : theme.palette.textSecondary)
-            .padding(.horizontal, NuvioSpacing.lg)
+            .foregroundStyle(selected ? theme.palette.textPrimary : theme.palette.textSecondary)
+            .padding(.horizontal, NuvioSpacing.xl)
             .padding(.vertical, NuvioSpacing.sm)
-            .background(
-                Capsule().fill(selected ? theme.palette.secondary
-                               : (isFocused ? theme.palette.focusBackground : Color.white.opacity(0.08)))
-            )
-            .overlay(Capsule().strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 3))
+            .background {
+                if selected {
+                    Capsule().fill(theme.palette.secondary.opacity(0.30))
+                }
+            }
+            .liquidGlassIf(!selected, in: Capsule())
+            .overlay(Capsule().strokeBorder(
+                isFocused ? Color.white.opacity(0.9)
+                          : (selected ? theme.palette.secondary.opacity(0.7) : .clear),
+                lineWidth: 3))
+            .shadow(color: isFocused ? .black.opacity(0.35) : .clear, radius: isFocused ? 16 : 0, y: 6)
             .focusLift(NuvioFocus.card, isFocused)
             .animation(PerformanceSettingsStore.shared.buttonAnimationsEffective
                        ? .spring(response: 0.3, dampingFraction: 0.8) : nil, value: isFocused)
     }
 }
-

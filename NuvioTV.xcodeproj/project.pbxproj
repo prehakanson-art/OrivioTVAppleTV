@@ -1008,7 +1008,7 @@
 			repositoryURL = "https://github.com/alexeichhorn/YouTubeKit";
 			requirement = {
 				kind = exactVersion;
-				version = 0.4.8;
+				version = 0.4.9;
 			};
 		};
 		FDB52EABAB443FA27592BF55 /* XCRemoteSwiftPackageReference "vlckit-spm" */ = {

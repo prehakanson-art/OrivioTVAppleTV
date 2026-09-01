@@ -137,7 +137,7 @@ struct SettingsView: View {
         )
         .padding(.horizontal, NuvioSpacing.xxl)
         .padding(.vertical, NuvioSpacing.xl)
-        .background(theme.palette.background.ignoresSafeArea())
+        .background(ATVBackground())
     }
 
     // MARK: - Vertical rail (Classic — tall pills)
@@ -492,8 +492,8 @@ struct AppearanceDetail: View {
                 }
 
                 SettingsToggleCard(
-                    title: "AMOLED Mode",
-                    subtitle: "Use pure black for app backgrounds",
+                    title: "Black Background",
+                    subtitle: "Pure black stage that keeps your accent glow",
                     isOn: Binding(get: { theme.amoled }, set: { theme.amoled = $0 })
                 )
             }
@@ -758,7 +758,7 @@ struct AccountSettingsDetail: View {
         }
         .fullScreenCover(isPresented: $showAccount) {
             ZStack {
-                theme.palette.background.ignoresSafeArea()
+                ATVBackground()
                 AccountView()
             }
             .environmentObject(theme)
@@ -863,7 +863,7 @@ struct ContentDiscoveryDetail: View {
         }
         .fullScreenCover(isPresented: $showAddons) {
             ZStack {
-                theme.palette.background.ignoresSafeArea()
+                ATVBackground()
                 AddonsManagementView()
             }
             .environmentObject(theme)
@@ -1210,7 +1210,7 @@ private struct CollectionsCoverView: View {
 
     var body: some View {
         ZStack {
-            theme.palette.background.ignoresSafeArea()
+            ATVBackground()
             CollectionsSettingsDetail()
                 .padding(.horizontal, NuvioSpacing.xxl)
                 .padding(.vertical, NuvioSpacing.xl)
@@ -1461,7 +1461,7 @@ private struct AddonImportView: View {
 
     var body: some View {
         ZStack {
-            theme.palette.background.ignoresSafeArea()
+            ATVBackground()
             DetailScaffold(title: "Import Add-ons", subtitle: "Paste manifest URLs from an exported setup") {
                 SettingsGroupCard(title: "Manifest URLs", subtitle: "One URL per line, or paste the full text from an export") {
                     TextField("https://.../manifest.json", text: $input, axis: .vertical)
@@ -1524,7 +1524,7 @@ private struct AddonHealthView: View {
 
     var body: some View {
         ZStack {
-            theme.palette.background.ignoresSafeArea()
+            ATVBackground()
             DetailScaffold(title: "Add-on Health", subtitle: "Manifest response times for installed providers") {
                 SettingsGroupCard(title: "Scan", subtitle: summary) {
                     Button { scan() } label: {
@@ -1693,7 +1693,7 @@ private struct AddonExportView: View {
 
     var body: some View {
         ZStack {
-            theme.palette.background.ignoresSafeArea()
+            ATVBackground()
             VStack(spacing: NuvioSpacing.xl) {
                 Text("Add-on Setup")
                     .font(.system(size: 44, weight: .bold))

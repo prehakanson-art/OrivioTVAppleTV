@@ -172,13 +172,21 @@ final class ImageCache: @unchecked Sendable {
     /// and RAM (a real jetsam risk on the 2 GB box when a Home load prefetched
     /// 100+ posters) before being evicted, for zero display benefit. The display
     /// path decodes from this disk cache at its own tight per-card budget.
+    /// The one live prefetch pass. Each Home reload used to spawn ANOTHER
+    /// uncancellable detached task — N reloads stacked N endless download
+    /// loops that kept running during playback.
+    private var prefetchTask: Task<Void, Never>?
+
     func prefetch(urls: [String]) {
         var seen = Set<String>()
         let unique = urls.filter { seen.insert($0).inserted }
-        let limit = PerformanceProfile.isLowPower ? 36 : (PerformanceProfile.isMidPower ? 60 : unique.count)
+        // Capped on EVERY tier — "all of them" was unbounded on 4K boxes.
+        let limit = PerformanceProfile.isLowPower ? 36 : (PerformanceProfile.isMidPower ? 60 : 96)
         let candidates = Array(unique.prefix(limit))
-        Task.detached(priority: .utility) { [weak self] in
+        prefetchTask?.cancel()
+        prefetchTask = Task.detached(priority: .utility) { [weak self] in
             for urlString in candidates {
+                guard !Task.isCancelled else { return }
                 guard let self, let url = URL(string: urlString) else { continue }
                 let fileURL = self.fileURL(for: urlString)
                 if self.fm.fileExists(atPath: fileURL.path) { continue }
@@ -859,6 +867,31 @@ private struct SpoilerBlur: ViewModifier {
     }
 }
 
+/// Liquid Glass on tvOS 26, translucent material earlier — the one frosted
+/// treatment every glass surface in the app goes through (rail, filter pills,
+/// search bar, detail icon circles, season chips).
+extension View {
+    @ViewBuilder
+    func liquidGlass<S: Shape>(in shape: S) -> some View {
+        if #available(tvOS 26.0, *) {
+            self.glassEffect(.regular, in: shape)
+        } else {
+            self.background(.ultraThinMaterial, in: shape)
+        }
+    }
+}
+
+extension View {
+    /// `liquidGlass` only while `active` — for controls whose focused state
+    /// swaps the glass for a solid fill. Rendered as a BACKGROUND view, never
+    /// wrapping the content: a `glassEffect` wrapped around focusable content
+    /// hides it from the tvOS focus engine (the detail page's action row
+    /// became a focus trap that swallowed every direction).
+    func liquidGlassIf<S: Shape>(_ active: Bool, in shape: S) -> some View {
+        background { if active { Color.clear.liquidGlass(in: shape) } }
+    }
+}
+
 /// Caption shown BELOW an Apple TV–theme card, OUTSIDE the focus platter.
 /// The native `CardButtonStyle` draws its raised platter behind the whole
 /// button label, so any caption kept inside the button gets bridged to the
@@ -895,6 +928,51 @@ struct ATVCardCaption: View {
         .padding(.top, 4)
         .offset(y: lowered ? dropDistance : 0)
         .animation(.spring(response: 0.32, dampingFraction: 0.85), value: lowered)
+    }
+}
+
+/// A grid poster cell in the app's one look: native platter focus, hold menu,
+/// ⏯ straight to the source picker, and the caption easing down while focused
+/// so the grown platter never crowds it. Used by the Home grid and Search.
+struct GridPosterCell: View {
+    let item: MetaItem
+    let captionWidth: CGFloat
+    let onSelect: (MetaItem) -> Void
+    var onPlayManually: (MetaItem, MetaVideo?) -> Void = { _, _ in }
+    /// Optional external focus tracking (Discover's back-to-top uses it).
+    var gridFocus: FocusState<String?>.Binding? = nil
+    @State private var focused = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            button
+
+            ATVCardCaption(
+                title: item.name,
+                subtitle: item.year,
+                width: captionWidth,
+                lowered: focused
+            )
+        }
+    }
+
+    @ViewBuilder
+    private var button: some View {
+        let base = Button {
+            onSelect(item)
+        } label: {
+            PosterCard(item: item)
+                .onFocusChange { focused = $0 }
+        }
+        .mediaCardButtonStyle()
+        .posterHoldMenu(item) { onSelect(item) }
+        .onPlayPauseCommand { onPlayManually(item, nil) }
+
+        if let gridFocus {
+            base.focused(gridFocus, equals: item.id)
+        } else {
+            base
+        }
     }
 }
 

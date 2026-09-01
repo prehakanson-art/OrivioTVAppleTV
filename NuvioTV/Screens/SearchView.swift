@@ -5,8 +5,12 @@ final class SearchViewModel: ObservableObject {
     @Published var query = ""
     @Published var results: [MetaItem] = []
     @Published var isSearching = false
+    /// Shown while the query is empty — the tab opens onto something browseable
+    /// (Apple TV style) instead of a bare "start typing" void. Loaded once.
+    @Published var trending: [MetaItem] = []
 
     private var searchTask: Task<Void, Never>?
+    private var loadedTrending = false
 
     func search(addonManager: AddonManager) {
         searchTask?.cancel()
@@ -47,6 +51,21 @@ final class SearchViewModel: ObservableObject {
             isSearching = false
         }
     }
+
+    /// First extra-free catalog's top titles, fetched once per session.
+    func loadTrendingIfNeeded(addonManager: AddonManager) async {
+        guard !loadedTrending else { return }
+        loadedTrending = true
+        for addon in addonManager.catalogAddons {
+            guard let catalog = (addon.manifest.catalogs ?? []).first(where: { !$0.requiresExtra })
+            else { continue }
+            if let items = try? await StremioAPI.catalog(addon: addon, catalog: catalog),
+               !items.isEmpty {
+                trending = Array(items.deduplicatedByID().prefix(18))
+                return
+            }
+        }
+    }
 }
 
 struct SearchView: View {
@@ -65,22 +84,13 @@ struct SearchView: View {
 
     var body: some View {
         ZStack {
-            theme.palette.background.ignoresSafeArea()
+            ATVBackground()
             VStack(alignment: .leading, spacing: NuvioSpacing.lg) {
                 searchBar
                 ScrollView(.vertical) {
                     if viewModel.isSearching && viewModel.results.isEmpty {
                         NuvioLoadingView(label: "Searching").frame(height: 480)
-                    } else if viewModel.results.isEmpty {
-                        NuvioEmptyState(
-                            icon: "magnifyingglass",
-                            title: viewModel.query.count >= 2 ? "No results" : "Start Searching",
-                            message: viewModel.query.count >= 2
-                                ? "Nothing matched “\(viewModel.query)”."
-                                : "Enter at least 2 characters"
-                        )
-                        .frame(height: 480)
-                    } else {
+                    } else if !viewModel.results.isEmpty {
                         // Results split by type: Movies on top, Shows below.
                         VStack(alignment: .leading, spacing: NuvioSpacing.xl) {
                             if !movieResults.isEmpty {
@@ -90,13 +100,34 @@ struct SearchView: View {
                                 resultSection(title: "Shows", items: showResults)
                             }
                         }
+                        .padding(.top, NuvioSpacing.sm)
                         .padding(.bottom, NuvioSpacing.huge)
+                    } else if viewModel.query.count >= 2 {
+                        NuvioEmptyState(
+                            icon: "magnifyingglass",
+                            title: "No results",
+                            message: "Nothing matched “\(viewModel.query)”."
+                        )
+                        .frame(height: 480)
+                    } else if !viewModel.trending.isEmpty {
+                        // Idle: something to browse instead of an empty void.
+                        resultSection(title: "Trending", items: viewModel.trending)
+                            .padding(.top, NuvioSpacing.sm)
+                            .padding(.bottom, NuvioSpacing.huge)
+                    } else {
+                        NuvioEmptyState(
+                            icon: "magnifyingglass",
+                            title: "Start Searching",
+                            message: "Enter at least 2 characters"
+                        )
+                        .frame(height: 480)
                     }
                 }
                 .scrollClipDisabled()
             }
             .padding(.top, NuvioSpacing.xl)
         }
+        .task { await viewModel.loadTrendingIfNeeded(addonManager: addonManager) }
         .onChange(of: viewModel.query) { _, _ in
             viewModel.search(addonManager: addonManager)
         }
@@ -104,11 +135,12 @@ struct SearchView: View {
 
     private var searchBar: some View {
         HStack(spacing: NuvioSpacing.md) {
-            Button(action: onOpenDiscover) { SearchBarIcon(systemName: "safari") }
-                .buttonStyle(PlainCardButtonStyle())
             SearchField(text: $viewModel.query)
+            Button(action: onOpenDiscover) { SearchBarIcon(systemName: "square.grid.2x2") }
+                .buttonStyle(PlainCardButtonStyle())
         }
         .padding(.horizontal, NuvioSpacing.huge)
+        .focusSection()
     }
 
     private var movieResults: [MetaItem] {
@@ -119,16 +151,19 @@ struct SearchView: View {
         viewModel.results.filter(\.isSeries)
     }
 
-    /// One titled grid section ("Movies" / "Shows"), its own focus section so
-    /// up/down moves cleanly between the two groups.
+    /// One titled grid section ("Movies" / "Shows" / "Trending"), its own focus
+    /// section so up/down moves cleanly between the groups.
     private func resultSection(title: String, items: [MetaItem]) -> some View {
         VStack(alignment: .leading, spacing: NuvioSpacing.md) {
             RowHeader(title: title)
+                .padding(.leading, -NuvioSpacing.huge)   // RowHeader pads itself
             LazyVGrid(columns: columns, alignment: .leading, spacing: NuvioSpacing.xl) {
                 ForEach(items) { item in
-                    Button { onSelect(item) } label: { PosterCard(item: item) }
-                        .mediaCardButtonStyle()
-                        .posterHoldMenu(item) { onSelect(item) }
+                    GridPosterCell(
+                        item: item,
+                        captionWidth: posterLayout.posterSize.posterWidth,
+                        onSelect: onSelect
+                    )
                 }
             }
         }
@@ -138,7 +173,7 @@ struct SearchView: View {
 }
 
 
-/// Round icon button in the Search top bar (Discover).
+/// Round glass icon button in the Search top bar (opens Discover).
 private struct SearchBarIcon: View {
     @EnvironmentObject private var theme: ThemeManager
     @Environment(\.isFocused) private var isFocused
@@ -147,40 +182,47 @@ private struct SearchBarIcon: View {
     var body: some View {
         Image(systemName: systemName)
             .font(.system(size: 26, weight: .semibold))
-            .foregroundStyle(theme.palette.textPrimary)
+            .foregroundStyle(isFocused ? theme.palette.onSecondary : theme.palette.textPrimary)
             .frame(width: 74, height: 74)
-            .background(Circle().fill(isFocused ? theme.palette.focusBackground : theme.palette.backgroundCard.opacity(0.7)))
-            .overlay(Circle().strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 3))
+            .background {
+                if isFocused { Circle().fill(theme.palette.secondary) }
+            }
+            .liquidGlassIf(!isFocused, in: Circle())
+            .overlay(Circle().strokeBorder(isFocused ? Color.white.opacity(0.95) : .clear, lineWidth: 3))
+            .shadow(color: isFocused ? theme.effectiveFocusGlow : .clear, radius: isFocused ? 22 : 0)
             .focusLift(NuvioFocus.card, isFocused)
             .animation(PerformanceSettingsStore.shared.buttonAnimationsEffective
                        ? .easeInOut(duration: 0.15) : nil, value: isFocused)
     }
 }
 
-/// The APK-style pill search field. A plain `TextField` in a dark resting
+/// The pill search field on glass. A plain `TextField` in a frosted resting
 /// capsule; on focus tvOS draws its own light editing surface, and we DON'T add
 /// a competing ring — otherwise the system fill sits inset inside our ring with
 /// a dark gap between them (the "weird bar" the user saw). Letting the system
 /// focus be the sole highlight means the highlight and the field are one shape.
-/// Auto-focuses on open so the keyboard is ready.
 private struct SearchField: View {
     @EnvironmentObject private var theme: ThemeManager
     @FocusState private var focused: Bool
     @Binding var text: String
 
     var body: some View {
-        TextField("Search movies & series", text: $text)
-            .textFieldStyle(.plain)
-            .focused($focused)
-            .font(.system(size: 26))
-            .foregroundStyle(theme.palette.textPrimary)
-            .tint(theme.palette.secondary)
-            .padding(.horizontal, NuvioSpacing.xl)
-            .frame(height: 74)
-            .frame(maxWidth: .infinity)
-            .background(Capsule().fill(theme.palette.backgroundCard.opacity(0.7)))
-            // No auto-focus: on the top-bar layout, merely moving focus over the
-            // Search tab would otherwise pop the keyboard. Focus the field only
-            // when the user actually selects it.
+        HStack(spacing: NuvioSpacing.sm) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundStyle(theme.palette.textTertiary)
+            TextField("Search movies & series", text: $text)
+                .textFieldStyle(.plain)
+                .focused($focused)
+                .font(.system(size: 26))
+                .foregroundStyle(theme.palette.textPrimary)
+                .tint(theme.palette.secondary)
+        }
+        .padding(.horizontal, NuvioSpacing.xl)
+        .frame(height: 74)
+        .frame(maxWidth: .infinity)
+        .background(Color.clear.liquidGlass(in: Capsule()))
+        // No auto-focus: merely moving focus over the Search tab must not pop
+        // the keyboard. Focus the field only when the user actually selects it.
     }
 }

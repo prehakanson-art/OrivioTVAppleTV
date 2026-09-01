@@ -168,6 +168,14 @@ extension View {
     }
 }
 
+/// The tone hero/backdrop scrims fade into so full-bleed art dissolves into
+/// `ATVBackground` without a seam — approximately the wash's color at the
+/// lower-middle of the screen (the flat `palette.background` used to leave a
+/// visible hard line where the hero band met the lighter graphite stage).
+enum ATVStage {
+    static let blend = Color(hex: 0x1E2126)
+}
+
 /// Fusion's environmental background (§4.1, §5): a deep graphite wash with a
 /// vignette and a faint accent bloom — "deep rather than flat." In light
 /// appearance it's a soft off-white stage. Sits behind every Fusion screen.
@@ -179,14 +187,18 @@ struct ATVBackground: View {
             theme.palette.background
             // Gentle grey depth wash — a touch lighter at top, slightly deeper
             // at the bottom, but staying a medium GREY (not sinking to black).
-            LinearGradient(
-                colors: [Color(hex: 0x252931), Color(hex: 0x1B1E24)],
-                startPoint: .top, endPoint: .bottom
-            )
-            .opacity(0.92)
-            // Accent bloom, top-leading — keeps the graphite from reading dead.
+            // Black Background mode drops the wash so the stage is pure black,
+            // keeping only the accent bloom.
+            if !theme.amoled {
+                LinearGradient(
+                    colors: [Color(hex: 0x252931), Color(hex: 0x1B1E24)],
+                    startPoint: .top, endPoint: .bottom
+                )
+                .opacity(0.92)
+            }
+            // Accent bloom, top-leading — keeps the stage from reading dead.
             RadialGradient(
-                colors: [theme.palette.secondary.opacity(0.14), .clear],
+                colors: [theme.palette.secondary.opacity(theme.amoled ? 0.12 : 0.14), .clear],
                 center: .topLeading, startRadius: 0, endRadius: 1500
             )
         }

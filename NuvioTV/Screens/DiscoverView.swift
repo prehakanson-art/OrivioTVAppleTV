@@ -69,12 +69,12 @@ struct DiscoverView: View {
 
     var body: some View {
         ZStack {
-            theme.palette.background.ignoresSafeArea()
+            ATVBackground()
             ScrollViewReader { proxy in
             ScrollView(.vertical) {
                 VStack(alignment: .leading, spacing: NuvioSpacing.lg) {
                     Text("Discover")
-                        .font(.system(size: 44, weight: .bold))
+                        .font(FusionType.pageTitle(theme.font))
                         .foregroundStyle(theme.palette.textPrimary)
                         .padding(.leading, NuvioSpacing.huge)
 
@@ -114,15 +114,18 @@ struct DiscoverView: View {
                     } else {
                         LazyVGrid(columns: columns, alignment: .leading, spacing: NuvioSpacing.xl) {
                             ForEach(viewModel.items) { item in
-                                Button { onSelect(item) } label: { PosterCard(item: item) }
-                                    .mediaCardButtonStyle()
-                                    .focused($focusedID, equals: item.id)
-                                    .id(item.id)
-                                    .onAppear {
-                                        if item.id == viewModel.items.last?.id {
-                                            Task { await viewModel.loadMore() }
-                                        }
+                                GridPosterCell(
+                                    item: item,
+                                    captionWidth: posterLayout.posterSize.posterWidth,
+                                    onSelect: onSelect,
+                                    gridFocus: $focusedID
+                                )
+                                .id(item.id)
+                                .onAppear {
+                                    if item.id == viewModel.items.last?.id {
+                                        Task { await viewModel.loadMore() }
                                     }
+                                }
                             }
                         }
                         .padding(.horizontal, NuvioSpacing.huge)

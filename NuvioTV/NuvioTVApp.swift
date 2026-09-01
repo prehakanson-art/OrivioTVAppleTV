@@ -271,6 +271,16 @@ struct RootView: View {
                         .replacingOccurrences(of: "-profile:", with: ""), let id = Int(p) {
                         profiles.setActive(id)
                     }
+                    // Dev: expand the rail shortly after launch (sim key
+                    // delivery is flaky; this makes the expanded panel
+                    // screenshot-able without remote input).
+                    if args.contains("-railDemo") {
+                        Task { @MainActor in
+                            try? await Task.sleep(nanoseconds: 4_000_000_000)
+                            sidebarEnabled = true
+                            sidebarFocus = 0
+                        }
+                    }
                     // Dev: jump straight to the profile gate.
                     if args.contains("-profileGateDemo") { showProfileGate = true }
                     // Dev/recovery: run the account-wide watch-history clear on

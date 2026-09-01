@@ -430,7 +430,7 @@ struct CommunityCollectionsView: View {
 
     var body: some View {
         ZStack {
-            theme.palette.background.ignoresSafeArea()
+            ATVBackground()
             ScrollView {
                 VStack(alignment: .leading, spacing: NuvioSpacing.xxl) {
                     HStack {

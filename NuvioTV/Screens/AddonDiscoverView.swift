@@ -90,7 +90,7 @@ struct AddonDiscoverView: View {
 
     var body: some View {
         ZStack {
-            theme.palette.background.ignoresSafeArea()
+            ATVBackground()
             DetailScaffold(
                 title: "Discover Add-ons",
                 subtitle: "Recommended picks and the full community catalog"

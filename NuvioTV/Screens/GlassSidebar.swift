@@ -55,7 +55,7 @@ struct GlassSidebar: View {
     /// floating collapsed pill, which hugs the screen edge at absolute
     /// 28..112pt — the safe inset (~90) covers most of it.
     static let collapsedWidth: CGFloat = 60
-    static let expandedWidth: CGFloat = 300
+    static let expandedWidth: CGFloat = 240
 
     private var panelShape: RoundedRectangle {
         RoundedRectangle(cornerRadius: expanded ? 34 : 42, style: .continuous)
@@ -63,8 +63,10 @@ struct GlassSidebar: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Profile chip — expanded panel only; the collapsed pill hugs its
-            // icons.
+            if expanded { Spacer(minLength: 0) }
+
+            // Profile chip — expanded panel only, sitting DIRECTLY above the
+            // nav items (one centered group, not pinned to the panel top).
             if expanded {
                 Button(action: onProfileTap) {
                     GlassProfileHeader(profile: profiles.active)
@@ -72,10 +74,8 @@ struct GlassSidebar: View {
                 .buttonStyle(PlainCardButtonStyle())
                 .focused(focusBinding, equals: -1)
                 .transition(.opacity)
-                .padding(.top, NuvioSpacing.lg)
                 .padding(.horizontal, NuvioSpacing.sm)
-
-                Spacer(minLength: 0)
+                .padding(.bottom, 14)
             }
 
             VStack(alignment: .leading, spacing: expanded ? 10 : 24) {
@@ -108,7 +108,9 @@ struct GlassSidebar: View {
         .clipped()
         // The pill hugs its icons vertically; the expanded panel stretches.
         .frame(maxHeight: expanded ? .infinity : nil)
-        .glassPanel(shape: panelShape, prominent: expanded)
+        // Background-style glass: glassEffect WRAPPING focusable content hides
+        // it from the focus engine (see liquidGlassIf).
+        .background(Color.clear.liquidGlass(in: panelShape))
         .padding(.vertical, expanded ? NuvioSpacing.xl : 0)
         .padding(.leading, 28)
         .frame(maxHeight: .infinity, alignment: .center)
@@ -123,18 +125,6 @@ struct GlassSidebar: View {
             if isExpanded && focusBinding.wrappedValue != selected {
                 focusBinding.wrappedValue = selected
             }
-        }
-    }
-}
-
-/// Liquid Glass on tvOS 26, translucent material earlier.
-private extension View {
-    @ViewBuilder
-    func glassPanel(shape: RoundedRectangle, prominent: Bool) -> some View {
-        if #available(tvOS 26.0, *) {
-            self.glassEffect(.regular, in: shape)
-        } else {
-            self.background(.ultraThinMaterial, in: shape)
         }
     }
 }

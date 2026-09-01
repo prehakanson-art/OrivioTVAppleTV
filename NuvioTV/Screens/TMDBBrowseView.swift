@@ -41,7 +41,7 @@ struct TMDBBrowseView: View {
 
     var body: some View {
         ZStack {
-            theme.palette.background.ignoresSafeArea()
+            ATVBackground()
             if viewModel.isLoading {
                 NuvioLoadingView(label: "Loading titles")
             } else if viewModel.items.isEmpty {

@@ -26,7 +26,7 @@ struct IntegrationsDetail: View {
         }
         .fullScreenCover(item: $sheet) { s in
             ZStack {
-                theme.palette.background.ignoresSafeArea()
+                ATVBackground()
                 integrationSheet(s)
             }
             .environmentObject(theme)
@@ -258,7 +258,7 @@ private struct DebridKeyEditor: View {
 
     var body: some View {
         ZStack {
-            theme.palette.background.ignoresSafeArea()
+            ATVBackground()
             VStack(spacing: NuvioSpacing.xl) {
                 Text("Connect \(provider.displayName)")
                     .font(.system(size: 40, weight: .bold))
@@ -364,7 +364,7 @@ private struct DebridConnectPage: View {
 
     var body: some View {
         ZStack {
-            theme.palette.background.ignoresSafeArea()
+            ATVBackground()
             VStack(spacing: NuvioSpacing.xl) {
                 Text("Connect \(provider.displayName)")
                     .font(.system(size: 48, weight: .heavy))
@@ -427,8 +427,12 @@ private struct DebridConnectPage: View {
         .onExitCommand { pollTask?.cancel(); onDone(false) }
     }
 
-    private func begin() async {
-        pollTask?.cancel()
+    private func begin(renewal: Bool = false) async {
+        // Only cancel when NOT renewing: the renewal call runs INSIDE pollTask
+        // itself, so cancelling here cancelled the very task doing the renewal
+        // — the fresh startDeviceAuth then ran in a cancelled context, its
+        // URLSession threw, and the user got an error instead of a new code.
+        if !renewal { pollTask?.cancel() }
         errorText = nil
         code = nil
         guard let c = await DebridService.startDeviceAuth(provider) else {
@@ -440,12 +444,25 @@ private struct DebridConnectPage: View {
         startPolling(c)
     }
 
+    /// Codes renewed since the screen opened — cap so an abandoned QR screen
+    /// doesn't hit the provider's device-auth endpoint forever.
+    @State private var renewals = 0
+
     private func startPolling(_ c: DebridDeviceCode) {
         pollTask = Task {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: UInt64(max(c.interval, 3)) * 1_000_000_000)
                 if Task.isCancelled { return }
-                if Date() >= expiresAt { await begin(); return }   // expired → fresh code
+                if Date() >= expiresAt {   // expired → fresh code (bounded)
+                    renewals += 1
+                    guard renewals <= 3 else {
+                        errorText = "The QR code expired. Press Back and reopen to try again."
+                        code = nil
+                        return
+                    }
+                    await begin(renewal: true)
+                    return
+                }
                 switch await DebridService.pollDeviceAuth(provider, c) {
                 case .pending:
                     continue
@@ -549,7 +566,7 @@ private struct MDBListKeyEditor: View {
 
     var body: some View {
         ZStack {
-            theme.palette.background.ignoresSafeArea()
+            ATVBackground()
             VStack(spacing: NuvioSpacing.xl) {
                 Text("MDBList API Key")
                     .font(.system(size: 40, weight: .bold))

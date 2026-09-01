@@ -523,6 +523,8 @@ struct StreamsView: View {
     /// isn't enough: the debrid/P2P resolve runs in its OWN unstructured Task
     /// that Back never cancels, so it needs an explicit view-level flag.
     @State private var isGone = false
+    /// The in-flight source sweeps, cancelled when the page pops.
+    @State private var sweepTasks: [Task<Void, Never>] = []
 
     let onSelect: (StreamEntry, [StreamEntry]) -> Void
 
@@ -555,7 +557,7 @@ struct StreamsView: View {
                 )
                 .transition(.opacity)
             } else {
-            theme.palette.background.ignoresSafeArea()
+            ATVBackground()
             backdrop
 
             // APK split layout: content info on the LEFT, sources panel on the RIGHT.
@@ -630,6 +632,11 @@ struct StreamsView: View {
             // Reuse last link: if we still have a fresh remembered source, play
             // it immediately, but keep loading so backing out shows the full
             // list (and the player's failover has alternates).
+            // Both sweeps are UNSTRUCTURED tasks (they must outlive awaits in
+            // this .task) — kept in state so popping the page CANCELS them:
+            // without that, backing out of a source list left the full addon
+            // sweep + the JS plugin scrapers running to completion, and quick
+            // browsing stacked concurrent full scrapes with no ceiling.
             let loadTask = Task {
                 await viewModel.load(
                     addonManager: addonManager,
@@ -638,9 +645,10 @@ struct StreamsView: View {
                     filtersEnabled: s.sourceFiltersEnabled
                 )
             }
+            sweepTasks.append(loadTask)
             // Plugin scrapers run alongside the addon sweep (they want a TMDB id).
             if !plugins.enabledScrapers.isEmpty {
-                Task {
+                let pluginTask = Task {
                     guard let (tmdbID, isMovie) = await TMDBService.resolveTMDBID(
                         from: viewModel.meta.id, type: viewModel.meta.type
                     ) else { return }
@@ -651,6 +659,7 @@ struct StreamsView: View {
                     guard !Task.isCancelled, !isGone else { return }
                     viewModel.addPluginStreams(entries)
                 }
+                sweepTasks.append(pluginTask)
             }
             // Reuse-last-link replays the remembered URL — skip it entirely when
             // resuming, since the whole point of a resume is to re-connect fresh.
@@ -725,8 +734,13 @@ struct StreamsView: View {
             if autoLinkResolving && !didAutoAct { autoLinkResolving = false }
         }
         // Back popped this page: block every pending async completion from
-        // presenting the player / touching navigation on a torn-down view.
-        .onDisappear { isGone = true }
+        // presenting the player / touching navigation on a torn-down view,
+        // and stop the sweeps themselves (their awaits return promptly).
+        .onDisappear {
+            isGone = true
+            for task in sweepTasks { task.cancel() }
+            sweepTasks = []
+        }
         .alert("Couldn't resolve stream", isPresented: Binding(
             get: { resolveError != nil },
             set: { if !$0 { resolveError = nil; autoLinkResolving = false } }

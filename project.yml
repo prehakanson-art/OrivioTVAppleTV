@@ -15,7 +15,7 @@ packages:
   # YouTube keys on tvOS (no WebKit/WKWebView, so no iframe embed).
   YouTubeKit:
     url: https://github.com/alexeichhorn/YouTubeKit
-    exactVersion: 0.4.8
+    exactVersion: 0.4.9
   # VLCKit as a binary xcframework; the tvOS slice vends module `TVVLCKit`.
   # Adds the VLC playback engine alongside KSPlayer.
   VLCKit:
@@ -58,7 +58,6 @@ targets:
         # real AppleTVOS/arm64 app and installs to the Apple TV normally.
         LSRequiresIPhoneOS: true
         # Tracks the Android APK release this port mirrors (v0.7.15-beta).
-        CFBundleShortVersionString: "0.7.15"
         UIUserInterfaceStyle: Dark
         # Plus Jakarta Sans — bundled for the Stremio theme's chrome typography.
         UIAppFonts:

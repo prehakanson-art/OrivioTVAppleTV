@@ -801,6 +801,11 @@ struct HomeView: View {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: UInt64(minutes) * 60_000_000_000)
                 guard !Task.isCancelled else { return }
+                // Same gate the account-sync loops use: never fire a full
+                // multi-addon catalog sweep (plus its poster prefetch) while
+                // the home is covered or a stream is playing — that competed
+                // with the movie for bandwidth mid-film.
+                guard isVisible, !NuvioSyncManager.playbackActive else { continue }
                 await viewModel.load(
                     addonManager: addonManager,
                     collections: collections,
@@ -820,7 +825,7 @@ struct HomeView: View {
 
     private var fusionModernLayout: some View {
         ZStack {
-            theme.palette.background.ignoresSafeArea()
+            ATVBackground()
             ScrollView(.vertical) {
                 VStack(alignment: .leading, spacing: NuvioSpacing.xl) {
                     if perf.settings.heroBackdrop {
@@ -1176,7 +1181,7 @@ struct HomeView: View {
                     // drive the hero — that per-focus enrich fetch was firing
                     // a network request on every D-pad move and is what made
                     // grid navigation lag.
-                    HomeGridCell(
+                    GridPosterCell(
                         item: item,
                         captionWidth: homeCatalogSettings.posterSize.posterWidth,
                         onSelect: onSelect,
@@ -1406,37 +1411,6 @@ private struct HomePosterCell: View, Equatable {
                 width: captionWidth,
                 lowered: focused,
                 dropDistance: useLandscape ? 13 : 18
-            )
-        }
-    }
-}
-
-private struct HomeGridCell: View {
-    let item: MetaItem
-    let captionWidth: CGFloat
-    let onSelect: (MetaItem) -> Void
-    let onPlayManually: (MetaItem, MetaVideo?) -> Void
-    @State private var focused = false
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Button {
-                onSelect(item)
-            } label: {
-                PosterCard(item: item)
-                    .onFocusChange { focused = $0 }
-            }
-            .mediaCardButtonStyle()
-            .posterHoldMenu(item) { onSelect(item) }
-            // ⏯ parity with the horizontal rows: skip Detail, go straight to
-            // the source picker.
-            .onPlayPauseCommand { onPlayManually(item, nil) }
-
-            ATVCardCaption(
-                title: item.name,
-                subtitle: item.year,
-                width: captionWidth,
-                lowered: focused
             )
         }
     }
@@ -1765,33 +1739,40 @@ private struct FusionHeroHeader: View {
         ZStack(alignment: .bottomLeading) {
             // Full-bleed backdrop (the scroll ignores the safe area, so this
             // fills the whole screen width like the Detail-page backdrop).
+            // The art's ALPHA fades out toward the bottom so the shared
+            // ATVBackground stage shows through — an opaque blend color can
+            // never match the stage's bloom and always left a seam line.
             GeometryReader { geo in
                 if let art = hero.item?.background ?? hero.item?.poster {
                     RemoteImage(url: art)
                         .frame(width: geo.size.width, height: geo.size.height)
                         .clipped()
+                        // Left readability wash rides INSIDE the mask so it
+                        // fades away with the art instead of tinting the stage.
+                        .overlay(
+                            LinearGradient(
+                                stops: [
+                                    .init(color: .black.opacity(0.72), location: 0),
+                                    .init(color: .black.opacity(0.5), location: 0.22),
+                                    .init(color: .black.opacity(0.25), location: 0.38),
+                                    .init(color: .clear, location: 0.60)
+                                ],
+                                startPoint: .leading, endPoint: .trailing
+                            )
+                        )
+                        .mask(
+                            LinearGradient(
+                                stops: [
+                                    .init(color: .white, location: 0),
+                                    .init(color: .white, location: 0.55),
+                                    .init(color: .white.opacity(0.35), location: 0.82),
+                                    .init(color: .clear, location: 1.0)
+                                ],
+                                startPoint: .top, endPoint: .bottom
+                            )
+                        )
                 }
             }
-            // Left readability wash.
-            LinearGradient(
-                stops: [
-                    .init(color: theme.palette.background, location: 0),
-                    .init(color: theme.palette.background.opacity(0.82), location: 0.16),
-                    .init(color: theme.palette.background.opacity(0.45), location: 0.34),
-                    .init(color: .clear, location: 0.60)
-                ],
-                startPoint: .leading, endPoint: .trailing
-            )
-            // Strong bottom gradient blending into the grey page.
-            LinearGradient(
-                stops: [
-                    .init(color: theme.palette.background, location: 0),
-                    .init(color: theme.palette.background.opacity(0.9), location: 0.14),
-                    .init(color: theme.palette.background.opacity(0.5), location: 0.32),
-                    .init(color: .clear, location: 0.6)
-                ],
-                startPoint: .bottom, endPoint: .top
-            )
             // Spotlight info — extra leading inset so text/logo stay title-safe
             // even though the art bleeds to the edge.
             ATVHeroInfoView(hero: hero, onPlay: onPlay, playFocus: playFocus)
