@@ -1,5 +1,12 @@
 # On-device P2P streaming (nodejs-mobile)
 
+> **STATUS: NOT WIRED UP.** Nothing in the app references any of this. On-device
+> P2P has never run: it needs `Vendor/NodeMobile.xcframework`, which has never
+> been built, and `nodeserver/` is not in the app target. **TorrServer
+> (Settings → Integrations → P2P) is the live P2P path** — that one works.
+> Everything below is the plan for finishing this, not a description of
+> shipped behaviour.
+
 NuvioTV can stream torrents **on-device**, peer-to-peer, the same way Stremio's
 tvOS app does: a Node.js runtime is linked into the app as a framework
 (nodejs-mobile) and runs a small streaming server **in-process** — no

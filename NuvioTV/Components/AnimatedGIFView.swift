@@ -192,11 +192,6 @@ enum GIFDecoder {
 /// Plays an animated GIF from a URL. Renders nothing until the GIF has decoded,
 /// so the caller can keep the static cover visible underneath and cross-fade.
 struct AnimatedGIFView: UIViewRepresentable {
-    /// Whether this device should animate collection GIFs at all. The 2 GB
-    /// Apple TV HD has no headroom for a second decoded animation on top of
-    /// artwork + UI, and this feature is pure decoration.
-    static var isSupported: Bool { !PerformanceProfile.isLowPower }
-
     let url: String
     var contentMode: UIView.ContentMode = .scaleAspectFit
     /// "Partial" quality: decode ONE frame and show it as a still. Keeps the

@@ -84,7 +84,7 @@ private struct SourcePickerTabPill: View {
             .background(Capsule().fill(selected ? theme.palette.secondary
                         : (isFocused ? theme.palette.focusBackground : Color.white.opacity(0.08))))
             .overlay(Capsule().strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 3))
-            .scaleEffect(isFocused ? 1.04 : 1)
+            .focusLift(NuvioFocus.card, isFocused)
     }
 }
 

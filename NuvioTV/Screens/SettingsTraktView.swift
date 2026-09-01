@@ -273,8 +273,7 @@ private struct DestructivePillLabel: View {
                 Capsule(style: .continuous)
                     .strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 3)
             )
-            .scaleEffect(isFocused ? 1.05 : 1)
-            .animation(.spring(response: 0.3, dampingFraction: 0.8), value: isFocused)
+            .focusLift(NuvioFocus.card, isFocused)
     }
 }
 

@@ -1,12 +1,5 @@
 import Foundation
 
-/// How the "next episode" threshold is measured, matching the Android
-/// `NextEpisodeThresholdMode`.
-enum NextEpisodeThresholdMode: String, Codable, CaseIterable {
-    case percentage        // fire when position ≥ percent of duration
-    case minutesBeforeEnd  // fire when (duration - position) ≤ minutes
-}
-
 /// How much of the stream to buffer AHEAD (read-ahead cache), so a slow or
 /// bursty connection doesn't cause mid-playback rebuffering.
 ///
@@ -44,73 +37,6 @@ enum BufferProfile: String, Codable, CaseIterable {
         case .gb2: return 2000 << 20
         case .max: return .max
         }
-    }
-}
-
-/// How hard the on-device Dolby Vision Profile 7 → 8.1 conversion is allowed
-/// to work. The remux re-reads and RPU-rewrites the whole file in the
-/// background while playback streams in parallel; at full tilt that saturates
-/// CPU / memory / network and can hang the UI on a RAM-limited box (the 3 GB
-/// gen-1 4K). "Smooth" runs the worker at a lower thread priority and paces it
-/// to a little above realtime (after a short head-start burst) so playback and
-/// the rest of the app keep breathing; "Fast" lets it run flat out (best on
-/// 4 GB+ boxes). The default is device-aware.
-enum DolbyVisionRemuxPace: String, Codable, CaseIterable {
-    case smooth, balanced, fast
-
-    var label: String {
-        switch self {
-        case .smooth:   return "Smooth (older Apple TVs)"
-        case .balanced: return "Balanced"
-        case .fast:     return "Fast (newer Apple TVs)"
-        }
-    }
-
-    /// Worker-thread priority. A lower QoS lets tvOS shed the conversion under
-    /// UI pressure instead of starving the main thread into a hang.
-    var qos: QualityOfService {
-        switch self {
-        case .smooth, .balanced: return .utility
-        case .fast:              return .userInitiated
-        }
-    }
-
-    /// Max processing speed as a multiple of realtime once past the head start
-    /// (0 = unbounded). Bounds the download/decode burst so it can't flood a
-    /// constrained box.
-    var speedFactor: Double {
-        switch self {
-        case .smooth:   return 1.5
-        case .balanced: return 3.0
-        case .fast:     return 0
-        }
-    }
-
-    /// Seconds of content the worker may get ahead before pacing kicks in —
-    /// the initial burst that lets playback start quickly, and thereafter the
-    /// STALL CUSHION: how much finished playlist stands between the viewer
-    /// and a dry AVPlayer when the network dips or the P7 conversion hiccups.
-    ///
-    /// 20s proved far too thin on the A10X: AVPlayer itself keeps ~12s
-    /// buffered, so ~8s of real margin separated "playing" from "stalled →
-    /// native DV abandoned" — real sessions died at the ~4-minute mark on a
-    /// perfectly adequate connection. The cushion lives on DISK (segments,
-    /// separately capped by the remuxer's disk budget), not in RAM, so a
-    /// deep one costs nothing the jetsam killer cares about. 90s at a 70 Mbps
-    /// remux is ~790 MB on disk — inside the budget — and rides out dips
-    /// an order of magnitude longer.
-    var leadSeconds: Double {
-        switch self {
-        case .smooth:   return 90
-        case .balanced: return 90
-        case .fast:     return 0
-        }
-    }
-
-    /// Sensible default for this hardware tier: gentle on the 3 GB gen-1/2 and
-    /// 2 GB HD, flat-out on the 4 GB+ boxes.
-    static var deviceDefault: DolbyVisionRemuxPace {
-        (PerformanceProfile.isLowPower || PerformanceProfile.isMidPower) ? .smooth : .fast
     }
 }
 
@@ -177,12 +103,6 @@ struct PlayerSettings: Codable, Equatable {
     var autoPlayTimeoutSeconds: Int = 3
     var stillWatchingEnabled: Bool = false
     var stillWatchingEpisodeThreshold: Int = 3
-    /// LEGACY (pre-upNextLeadSeconds): kept for save-file compatibility, not
-    /// shown or used anymore — the Up Next timing is now credits-chapter
-    /// first, then `upNextLeadSeconds` before the end.
-    var nextEpisodeThresholdMode: NextEpisodeThresholdMode = .percentage
-    var nextEpisodeThresholdPercent: Double = 99
-    var nextEpisodeThresholdMinutesBeforeEnd: Double = 2
     /// Fallback for files WITHOUT an end-credits chapter: how many seconds
     /// before the end the Up Next card appears. Default 30.
     var upNextLeadSeconds: Int = 30
@@ -208,6 +128,11 @@ struct PlayerSettings: Codable, Equatable {
     /// Diagnostics: show the last trackpad/remote event on-screen in the player
     /// (helps tune gestures on a real Apple TV — the Simulator has no remote).
     var showInputDebug: Bool = false
+    /// Generate scrub preview frames (the scene window on the progress bar).
+    /// The pass is a SECOND connection and a second FFmpeg decoder running
+    /// against live playback, so on a marginal source or a busy box it is a
+    /// real cost — this is the switch for trading the previews away.
+    var scrubPreviewsEnabled: Bool = true
     /// Subtitle presentation: point size (KSPlayer stamps it onto every cue),
     /// optional dark plate behind lines, bold text.
     var subtitleSize: Int = 36
@@ -287,10 +212,6 @@ struct PlayerSettings: Codable, Equatable {
     /// returned them (cached still first), capped per addon so a Torrentio
     /// flood can't drown the UI.
     var sourceFiltersEnabled: Bool = true
-    /// LEGACY (pre-size-tier sort): the old per-resolution high/low counts.
-    /// Kept only so existing saves decode; not used or shown anymore.
-    var sourcesHighGBPerTier: Int = 5
-    var sourcesLowGBPerTier: Int = 5
     /// Links shown per size tier (250 MB–4 GB / 4–10 / 10–20 / 20–30 / 30+).
     var sourcesPerSizeTier: Int = 6
     // --- Stream filters (applied before curation) ---
@@ -350,15 +271,6 @@ struct PlayerSettings: Codable, Equatable {
     /// already carries, so turning it off never costs the picture.
     var hdr10PlusPassthrough: Bool = true
 
-    /// Put the TV back in its home-screen display mode when playback ends.
-    ///
-    /// ON is correct behaviour and the default. OFF exists because some TVs
-    /// mis-handshake the HDMI mode change on the way OUT and wedge on a grey
-    /// or miscoloured screen until they are power-cycled — no app-side
-    /// sequencing fully prevents that on those panels, and simply never
-    /// switching back does. The Apple TV then stays in the content's mode
-    /// until tvOS moves it on its own terms.
-    var restoreDisplayModeOnExit: Bool = true
     /// Convert Dolby Vision Profile 7 (dual-layer) → 8.1 via
     /// libdovi so DV7 files also get native DV output (the base layer is kept,
     /// the enhancement layer dropped, each RPU rewritten 7→8.1). The DEFAULT is
@@ -368,10 +280,6 @@ struct PlayerSettings: Codable, Equatable {
     /// tone-maps to HDR10 (the standard engine), exactly as before. Requires
     /// Native Dolby Vision on.
     var dolbyVisionProfile7: Bool = PerformanceProfile.recommendsDolbyVisionProfile7
-    /// How aggressively the DV7 → 8.1 conversion runs. Defaults gentle on
-    /// RAM-limited boxes (so DV7 can be turned on there without hanging) and
-    /// flat-out on 4 GB+ boxes. See DolbyVisionRemuxPace.
-    var dolbyVisionProfile7Pace: DolbyVisionRemuxPace = .deviceDefault
     /// Render styled ASS/SSA subtitles fully (custom fonts, positioning,
     /// karaoke) by playing titles that carry them in the VLC engine, which
     /// includes libass. KSPlayer's built-in ASS parser drops embedded fonts
@@ -454,9 +362,6 @@ struct PlayerSettings: Codable, Equatable {
         autoPlayTimeoutSeconds = (try? c.decode(Int.self, forKey: .autoPlayTimeoutSeconds)) ?? d.autoPlayTimeoutSeconds
         stillWatchingEnabled = (try? c.decode(Bool.self, forKey: .stillWatchingEnabled)) ?? d.stillWatchingEnabled
         stillWatchingEpisodeThreshold = (try? c.decode(Int.self, forKey: .stillWatchingEpisodeThreshold)) ?? d.stillWatchingEpisodeThreshold
-        nextEpisodeThresholdMode = (try? c.decode(NextEpisodeThresholdMode.self, forKey: .nextEpisodeThresholdMode)) ?? d.nextEpisodeThresholdMode
-        nextEpisodeThresholdPercent = (try? c.decode(Double.self, forKey: .nextEpisodeThresholdPercent)) ?? d.nextEpisodeThresholdPercent
-        nextEpisodeThresholdMinutesBeforeEnd = (try? c.decode(Double.self, forKey: .nextEpisodeThresholdMinutesBeforeEnd)) ?? d.nextEpisodeThresholdMinutesBeforeEnd
         upNextLeadSeconds = (try? c.decode(Int.self, forKey: .upNextLeadSeconds)) ?? d.upNextLeadSeconds
         autoPlayTrailerSeconds = (try? c.decode(Int.self, forKey: .autoPlayTrailerSeconds)) ?? d.autoPlayTrailerSeconds
         skipIntroEnabled = (try? c.decode(Bool.self, forKey: .skipIntroEnabled)) ?? d.skipIntroEnabled
@@ -465,6 +370,7 @@ struct PlayerSettings: Codable, Equatable {
         skipSeconds = (try? c.decode(Int.self, forKey: .skipSeconds)) ?? d.skipSeconds
         scrubJumpSeconds = (try? c.decode(Int.self, forKey: .scrubJumpSeconds)) ?? d.scrubJumpSeconds
         showInputDebug = (try? c.decode(Bool.self, forKey: .showInputDebug)) ?? d.showInputDebug
+        scrubPreviewsEnabled = (try? c.decode(Bool.self, forKey: .scrubPreviewsEnabled)) ?? d.scrubPreviewsEnabled
         subtitleSize = (try? c.decode(Int.self, forKey: .subtitleSize)) ?? d.subtitleSize
         subtitleBackground = (try? c.decode(Bool.self, forKey: .subtitleBackground)) ?? d.subtitleBackground
         subtitleBold = (try? c.decode(Bool.self, forKey: .subtitleBold)) ?? d.subtitleBold
@@ -498,8 +404,6 @@ struct PlayerSettings: Codable, Equatable {
         showPlayerLoadingStatus = (try? c.decode(Bool.self, forKey: .showPlayerLoadingStatus)) ?? d.showPlayerLoadingStatus
         parentalGuideEnabled = (try? c.decode(Bool.self, forKey: .parentalGuideEnabled)) ?? d.parentalGuideEnabled
         sourceFiltersEnabled = (try? c.decode(Bool.self, forKey: .sourceFiltersEnabled)) ?? d.sourceFiltersEnabled
-        sourcesHighGBPerTier = (try? c.decode(Int.self, forKey: .sourcesHighGBPerTier)) ?? d.sourcesHighGBPerTier
-        sourcesLowGBPerTier = (try? c.decode(Int.self, forKey: .sourcesLowGBPerTier)) ?? d.sourcesLowGBPerTier
         sourcesPerSizeTier = (try? c.decode(Int.self, forKey: .sourcesPerSizeTier)) ?? d.sourcesPerSizeTier
         streamMinResolution = (try? c.decode(String.self, forKey: .streamMinResolution)) ?? d.streamMinResolution
         streamExcludeAV1 = (try? c.decode(Bool.self, forKey: .streamExcludeAV1)) ?? d.streamExcludeAV1
@@ -515,9 +419,7 @@ struct PlayerSettings: Codable, Equatable {
         matchFrameRate = (try? c.decode(Bool.self, forKey: .matchFrameRate)) ?? d.matchFrameRate
         nativeDolbyVision = (try? c.decode(Bool.self, forKey: .nativeDolbyVision)) ?? d.nativeDolbyVision
         hdr10PlusPassthrough = (try? c.decode(Bool.self, forKey: .hdr10PlusPassthrough)) ?? d.hdr10PlusPassthrough
-        restoreDisplayModeOnExit = (try? c.decode(Bool.self, forKey: .restoreDisplayModeOnExit)) ?? d.restoreDisplayModeOnExit
         dolbyVisionProfile7 = (try? c.decode(Bool.self, forKey: .dolbyVisionProfile7)) ?? d.dolbyVisionProfile7
-        dolbyVisionProfile7Pace = (try? c.decode(DolbyVisionRemuxPace.self, forKey: .dolbyVisionProfile7Pace)) ?? d.dolbyVisionProfile7Pace
         fullAssSubtitles = (try? c.decode(Bool.self, forKey: .fullAssSubtitles)) ?? d.fullAssSubtitles
     }
 }

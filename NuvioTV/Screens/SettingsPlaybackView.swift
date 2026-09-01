@@ -53,15 +53,8 @@ struct PlaybackSettingsDetail: View {
                 PlaybackToggleRow(
                     icon: "sparkles.tv",
                     title: "AniSkip for anime",
-                    subtitle: "Fetch anime intro/outro skip times (AniSkip) for episodes that carry no chapter markers, so Skip Intro and Up Next work on anime web releases.",
+                    subtitle: "Fetch intro/outro skip times from the public AniSkip database for anime episodes that carry no chapter markers, so Skip Intro and Up Next work on anime web releases. No account or key needed.",
                     isOn: s.animeSkipEnabled
-                )
-
-                PlaybackToggleRow(
-                    icon: "ladybug.fill",
-                    title: "Show input debug",
-                    subtitle: "Overlay the last trackpad/remote event in the player (for tuning gestures on a real Apple TV)",
-                    isOn: s.showInputDebug
                 )
             }
 
@@ -271,16 +264,6 @@ struct PlaybackSettingsDetail: View {
                         subtitle: "Also handle dual-layer Profile 7 files (UHD Blu-ray remuxes) by converting them to Profile 8.1 on the fly, for native DV instead of the HDR10 tone-map. \(PerformanceProfile.recommendsDolbyVisionProfile7 ? "On by default on \(PerformanceProfile.tierLabel)." : "Off by default on \(PerformanceProfile.tierLabel): the on-the-fly conversion re-processes the whole file and can freeze playback on this box — turn on only if you accept that.") If a P7 title looks wrong, turn this off and it reverts to HDR10. Needs Native Dolby Vision on.\(ExternalPlayers.player(id: "senplayer")?.isInstalled == true ? " SenPlayer is installed on this Apple TV and does the same P7 → 8.1 conversion in its own app — set Playback engine to External and pick it there to hand P7 titles off instead of converting them here." : "")",
                         isOn: s.dolbyVisionProfile7
                     )
-
-                    if s.dolbyVisionProfile7.wrappedValue {
-                        NuvioDropdown(
-                            title: "DV7 conversion speed",
-                            subtitle: "How hard the Profile 7 → 8.1 conversion is allowed to work. \"Smooth\" runs it at low priority and paces it to just above realtime after a short head start, so it won't starve a RAM-limited Apple TV (the 3 GB gen-1) into a freeze; \"Fast\" runs it flat out (best on 4 GB+ boxes). If DV7 hangs this box, choose Smooth.",
-                            icon: "speedometer",
-                            selection: store.settings.dolbyVisionProfile7Pace.rawValue,
-                            options: DolbyVisionRemuxPace.allCases.map { NuvioDropdownOption($0.rawValue, $0.label) }
-                        ) { store.settings.dolbyVisionProfile7Pace = DolbyVisionRemuxPace(rawValue: $0) ?? .deviceDefault }
-                    }
                 }
 
                 PlaybackToggleRow(
@@ -289,8 +272,6 @@ struct PlaybackSettingsDetail: View {
                     subtitle: "Also switch the TV into the matching HDR mode and refresh rate for non-Dolby-Vision videos (HDR10/SDR). Dolby Vision always switches — that's the point of DV — and the mode is held until you leave the app, so the TV only ever sees one switch per session. Off = non-DV videos tone-map into the home screen's format.",
                     isOn: s.matchContentDisplayMode
                 )
-
-                
 
                 NuvioDropdown(
                     title: "Video scaling",

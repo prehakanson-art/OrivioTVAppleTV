@@ -539,7 +539,7 @@ struct PosterCard: View {
     private var stremio: Bool { theme.isStremioTheme }
     /// Stremio uses generously rounded poster corners.
     private var cornerRadius: CGFloat {
-        stremio ? StremioFocus.cardRadius : CGFloat(layout.posterCornerRadius)
+        CGFloat(layout.posterCornerRadius)
     }
 
     /// Explicit progress wins; otherwise an O(1) Continue Watching lookup so
@@ -550,10 +550,10 @@ struct PosterCard: View {
         return progressStore.continueFractions[item.id]
     }
 
-    /// Apple TV theme: the native CardButtonStyle platter supplies focus
-    /// (raise + trackpad wiggle), so the card's own ring / scale / shadow /
-    /// caption are suppressed — posters read as clean "icons".
-    private var atv: Bool { theme.isAppleTVTheme }
+    /// The native CardButtonStyle platter supplies focus (raise + trackpad
+    /// wiggle), so the card's own ring / scale / shadow / caption are
+    /// suppressed — posters read as clean "icons".
+    private var atv: Bool { true }
 
     /// Focus ring fallback. Classic always rings its focused card. Fusion
     /// normally lets the accent GLOW mark focus — but the glow rides the Card
@@ -602,7 +602,7 @@ struct PosterCard: View {
                 // Stremio marks focus with a thicker purple border.
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                     .strokeBorder(showsFocusRing ? theme.palette.focusRing : .clear,
-                                  lineWidth: stremio ? StremioFocus.borderWidth : 3)
+                                  lineWidth: 3)
             )
             // FOCUSED card only. A drop shadow is an offscreen render pass per
             // card; with the old always-on ambient shadow every visible poster
@@ -615,8 +615,6 @@ struct PosterCard: View {
             // Stremio: the same purple ambient glow marks focus.
             .shadow(color: isFocused ? theme.effectiveFocusGlow : .clear,
                     radius: atv && isFocused ? 30 : 0)
-            .shadow(color: stremio && isFocused ? StremioFocus.glow.opacity(0.75) : .clear,
-                    radius: stremio && isFocused ? 26 : 0, y: 6)
 
             if layout.showPosterLabels && !atv {
                 MarqueeText(
@@ -628,17 +626,10 @@ struct PosterCard: View {
                 .frame(width: cardWidth, alignment: .leading)
             }
         }
-        .scaleEffect(scaleWhenFocused)
-        .animation(cardAnimation, value: isFocused)
-    }
-
-    private var scaleWhenFocused: CGFloat {
-        guard perf.focusZoomEffective && isFocused && !atv else { return 1.0 }
-        return stremio ? StremioFocus.posterScale : 1.08
-    }
-
-    private var cardAnimation: Animation {
-        atv ? FusionMotion.focusMove : .spring(response: 0.32, dampingFraction: 0.82)
+        // `atv` opts out: the Apple TV theme uses the native tvOS card platter
+        // (lift + trackpad tilt) instead of a scale. Every other theme gets the
+        // shared card lift, so a poster grows identically in all of them.
+        .focusLift(atv ? 1.0 : NuvioFocus.card, isFocused)
     }
 }
 
@@ -673,7 +664,7 @@ struct LandscapeCard: View {
     @Environment(\.isFocused) private var isFocused
 
     private var stremio: Bool { theme.isStremioTheme }
-    private var cardRadius: CGFloat { stremio ? StremioFocus.cardRadius : NuvioRadius.md }
+    private var cardRadius: CGFloat { NuvioRadius.md }
 
     let imageURL: String?
     let title: String
@@ -744,27 +735,21 @@ struct LandscapeCard: View {
                     // tier defaults), fall back to the ring so the focused card
                     // is always marked. One vector stroke, no offscreen pass
                     // (see PosterCard.showsFocusRing). Stremio: thicker purple.
-                    .strokeBorder(isFocused && (!theme.isAppleTVTheme || !perf.settings.cardShadows)
+                    .strokeBorder(isFocused && !perf.settings.cardShadows
                                       ? theme.palette.focusRing : .clear,
-                                  lineWidth: stremio ? StremioFocus.borderWidth : 3)
+                                  lineWidth: 3)
             )
-            // Focused card only — same offscreen-pass reasoning as PosterCard.
-            .shadow(color: .black.opacity(perf.settings.cardShadows && isFocused && !theme.isAppleTVTheme ? 0.65 : 0),
-                    radius: perf.settings.cardShadows && isFocused && !theme.isAppleTVTheme ? 22 : 0, y: 10)
-            // Fusion (§13.3): accent focus glow.
+            // Accent focus glow beneath the native platter.
             .shadow(color: isFocused ? theme.effectiveFocusGlow : .clear,
-                    radius: theme.isAppleTVTheme && isFocused ? 32 : 0)
+                    radius: isFocused ? 32 : 0)
             // Stremio: purple ambient focus glow.
-            .shadow(color: stremio && isFocused ? StremioFocus.glow.opacity(0.75) : .clear,
-                    radius: stremio && isFocused ? 26 : 0, y: 6)
 
             if showsCaption {
                 caption
             }
         }
-        .scaleEffect(landscapeScale)
-        .animation(theme.isAppleTVTheme ? FusionMotion.focusMove
-                   : .spring(response: 0.32, dampingFraction: 0.82), value: isFocused)
+        // Native card platter carries the lift.
+        .focusLift(1.0, isFocused)
     }
 
     private var caption: some View {
@@ -830,10 +815,6 @@ struct LandscapeCard: View {
         return expanded ? (Self.episodeCastLineEnabled && detailLine?.isEmpty == false ? 156 : 132) : 72
     }
 
-    private var landscapeScale: CGFloat {
-        guard perf.focusZoomEffective && isFocused && !theme.isAppleTVTheme else { return 1.0 }
-        return stremio ? StremioFocus.landscapeScale : 1.06
-    }
 }
 
 private struct RemainingTimeBadge: View {
@@ -889,6 +870,13 @@ struct ATVCardCaption: View {
     let title: String
     var subtitle: String? = nil
     var width: CGFloat
+    /// True while this caption's card is focused: the native platter grows the
+    /// artwork downward past the caption's resting gap, so the caption eases
+    /// down in step to keep a constant distance from the poster's bottom edge.
+    var lowered: Bool = false
+    /// How far to drop while lowered — the platter's bottom-edge growth plus
+    /// breathing room, so the gap reads clearly at couch distance.
+    var dropDistance: CGFloat = 18
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -905,6 +893,8 @@ struct ATVCardCaption: View {
         }
         .frame(width: width, alignment: .leading)
         .padding(.top, 4)
+        .offset(y: lowered ? dropDistance : 0)
+        .animation(.spring(response: 0.32, dampingFraction: 0.85), value: lowered)
     }
 }
 
@@ -920,17 +910,15 @@ private struct MediaCardButtonStyleModifier: ViewModifier {
 
     @ViewBuilder
     func body(content: Content) -> some View {
-        if theme.isAppleTVTheme && perf.cardParallaxEffective {
+        if perf.cardParallaxEffective {
             // Native platter: raised card + trackpad tilt/parallax.
             content.buttonStyle(CardButtonStyle())
-        } else if theme.isAppleTVTheme {
+        } else {
             // "Card wiggle & lift" off (Settings → Performance): a lightweight
             // scale-only focus that never re-composites the card as the finger
             // moves — the cheap path for the A8. Cards still respond to focus;
             // their own glow/border (drawn off \.isFocused) still shows.
             content.buttonStyle(FlatCardButtonStyle(onPressChanged: onPressChanged))
-        } else {
-            content.buttonStyle(PlainCardButtonStyle(onPressChanged: onPressChanged))
         }
     }
 }
@@ -952,10 +940,8 @@ struct FlatCardButtonStyle: ButtonStyle {
         let onPressChanged: ((Bool) -> Void)?
 
         var body: some View {
-            let perf = PerformanceSettingsStore.shared
-            return configuration.label
-                .scaleEffect(perf.focusScale(1.06, isFocused))
-                .animation(perf.motion(.easeOut(duration: 0.18)), value: isFocused)
+            configuration.label
+                .focusLift(NuvioFocus.card, isFocused)
                 .cardPressDip(configuration.isPressed)
                 .onChange(of: configuration.isPressed) { _, pressed in
                     onPressChanged?(pressed)
@@ -1004,6 +990,39 @@ private struct CardPressDip: ViewModifier {
     }
 }
 
+/// The one focus-motion vocabulary the whole app speaks.
+///
+/// Every focusable element picks a ROLE here instead of writing its own
+/// `.scaleEffect(isFocused ? 1.0x : 1)`. A poster therefore lifts by the same
+/// amount in Classic, Apple TV, Cinematic, Theater, Aurora, Onyx, Marquee,
+/// Streamline and Stremio — and in any theme added later — and settles on the
+/// same curve, because they all go through `View.focusLift(_:_:)`.
+///
+/// Roles differ from ONE ANOTHER on purpose: a 300pt poster and a 72pt
+/// settings row should not grow by the same fraction. What they never differ
+/// by is which theme happens to be on screen.
+///
+/// Adding a theme? Don't add scales — reuse these roles and the theme
+/// automatically inherits the app's focus behaviour, the "Focus zoom"
+/// performance switch and Reduce Motion.
+enum NuvioFocus {
+    /// Full-width list rows: settings rows, side-panel rows, dropdown options.
+    static let row: CGFloat = 1.02
+    /// The default for anything card-shaped: posters, tiles, episode cards,
+    /// chips, pills and ordinary buttons.
+    static let card: CGFloat = 1.05
+    /// Small circular icon controls — trash, reorder, player transport, keypad
+    /// keys. Small targets need a larger fraction to read as focused at all.
+    static let control: CGFloat = 1.08
+    /// Deliberately-large focus targets: profile avatars and their tiles.
+    static let avatar: CGFloat = 1.12
+    /// Carousel position dots — tiny, so they take the largest scale.
+    static let dot: CGFloat = 1.4
+
+    /// The single curve every focus move settles on, app-wide.
+    static let animation: Animation = FusionFocus.liftAnimation
+}
+
 /// The shared focus lift for a themed card/tile: the theme's own scale, but
 /// gated by "Cards spring slightly larger when focused" + Reduce Motion, and
 /// animated on one curve so a focus move settles at the same rate in every
@@ -1019,6 +1038,29 @@ private struct FocusLift: ViewModifier {
         content
             .scaleEffect(perf.focusScale(scale, focused))
             .animation(perf.motion(animation), value: focused)
+    }
+}
+
+/// Applies an external `.focused(_:)` binding only when one is supplied, so a
+/// reusable card can accept an optional focus binding from its parent.
+/// (Was duplicated verbatim as MaxExternalFocus and HuluExternalFocus.)
+private struct OptionalExternalFocus: ViewModifier {
+    let binding: FocusState<Bool>.Binding?
+    func body(content: Content) -> some View {
+        if let binding { content.focused(binding) } else { content }
+    }
+}
+
+extension View {
+    /// Attach `binding` with `.focused(_:)` when it exists, otherwise no-op.
+    func externalFocus(_ binding: FocusState<Bool>.Binding?) -> some View {
+        modifier(OptionalExternalFocus(binding: binding))
+    }
+
+    /// Pulls focus to `binding` shortly after appear so a browse page opens
+    /// focused on its content instead of on the chrome.
+    func pullFocusOnAppear(_ binding: FocusState<Bool>.Binding) -> some View {
+        onAppear { DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { binding.wrappedValue = true } }
     }
 }
 
@@ -1221,10 +1263,7 @@ struct RowHeader: View {
 
     var body: some View {
         Text(title)
-            // Fusion uses its module-heading role (serif-capable); Classic
-            // keeps its original weight.
-            .font(theme.isAppleTVTheme ? FusionType.moduleHeading(theme.font)
-                  : .system(size: 30, weight: .bold))
+            .font(FusionType.moduleHeading(theme.font))
             .foregroundStyle(theme.palette.textPrimary)
             .padding(.leading, NuvioSpacing.huge)
     }
@@ -1426,9 +1465,7 @@ struct FusionToastHost: View {
     var body: some View {
         VStack {
             Spacer()
-            // Fusion and Netflix both surface browse toasts (§54 / Netflix
-            // spec §95); Classic keeps its original toast-free behavior.
-            if theme.isAppleTVTheme || theme.isNetflixTheme, let message = center.message {
+            if let message = center.message {
                 HStack(spacing: NuvioSpacing.sm) {
                     if let icon = center.icon {
                         Image(systemName: icon)

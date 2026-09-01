@@ -130,7 +130,7 @@ struct FusionHeroBar: View {
                 y: focusedInside ? 16 : 8)
         .shadow(color: focusedInside ? theme.effectiveFocusGlow : .clear,
                 radius: perf.settings.cardShadows ? 36 : 0)
-        .scaleEffect(focusedInside ? 1.04 : 1.0)
+        .focusLift(NuvioFocus.card, focusedInside)
         .offset(y: focusedInside ? -8 : 0)
         .animation(FusionMotion.focusEntry, value: focusedInside)
     }
@@ -196,25 +196,37 @@ struct FusionHeroBar: View {
         }
     }
 
+    /// -1 / 1 while an invisible stepping sentinel beside the button holds
+    /// focus for a beat. NOT `.onMoveCommand` — that swallows EVERY direction
+    /// on the focused view, so Down could never leave the bar for the rows.
+    @FocusState private var stepFocus: Int?
+    @FocusState private var playButtonFocus: Bool
+
     @ViewBuilder
     private var buttons: some View {
-        // One primary action, matching the reference — opens the title's page.
-        Button { if let c = current { onPlay(c) } } label: {
-            Label("Go to Movie", systemImage: "play.fill")
-        }
-        .buttonStyle(FusionHeroBarButtonStyle(prominent: true))
-        .onFocusChange { focused in
-            playFocused = focused
-            if focused { lastInteraction = Date() }
-        }
-        // Left/Right on the (horizontally-alone) button step between the
-        // featured titles; Up/Down fall through to the focus engine.
-        .onMoveCommand { direction in
-            switch direction {
-            case .left: advance(by: -1)
-            case .right: advance(by: 1)
-            default: break
+        HStack(spacing: 0) {
+            Color.clear.frame(width: 1, height: 40)
+                .focusable()
+                .focused($stepFocus, equals: -1)
+            // One primary action, matching the reference — opens the title's page.
+            Button { if let c = current { onPlay(c) } } label: {
+                Label("Go to Movie", systemImage: "play.fill")
             }
+            .buttonStyle(FusionHeroBarButtonStyle(prominent: true))
+            .focused($playButtonFocus)
+            .onFocusChange { focused in
+                playFocused = focused
+                if focused { lastInteraction = Date() }
+            }
+            Color.clear.frame(width: 1, height: 40)
+                .focusable()
+                .focused($stepFocus, equals: 1)
+        }
+        .onChange(of: stepFocus) { _, step in
+            guard let step else { return }
+            advance(by: step)
+            stepFocus = nil
+            playButtonFocus = true
         }
         .padding(.top, NuvioSpacing.xs)
     }
@@ -298,9 +310,8 @@ private struct FusionChevronStyle: ButtonStyle {
                 )
                 .overlay(Circle().strokeBorder(.white.opacity(isFocused ? 0.9 : 0.15), lineWidth: isFocused ? 2 : 1))
                 .opacity(isFocused ? 1 : 0.55)
-                .scaleEffect(isFocused ? 1.08 : 1)
-                .scaleEffect(configuration.isPressed ? 0.94 : 1)
-                .animation(FusionMotion.focusEntry, value: isFocused)
+                .focusLift(NuvioFocus.control, isFocused)
+                .cardPressDip(configuration.isPressed)
         }
     }
 }
@@ -337,11 +348,8 @@ private struct FusionHeroBarButtonStyle: ButtonStyle {
                 .padding(.vertical, NuvioSpacing.sm)
                 .background(Capsule().fill(fill))
                 .shadow(color: .black.opacity(isFocused ? 0.3 : 0), radius: isFocused ? 14 : 0, y: 6)
-                .scaleEffect(isFocused ? 1.05 : 1)
-                .scaleEffect(configuration.isPressed ? 0.98 : 1)
-                .animation(FusionMotion.focusEntry, value: isFocused)
-                .animation(configuration.isPressed ? FusionMotion.pressDown : FusionMotion.pressRelease,
-                           value: configuration.isPressed)
+                .focusLift(NuvioFocus.card, isFocused)
+                .cardPressDip(configuration.isPressed)
         }
     }
 }

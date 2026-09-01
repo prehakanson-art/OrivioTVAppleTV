@@ -367,7 +367,6 @@ private struct ChannelCard: View, Equatable {
             )
             .frame(width: width, alignment: .leading)
         }
-        .scaleEffect(perf.focusZoomEffective && isFocused ? 1.06 : 1.0)
-        .animation(theme.isAppleTVTheme ? FusionMotion.focusMove : .spring(response: 0.32, dampingFraction: 0.82), value: isFocused)
+        .focusLift(NuvioFocus.card, isFocused)
     }
 }

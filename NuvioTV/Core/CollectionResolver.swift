@@ -38,28 +38,54 @@ enum CollectionResolver {
         let resolvableTmdb = tmdbEnabled ? tmdbSources : []
         guard !addonSources.isEmpty || !resolvableTmdb.isEmpty || !traktSources.isEmpty else { return [] }
 
-        var items: [MetaItem] = []
-        var seen = Set<String>()
         let isContinuation = tmdbStartPage > 1
-        for source in addonSources where !isContinuation {
+
+        // Every source in the folder is fetched CONCURRENTLY. They used to run
+        // one after another — each addon catalog, then each TMDB source, then
+        // each Trakt list, every one a full network round-trip — so a folder
+        // built from four sources took four round-trips end to end even though
+        // none of them depends on the others. Folders were already parallel;
+        // the wait was inside each one.
+        //
+        // Order is preserved by INDEX, not by arrival: the merge below still
+        // goes addon → TMDB → Trakt, in each group's own source order, so the
+        // de-duplication keeps giving the same winner it always did (first
+        // source to claim an id owns it). Concurrency changes when things
+        // arrive, never what the folder resolves to.
+        func gather(_ count: Int,
+                    _ body: @escaping @Sendable (Int) async -> [MetaItem]) async -> [[MetaItem]] {
+            guard count > 0 else { return [] }
+            var out = [[MetaItem]](repeating: [], count: count)
+            await withTaskGroup(of: (Int, [MetaItem]).self) { group in
+                for i in 0..<count { group.addTask { (i, await body(i)) } }
+                for await (i, items) in group { out[i] = items }
+            }
+            return out
+        }
+
+        async let addonResults: [[MetaItem]] = isContinuation ? [] : gather(addonSources.count) { i in
+            let source = addonSources[i]
             guard let addonID = source.addonId,
                   let type = source.type,
                   let catalogID = source.catalogId,
                   let addon = addons.first(where: { $0.manifest.id == addonID }),
                   let catalog = (addon.manifest.catalogs ?? [])
                     .first(where: { $0.type == type && $0.id == catalogID })
-            else { continue }
-            let fetched = (try? await StremioAPI.catalog(addon: addon, catalog: catalog)) ?? []
-            for item in fetched where seen.insert(item.id).inserted { items.append(item) }
+            else { return [] }
+            return (try? await StremioAPI.catalog(addon: addon, catalog: catalog)) ?? []
         }
-        for source in resolvableTmdb {
-            let fetched = await TMDBService.resolve(source: source, language: tmdbLanguage,
-                                                    maxPages: maxTmdbPages, startPage: tmdbStartPage)
-            for item in fetched where seen.insert(item.id).inserted { items.append(item) }
+        async let tmdbResults: [[MetaItem]] = gather(resolvableTmdb.count) { i in
+            await TMDBService.resolve(source: resolvableTmdb[i], language: tmdbLanguage,
+                                      maxPages: maxTmdbPages, startPage: tmdbStartPage)
         }
-        for source in traktSources where !isContinuation {
-            let fetched = await resolveTrakt(source: source, addonManager: addonManager)
-            for item in fetched where seen.insert(item.id).inserted { items.append(item) }
+        async let traktResults: [[MetaItem]] = isContinuation ? [] : gather(traktSources.count) { i in
+            await resolveTrakt(source: traktSources[i], addonManager: addonManager)
+        }
+
+        var items: [MetaItem] = []
+        var seen = Set<String>()
+        for batch in await addonResults + tmdbResults + traktResults {
+            for item in batch where seen.insert(item.id).inserted { items.append(item) }
         }
         return hideUnreleased ? items.filter { !$0.isUnreleased } : items
     }
@@ -75,23 +101,59 @@ enum CollectionResolver {
         let raw = await TraktService.publicListItems(
             traktListId: traktListId, type: type, sortBy: sortBy, sortHow: sortHow
         )
-        var enriched = 0
-        var out: [MetaItem] = []
-        for item in raw {
+        // Flatten first: every entry gets its placeholder, and the first 30 get
+        // upgraded in place if their meta lookup lands.
+        struct Entry { let id: String; let type: String; let placeholder: MetaItem }
+        let entries: [Entry] = raw.compactMap { item in
             let metaType = item.isMovie ? "movie" : "series"
-            let id = item.imdb ?? item.tmdb.map { "tmdb:\($0)" }
-            guard let id else { continue }
-            if enriched < 30, let addon = await addonManager.metaAddon(for: metaType, id: id),
-               let meta = try? await StremioAPI.meta(addon: addon, type: metaType, id: id) {
-                enriched += 1
-                out.append(meta)
-            } else {
-                out.append(MetaItem(
-                    id: id, type: metaType, name: item.title,
-                    releaseInfo: item.year.map(String.init)
-                ))
+            guard let id = item.imdb ?? item.tmdb.map({ "tmdb:\($0)" }) else { return nil }
+            return Entry(id: id, type: metaType, placeholder: MetaItem(
+                id: id, type: metaType, name: item.title,
+                releaseInfo: item.year.map(String.init)
+            ))
+        }
+        guard !entries.isEmpty else { return [] }
+
+        // Resolve the meta add-on ONCE per type rather than per item. It is a
+        // main-actor lookup, so doing it inside the loop cost thirty hops onto
+        // the main thread — while the main thread is drawing the grid.
+        var addonByType: [String: InstalledAddon] = [:]
+        for type in Set(entries.prefix(30).map(\.type)) {
+            if let first = entries.first(where: { $0.type == type }),
+               let addon = await addonManager.metaAddon(for: type, id: first.id) {
+                addonByType[type] = addon
             }
         }
-        return out
+
+        // The enrichment is what made a Trakt list slow: thirty meta fetches,
+        // strictly one after another, before a single poster appeared. They are
+        // independent lookups — run them together, bounded so a list doesn't
+        // open thirty sockets at once.
+        let enrichCount = min(entries.count, 30)
+        var upgraded = [MetaItem?](repeating: nil, count: enrichCount)
+        await withTaskGroup(of: (Int, MetaItem?).self) { group in
+            let window = min(8, enrichCount)
+            var next = 0
+            func start() {
+                guard next < enrichCount else { return }
+                let i = next
+                next += 1
+                let entry = entries[i]
+                let addon = addonByType[entry.type]
+                group.addTask {
+                    guard let addon else { return (i, nil) }
+                    return (i, try? await StremioAPI.meta(addon: addon, type: entry.type, id: entry.id))
+                }
+            }
+            for _ in 0..<window { start() }
+            for await (i, meta) in group {
+                start()
+                upgraded[i] = meta
+            }
+        }
+
+        return entries.enumerated().map { index, entry in
+            (index < enrichCount ? upgraded[index] : nil) ?? entry.placeholder
+        }
     }
 }

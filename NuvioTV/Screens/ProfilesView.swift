@@ -182,8 +182,7 @@ private struct GateTile<Content: View>: View {
                         .background(Circle().fill(.black.opacity(0.65)))
                 }
             }
-            .scaleEffect(isFocused ? 1.08 : 1)
-            .animation(.spring(response: 0.3, dampingFraction: 0.8), value: isFocused)
+            .focusLift(NuvioFocus.avatar, isFocused)
 
             Text(title)
                 .font(.system(size: 24, weight: .semibold))
@@ -210,8 +209,7 @@ private struct ColorSwatchLabel: View {
                 Circle().strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 4)
                     .padding(-6)
             )
-            .scaleEffect(isFocused ? 1.18 : 1)
-            .animation(.spring(response: 0.3, dampingFraction: 0.8), value: isFocused)
+            .focusLift(NuvioFocus.avatar, isFocused)
     }
 }
 
@@ -229,8 +227,7 @@ private struct AvatarPickLabel<Content: View>: View {
                 Circle().strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 5)
                     .padding(-6)
             )
-            .scaleEffect(isFocused ? 1.1 : 1)
-            .animation(.spring(response: 0.3, dampingFraction: 0.8), value: isFocused)
+            .focusLift(NuvioFocus.avatar, isFocused)
     }
 }
 
@@ -362,35 +359,7 @@ private struct PinKeyStyle: ButtonStyle {
             .frame(width: 90, height: 90)
             .background(Circle().fill(isFocused ? Color.white.opacity(0.9) : Color.white.opacity(0.12)))
             .foregroundStyle(isFocused ? .black : .white)
-            .scaleEffect(isFocused ? 1.12 : 1)
-            .animation(.spring(response: 0.25, dampingFraction: 0.8), value: isFocused)
-    }
-}
-
-/// PIN prompt shown when selecting a locked profile.
-struct PinUnlockView: View {
-    @EnvironmentObject private var profiles: ProfileStore
-    let profile: UserProfile
-    let onUnlocked: () -> Void
-    let onCancel: () -> Void
-
-    var body: some View {
-        PinEntryView(
-            title: "Enter PIN",
-            subtitle: profile.name,
-            onSubmit: { pin in
-                let outcome = await profiles.verifyPin(id: profile.id, pin: pin)
-                if outcome.unlocked {
-                    onUnlocked()
-                    return nil
-                }
-                if outcome.retryAfterSeconds > 0 {
-                    return "Too many attempts. Try again in \(outcome.retryAfterSeconds)s."
-                }
-                return outcome.message ?? "Incorrect PIN"
-            },
-            onCancel: onCancel
-        )
+            .focusLift(NuvioFocus.control, isFocused)
     }
 }
 
@@ -794,10 +763,6 @@ struct ProfileEditView: View {
                     .font(.system(size: 24, weight: .medium))
                     .tint(theme.palette.secondary)
                     .frame(maxWidth: 560)
-                Text("Dolby Vision sources can play with green/purple colors on tvOS. Leave on unless your DV playback works.")
-                    .font(.system(size: 18))
-                    .foregroundStyle(theme.palette.textTertiary)
-                    .frame(maxWidth: 820, alignment: .leading)
             }
         }
         .padding(.top, NuvioSpacing.lg)

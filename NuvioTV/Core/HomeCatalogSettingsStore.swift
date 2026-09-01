@@ -161,6 +161,9 @@ final class HomeCatalogSettingsStore: ObservableObject {
         didSet { guard landscapePosters != oldValue else { return }; save(); notifyPresentationChange() }
     }
     /// Whether the home hero backdrop fills the screen (APK "Fullscreen Hero Backdrop").
+    /// Sync-payload only: no code reads this and no settings row sets it (the
+    /// Home hero is always fullscreen). Kept so account blobs written by other
+    /// Orivio clients round-trip unchanged.
     @Published var fullscreenHero: Bool = true {
         didSet { guard fullscreenHero != oldValue else { return }; save(); notifyPresentationChange() }
     }
@@ -297,9 +300,40 @@ final class HomeCatalogSettingsStore: ObservableObject {
 
     // MARK: Mutations (UI)
 
+    /// Splice saved keys the caller doesn't know about back into a reordered
+    /// list. The Layout editor works in `mergedOrder` terms — only what this
+    /// device can resolve — so writing its result back verbatim would delete
+    /// every key belonging to the phone's add-ons, a disabled add-on, or a
+    /// collection this profile hides. Each unknown key re-attaches behind the
+    /// same visible key it used to follow (head-anchored ones stay at the
+    /// front), so its position survives a reorder it wasn't part of.
+    private func reanchoring(_ keys: [String]) -> [String] {
+        let known = Set(keys)
+        var head: [String] = []
+        var trailing: [String: [String]] = [:]
+        var anchor: String?
+        for key in orderKeys {
+            if known.contains(key) {
+                anchor = key
+            } else if let anchor {
+                trailing[anchor, default: []].append(key)
+            } else {
+                head.append(key)
+            }
+        }
+        var result = head
+        for key in keys {
+            result.append(key)
+            if let extras = trailing[key] { result.append(contentsOf: extras) }
+        }
+        var seen = Set<String>()
+        return result.filter { seen.insert($0).inserted }
+    }
+
     func setOrder(_ keys: [String]) {
-        guard keys != orderKeys else { return }
-        orderKeys = keys
+        let full = reanchoring(keys)
+        guard full != orderKeys else { return }
+        orderKeys = full
         save()
         notifyLocalChange()
     }
@@ -371,11 +405,34 @@ final class HomeCatalogSettingsStore: ObservableObject {
 
     // MARK: Sync plumbing
 
+    /// Order to PUSH: every saved key keeps its slot — including keys this
+    /// device can't currently resolve — then newly-available catalogs, then
+    /// new collections.
+    ///
+    /// This deliberately does NOT use `mergedOrder`, which filters to what is
+    /// available right now. That filter is correct for rendering and wrong for
+    /// the wire: the blob is shared across every device, platform and profile,
+    /// so "not available HERE" is routinely "installed on the phone",
+    /// "belonging to a temporarily disabled add-on", or "hidden on this
+    /// profile" — and pushing the filtered list deleted those positions for
+    /// everyone. Disabling one add-on, or pushing before add-ons finished
+    /// loading, was enough to flatten the account's whole Home order.
+    private func exportOrder(catalogKeys: [String], collectionKeys: [String]) -> [String] {
+        var seen = Set<String>()
+        let saved = orderKeys.filter { seen.insert($0).inserted }
+        return saved
+            + catalogKeys.filter { seen.insert($0).inserted }
+            + collectionKeys.filter { seen.insert($0).inserted }
+    }
+
     /// Build the push payload from currently-available addons + collections.
-    /// The order array merges the saved order with any newly-available catalogs
-    /// (then collections), exactly like Android's buildHomeCatalogSyncPayload;
-    /// disabled keys and custom titles ship as-is (they already include anything
-    /// pulled from the phone, so cross-device state isn't dropped).
+    /// New catalogs (then collections) append to the saved order, exactly like
+    /// Android's buildHomeCatalogSyncPayload; disabled keys and custom titles
+    /// ship as-is (they already include anything pulled from the phone, so
+    /// cross-device state isn't dropped).
+    ///
+    /// `collections` must be the account-wide LIBRARY, not a profile's visible
+    /// subset — see the note on exportOrder.
     func exportPayload(addons: [InstalledAddon], collections: [NuvioCollection]) -> SyncHomeCatalogPayload {
         var catalogKeys: [String] = []
         var collectionKeys: [String] = []
@@ -394,7 +451,7 @@ final class HomeCatalogSettingsStore: ObservableObject {
             collectionKeys.append(key)
         }
 
-        let order = mergedOrder(catalogKeys: catalogKeys, collectionKeys: collectionKeys)
+        let order = exportOrder(catalogKeys: catalogKeys, collectionKeys: collectionKeys)
         return SyncHomeCatalogPayload(
             orderKeys: order,
             disabledKeys: Array(disabledKeys),

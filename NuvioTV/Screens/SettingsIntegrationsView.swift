@@ -1,18 +1,17 @@
 import SwiftUI
 
-/// Settings → Integrations: TMDB and Debrid (Real-Debrid, Premiumize, TorBox,
-/// AllDebrid). Trakt has its own top-level pane. Debrid section is added in a
-/// later stage.
+/// Settings → Integrations: the external services Orivio talks to — TMDB,
+/// MDBList, the debrid providers, and a self-hosted TorrServer for P2P.
+/// Trakt and the Orivio/Stremio accounts have their own panes.
 struct IntegrationsDetail: View {
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var tmdb: TMDBSettingsStore
     @EnvironmentObject private var mdblist: MDBListSettingsStore
     @EnvironmentObject private var debrid: DebridStore
     @EnvironmentObject private var torrent: TorrentSettingsStore
-    @EnvironmentObject private var playerSettings: PlayerSettingsStore
     @State private var sheet: IntegrationSheet?
 
-    enum IntegrationSheet: String, Identifiable { case tmdb, mdblist, debrid, aniskip, p2p; var id: String { rawValue } }
+    enum IntegrationSheet: String, Identifiable { case tmdb, mdblist, debrid, p2p; var id: String { rawValue } }
 
     var body: some View {
         // APK layout: a single list of drill-in rows, each opening a sub-screen.
@@ -22,10 +21,7 @@ struct IntegrationsDetail: View {
                 integrationRow(title: "TMDB", subtitle: "Metadata enrichment controls", icon: "film.stack") { sheet = .tmdb }
                 integrationRow(title: "MDBList", subtitle: "External ratings providers", icon: "star.circle.fill") { sheet = .mdblist }
                 integrationRow(title: "Debrid", subtitle: "Cached torrent sources as direct streams", icon: "bolt.horizontal.circle.fill") { sheet = .debrid }
-                integrationRow(title: "Anime Skips", subtitle: "Auto-skip anime intros & outros (AniSkip)", icon: "forward.end.alt.fill") { sheet = .aniskip }
-                // P2P (TorrServer) hidden for now — the .p2p sheet + engine stay
-                // wired; re-add this row to surface it again.
-                // integrationRow(title: "P2P (TorrServer)", subtitle: "Stream torrents peer-to-peer via a TorrServer") { sheet = .p2p }
+                integrationRow(title: "P2P (TorrServer)", subtitle: "Stream uncached torrents through your own TorrServer", icon: "point.3.connected.trianglepath.dotted") { sheet = .p2p }
             }
         }
         .fullScreenCover(item: $sheet) { s in
@@ -38,7 +34,6 @@ struct IntegrationsDetail: View {
             .environmentObject(mdblist)
             .environmentObject(debrid)
             .environmentObject(torrent)
-            .environmentObject(playerSettings)
             .onExitCommand { sheet = nil }
         }
     }
@@ -65,10 +60,6 @@ struct IntegrationsDetail: View {
             DetailScaffold(title: "Debrid", subtitle: "Cached torrent sources as direct, high-speed streams") {
                 SettingsGroupCard(title: "") { debridSection }
             }
-        case .aniskip:
-            DetailScaffold(title: "Anime Skips", subtitle: "Skip anime intros and outros automatically") {
-                SettingsGroupCard(title: "") { aniskipSection }
-            }
         case .p2p:
             DetailScaffold(title: "P2P (TorrServer)", subtitle: "Stream torrents peer-to-peer via a TorrServer instance") {
                 SettingsGroupCard(title: "") { P2PSection() }
@@ -94,23 +85,6 @@ struct IntegrationsDetail: View {
             }
 
             Text("Get a key at mdblist.com/preferences.")
-                .font(.system(size: 18))
-                .foregroundStyle(theme.palette.textTertiary)
-                .padding(.top, 2)
-        }
-    }
-
-    // MARK: - Anime Skips
-
-    private var aniskipSection: some View {
-        VStack(alignment: .leading, spacing: NuvioSpacing.md) {
-            SettingsToggleCard(
-                title: "AniSkip",
-                subtitle: "Fetch anime intro/outro skip times so Skip Intro and Up Next work on anime episodes that carry no chapter markers.",
-                isOn: Binding(get: { playerSettings.settings.animeSkipEnabled },
-                              set: { playerSettings.settings.animeSkipEnabled = $0 })
-            )
-            Text("Uses the public AniSkip database (api.aniskip.com), matched to each title via MyAnimeList — no account or key needed. Also available under Playback → Seeking.")
                 .font(.system(size: 18))
                 .foregroundStyle(theme.palette.textTertiary)
                 .padding(.top, 2)
@@ -205,17 +179,6 @@ struct IntegrationsDetail: View {
         }
     }
 
-    private func integrationToggleLabel(title: String, subtitle: String) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(title)
-                .font(.system(size: 25, weight: .medium))
-                .foregroundStyle(theme.palette.textPrimary)
-            Text(subtitle)
-                .font(.system(size: 19))
-                .foregroundStyle(theme.palette.textSecondary)
-                .lineLimit(2)
-        }
-    }
 }
 
 // MARK: - Debrid rows

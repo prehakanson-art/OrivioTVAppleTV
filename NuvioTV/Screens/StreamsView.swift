@@ -76,12 +76,23 @@ final class StreamsViewModel: ObservableObject {
     ///     form instead of trusting a stored `video.id`, which after a
     ///     Continue-Watching round-trip can be the bare show id.
     private var resolvedID: String?
+    /// When the user pressed Play. Every stage below logs its offset from this,
+    /// so a slow open can be attributed to a stage instead of guessed at.
+    var openedAt = Date()
+    func stage(_ name: String) {
+        NSLog("[OrivioPlay] +%.2fs %@", Date().timeIntervalSince(openedAt), name)
+    }
+
     private func effectiveStreamID() async -> String {
         if let resolvedID { return resolvedID }
         var showID = meta.id
         if showID.hasPrefix("tmdb:"), let n = Int(showID.dropFirst("tmdb:".count)),
            let tt = await TMDBService.imdbID(tmdbID: n, isMovie: meta.type != "series") {
+            // A network round-trip BEFORE a single addon is queried. Catalogs
+            // sourced from TMDB hand us `tmdb:` ids, so this is on the critical
+            // path of most plays.
             showID = tt
+            stage("tmdb→imdb id resolved")
         }
         let id: String
         if showID.hasPrefix("tt"), let season = video?.season, let episode = video?.episode {
@@ -153,7 +164,60 @@ final class StreamsViewModel: ObservableObject {
     /// secondary), falling back to the best remaining link. Unknown
     /// resolution/size never disqualifies a link (missing metadata shouldn't
     /// hide a possibly-good source).
-    func autoLinkPick(_ prefs: AutoLinkPreferences) -> StreamEntry? {
+    /// Addons whose stream request has returned (either way).
+    @Published private(set) var finishedAddonNames: Set<String> = []
+    private var sweepStarted = Date()
+    /// Set by the view while the Auto Link Selector is armed, so the sweep can
+    /// hand back a pick without waiting for every addon.
+    var autoLinkPrefs: AutoLinkPreferences?
+    var onEarlyAutoLink: ((StreamEntry) -> Void)?
+    private var earlyPickFired = false
+    /// Longest we will hold out for a preferred addon that hasn't answered.
+    private static let preferredAddonWait: TimeInterval = 6
+
+    /// A pick that is safe to act on BEFORE the sweep has finished.
+    ///
+    /// The Auto Link Selector used to run only after `load` returned — that is,
+    /// after the SLOWEST installed addon had answered or timed out. Your
+    /// preferred addon replying in half a second bought nothing; every play was
+    /// paced by the worst one in the list, which is why turning the selector on
+    /// made starting a title feel slower rather than faster.
+    ///
+    /// The rule: if the preferred addon has produced a usable match, take it.
+    /// If it has answered and produced nothing, fall through to the secondary
+    /// on the same terms. Only wait while an addon we actually care about is
+    /// still outstanding — and not past `preferredAddonWait`, so one dead addon
+    /// can't hold up the whole thing.
+    func earlyAutoLinkPick(_ prefs: AutoLinkPreferences) -> StreamEntry? {
+        let pool = autoLinkPool(prefs)
+        let patient = Date().timeIntervalSince(sweepStarted) < Self.preferredAddonWait
+
+        /// Whether an addon can still change the answer: it has to be one we
+        /// queried at all, and not yet returned.
+        func outstanding(_ name: String) -> Bool {
+            let q = name.trimmingCharacters(in: .whitespaces).lowercased()
+            guard !q.isEmpty else { return false }
+            guard queriedAddonNames.contains(where: { $0.lowercased().contains(q) }) else { return false }
+            return !finishedAddonNames.contains { $0.lowercased().contains(q) }
+        }
+        func firstFrom(_ name: String) -> StreamEntry? {
+            let q = name.trimmingCharacters(in: .whitespaces).lowercased()
+            guard !q.isEmpty else { return nil }
+            return pool.first { $0.addonName.lowercased().contains(q) }
+        }
+
+        if let hit = firstFrom(prefs.preferredAddon) { return hit }
+        if patient, outstanding(prefs.preferredAddon) { return nil }
+        if let hit = firstFrom(prefs.secondaryAddon) { return hit }
+        if patient, outstanding(prefs.secondaryAddon) { return nil }
+        // No addon preference left to honour. Anything already in hand will do
+        // once the sweep is done; until then keep collecting.
+        guard finishedAddons >= totalAddons || !patient else { return nil }
+        return pool.first
+    }
+
+    /// The entries a profile's Auto Link prefs allow, best-first.
+    private func autoLinkPool(_ prefs: AutoLinkPreferences) -> [StreamEntry] {
         let minTier = prefs.minResolution.isEmpty ? nil
             : ResolutionTier.from(resolutionLabel: prefs.minResolution)
         let maxSizeGB = AutoLinkPreferences.sanitizedMaxSizeGB(prefs.maxSizeGB)
@@ -166,6 +230,18 @@ final class StreamsViewModel: ObservableObject {
             if let maxBytes, let bytes = entry.sizeBytes, bytes > 0, bytes > maxBytes { return false }
             return true
         }
+        // Skip links a recent session walked straight back out of, so pressing
+        // Play again moves on instead of re-serving the one that just failed.
+        let rejected = RejectedLinks.rejected(for: ProgressStore.key(metaID: meta.id, video: video))
+        guard !rejected.isEmpty else { return pool }
+        let survivors = pool.filter { !rejected.contains($0.rejectionKey) }
+        // If avoiding them leaves nothing, the grudge is worse than the link:
+        // play the best match rather than dropping to the manual list.
+        return survivors.isEmpty ? pool : survivors
+    }
+
+    func autoLinkPick(_ prefs: AutoLinkPreferences) -> StreamEntry? {
+        let pool = autoLinkPool(prefs)
         guard !pool.isEmpty else { return nil }
         func firstFromAddon(_ name: String) -> StreamEntry? {
             let q = name.trimmingCharacters(in: .whitespaces).lowercased()
@@ -245,6 +321,7 @@ final class StreamsViewModel: ObservableObject {
     /// during load) choke.
     func load(addonManager: AddonManager, debridEnabled: Bool, perTier: Int, filtersEnabled: Bool = true, forceRefresh: Bool = false) async {
         let fetchID = await effectiveStreamID()
+        stage("stream id ready (\(fetchID))")
         // Self-heal: an addon installed by account sync while its manifest
         // fetch failed is a silent placeholder (no stream resource → never
         // queried, no error anywhere). Retry those now, when the user actually
@@ -291,7 +368,10 @@ final class StreamsViewModel: ObservableObject {
         }
 
         failedAddons = [:]
-        await withTaskGroup(of: (entries: [StreamEntry], failure: (name: String, reason: String)?).self) { group in
+        finishedAddonNames = []
+        sweepStarted = Date()
+        await withTaskGroup(of: (name: String, entries: [StreamEntry],
+                                 failure: (name: String, reason: String)?).self) { group in
             // Bounded window: with a large install this sweep queries dozens of
             // addons. Firing them all at once spikes memory right when the user
             // is waiting on the list, and the tail is set by the slowest addon
@@ -308,14 +388,14 @@ final class StreamsViewModel: ObservableObject {
                         let entries = streams
                             .filter { $0.isPlayable || (debridEnabled && $0.isTorrent) || $0.isExternal }
                             .map { StreamEntry(addonName: addon.manifest.name, stream: $0) }
-                        return (entries, nil)
+                        return (addon.manifest.name, entries, nil)
                     } catch {
                         // Request failed (timeout / HTTP error / unreachable) —
                         // record the SPECIFIC reason so the UI can say what's
                         // wrong instead of a generic "didn't respond".
                         NSLog("[OrivioSources] %@ stream request failed: %@",
                               addon.manifest.name, String(describing: error))
-                        return ([], (addon.manifest.name, Self.shortReason(for: error)))
+                        return (addon.manifest.name, [], (addon.manifest.name, Self.shortReason(for: error)))
                     }
                 }
             }
@@ -327,12 +407,24 @@ final class StreamsViewModel: ObservableObject {
             for await batch in group {
                 startNext()
                 finishedAddons += 1
+                finishedAddonNames.insert(batch.name)
+                stage("addon \(batch.name) answered (\(batch.entries.count) links, \(finishedAddons)/\(totalAddons))")
                 pool.append(contentsOf: batch.entries)
                 if let failure = batch.failure { failedAddons[failure.name] = failure.reason }
                 let now = Date()
                 if !pool.isEmpty, now.timeIntervalSince(lastFlush) > 0.4 {
                     rebuildGroups()
                     lastFlush = now
+                }
+                // Auto Link Selector: act the MOMENT the answer is knowable,
+                // rather than at the end of the sweep. See earlyAutoLinkPick.
+                if let prefs = autoLinkPrefs, !earlyPickFired {
+                    rebuildGroups()
+                    if let pick = earlyAutoLinkPick(prefs) {
+                        earlyPickFired = true
+                        stage("auto-link picked \(pick.addonName) — \(pick.displayName)")
+                        onEarlyAutoLink?(pick)
+                    }
                 }
             }
             rebuildGroups()
@@ -448,6 +540,21 @@ struct StreamsView: View {
 
     var body: some View {
         ZStack {
+            // Auto Link Selector armed: the source page is an implementation
+            // detail the viewer never asked to see. Show the title's own
+            // loading screen — the SAME one the player is about to put up — and
+            // let the addon sweep finish behind it, so pressing Play reads as
+            // one continuous "opening the movie" rather than a detour through a
+            // list that flashes past.
+            if autoLinkResolving {
+                AutoLinkLoadingScreen(
+                    meta: viewModel.meta,
+                    status: resolving
+                        ? "Resolving via \(debrid.resolverProvider?.displayName ?? (torrent.settings.isConfigured ? "TorrServer" : "debrid"))"
+                        : "Finding the best source"
+                )
+                .transition(.opacity)
+            } else {
             theme.palette.background.ignoresSafeArea()
             backdrop
 
@@ -474,19 +581,51 @@ struct StreamsView: View {
             .padding(.horizontal, NuvioSpacing.huge)
             .padding(.vertical, NuvioSpacing.xxl)
 
+            // Only over the LIST — while the auto-link loading screen is up it
+            // carries the resolve status itself, rather than stacking a second
+            // dimmed spinner on top of a screen that is already a spinner.
             if resolving {
                 ZStack {
                     Color.black.opacity(0.6).ignoresSafeArea()
                     NuvioLoadingView(label: "Resolving via \(debrid.resolverProvider?.displayName ?? (torrent.settings.isConfigured ? "TorrServer" : "debrid"))")
                 }
             }
+            }
         }
+        .animation(.easeOut(duration: 0.2), value: autoLinkResolving)
         .task {
             let s = playerSettings.settings
             viewModel.streamFilters = s.streamFilterOptions
             // Auto Link Selector on (and not forced manual): show the loading
             // screen instead of the source list from the very first frame.
             autoLinkResolving = (profiles.activeAutoLink.enabled || resumeAutoPlay) && !forceManual
+            viewModel.openedAt = Date()
+            viewModel.stage("sources page opened")
+
+            // Arm the early pick BEFORE the sweep starts, so the selector can
+            // act as soon as the preferred addon answers instead of waiting for
+            // the slowest one. The `didAutoAct` guard below still runs for the
+            // cases this can't decide early (resume match, reuse-last-link).
+            let armedAutoLink = profiles.activeAutoLink
+            // No reuse-last-link condition here. That check runs synchronously
+            // just below and, if it hits, sets `didAutoAct` — which the early
+            // callback already tests. Gating on the SETTING instead meant that
+            // simply having "Reuse last link" switched on disabled the early
+            // pick for every title, including the ones with nothing remembered.
+            // Resumes are armed too. Continue Watching used to run its own
+            // format-matching pick and never consult the selector, so the same
+            // title started one way from the detail page and another way from
+            // the Continue Watching row. With the selector on it should choose
+            // sources the same way everywhere.
+            if armedAutoLink.enabled, !forceManual {
+                viewModel.autoLinkPrefs = armedAutoLink
+                viewModel.onEarlyAutoLink = { pick in
+                    guard !isGone, !didAutoAct else { return }
+                    didAutoAct = true
+                    handleSelection(pick, viewModel.allEntries)
+                    onAutoDismiss()
+                }
+            }
 
             // Reuse last link: if we still have a fresh remembered source, play
             // it immediately, but keep loading so backing out shows the full
@@ -538,7 +677,11 @@ struct StreamsView: View {
             // link that best matches the format last watched (fresh connection,
             // so expired debrid/Comet links don't fail). Takes precedence over
             // the profile Auto Link Selector / global auto-play below.
-            if !didAutoAct, !forceManual, resumeAutoPlay {
+            // Continue Watching resume. With the Auto Link Selector OFF this is
+            // unchanged: re-pick the link closest to the format last watched.
+            // With it ON, the selector's preferences win and this is skipped —
+            // the selector block below handles the resume as an ordinary play.
+            if !didAutoAct, !forceManual, resumeAutoPlay, !armedAutoLink.enabled {
                 if let pick = viewModel.bestResumeMatch(signature: resumeSignature) {
                     didAutoAct = true
                     handleSelection(pick, viewModel.allEntries)
@@ -551,7 +694,7 @@ struct StreamsView: View {
             // Auto Link Selector (per profile): pick the best link matching the
             // profile's preferred addon / quality / size and play it directly.
             // Takes precedence over the global auto-play. Skipped in manual mode.
-            let autoLink = profiles.activeAutoLink
+            let autoLink = armedAutoLink
             if !didAutoAct, !forceManual, autoLink.enabled {
                 if let pick = viewModel.autoLinkPick(autoLink) {
                     didAutoAct = true
@@ -698,10 +841,12 @@ struct StreamsView: View {
             return
         }
         guard entry.stream.isTorrent else {
+            viewModel.stage("direct link — handing to player")
             viewModel.recordLastLink(entry)
             onSelect(entry, all)
             return
         }
+        viewModel.stage("torrent — starting debrid resolve")
         guard let provider = debrid.resolverProvider else {
             // No debrid: fall back to P2P (TorrServer) if the user enabled it.
             if torrent.settings.isConfigured {
@@ -739,6 +884,7 @@ struct StreamsView: View {
                 )
                 let resolvedEntry = StreamEntry(addonName: "\(provider.shortName) · \(entry.addonName)", stream: resolved)
                 viewModel.recordLastLink(resolvedEntry)
+                viewModel.stage("resolved — handing to player")
                 onSelect(resolvedEntry, all)
             case .missingKey:
                 resolveError = "\(provider.displayName) API key is missing."
@@ -780,6 +926,7 @@ struct StreamsView: View {
                 )
                 let resolvedEntry = StreamEntry(addonName: "P2P · \(entry.addonName)", stream: resolved)
                 viewModel.recordLastLink(resolvedEntry)
+                viewModel.stage("resolved — handing to player")
                 onSelect(resolvedEntry, all)
             case .notConfigured:
                 resolveError = "Turn on P2P and set a TorrServer URL in Settings → Integrations."
@@ -833,7 +980,7 @@ struct StreamsView: View {
                     VStack(alignment: .leading, spacing: NuvioSpacing.md) {
                         // Level 1: addon.
                         Text(group.addonName.uppercased())
-                            .font(theme.isStremioTheme ? StremioFont.bold(24) : .system(size: 24, weight: .heavy))
+                            .font(.system(size: 24, weight: .heavy))
                             .foregroundStyle(theme.palette.textPrimary)
                             .padding(.leading, 4)
                         ForEach(group.sections) { section in
@@ -841,7 +988,7 @@ struct StreamsView: View {
                                 // Level 2: resolution (hidden when untiered).
                                 if !section.title.isEmpty {
                                     Text(section.title.uppercased())
-                                        .font(theme.isStremioTheme ? StremioFont.bold(20) : .system(size: 20, weight: .heavy))
+                                        .font(.system(size: 20, weight: .heavy))
                                         .foregroundStyle(theme.palette.secondary)
                                         .padding(.leading, 8)
                                         .padding(.top, 2)
@@ -934,12 +1081,12 @@ struct StreamRowView: View {
 
             VStack(alignment: .leading, spacing: 3) {
                 Text(entry.displayName)
-                    .font(theme.isStremioTheme ? StremioFont.medium(25) : .system(size: 25, weight: .semibold))
+                    .font(.system(size: 25, weight: .semibold))
                     .foregroundStyle(theme.palette.textPrimary)
                     .lineLimit(1)
                 if !entry.displayDetail.isEmpty {
                     Text(entry.displayDetail)
-                        .font(theme.isStremioTheme ? StremioFont.regular(20) : .system(size: 20))
+                        .font(.system(size: 20))
                         .foregroundStyle(theme.palette.textSecondary)
                         .lineLimit(2)
                 }
@@ -1046,8 +1193,7 @@ private struct AddonFilterChipLabel: View {
             .overlay(
                 Capsule().strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 3)
             )
-            .scaleEffect(isFocused ? 1.05 : 1)
-            .animation(.spring(response: 0.28, dampingFraction: 0.85), value: isFocused)
+            .focusLift(NuvioFocus.card, isFocused)
     }
 
     private var foreground: Color {
@@ -1060,5 +1206,69 @@ private struct AddonFilterChipLabel: View {
         if isFocused { return theme.palette.secondary }
         if selected { return theme.palette.secondary.opacity(0.22) }
         return theme.palette.backgroundCard.opacity(0.85)
+    }
+}
+
+
+/// The title's loading screen, shown while the Auto Link Selector picks a
+/// source. Deliberately a near-copy of `PlayerLoadingOverlay`: the player puts
+/// that up the instant this view hands off, so matching it means the source
+/// sweep and the stream opening read as one screen that never changed.
+private struct AutoLinkLoadingScreen: View {
+    let meta: MetaItem
+    let status: String
+    @State private var revealed = false
+
+    private var hasLogo: Bool {
+        if let logo = meta.logo { return !logo.isEmpty }
+        return false
+    }
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            RemoteImage(url: meta.background ?? meta.poster)
+                .ignoresSafeArea()
+            LinearGradient(
+                stops: [
+                    .init(color: .black.opacity(0.30), location: 0),
+                    .init(color: .black.opacity(0.60), location: 0.35),
+                    .init(color: .black.opacity(0.80), location: 0.70),
+                    .init(color: .black.opacity(0.92), location: 1)
+                ],
+                startPoint: .top, endPoint: .bottom
+            )
+            .ignoresSafeArea()
+
+            VStack(spacing: NuvioSpacing.xxl) {
+                Group {
+                    if hasLogo {
+                        RemoteImage(url: meta.logo, contentMode: .fit)
+                            .frame(width: 480, height: 270)
+                    } else {
+                        Text(meta.name)
+                            .font(.system(size: 68, weight: .heavy))
+                            .foregroundStyle(.white)
+                            .multilineTextAlignment(.center)
+                            .lineLimit(2)
+                    }
+                }
+                .opacity(revealed ? 1 : 0)
+
+                ProgressView()
+                    .progressViewStyle(.circular)
+                    .tint(.white)
+                    .scaleEffect(1.7)
+                    .opacity(revealed ? 1 : 0)
+
+                Text(status)
+                    .font(.system(size: 24, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.75))
+                    .opacity(revealed ? 1 : 0)
+                    .animation(.easeOut(duration: 0.2), value: status)
+            }
+            .padding(.horizontal, NuvioSpacing.huge)
+        }
+        .onAppear { withAnimation(.easeOut(duration: 0.5).delay(0.1)) { revealed = true } }
     }
 }

@@ -119,3 +119,93 @@ enum PlaybackMemory {
         saveAll(all)
     }
 }
+
+/// Links the viewer walked out on.
+///
+/// The Auto Link Selector always picks the same "best" source for a title, so a
+/// link that is dead, wrong-language, or badly muxed sends you into the player,
+/// straight back out, and then into the *same* link again — with no way to say
+/// "not that one" short of turning the selector off. This remembers the ones a
+/// session bailed out of and takes them out of the running for a while.
+///
+/// Five minutes of playback is the line. Past it the link demonstrably works,
+/// so any earlier grudge against it is dropped — whatever went wrong before was
+/// transient (a bad debrid cache, a stalled CDN) and holding it would only push
+/// future plays onto worse sources.
+enum RejectedLinks {
+    private static let key = "nuvio.player.rejectedLinks.v1"
+    /// A rejection is a hint, not a verdict — sources come and go, and a link
+    /// that failed this morning may be the best one tonight.
+    private static let ttl: TimeInterval = 8 * 60 * 60
+    /// Titles remembered, newest first.
+    private static let titleLimit = 60
+    /// Rejections per title. Past this the selector has run out of road and the
+    /// list is doing more harm than good.
+    private static let perTitleLimit = 6
+
+    private struct Entry: Codable { var links: [String: Date] }
+
+    private static func loadAll() -> [String: Entry] {
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let decoded = try? JSONDecoder().decode([String: Entry].self, from: data)
+        else { return [:] }
+        return decoded
+    }
+
+    private static func saveAll(_ all: [String: Entry]) {
+        var all = all
+        let cutoff = Date().addingTimeInterval(-ttl)
+        for (title, entry) in all {
+            let fresh = entry.links.filter { $0.value > cutoff }
+            if fresh.isEmpty { all.removeValue(forKey: title) } else { all[title] = Entry(links: fresh) }
+        }
+        if all.count > titleLimit {
+            let newest = all.sorted {
+                ($0.value.links.values.max() ?? .distantPast)
+                    > ($1.value.links.values.max() ?? .distantPast)
+            }.prefix(titleLimit)
+            all = Dictionary(uniqueKeysWithValues: Array(newest))
+        }
+        if let data = try? JSONEncoder().encode(all) {
+            UserDefaults.standard.set(data, forKey: key)
+        }
+    }
+
+    /// Link keys to avoid for this title right now.
+    static func rejected(for titleKey: String) -> Set<String> {
+        let cutoff = Date().addingTimeInterval(-ttl)
+        guard let entry = loadAll()[titleKey] else { return [] }
+        return Set(entry.links.filter { $0.value > cutoff }.keys)
+    }
+
+    static func reject(_ linkKey: String, for titleKey: String) {
+        guard !linkKey.isEmpty else { return }
+        var all = loadAll()
+        var entry = all[titleKey] ?? Entry(links: [:])
+        entry.links[linkKey] = Date()
+        // Oldest rejections fall off first, so a title can't accumulate a list
+        // long enough to starve the selector of anything to play.
+        if entry.links.count > perTitleLimit {
+            let keep = entry.links.sorted { $0.value > $1.value }.prefix(perTitleLimit)
+            entry.links = Dictionary(uniqueKeysWithValues: Array(keep))
+        }
+        all[titleKey] = entry
+        saveAll(all)
+        NSLog("[OrivioAutoLink] rejected a link for %@ (%d held)", titleKey, entry.links.count)
+    }
+
+    /// This link proved itself — drop any rejection standing against it.
+    ///
+    /// Only this one. Other links rejected for the same title stay rejected:
+    /// they failed on their own merits, and one good source says nothing about
+    /// the rest.
+    static func keep(_ linkKey: String, for titleKey: String) {
+        guard !linkKey.isEmpty else { return }
+        var all = loadAll()
+        guard var entry = all[titleKey],
+              entry.links.removeValue(forKey: linkKey) != nil else { return }
+        if entry.links.isEmpty { all.removeValue(forKey: titleKey) } else { all[titleKey] = entry }
+        saveAll(all)
+        NSLog("[OrivioAutoLink] link cleared for %@ (watched past the threshold)", titleKey)
+    }
+}

@@ -108,8 +108,7 @@ struct PanelRow: View {
             RoundedRectangle(cornerRadius: NuvioRadius.md, style: .continuous)
                 .strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 2.5)
         )
-        .scaleEffect(isFocused ? 1.02 : 1)
-        .animation(.spring(response: 0.28, dampingFraction: 0.85), value: isFocused)
+        .focusLift(NuvioFocus.row, isFocused)
     }
 }
 
@@ -239,8 +238,7 @@ private struct EpisodeRow: View {
                     lineWidth: isFocused ? 2.5 : 2
                 )
         )
-        .scaleEffect(isFocused ? 1.02 : 1)
-        .animation(.spring(response: 0.28, dampingFraction: 0.85), value: isFocused)
+        .focusLift(NuvioFocus.row, isFocused)
     }
 }
 
@@ -401,16 +399,24 @@ struct EnginePanelContent: View {
                 .buttonStyle(PlainCardButtonStyle())
                 .focused($focused, equals: engine)
             }
-            Button {
-                viewModel.resyncDisplay()
-            } label: {
-                PanelRow(
-                    title: "Re-sync display",
-                    subtitle: "If the TV shows grey or wrong colors, renegotiate the connection (also: triple-press Play/Pause)",
-                    selected: false
-                )
+            // A diagnostic, so it rides with the diagnostics HUD (Settings →
+            // Performance) rather than sitting in the Engine panel for everyone.
+            // The triple-press Play/Pause shortcut still works with the row
+            // hidden — that is the escape hatch for a grey screen you can't
+            // navigate a menu on.
+            if PerformanceSettingsStore.shared.settings.showPlayerDiagnostics
+                || ProcessInfo.processInfo.arguments.contains("-playerHUD") {
+                Button {
+                    viewModel.resyncDisplay()
+                } label: {
+                    PanelRow(
+                        title: "Re-sync display",
+                        subtitle: "If the TV shows grey or wrong colors, renegotiate the connection (also: triple-press Play/Pause)",
+                        selected: false
+                    )
+                }
+                .buttonStyle(PlainCardButtonStyle())
             }
-            .buttonStyle(PlainCardButtonStyle())
         }
         .defaultFocus($focused, viewModel.effectiveEngine)
     }

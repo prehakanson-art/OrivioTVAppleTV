@@ -619,12 +619,6 @@ final class CollectionsStore: ObservableObject {
         onLocalChange?()       // account-wide → push the shared blob
     }
 
-    /// The folders of `collection` that this profile should actually see.
-    func visibleFolders(in collection: NuvioCollection) -> [NuvioCollectionFolder] {
-        let hidden = effectiveHiddenFolders
-        return collection.folders.filter { !hidden.contains($0.id) }
-    }
-
     private func recomputeVisible() {
         let hiddenFolders = effectiveHiddenFolders
         let next: [NuvioCollection] = library.compactMap { collection in

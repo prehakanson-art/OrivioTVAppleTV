@@ -9,7 +9,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable {
     // Matches the live APK rail (Essential mode): no Account/Profiles (those
     // live on the sidebar profile avatar). Only categories whose settings are
     // actually wired up are shown — no stub panes.
-    case account, appearance, themes, layout, contentDiscovery, integration, plugins, playback, performance, trakt, about
+    case account, appearance, layout, contentDiscovery, integration, plugins, playback, performance, trakt, about
 
     var id: String { rawValue }
 
@@ -17,7 +17,6 @@ enum SettingsCategory: String, CaseIterable, Identifiable {
         switch self {
         case .account: return "Account"
         case .appearance: return "Appearance"
-        case .themes: return "Themes"
         case .layout: return "Layout"
         case .contentDiscovery: return "Content & Discovery"
         case .integration: return "Integrations"
@@ -32,8 +31,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable {
     var subtitle: String {
         switch self {
         case .account: return "Orivio account and profiles"
-        case .appearance: return "Color theme and dark mode"
-        case .themes: return "Pick the overall app theme"
+        case .appearance: return "Theme, accent color, and font"
         case .layout: return "Home structure and poster styles"
         case .contentDiscovery: return "Add-ons, catalogs, and collections"
         case .integration: return "Manage available integrations"
@@ -50,7 +48,6 @@ enum SettingsCategory: String, CaseIterable, Identifiable {
         switch self {
         case .account: return "person.crop.circle.fill"
         case .appearance: return "paintpalette.fill"
-        case .themes: return "paintbrush.fill"
         case .layout: return "square.grid.2x2.fill"
         case .contentDiscovery: return "safari.fill"
         case .integration: return "link"
@@ -184,31 +181,32 @@ struct SettingsView: View {
 
     // MARK: - Detail
 
-    @ViewBuilder
     private var detail: some View {
-        switch selected {
-        case .account:
-            AccountSettingsDetail()
-        case .appearance:
-            AppearanceDetail()
-        case .themes:
-            ThemesDetail()
-        case .layout:
-            LayoutSettingsDetail()
-        case .contentDiscovery:
-            ContentDiscoveryDetail()
-        case .integration:
-            IntegrationsDetail()
-        case .plugins:
-            PluginsSettingsDetail()
-        case .trakt:
-            TraktDetail()
-        case .about:
-            AboutDetail()
-        case .playback:
-            PlaybackSettingsDetail()
-        case .performance:
-            PerformanceSettingsDetail()
+        SettingsCategoryPane(category: selected)
+    }
+}
+
+/// The detail pane for one settings category.
+///
+/// Every settings shell renders the SAME panes — Classic's two-pane rail, the
+/// Apple TV list, Stremio, Max and Hulu. This is the single switch they all go
+/// through, so adding or retiring a category is one edit, not five (each shell
+/// keeps its own chrome around this).
+struct SettingsCategoryPane: View {
+    let category: SettingsCategory
+
+    var body: some View {
+        switch category {
+        case .account:           AccountSettingsDetail()
+        case .appearance:        AppearanceDetail()
+        case .layout:            LayoutSettingsDetail()
+        case .contentDiscovery:  ContentDiscoveryDetail()
+        case .integration:       IntegrationsDetail()
+        case .plugins:           PluginsSettingsDetail()
+        case .playback:          PlaybackSettingsDetail()
+        case .performance:       PerformanceSettingsDetail()
+        case .trakt:             TraktDetail()
+        case .about:             AboutDetail()
         }
     }
 }
@@ -467,12 +465,17 @@ struct DetailScaffold<Content: View>: View {
 
 // MARK: - Appearance detail
 
+/// Settings → Appearance: every "how the app looks" control in one pane —
+/// the app theme, the accent palette, AMOLED, font, the independent
+/// detail/profile/player look axes, and how much of settings to expose.
+/// (Was split across an Appearance and a Themes pane; they were the same
+/// subject and the rail listed them twice.)
 struct AppearanceDetail: View {
     @EnvironmentObject private var theme: ThemeManager
 
     var body: some View {
         DetailScaffold(title: SettingsCategory.appearance.title, subtitle: SettingsCategory.appearance.subtitle) {
-            SettingsGroupCard(title: "Color Theme", subtitle: "Pick the accent color used across the app") {
+            SettingsGroupCard(title: "Accent Color", subtitle: "The highlight color used across the app") {
                 ScrollView(.horizontal) {
                     HStack(spacing: NuvioSpacing.md) {
                         ForEach(NuvioThemes.all) { palette in
@@ -487,9 +490,7 @@ struct AppearanceDetail: View {
                     .padding(.vertical, 6)
                     .padding(.horizontal, 6)
                 }
-            }
 
-            SettingsGroupCard(title: "AMOLED Mode") {
                 SettingsToggleCard(
                     title: "AMOLED Mode",
                     subtitle: "Use pure black for app backgrounds",
@@ -518,7 +519,7 @@ struct AppearanceDetail: View {
                         .buttonStyle(PlainCardButtonStyle())
                     }
                 }
-                Text("Essential hides the Plugins section and the advanced Playback options (engine, on-screen display, auto-play source, audio and display tuning).")
+                Text("Essential hides the Plugins section and the advanced Playback cards (auto-play source, player engine, on-screen display and audio).")
                     .font(.system(size: 17))
                     .foregroundStyle(theme.palette.textTertiary)
             }
@@ -538,226 +539,7 @@ struct AppearanceDetail: View {
             }
         }
     }
-}
 
-/// Settings → Themes: pick the overall app theme (look/feel preset). Distinct
-/// from Appearance's accent Color Theme. Currently ships "Classic"; more get
-/// added to `AppThemes.all` and appear here automatically.
-struct ThemesDetail: View {
-    @EnvironmentObject private var theme: ThemeManager
-
-    var body: some View {
-        DetailScaffold(title: SettingsCategory.themes.title, subtitle: SettingsCategory.themes.subtitle) {
-            SettingsGroupCard(title: "App Theme", subtitle: "Choose the overall look of the app") {
-                VStack(spacing: NuvioSpacing.sm) {
-                    ForEach(AppThemes.all) { appTheme in
-                        Button { theme.setAppTheme(appTheme) } label: {
-                            ThemeChoiceCard(appTheme: appTheme, selected: theme.appThemeID == appTheme.id)
-                        }
-                        .buttonStyle(PlainCardButtonStyle())
-                    }
-                }
-                if AppThemes.all.count <= 1 {
-                    Text("More themes are on the way — you'll be able to switch between them here.")
-                        .font(.system(size: 17))
-                        .foregroundStyle(theme.palette.textTertiary)
-                        .padding(.top, NuvioSpacing.xs)
-                }
-            }
-
-            // Independent LOOK axes — mix any theme's detail page, profile screen
-            // and player overlay regardless of the app theme.
-            SettingsGroupCard(title: "Detail Page", subtitle: "The movie & show details screen") {
-                variantPicker(kind: "detail page", current: theme.detailStyle) { theme.detailStyle = $0 }
-            }
-            SettingsGroupCard(title: "Profile Screen", subtitle: "The “Who’s watching?” screen") {
-                variantPicker(kind: "profile screen", current: theme.profileStyle) { theme.profileStyle = $0 }
-            }
-            SettingsGroupCard(title: "Player Layout", subtitle: "The playback controls overlay") {
-                playerLayoutPicker(current: theme.playerStyle) { theme.playerStyle = $0 }
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func variantPicker(kind: String, current: ThemeVariant,
-                               select: @escaping (ThemeVariant) -> Void) -> some View {
-        VStack(spacing: NuvioSpacing.sm) {
-            ForEach(ThemeVariant.allCases) { v in
-                Button { select(v) } label: {
-                    VariantChoiceCard(variant: v, kind: kind, selected: current == v)
-                }
-                .buttonStyle(PlainCardButtonStyle())
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func playerLayoutPicker(current: PlayerLayout,
-                                    select: @escaping (PlayerLayout) -> Void) -> some View {
-        VStack(spacing: NuvioSpacing.sm) {
-            ForEach(PlayerLayout.allCases) { layout in
-                Button { select(layout) } label: {
-                    PlayerLayoutChoiceCard(layout: layout, selected: current == layout)
-                }
-                .buttonStyle(PlainCardButtonStyle())
-            }
-        }
-    }
-}
-
-/// One selectable player-layout row (Classic / HBO).
-private struct PlayerLayoutChoiceCard: View {
-    @EnvironmentObject private var theme: ThemeManager
-    @Environment(\.isFocused) private var isFocused
-    let layout: PlayerLayout
-    let selected: Bool
-
-    var body: some View {
-        HStack(spacing: NuvioSpacing.md) {
-            Image(systemName: layout.icon)
-                .font(.system(size: 24))
-                .foregroundStyle(isFocused ? theme.palette.onSecondary : theme.palette.secondary)
-                .frame(width: 44)
-            VStack(alignment: .leading, spacing: 4) {
-                Text(layout.displayName)
-                    .font(.system(size: 25, weight: .semibold))
-                    .foregroundStyle(isFocused ? theme.palette.onSecondary : theme.palette.textPrimary)
-                Text(layout.summary)
-                    .font(.system(size: 19))
-                    .foregroundStyle(isFocused ? theme.palette.onSecondary.opacity(0.85) : theme.palette.textSecondary)
-                    .lineLimit(1)
-            }
-            Spacer(minLength: NuvioSpacing.lg)
-            if selected {
-                Image(systemName: "checkmark.circle.fill")
-                    .font(.system(size: 26))
-                    .foregroundStyle(isFocused ? theme.palette.onSecondary : theme.palette.secondary)
-            }
-        }
-        .padding(.horizontal, NuvioSpacing.lg)
-        .padding(.vertical, NuvioSpacing.md)
-        .frame(maxWidth: .infinity, minHeight: 72, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: theme.settingsRowRadius, style: .continuous)
-                .fill(isFocused ? theme.palette.secondary
-                      : (selected ? theme.palette.secondary.opacity(0.16) : theme.palette.field))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: theme.settingsRowRadius, style: .continuous)
-                .strokeBorder(isFocused ? theme.palette.focusRing
-                              : (selected ? theme.palette.secondary.opacity(0.7) : .clear),
-                              lineWidth: isFocused ? 4 : 2)
-        )
-        .scaleEffect(isFocused ? 1.02 : 1)
-        .animation(.spring(response: 0.28, dampingFraction: 0.85), value: isFocused)
-    }
-}
-
-/// One selectable look-variant row (detail / profile / player axis).
-private struct VariantChoiceCard: View {
-    @EnvironmentObject private var theme: ThemeManager
-    @Environment(\.isFocused) private var isFocused
-    let variant: ThemeVariant
-    let kind: String
-    let selected: Bool
-
-    private var icon: String {
-        switch variant {
-        case .orivio: return "circle.grid.2x2.fill"
-        case .marquee: return "rectangle.stack.badge.play.fill"
-        case .streamline: return "play.tv.fill"
-        }
-    }
-
-    var body: some View {
-        HStack(spacing: NuvioSpacing.md) {
-            Image(systemName: icon)
-                .font(.system(size: 24))
-                .foregroundStyle(isFocused ? theme.palette.onSecondary : theme.palette.secondary)
-                .frame(width: 44)
-            VStack(alignment: .leading, spacing: 4) {
-                Text(variant.displayName)
-                    .font(.system(size: 25, weight: .semibold))
-                    .foregroundStyle(isFocused ? theme.palette.onSecondary : theme.palette.textPrimary)
-                Text(variant.summary(kind))
-                    .font(.system(size: 19))
-                    .foregroundStyle(isFocused ? theme.palette.onSecondary.opacity(0.85) : theme.palette.textSecondary)
-                    .lineLimit(1)
-            }
-            Spacer(minLength: NuvioSpacing.lg)
-            if selected {
-                Image(systemName: "checkmark.circle.fill")
-                    .font(.system(size: 26))
-                    .foregroundStyle(isFocused ? theme.palette.onSecondary : theme.palette.secondary)
-            }
-        }
-        .padding(.horizontal, NuvioSpacing.lg)
-        .padding(.vertical, NuvioSpacing.md)
-        .frame(maxWidth: .infinity, minHeight: 72, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: theme.settingsRowRadius, style: .continuous)
-                .fill(isFocused ? theme.palette.secondary
-                      : (selected ? theme.palette.secondary.opacity(0.16) : theme.palette.field))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: theme.settingsRowRadius, style: .continuous)
-                .strokeBorder(isFocused ? theme.palette.focusRing
-                              : (selected ? theme.palette.secondary.opacity(0.7) : .clear),
-                              lineWidth: isFocused ? 4 : 2)
-        )
-        .scaleEffect(isFocused ? 1.02 : 1)
-        .animation(.spring(response: 0.28, dampingFraction: 0.85), value: isFocused)
-    }
-}
-
-/// One selectable app-theme row: name + summary, with a check + accent border
-/// when it's the active theme.
-private struct ThemeChoiceCard: View {
-    @EnvironmentObject private var theme: ThemeManager
-    @Environment(\.isFocused) private var isFocused
-    let appTheme: AppTheme
-    let selected: Bool
-
-    var body: some View {
-        HStack(spacing: NuvioSpacing.md) {
-            Image(systemName: appTheme.icon)
-                .font(.system(size: 24))
-                .foregroundStyle(isFocused ? theme.palette.onSecondary : theme.palette.secondary)
-                .frame(width: 44)
-            VStack(alignment: .leading, spacing: 4) {
-                Text(appTheme.displayName)
-                    .font(.system(size: 25, weight: .semibold))
-                    .foregroundStyle(isFocused ? theme.palette.onSecondary : theme.palette.textPrimary)
-                Text(appTheme.summary)
-                    .font(.system(size: 19))
-                    .foregroundStyle(isFocused ? theme.palette.onSecondary.opacity(0.85) : theme.palette.textSecondary)
-                    .lineLimit(1)
-            }
-            Spacer(minLength: NuvioSpacing.lg)
-            if selected {
-                Image(systemName: "checkmark.circle.fill")
-                    .font(.system(size: 26))
-                    .foregroundStyle(isFocused ? theme.palette.onSecondary : theme.palette.secondary)
-            }
-        }
-        .padding(.horizontal, NuvioSpacing.lg)
-        .padding(.vertical, NuvioSpacing.md)
-        .frame(maxWidth: .infinity, minHeight: 72, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: theme.settingsRowRadius, style: .continuous)
-                .fill(isFocused ? theme.palette.secondary
-                      : (selected ? theme.palette.secondary.opacity(0.16) : theme.palette.field))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: theme.settingsRowRadius, style: .continuous)
-                .strokeBorder(isFocused ? theme.palette.focusRing
-                              : (selected ? theme.palette.secondary.opacity(0.7) : .clear),
-                              lineWidth: isFocused ? 4 : 2)
-        )
-        .scaleEffect(isFocused ? 1.02 : 1)
-        .animation(.spring(response: 0.28, dampingFraction: 0.85), value: isFocused)
-    }
 }
 
 /// Reusable focus-aware selection chip (accent fill on focus, readable in
@@ -784,8 +566,7 @@ struct SelectableChip: View {
                     .strokeBorder(isFocused ? theme.palette.focusRing : (selected ? theme.palette.secondary : .clear),
                                   lineWidth: isFocused ? 4 : 2)
             )
-            .scaleEffect(isFocused ? 1.05 : 1)
-            .animation(.spring(response: 0.28, dampingFraction: 0.85), value: isFocused)
+            .focusLift(NuvioFocus.card, isFocused)
     }
 }
 
@@ -1206,9 +987,7 @@ private struct AddonsManagementView: View {
     @State private var installing = false
     @State private var installMessage: String?
     @State private var showCollections = false
-    @State private var showCatalogOrder = false
     @State private var showDiscover = false
-    @State private var showCommunityCatalogs = false
     @State private var showCommunityCollections = false
     @State private var refreshing = false
     @State private var showExport = false
@@ -1251,28 +1030,8 @@ private struct AddonsManagementView: View {
             Button { showDiscover = true } label: {
                 SettingsActionRow(
                     title: "Discover Add-ons",
-                    subtitle: "Browse and install popular add-ons — no manifest URL needed",
+                    subtitle: "Browse and install popular add-ons — streams, catalogs, metadata and subtitles",
                     leadingIcon: "sparkle.magnifyingglass"
-                )
-            }
-            .buttonStyle(PlainCardButtonStyle())
-
-            // Catalog Order (APK files this under Add-ons)
-            Button { showCatalogOrder = true } label: {
-                SettingsActionRow(
-                    title: "Catalog Order",
-                    subtitle: "Reorder, rename and hide your home catalog rows",
-                    leadingIcon: "arrow.up.arrow.down"
-                )
-            }
-            .buttonStyle(PlainCardButtonStyle())
-
-            // Community Catalogs — add catalog add-ons from the live directory.
-            Button { showCommunityCatalogs = true } label: {
-                SettingsActionRow(
-                    title: "Community Catalogs",
-                    subtitle: "Browse and add catalog add-ons from the community — their rows appear on Home",
-                    leadingIcon: "square.grid.3x3.fill.square"
                 )
             }
             .buttonStyle(PlainCardButtonStyle())
@@ -1372,20 +1131,8 @@ private struct AddonsManagementView: View {
                 .environmentObject(theme)
                 .environmentObject(collections)
         }
-        .fullScreenCover(isPresented: $showCatalogOrder) {
-            CatalogOrderCoverView { showCatalogOrder = false }
-                .environmentObject(theme)
-                .environmentObject(addonManager)
-                .environmentObject(collections)
-                .environmentObject(homeCatalogSettings)
-        }
         .fullScreenCover(isPresented: $showDiscover) {
             AddonDiscoverView { showDiscover = false }
-                .environmentObject(theme)
-                .environmentObject(addonManager)
-        }
-        .fullScreenCover(isPresented: $showCommunityCatalogs) {
-            AddonDiscoverView(onDone: { showCommunityCatalogs = false }, catalogsOnly: true)
                 .environmentObject(theme)
                 .environmentObject(addonManager)
         }
@@ -1553,8 +1300,7 @@ private struct AddonToggle: View {
                 RoundedRectangle(cornerRadius: 26, style: .continuous)
                     .strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 3)
             )
-            .scaleEffect(isFocused ? 1.06 : 1)
-            .animation(.spring(response: 0.3, dampingFraction: 0.8), value: isFocused)
+            .focusLift(NuvioFocus.control, isFocused)
     }
 }
 
@@ -1581,8 +1327,7 @@ private struct RowActionCircleLabel: View {
             .frame(width: 60, height: 60)
             .background(Circle().fill(isFocused ? theme.palette.secondary : Color.white.opacity(0.12)))
             .overlay(Circle().strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 3))
-            .scaleEffect(isFocused ? 1.06 : 1)
-            .animation(.spring(response: 0.3, dampingFraction: 0.8), value: isFocused)
+            .focusLift(NuvioFocus.control, isFocused)
     }
 }
 
@@ -1599,8 +1344,7 @@ private struct TrashCircle: View {
             .frame(width: 64, height: 64)
             .background(Circle().fill(isFocused ? NuvioPrimitives.red500 : NuvioPrimitives.red500.opacity(0.18)))
             .overlay(Circle().strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 3))
-            .scaleEffect(isFocused ? 1.08 : 1)
-            .animation(.easeInOut(duration: 0.15), value: isFocused)
+            .focusLift(NuvioFocus.control, isFocused)
     }
 }
 
@@ -1611,12 +1355,6 @@ struct AboutDetail: View {
     @State private var info: AboutInfo?
     @State private var cacheLabel = DiagnosticsService.cacheSizeLabel()
     @State private var clearing = false
-
-    private var version: String {
-        let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
-        let b = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
-        return "\(v) (\(b))"
-    }
 
     var body: some View {
         DetailScaffold(title: SettingsCategory.about.title, subtitle: SettingsCategory.about.subtitle) {
@@ -1630,7 +1368,7 @@ struct AboutDetail: View {
                             .font(.system(size: 40, weight: .heavy))
                             .foregroundStyle(theme.palette.textPrimary)
                     }
-                    Text("Version \(version)")
+                    Text("Version \(DiagnosticsService.appVersion)")
                         .font(.system(size: 18))
                         .foregroundStyle(theme.palette.textTertiary)
                 }
@@ -1645,8 +1383,7 @@ struct AboutDetail: View {
                 }.buttonStyle(PlainCardButtonStyle())
             }
 
-            SettingsGroupCard(title: "Diagnostics", subtitle: "Build information and storage") {
-                SettingsValueCard(title: "Version", subtitle: "App build", value: DiagnosticsService.appVersion, icon: "number")
+            SettingsGroupCard(title: "Diagnostics", subtitle: "Device information and storage") {
                 SettingsValueCard(title: "System", subtitle: DiagnosticsService.deviceModel, value: DiagnosticsService.systemVersion, icon: "appletv.fill")
                 Button {
                     guard !clearing else { return }

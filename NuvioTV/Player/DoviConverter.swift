@@ -40,21 +40,4 @@ enum DoviConverter {
             return Data(bytes: bytes, count: out.pointee.len)
         }
     }
-
-    /// The DV profile of an RPU NAL (same NAL-format rules as above), or nil if
-    /// it isn't a parseable RPU. Lets the remuxer confirm a stream really is
-    /// profile 7 at the RPU level (the container `dv_profile` can lie).
-    static func rpuProfile(_ nal: Data) -> Int? {
-        nal.withUnsafeBytes { raw -> Int? in
-            guard let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
-                return nil
-            }
-            guard let rpu = dovi_parse_unspec62_nalu(base, nal.count) else { return nil }
-            defer { dovi_rpu_free(rpu) }
-            if dovi_rpu_get_error(rpu) != nil { return nil }
-            guard let header = dovi_rpu_get_header(rpu) else { return nil }
-            defer { dovi_rpu_free_header(header) }
-            return Int(header.pointee.guessed_profile)
-        }
-    }
 }

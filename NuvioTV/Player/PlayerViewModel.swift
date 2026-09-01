@@ -500,6 +500,10 @@ final class PlayerViewModel: ObservableObject {
 
     // UI state
     @Published var overlay: PlayerOverlay = .none
+    /// Fusion layout: the small options panel anchored to the "..." button.
+    /// Lives here rather than in the view so Back can close it — the Menu
+    /// press is caught at the window level, which can't see view state.
+    @Published var optionsPopupVisible = false
     /// Coarse "a scrub is in progress" flag (flips twice per gesture) so the
     /// player can show/hide the scrub bar. The fine-grained target lives on
     /// `clock.scrubTarget`.
@@ -561,11 +565,24 @@ final class PlayerViewModel: ObservableObject {
 
     // MARK: - Engine-agnostic transport (branch KS ↔ VLC)
 
+    /// Whether playback is stopped ON PURPOSE — the user pressed pause, the app
+    /// was backgrounded, or a fast-forward preview froze it.
+    ///
+    /// Engine STATE is not the same as intent, and the buffering callbacks
+    /// below conflated them: they reported `isPlaying = true` on every
+    /// `.buffering` / `.bufferFinished`, which the reader emits while filling
+    /// its cache — including while paused. So sitting on a paused frame, a
+    /// routine cache event flipped the player back to "playing" with no input
+    /// at all. Those callbacks now ask this instead of assuming.
+    private var pauseIntent = false
+
     private func enginePlay() {
+        pauseIntent = false
         if let dvDirectEngine { dvDirectEngine.play() }
         else if let vlcEngine { vlcEngine.play() } else { playerLayer?.play() }
     }
     private func enginePause() {
+        pauseIntent = true
         if let dvDirectEngine { dvDirectEngine.pause() }
         else if let vlcEngine { vlcEngine.pause() } else { playerLayer?.pause() }
     }
@@ -1175,31 +1192,32 @@ final class PlayerViewModel: ObservableObject {
         guard result == KERN_SUCCESS else {
             Self.dvTrail("mem ? \(phase) (\(why))"); return
         }
+        // Carry the presentation census with the memory line: the trail is the
+        // only record that outlives the session, and "is it jittery" is
+        // answered by repeats/skips, not by footprint.
+        let census = dvDirectEngine.map { " \($0.lastVsyncCensus)" } ?? ""
         let mb = Double(info.phys_footprint) / 1_048_576
         let anon = Double(info.internal) / 1_048_576
         let comp = Double(info.compressed) / 1_048_576
-        // THE EXPERIMENT: ask malloc to return freed-but-held pages to the
-        // kernel, then resample. The persistent compressed ballast survived
-        // the remux thread's exit, which rules out autorelease pools; the
-        // remaining candidate is allocator retention — memory our code has
-        // long since freed that malloc keeps (and the compressor dutifully
-        // compresses instead of discarding). The before→after delta in every
-        // breadcrumb measures exactly that — and if it IS the cause, this
-        // call is also the fix.
-        malloc_zone_pressure_relief(nil, 0)
-        var info2 = task_vm_info_data_t()
-        var count2 = mach_msg_type_number_t(
-            MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size
-        )
-        let result2 = withUnsafeMutablePointer(to: &info2) {
-            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count2)) {
-                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count2)
-            }
-        }
-        let after = result2 == KERN_SUCCESS ? Double(info2.phys_footprint) / 1_048_576 : -1
+        // THE EXPERIMENT IS OVER, AND IT ANSWERED ITSELF.
+        //
+        // This used to call `malloc_zone_pressure_relief(nil, 0)` here and
+        // resample, to test whether the compressed ballast was allocator
+        // retention. Every breadcrumb it ever wrote came back X→X: across the
+        // whole persisted trail, on every engine, the delta was ZERO. malloc
+        // was holding nothing, so the call reclaimed nothing.
+        //
+        // What it DID do was run on the main actor, every 40 seconds, for the
+        // entire film. `nil` zone means all zones and 0 means "release as much
+        // as possible", so it walks every free list in a ~450 MB heap full of
+        // video buffers and madvises pages back to the kernel — unbounded work
+        // in the middle of playback. That is the periodic one-to-two second
+        // freeze with no buffering indicator: not the network, not the decoder,
+        // just the diagnostic stopping the world to measure a number that never
+        // changed. Measure once, cheaply, and get out.
         Self.dvTrail(String(
-            format: "mem %.0f→%.0fMB int=%.0f cmp=%.0f %@ pos=%.0fs (%@)",
-            mb, after, anon, comp, phase, position, why
+            format: "mem %.0fMB int=%.0f cmp=%.0f %@ pos=%.0fs (%@)%@",
+            mb, anon, comp, phase, position, why, census
         ))
     }
 
@@ -1285,8 +1303,14 @@ final class PlayerViewModel: ObservableObject {
     private var scanTask: Task<Void, Never>?
     private var toastTask: Task<Void, Never>?
     private var lastProgressSave = Date.distantPast
+    private var transientSaveCount = 0
+    /// Seconds between periodic crash-safety progress writes.
+    private static let progressSaveInterval: TimeInterval = 10
     private var lastSubtitleSearchAt: Double = -1
     private var pendingResume: Double?
+    /// Where this session picked the film up, so the exit can tell a viewer who
+    /// watched from one who bailed out.
+    private var sessionStartPosition: Double = 0
     /// Options of the stream currently loading, kept for open-timing logs.
     private var currentOptions: KSOptions?
     /// Why the current playback path looks the way it does — shown in the
@@ -1304,6 +1328,10 @@ final class PlayerViewModel: ObservableObject {
     @Published private(set) var scrubThumbnails: [ScrubThumbnail] = []
     private var thumbnailTask: Task<Void, Never>?
     private var thumbnailsStarted = false
+    /// Seconds of buffer ahead of the playhead, mirrored for the thumbnailer's
+    /// worker thread (which cannot touch main-actor state). Updated on the
+    /// position tick.
+    private let bufferAhead = Atomic<Double>(wrappedValue: 0)
     /// The running grabber, so cancelling actually aborts its FFmpeg session —
     /// `thumbnailTask?.cancel()` alone cannot interrupt a blocking network read.
     private var thumbnailer: ScrubThumbnailer?
@@ -1422,6 +1450,7 @@ final class PlayerViewModel: ObservableObject {
         self.progressStore = progressStore
         self.settings = settings
         self.pendingResume = request.resumePosition
+        self.sessionStartPosition = request.resumePosition ?? 0
 
         // Pause the 30s account auto-sync for the duration of playback — a
         // multi-endpoint sync competing for bandwidth mid-stream is exactly the
@@ -1781,12 +1810,7 @@ final class PlayerViewModel: ObservableObject {
         // requested (survives options replacement on failover/DV swap) — the
         // exit path waits out the switch-back only when one could be pending.
         options.onDisplayCriteriaApplied = { [weak self] in
-            DispatchQueue.main.async {
-                self?.displayCriteriaApplied = true
-                // This playback owns the display now; a release still pending
-                // from the last exit must not fire underneath it.
-                DisplayModeRestorer.cancelPending()
-            }
+            DispatchQueue.main.async { self?.displayCriteriaApplied = true }
         }
         // Display-mode switching is opt-in (see matchDisplayCriteria doc); and
         // even when on it only varies dynamic range, never refresh rate — so
@@ -2044,6 +2068,24 @@ final class PlayerViewModel: ObservableObject {
         // A10X. Slight blockiness in dark gradients beats a slideshow.
         // (threads=auto is already KSPlayer's default.)
         options.decoderOptions["skip_loop_filter"] = "all"
+        // RESUME: open the stream AT the saved position instead of opening at
+        // zero and seeking afterwards.
+        //
+        // This is why Continue Watching took so much longer to start than a
+        // fresh play. Opening at 0 demuxes, decodes and fills the buffer at the
+        // top of the film; the `.readyToPlay` seek then flushes all of it and
+        // refills from a completely different byte offset — the whole opening
+        // cost paid twice, plus a second range request. On a large remux over
+        // debrid that is most of the wait.
+        //
+        // MEPlayerItem honours `startPlayTime` during open, so FFmpeg seeks
+        // while the container is being read and only one fill ever happens.
+        // The `.readyToPlay` seek stays as the fallback for engines that ignore
+        // it; it checks how far off the position already is before acting.
+        if let resume = pendingResume, resume > 5,
+           duration <= 0 || resume < duration - 30 {
+            options.startPlayTime = resume
+        }
         currentOptions = options
         loadStartedAt = Date()
         currentURL = url
@@ -2061,6 +2103,7 @@ final class PlayerViewModel: ObservableObject {
         animeSkipFetched = false
         setSkipIntroActive(false)
         autoSkippedChapters = []
+        dismissedIntroStart = nil
         if !hasStartedPlayback {
             loadPhase = .loading
             cacheProgress = 0
@@ -2212,6 +2255,7 @@ final class PlayerViewModel: ObservableObject {
         animeSkipFetched = false
         setSkipIntroActive(false)
         autoSkippedChapters = []
+        dismissedIntroStart = nil
         engineName = "VLC"
         if !hasStartedPlayback {
             loadPhase = .loading   // VLC never enters the .caching hold
@@ -2691,6 +2735,11 @@ final class PlayerViewModel: ObservableObject {
         if scanPreview != nil { scanCommit(); return }
         if isPlaying {
             enginePause()
+            // Pausing is the moment a viewer is most likely to leave — by the
+            // remote, by the TV button, or by pulling the plug. Publish the
+            // position here rather than relying on the exit path being reached,
+            // so "I paused two minutes in and came back later" always resumes.
+            saveProgress()
             if overlay == .none {
                 overlay = .pauseInfo
             }
@@ -2746,7 +2795,16 @@ final class PlayerViewModel: ObservableObject {
     private var lastUserSeekAt: Date?
     private var seekRecoveryInFlight = false
 
-    func seek(to seconds: Double) {
+    /// Seek, keeping the transport state you were in.
+    ///
+    /// `autoPlay` defaults to nil, meaning "whatever we were doing" — a seek
+    /// from a PAUSED player leaves it paused. It used to pass `true`
+    /// unconditionally, which is why pausing and then pressing skip started
+    /// playback again about two thirds of a second later (the nudge commits on
+    /// a debounce), with nothing on screen to explain it. Callers that must
+    /// start playback — committing a fast-forward preview, restarting a
+    /// finished title — pass `true` explicitly.
+    func seek(to seconds: Double, autoPlay: Bool? = nil) {
         let target = max(0, min(seconds, duration > 0 ? duration - 1 : seconds))
         position = target
         clock.position = target   // instant UI feedback, no waiting for a tick
@@ -2755,7 +2813,13 @@ final class PlayerViewModel: ObservableObject {
         // seeking BACKWARDS — otherwise the floor would drag them forward again
         // on the next failover).
         sessionResumeFloor = target
-        engineSeek(to: target, autoPlay: true)
+        playedToEndHandled = false
+        let play = autoPlay ?? isPlaying
+        // engineSeek starts playback itself, bypassing enginePlay, so the
+        // intent has to be cleared here or the buffer events that follow the
+        // seek would be read as "still paused".
+        if play { pauseIntent = false }
+        engineSeek(to: target, autoPlay: play)
     }
 
     // MARK: - Infuse-style touchpad scrubbing
@@ -2886,6 +2950,8 @@ final class PlayerViewModel: ObservableObject {
         let proposed = target + Double(inc) * secondsPerPoint
         let clamped = max(0, min(proposed, duration > 0 ? duration - 1 : proposed))
         publishScrub(clamped)
+        // Turned far enough to leave the dense window — fetch the next one.
+        startFineThumbnailsIfNeeded(around: clamped)
         restartScrubTimeout()
     }
 
@@ -2899,6 +2965,8 @@ final class PlayerViewModel: ObservableObject {
         clock.scrubTarget = position
         isScrubbing = true
         resetWheel()
+        // AFTER resetWheel, which clears it.
+        wheelAwaitingLift = true
         restartScrubTimeout()
     }
 
@@ -2919,6 +2987,7 @@ final class PlayerViewModel: ObservableObject {
         scrubValue = nil
         isScrubbing = false
         resetWheel()
+        clearFineThumbnails()
         scrubTimeoutTask?.cancel()
         // Leave the bar up briefly so you see where you landed, Netflix-style.
         showControls()
@@ -2929,13 +2998,19 @@ final class PlayerViewModel: ObservableObject {
         scrubValue = nil
         isScrubbing = false
         resetWheel()
+        clearFineThumbnails()
         scrubTimeoutTask?.cancel()
     }
 
     /// Coarse jump while in scrub mode: a left/right press moves the target by
-    /// the configured scrubber-jump amount (default a minute) — pan zooms,
-    /// presses hop, the wheel fine-tunes.
+    /// the configured scrubber-jump amount (default a minute) — pan drags,
+    /// presses hop, a rested finger becomes the fine-tune wheel.
     func scrubJump(_ seconds: Double) {
+        // The wheel owns the whole pad while it is turning. A circling thumb
+        // brushes the pad's edges, which the remote also reports as directional
+        // presses — and a jump of a minute in the middle of a two-second
+        // adjustment is the opposite of fine-tuning.
+        guard !wheelEngaged else { return }
         guard isScrubbing, let target = scrubValue else { return }
         let proposed = target + seconds
         let clamped = max(0, min(proposed, duration > 0 ? duration - 1 : proposed))
@@ -2943,14 +3018,47 @@ final class PlayerViewModel: ObservableObject {
         restartScrubTimeout()
     }
 
-    // MARK: - Edge wheel fine-tune (Infuse-style: hold at the side & circle)
+    // MARK: - Wheel fine-tune (rest a finger on the pad, then circle)
 
-    /// True while the finger is held at the trackpad EDGE — fine-tune mode.
-    /// Engaging at the edge (not on any arc) is what stops the wheel from
-    /// hijacking a normal horizontal scrub, and it drives the on-screen
-    /// fine-tune indicator.
+    /// True once the wheel has taken the pad — fine-tune mode. Drives the
+    /// on-screen indicator and locks out every other scrub input.
     @Published private(set) var wheelEngaged = false
     private var wheelLastAngle: Double?
+    /// Consecutive near-zero samples, so one glitchy reading can't end a turn.
+    private var wheelLiftSamples = 0
+    /// When the current stationary contact began, and where it landed.
+    private var wheelHoldStart: Date?
+    private var wheelHoldOrigin: (x: Double, y: Double)?
+    /// The finger moved before the hold completed, so this touch is a scrub
+    /// drag and must never turn into a wheel part-way through.
+    private var wheelHoldDisqualified = false
+    /// How long a finger has to sit on the outer ring before the wheel takes
+    /// over. A beat, not a wait — long enough that swiping THROUGH the rim
+    /// during a side-to-side scrub doesn't trigger it.
+    private let wheelHoldSeconds: TimeInterval = 0.25
+    /// How far out counts as the outer ring (the pad reports -1…1 from centre).
+    private let wheelRingRadius: Double = 0.72
+    /// Fires the engage. The hold CANNOT be measured from the sample stream:
+    /// `microGamepad.dpad.valueChangedHandler` only fires when the value
+    /// CHANGES, so a finger held perfectly still produces no further samples at
+    /// all — which is exactly the gesture we are waiting for. Checking elapsed
+    /// time inside `wheelSample` therefore never ran again after the first
+    /// touch, and the wheel could never engage. A timer, armed on contact, is
+    /// the only thing that can see a still finger.
+    private var wheelHoldTask: Task<Void, Never>?
+    /// Whether a finger is currently down, maintained by the sample stream
+    /// (contact and lift both change the value, so both do arrive).
+    private var wheelTouching = false
+    /// Set when scrubbing begins: the touch that is ALREADY on the pad cannot
+    /// arm the hold. Clicking Select to enter scrub leaves your finger resting
+    /// on the trackpad — a click is a press — so that same contact satisfied
+    /// the rest-to-engage timer half a second later and threw you straight into
+    /// fine-tune before you had scrubbed anything. Only a touch that begins
+    /// AFTER a lift counts.
+    private var wheelAwaitingLift = false
+    /// Movement (in pad units, the pad being -1…1) that marks a touch as a drag
+    /// rather than a rest.
+    private let wheelHoldSlop: Double = 0.16
     /// One full revolution ≈ this many seconds — small, because it's FINE tuning.
     private let wheelSecondsPerRevolution: Double = 24
 
@@ -2959,19 +3067,71 @@ final class PlayerViewModel: ObservableObject {
         guard isScrubbing else { resetWheel(); return }
         let radius = (x * x + y * y).squareRoot()
 
-        // Finger lifted → leave fine-tune; normal pan owns the scrub again.
-        if radius < 0.1 {
-            wheelEngaged = false
-            wheelLastAngle = nil
+        // Finger LIFTED → leave fine-tune; normal pan owns the scrub again.
+        //
+        // The bar for "lifted" is deliberately near zero and needs two samples
+        // in a row. It used to be 0.1, which a finger passing anywhere near the
+        // middle of the pad crosses on its way round — so a single sloppy
+        // circle dropped out of fine-tune and the rest of that same gesture
+        // landed on the pan recognizer as a scrub. Once engaged, the wheel
+        // holds until you actually take your thumb off.
+        // LIFT — acted on immediately, and on a SINGLE sample.
+        //
+        // It has to be one: the pad only reports on VALUE CHANGE, so lifting
+        // produces exactly one (0,0) event and then silence. Waiting for a
+        // second consecutive near-zero reading meant the second never came and
+        // the wheel stayed engaged after you took your finger off — scrubbing
+        // was dead until you touched and lifted again. The 0.02 threshold is
+        // low enough that only a real lift reaches it.
+        if radius < 0.02 {
+            wheelLiftSamples += 1
+            if wheelLiftSamples >= 1 {
+                wheelTouching = false
+                // A real lift: whatever was on the pad when scrubbing started
+                // is gone, so the next touch is a fresh gesture and may arm.
+                wheelAwaitingLift = false
+                wheelHoldTask?.cancel()
+                wheelHoldTask = nil
+                wheelEngaged = false
+                wheelLastAngle = nil
+                wheelHoldStart = nil
+                wheelHoldOrigin = nil
+                wheelHoldDisqualified = false
+                // The dense frames STAY. Lifting off the wheel is a pause in
+                // the middle of one adjustment, not the end of it — you drop
+                // back to coarse scrubbing and are expected to rest again a
+                // moment later. Throwing them away here meant re-running a
+                // decode pass every single time.
+            }
             return
         }
-        // ENGAGE only by reaching the EDGE. But once engaged, the WHOLE pad is
-        // the wheel — you can circle anywhere and it keeps turning; it only ends
-        // on lift. (Requested: "have the whole trackpad be for fine tuning".)
+        wheelLiftSamples = 0
+        if !wheelTouching { restartScrubTimeout() }   // a new touch is activity
+        wheelTouching = true
+        // ENGAGE by putting a finger on the OUTER RING and leaving it there for
+        // a beat. Side-to-side anywhere else stays a plain scrub.
+        //
+        // The rim is the gate and the quarter-second is what separates resting
+        // there from swiping across it: a scrub that runs out to the edge and
+        // keeps going is moving, so it is disqualified for the rest of that
+        // touch — a gesture must not change meaning half way through. Once
+        // engaged the WHOLE pad is the wheel, so you can circle inward, until
+        // you lift.
         if !wheelEngaged {
-            guard radius > 0.72 else { return }   // not at edge yet → pan handles it
-            wheelEngaged = true
-            wheelLastAngle = nil
+            if let origin = wheelHoldOrigin {
+                let travel = ((x - origin.x) * (x - origin.x)
+                              + (y - origin.y) * (y - origin.y)).squareRoot()
+                if travel > wheelHoldSlop, !wheelHoldDisqualified {
+                    wheelHoldDisqualified = true
+                    wheelHoldTask?.cancel()
+                    wheelHoldTask = nil
+                }
+            } else if !wheelAwaitingLift, radius > wheelRingRadius {
+                wheelHoldOrigin = (x, y)
+                wheelHoldStart = Date()
+                armWheelHold()
+            }
+            return   // the timer engages, not this sample
         }
         // Near dead-center atan2 is noisy and flips direction — pause the angle
         // there (don't jump) but STAY engaged; re-anchor when it recovers.
@@ -2992,9 +3152,30 @@ final class PlayerViewModel: ObservableObject {
         restartScrubTimeout()
     }
 
+    /// Arm the rest-to-engage timer for the touch that just landed.
+    private func armWheelHold() {
+        wheelHoldTask?.cancel()
+        wheelHoldTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64((self?.wheelHoldSeconds ?? 0.5) * 1_000_000_000))
+            guard !Task.isCancelled, let self else { return }
+            guard self.isScrubbing, self.wheelTouching,
+                  !self.wheelHoldDisqualified, !self.wheelEngaged else { return }
+            self.wheelEngaged = true
+            self.wheelLastAngle = nil
+            self.startFineThumbnailsIfNeeded(around: self.scrubValue ?? self.position)
+        }
+    }
+
     private func resetWheel() {
+        wheelHoldTask?.cancel()
+        wheelHoldTask = nil
         wheelLastAngle = nil
         wheelEngaged = false
+        wheelLiftSamples = 0
+        wheelTouching = false
+        wheelHoldStart = nil
+        wheelHoldOrigin = nil
+        wheelHoldDisqualified = false
     }
 
     // MARK: - Circular wheel (GameController absolute position, scrub-only)
@@ -3078,8 +3259,17 @@ final class PlayerViewModel: ObservableObject {
         scrubTimeoutTask?.cancel()
         scrubTimeoutTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 6_000_000_000)
-            guard !Task.isCancelled else { return }
-            self?.cancelScrub()
+            guard !Task.isCancelled, let self else { return }
+            // Never time out mid-adjustment. The intended flow is a series of
+            // deliberate pauses — scrub, lift, rest to take the wheel, circle,
+            // lift, scrub again — and a finger resting on the pad is the one
+            // gesture that generates no samples at all. Dropping the whole
+            // scrub out from under that is exactly wrong.
+            guard !self.wheelEngaged, !self.wheelTouching else {
+                self.restartScrubTimeout()
+                return
+            }
+            self.cancelScrub()
         }
     }
 
@@ -3143,9 +3333,18 @@ final class PlayerViewModel: ObservableObject {
     func restartHideTimer() {
         hideControlsTask?.cancel()
         hideControlsTask = Task { [weak self] in
-            // 3s of true idle — every remote interaction (focus moves included)
-            // restarts this, so the controls never vanish mid-navigation.
-            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            // Idle time before the controls go away. Every remote interaction
+            // (focus moves included) restarts this, so they never vanish
+            // mid-navigation.
+            //
+            // Was 3s, which is fine when the transport is a row of buttons you
+            // are stepping through — each move resets the clock. Fusion's whole
+            // transport is ONE bar: you look at it, decide, and press, with no
+            // intervening input to restart the timer. Three seconds of that is
+            // easy to exceed, and then the press lands on hidden controls and
+            // merely brings them back rather than starting a scrub — which
+            // reads as "half the time Select does nothing".
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
             guard !Task.isCancelled, let self else { return }
             // Keep the transport up while a fast-forward/rewind preview is
             // active (so the moving playhead stays visible); otherwise hide once
@@ -3186,6 +3385,13 @@ final class PlayerViewModel: ObservableObject {
         // Peek bar up → Back just hides the bar (don't prompt to exit).
         if peekVisible {
             hidePeek()
+            return true
+        }
+        // Fusion's options panel closes back to the controls, never out of the
+        // player — same rule the side panels follow below.
+        if optionsPopupVisible {
+            optionsPopupVisible = false
+            restartHideTimer()
             return true
         }
         switch overlay {
@@ -3328,6 +3534,44 @@ final class PlayerViewModel: ObservableObject {
         showToast("Speed \(speed == 1 ? "Normal" : String(format: "%gx", speed))")
     }
 
+    /// A left/right press on the Fusion bar. A lone press nudge-seeks; holding
+    /// the direction down escalates into the continuous fast-forward sweep.
+    ///
+    /// The old Apple-TV layout had dedicated FF/RW buttons that could tell a
+    /// tap from a long-press. A single bar has no such button, and tvOS gives
+    /// no "held" state for a directional press — only a stream of repeats — so
+    /// the repeats themselves are the signal.
+    func barDirectionalPress(forward: Bool) {
+        guard hasStartedPlayback else { return }
+        // Already sweeping (or holding a preview): the press belongs to the
+        // scan transport — bump the speed, or step the frozen preview.
+        if scanPreview != nil {
+            scanTap(forward: forward)
+            barRepeatCount = 0
+            return
+        }
+        let now = Date()
+        if let last = lastBarPressAt, barRepeatForward == forward,
+           now.timeIntervalSince(last) < 0.4 {
+            barRepeatCount += 1
+        } else {
+            barRepeatCount = 1
+        }
+        lastBarPressAt = now
+        barRepeatForward = forward
+        // Four presses in quick succession reads as "held".
+        if barRepeatCount >= 4 {
+            barRepeatCount = 0
+            scanHold(forward: forward)
+            return
+        }
+        nudgeSeek(forward ? Double(settings.skipSeconds) : -Double(settings.skipSeconds))
+    }
+
+    private var lastBarPressAt: Date?
+    private var barRepeatForward = true
+    private var barRepeatCount = 0
+
     // MARK: - Fast-forward / rewind scan (native transport, preview-based)
 
     /// Enter preview mode if we aren't already: pause playback and anchor the
@@ -3406,7 +3650,7 @@ final class PlayerViewModel: ObservableObject {
         // stale-socket resume in togglePlayPause.) If the engine can't seek
         // yet, KSPlayerLayer stashes the target WITH autoplay armed, so
         // playback still starts.
-        seek(to: target)        // loads the new position here
+        seek(to: target, autoPlay: true)   // loads the new position here
         showControls()
     }
 
@@ -3506,16 +3750,33 @@ final class PlayerViewModel: ObservableObject {
     /// "Teaser", "Recap"). Needs the FILE to carry named chapters — most
     /// movie/web-dl remuxes don't, which is why the pill often won't appear.
     private var introChapter: SkipSegment? {
-        if let chapter = chapters.first(where: { chapter in
-            let t = chapter.title.lowercased().trimmingCharacters(in: .whitespaces)
-            if t == "op" || t == "ncop" || t == "opening" || t == "intro" { return true }
-            return t.contains("intro") || t.contains("opening")
-                || t.contains("recap") || t.contains("prologue")
-                || t.contains("cold open") || t.contains("avant") || t.contains("teaser")
-        }) { return SkipSegment(start: chapter.start, end: chapter.end, title: chapter.title) }
+        // An intro has to be near the FRONT. Without this, a chapter named
+        // "Recap"/"Teaser"/"Cold Open" anywhere in the file raised the pill —
+        // and with auto-skip on, landing in one at 1:20:00 threw the viewer
+        // forward. Mirrors the back-half guard `creditsChapter` already had.
+        // Only applied once the duration is known.
+        func isNearFront(_ start: Double) -> Bool { duration <= 0 || start < duration * 0.5 }
+
+        // EARLIEST match, not the first in file order — chapter lists aren't
+        // guaranteed sorted, and an episode with both a recap and an opening
+        // should offer the one you're about to sit through.
+        if let chapter = chapters
+            .filter({ chapter in
+                guard isNearFront(chapter.start), chapter.end > chapter.start else { return false }
+                let t = chapter.title.lowercased().trimmingCharacters(in: .whitespaces)
+                if t == "op" || t == "ncop" || t == "opening" || t == "intro" { return true }
+                return t.contains("intro") || t.contains("opening")
+                    || t.contains("recap") || t.contains("prologue")
+                    || t.contains("cold open") || t.contains("avant") || t.contains("teaser")
+            })
+            .min(by: { $0.start < $1.start }) {
+            return SkipSegment(start: chapter.start, end: chapter.end, title: chapter.title)
+        }
         // Anime-skip fallback: time-based op interval when the file has no
         // named chapters (most anime web releases).
-        if let op = animeSkipIntervals.first(where: { $0.kind == .intro }) {
+        if let op = animeSkipIntervals
+            .filter({ $0.kind == .intro && $0.end > $0.start && isNearFront($0.start) })
+            .min(by: { $0.start < $1.start }) {
             return SkipSegment(start: op.start, end: op.end, title: "Intro")
         }
         return nil
@@ -3551,6 +3812,19 @@ final class PlayerViewModel: ObservableObject {
     /// one at most once (the viewer can seek back into it without re-skipping).
     private var autoSkippedChapters: Set<Double> = []
 
+    /// The intro the viewer has already skipped by hand, keyed by its start.
+    /// A seek doesn't land on an exact timestamp — engines snap to the nearest
+    /// keyframe, which is usually the one BEFORE the target — so jumping to
+    /// `intro.end` routinely put playback a couple of seconds back inside the
+    /// segment. The next tick then saw "inside the intro" and raised the pill
+    /// again (or, with auto-skip on, fired a second seek): press Skip Intro,
+    /// watch it blink straight back. Remembering the segment keeps it down.
+    private var dismissedIntroStart: Double?
+
+    /// How far past the end of an intro to land. Same keyframe-snapping
+    /// reason: aiming exactly at the boundary can resolve to just inside it.
+    private static let skipOvershoot: Double = 0.5
+
     /// Fetch AnimeSkip op/ed intervals for the current episode once, after the
     /// duration is known (sharpens AniSkip matching). Series episodes only.
     private func loadAnimeSkipIfNeeded() {
@@ -3575,13 +3849,27 @@ final class PlayerViewModel: ObservableObject {
             if skipIntroActive { setSkipIntroActive(false) }
             return
         }
-        let inside = position >= intro.start && position < intro.end - 2
+        // A deliberate rewind to BEFORE the intro re-arms it — you asked to
+        // watch it. (Landing a shade short of the end from the skip itself
+        // doesn't, which is the whole point of the dismissal.)
+        if let dismissed = dismissedIntroStart,
+           dismissed != intro.start || position < intro.start - 1 {
+            dismissedIntroStart = nil
+        }
+        // The pill used to vanish 2s early, which on a short recap chapter
+        // left barely a window to press it. Hold it to within 1s of the end,
+        // and never offer a "skip" that would seek backwards.
+        let inside = position >= intro.start && position < intro.end - 1
+        guard dismissedIntroStart == nil else {
+            if skipIntroActive { setSkipIntroActive(false) }
+            return
+        }
         // Auto-skip: jump straight past the intro/recap the first time we land
         // in it (no button press needed).
         if inside, settings.autoSkipSegments, !autoSkippedChapters.contains(intro.start) {
             autoSkippedChapters.insert(intro.start)
             setSkipIntroActive(false)
-            seek(to: intro.end)
+            seek(to: intro.end + Self.skipOvershoot)
             showToast("Skipped intro")
             return
         }
@@ -3600,8 +3888,18 @@ final class PlayerViewModel: ObservableObject {
 
     /// Jump past the intro chapter.
     func skipIntro() {
-        guard let intro = introChapter else { return }
-        seek(to: intro.end)
+        guard let intro = introChapter, intro.end > position else {
+            // Nothing left to skip — don't seek backwards, just take the pill
+            // down so the press still feels like it did something.
+            setSkipIntroActive(false)
+            return
+        }
+        // Remember it: the seek below can land back inside the segment (see
+        // `dismissedIntroStart`), and the pill must not blink back up. Also
+        // stops auto-skip from firing a second jump on top of this one.
+        dismissedIntroStart = intro.start
+        autoSkippedChapters.insert(intro.start)
+        seek(to: intro.end + Self.skipOvershoot)
         setSkipIntroActive(false)
         showToast("Skipped intro")
     }
@@ -4190,13 +4488,23 @@ final class PlayerViewModel: ObservableObject {
         // Seek only — it autoplays on completion. A second, synchronous play()
         // here ran inside the seek's flush and left the picture frozen with the
         // audio running (see scanCommit / `.readyToPlay` for the full story).
-        seek(to: 0)
+        seek(to: 0, autoPlay: true)
     }
+
+    /// True once the end of this stream has been acted on; cleared whenever a
+    /// new stream (or a seek back into this one) makes an ending possible again.
+    private var playedToEndHandled = false
 
     /// End-of-content handling: queue the next episode (the Up Next card
     /// always appears when one exists; auto-play only controls its
     /// countdown), or show the post-play overlay for movies / last episodes.
     private func handlePlayedToEnd() {
+        // Idempotent by contract. Engines are not consistent about how many
+        // times they announce the end — the direct DV engine reported it from a
+        // media-request callback — and re-running this re-publishes progress
+        // and re-assigns the overlay, which churns the whole UI.
+        guard !playedToEndHandled else { return }
+        playedToEndHandled = true
         saveProgress()
         if let next = nextEpisode {
             autoAdvanceArmed = true
@@ -4222,6 +4530,7 @@ final class PlayerViewModel: ObservableObject {
         autoAdvanceArmed = false
         if !autoAdvance { consecutiveAutoAdvances = 0 }
         isSwitchingSource = true
+        playedToEndHandled = false
         saveProgress()
         playerLayer?.pause()
         let hasResolver = torrentResolver != nil
@@ -4332,13 +4641,31 @@ final class PlayerViewModel: ObservableObject {
 
     // MARK: - Progress persistence
 
+    /// Keep the thumbnailer's view of buffer health current. Called from the
+    /// same tick that saves progress, so it costs nothing extra.
+    private func publishBufferHealth() {
+        bufferAhead.wrappedValue = max(buffered - position, 0)
+    }
+
     private func saveProgressThrottled() {
+        publishBufferHealth()
         // Periodic saves are TRANSIENT: persisted to disk for crash safety,
         // but never published — a publish re-renders the whole Home screen
         // behind the player, which was the periodic playback hiccup. The
         // exit/teardown paths call saveProgress(), which publishes once.
-        guard Date().timeIntervalSince(lastProgressSave) > 30 else { return }
+        //
+        // The interval is the worst-case loss when the app dies without a
+        // teardown (crash, force-quit, tvOS reclaiming memory). 30s meant
+        // losing up to half a minute of a film; the write is a background
+        // encode that never touches the main actor, so a tighter cadence
+        // costs nothing on screen.
+        guard Date().timeIntervalSince(lastProgressSave) > Self.progressSaveInterval else { return }
         lastProgressSave = Date()
+        // Every 12th save (~2 minutes) also nudges the account push, so another
+        // device sees a film in progress rather than nothing until you stop
+        // watching. No publish: see requestSyncPush.
+        transientSaveCount &+= 1
+        if transientSaveCount % 12 == 0 { progressStore.requestSyncPush() }
         progressStore.updateTransient(
             meta: meta,
             video: currentVideo,
@@ -4354,6 +4681,7 @@ final class PlayerViewModel: ObservableObject {
 
     func saveProgress() {
         lastProgressSave = Date()
+        Self.dvTrail(String(format: "progress saved: pos=%.0fs of %.0fs", position, duration))
         progressStore.update(
             meta: meta,
             video: currentVideo,
@@ -4374,6 +4702,29 @@ final class PlayerViewModel: ObservableObject {
     private(set) var displayCriteriaApplied = false
     private var displayReleasedForExit = false
 
+    /// Was this link worth keeping? Decided at the moment of leaving, on one
+    /// threshold: five minutes of actual playback this session.
+    ///
+    /// Under it, the viewer almost always hit a bad source — dead link, wrong
+    /// audio, a mux the engine chokes on — and the Auto Link Selector, being
+    /// deterministic, would hand them the exact same one on the next press.
+    /// Remembering the bail-out lets the next attempt move on. Over it, the
+    /// link plays, so any rejection standing against it is dropped.
+    ///
+    /// Measured from where this session STARTED, not from zero: resuming at
+    /// 1h20m and stopping two minutes later is two minutes of evidence, not
+    /// eighty-two.
+    private func recordLinkVerdict() {
+        guard duration > 60 else { return }
+        let titleKey = ProgressStore.key(metaID: meta.id, video: currentVideo)
+        let watched = max(position - sessionStartPosition, 0)
+        if hasStartedPlayback, watched >= 5 * 60 {
+            RejectedLinks.keep(currentEntry.rejectionKey, for: titleKey)
+        } else {
+            RejectedLinks.reject(currentEntry.rejectionKey, for: titleKey)
+        }
+    }
+
     /// Called when the exit sequence starts. Persists progress, halts
     /// playback, and detaches the render surface before teardown. Display
     /// criteria are released separately by `releaseDisplayForExit()`, after the
@@ -4382,6 +4733,7 @@ final class PlayerViewModel: ObservableObject {
         guard !isExiting else { return }
         isExiting = true
         saveProgress()
+        recordLinkVerdict()
         cacheTask?.cancel()
         thumbnailTask?.cancel()
         thumbnailer?.cancel()   // aborts its FFmpeg session, even mid-read
@@ -4536,6 +4888,7 @@ final class PlayerViewModel: ObservableObject {
     /// then releases playback — so the movie opens straight into smooth,
     /// cached video instead of stuttering on a thin buffer.
     private func beginPrecache() {
+        NSLog("[OrivioPlay] player: pre-cache hold begins (target %.0fs)", cacheTargetSeconds)
         guard !hasStartedPlayback else { return }
         playerLayer?.pause()
         loadPhase = .caching
@@ -4596,10 +4949,23 @@ final class PlayerViewModel: ObservableObject {
         // ceiling for 1080p — it visibly nicks playback there no matter how
         // "idle" the network is. Skip; the scrub HUD falls back to the time
         // chip, exactly as it already does for HLS and oversized files.
-        guard !PerformanceProfile.isLowPower else { return }
-        guard !thumbnailsStarted,
-              let url = currentURL,
-              url.pathExtension.lowercased() != "m3u8" else { return }
+        // Each of these silently produced NO previews at all, which is
+        // indistinguishable from a broken thumbnailer from the sofa. Say which
+        // gate fired so "the preview window doesn't generate frames" is
+        // answerable from a device log.
+        guard settings.scrubPreviewsEnabled else {
+            NSLog("[OrivioPlayer] scrub previews skipped: turned off in Settings")
+            return
+        }
+        guard !PerformanceProfile.isLowPower else {
+            NSLog("[OrivioPlayer] scrub previews skipped: low-power device")
+            return
+        }
+        guard !thumbnailsStarted, let url = currentURL else { return }
+        guard url.pathExtension.lowercased() != "m3u8" else {
+            NSLog("[OrivioPlayer] scrub previews skipped: HLS source")
+            return
+        }
         thumbnailsStarted = true
         thumbnailTask = Task { [weak self] in
             // The preview pass opens a SECOND connection and decodes dozens of
@@ -4611,37 +4977,77 @@ final class PlayerViewModel: ObservableObject {
             let headers = self?.currentEntry.stream.behaviorHints?.proxyHeaders?.requestHeaders
             var bytes = self?.currentEntry.stream.behaviorHints?.videoSize
             if bytes == nil { bytes = await Self.remoteContentLength(url, headers: headers) }
-            guard let bytes, bytes > 0, bytes <= 8 * 1_073_741_824 else { return }
-            // Hold until the playback cache is essentially full (reader idle)
-            // so the pass never competes with the initial buffering.
+            guard let bytes, bytes > 0, bytes <= 8 * 1_073_741_824 else {
+                NSLog("[OrivioPlayer] scrub previews skipped: source size %@",
+                      bytes.map { "\($0 / 1_048_576) MB (over the 8 GB cap)" } ?? "unknown")
+                return
+            }
+            // A short settle only. This used to hold until the playback cache
+            // was essentially full — which on a slow source meant the pass
+            // started MINUTES in (or hit the 120s timeout), so the preview
+            // window was empty for exactly the stretch of film you had not
+            // watched yet. Previews are wanted from the start and across the
+            // whole file, including parts never played, so the pass now begins
+            // as soon as playback is stable and streams its frames out as it
+            // goes. It is still a second connection competing with playback —
+            // if that shows up as early stutter, this settle is the dial.
             let waitStart = Date()
-            // Gate on a fraction of the cache the session ACTUALLY got, not a
-            // fixed 18s. The tier defaults (24s/36s/90s) are only the starting
-            // point — the device-memory ceiling then clamps them to 6s on the
-            // 2 GB Apple TV HD and 12s on the 3 GB 4K gen-1, so a hardcoded 18
-            // was unsatisfiable on exactly the boxes this gate protects. They
-            // fell through to the 120s timeout every time and then ran the
-            // preview pass against live playback — the opposite of the intent.
-            let cap = await MainActor.run { self?.currentOptions?.maxBufferDuration ?? 24 }
-            let gate = max(min(18, cap * 0.75), 4)
             while !Task.isCancelled {
                 guard let self else { return }
-                let ahead = self.buffered - self.position
-                if self.hasStartedPlayback && ahead >= gate { break }
-                // VLC exposes no ahead-buffer at all (`buffered` is pinned to
-                // 0 on that path), so the cache gate above can NEVER pass —
-                // every VLC session fell through to the 120s timeout and then
-                // ran the decode pass against live playback, which is the exact
-                // thing the gate exists to prevent. Give it a fixed settle.
-                if self.usingVLC, self.hasStartedPlayback,
-                   Date().timeIntervalSince(waitStart) > 20 { break }
-                if Date().timeIntervalSince(waitStart) > 120 { break }
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                // Wait for a HEALTHY buffer, not just a few seconds on the
+                // clock. Opening the pass is not free even before it decodes a
+                // frame — a second connection, avformat_open_input and a
+                // stream-info probe — and doing that while the movie is still
+                // establishing its own buffer is a burst right at the start,
+                // which is the one-off stall a few seconds into playback. The
+                // per-frame gate can't help: this happens before the first
+                // frame. The 45s ceiling keeps a source that never reports a
+                // buffer (VLC) from waiting forever.
+                let healthy = self.bufferAhead.wrappedValue >= 12
+                if self.hasStartedPlayback, healthy,
+                   Date().timeIntervalSince(waitStart) > 5 { break }
+                if Date().timeIntervalSince(waitStart) > 45 { break }
+                try? await Task.sleep(nanoseconds: 500_000_000)
             }
             guard !Task.isCancelled else { return }
-            let thumbnailer = ScrubThumbnailer(url: url, headers: headers)
+            // One frame per 30 seconds of runtime rather than a flat 36 across
+            // the whole film: 36 frames on a two-hour movie is a preview every
+            // THREE AND A HALF MINUTES, so the window showed a frame from a
+            // different scene than the one under the playhead. The budget
+            // scales with the count or a long film would hit the wall-clock
+            // limit part-way through and leave the back half with no previews.
+            let runtime = await MainActor.run { self?.duration ?? 0 }
+            let frames = ScrubThumbnailer.frameCount(forDuration: runtime)
+            // Roughly 2.5s a frame: each one is a seek plus a decode over the
+            // network, and the old `max(60, frames)` (one second each) cut a
+            // long film's pass off less than half way through.
+            let budget = min(TimeInterval(frames) * 2.5, 900)
+            NSLog("[OrivioPlayer] scrub previews: %d frames over %.0fs runtime (budget %.0fs)",
+                  frames, runtime, budget)
+            // VLC never reports an ahead-buffer (it is pinned to 0), so gating
+            // on it there would stall the pass forever — let it run ungated,
+            // which is what it did before any of this.
+            let gated = await MainActor.run { !(self?.usingVLC ?? false) }
+            let health = self?.bufferAhead
+            var proceed: (@Sendable () -> Bool)?
+            if gated, let health {
+                proceed = { health.wrappedValue >= 8 }
+            }
+            let thumbnailer = ScrubThumbnailer(
+                url: url, count: frames, budgetSeconds: budget,
+                headers: headers, shouldProceed: proceed
+            )
             self?.thumbnailer = thumbnailer
-            let thumbs = await thumbnailer.generate()
+            // Publish frames AS THEY LAND rather than only at the end. A pass
+            // over a long film can run for minutes behind the cache gate, and
+            // an all-or-nothing hand-off meant the scene window showed nothing
+            // at all for that whole time — indistinguishable from broken.
+            let thumbs = await thumbnailer.generate { partial in
+                Task { @MainActor [weak self] in
+                    guard let self, self.thumbnailer === thumbnailer else { return }
+                    self.scrubThumbnails = partial
+                }
+            }
             guard !Task.isCancelled, self?.thumbnailer === thumbnailer else { return }
             self?.thumbnailer = nil
             guard !thumbs.isEmpty else { return }
@@ -4678,7 +5084,90 @@ final class PlayerViewModel: ObservableObject {
     }
 
     /// Nearest preview frame for a scrub target, if generation has finished.
+    /// Dense frames around the playhead, one every two seconds, generated when
+    /// the fine-tune wheel engages. Separate from `scrubThumbnails` so the
+    /// coarse whole-film set is never thrown away by a fine pass.
+    @Published private(set) var fineThumbnails: [ScrubThumbnail] = []
+    private var fineThumbnailer: ScrubThumbnailer?
+    private var fineTask: Task<Void, Never>?
+    /// Centre of the window `fineThumbnails` covers, so a small wheel movement
+    /// doesn't restart the pass.
+    private var fineCenter: Double?
+
+    /// Start (or re-centre) the fine pass. Called when the wheel engages and as
+    /// the target drifts out of the window already covered.
+    private func startFineThumbnailsIfNeeded(around target: Double) {
+        guard settings.scrubPreviewsEnabled, !PerformanceProfile.isLowPower,
+              thumbnailsStarted, duration > 0 else { return }
+        let half = ScrubThumbnailer.fineWindowSeconds / 2
+        // Still inside the covered window (with a margin) — nothing to do.
+        if let centre = fineCenter, abs(centre - target) < half * 0.5 { return }
+        guard let url = currentURL, url.pathExtension.lowercased() != "m3u8" else { return }
+
+        fineCenter = target
+        fineTask?.cancel()
+        fineThumbnailer?.cancel()
+        let lower = max(target - half, 0)
+        let upper = min(target + half, max(duration - 1, 0))
+        guard upper > lower else { return }
+        let count = max(4, Int((upper - lower) / ScrubThumbnailer.fineSecondsPerFrame))
+        let headers = currentEntry.stream.behaviorHints?.proxyHeaders?.requestHeaders
+
+        fineTask = Task { [weak self] in
+            let health = await MainActor.run { self?.bufferAhead }
+            var proceed: (@Sendable () -> Bool)?
+            if let health { proceed = { health.wrappedValue >= 6 } }
+            let fine = ScrubThumbnailer(url: url, count: count, budgetSeconds: 30,
+                                        headers: headers, range: lower...upper,
+                                        shouldProceed: proceed)
+            await MainActor.run { self?.fineThumbnailer = fine }
+            let thumbs = await fine.generate { partial in
+                Task { @MainActor [weak self] in
+                    guard let self, self.fineThumbnailer === fine else { return }
+                    self.fineThumbnails = partial
+                }
+            }
+            await MainActor.run {
+                guard let self, self.fineThumbnailer === fine else { return }
+                self.fineThumbnailer = nil
+                if !thumbs.isEmpty { self.fineThumbnails = thumbs.sorted { $0.time < $1.time } }
+            }
+        }
+    }
+
+    /// Drop the dense set when fine-tuning ends — it is ~45 frames held only
+    /// for the window you were working in.
+    private func clearFineThumbnails() {
+        fineTask?.cancel(); fineTask = nil
+        fineThumbnailer?.cancel(); fineThumbnailer = nil
+        fineCenter = nil
+        if !fineThumbnails.isEmpty { fineThumbnails = [] }
+    }
+
+    /// How far a coarse frame may be from the asked-for time and still be
+    /// worth showing: one and a half times the spacing the pass has reached so
+    /// far, never tighter than three of its target steps.
+    private var coarseTolerance: Double {
+        guard scrubThumbnails.count > 1, duration > 0 else { return .infinity }
+        let spacing = duration / Double(scrubThumbnails.count)
+        return max(ScrubThumbnailer.secondsPerFrame * 3, spacing * 1.5)
+    }
+
     func thumbnail(at time: Double) -> UIImage? {
+        // Prefer a fine frame when one is genuinely near — within a single
+        // fine step. Past that the coarse set is the better answer than a
+        // stale close-up from the edge of the window.
+        if !fineThumbnails.isEmpty {
+            var best: ScrubThumbnail?
+            var bestDistance = Double.infinity
+            for thumb in fineThumbnails {
+                let distance = abs(thumb.time - time)
+                if distance < bestDistance { bestDistance = distance; best = thumb }
+            }
+            if let best, bestDistance <= ScrubThumbnailer.fineSecondsPerFrame {
+                return best.image
+            }
+        }
         guard !scrubThumbnails.isEmpty else { return nil }
         var best: UIImage?
         var bestDistance = Double.infinity
@@ -4689,6 +5178,14 @@ final class PlayerViewModel: ObservableObject {
                 best = thumb.image
             }
         }
+        // Reject a frame that is nowhere near this scene — but judge "near" by
+        // the coverage that actually EXISTS, not by the spacing the pass is
+        // aiming for. A flat 90s cut-off meant that early on, when the pass had
+        // only laid down a coarse spread, almost every position was further
+        // than that from a frame and the window simply refused to appear. The
+        // tolerance now starts wide and tightens on its own as frames fill in,
+        // so there is always something to show and it gets more accurate.
+        guard bestDistance <= coarseTolerance else { return nil }
         return best
     }
 
@@ -4697,19 +5194,39 @@ final class PlayerViewModel: ObservableObject {
     private static func remoteContentLength(
         _ url: URL, headers: [String: String]? = nil
     ) async -> Int64? {
-        var request = URLRequest(url: url)
-        request.httpMethod = "HEAD"
-        request.timeoutInterval = 8
-        for (key, value) in headers ?? [:] {
-            request.setValue(value, forHTTPHeaderField: key)
+        func probe(_ method: String, range: Bool) async -> Int64? {
+            var request = URLRequest(url: url)
+            request.httpMethod = method
+            request.timeoutInterval = 8
+            for (key, value) in headers ?? [:] {
+                request.setValue(value, forHTTPHeaderField: key)
+            }
+            if range { request.setValue("bytes=0-0", forHTTPHeaderField: "Range") }
+            guard let (_, response) = try? await URLSession.shared.data(for: request),
+                  let http = response as? HTTPURLResponse,
+                  (200..<300).contains(http.statusCode) else { return nil }
+            // A ranged reply carries the real total after the slash:
+            // "Content-Range: bytes 0-0/8123456789". Content-Length on that
+            // reply is 1, so it must be read from Content-Range, not from it.
+            if range, let content = http.value(forHTTPHeaderField: "Content-Range"),
+               let total = content.split(separator: "/").last, let bytes = Int64(total),
+               bytes > 0 {
+                return bytes
+            }
+            if !range, let length = http.value(forHTTPHeaderField: "Content-Length"),
+               let bytes = Int64(length), bytes > 0 {
+                return bytes
+            }
+            return nil
         }
-        guard let (_, response) = try? await URLSession.shared.data(for: request),
-              let http = response as? HTTPURLResponse else { return nil }
-        if let length = http.value(forHTTPHeaderField: "Content-Length"),
-           let bytes = Int64(length), bytes > 0 {
-            return bytes
-        }
-        return nil
+
+        if let bytes = await probe("HEAD", range: false) { return bytes }
+        // Plenty of stream hosts — debrid endpoints especially — answer HEAD
+        // with 405, or with no Content-Length at all. A one-byte ranged GET is
+        // what actually works, and it costs a single byte. Without this the
+        // size read as "unknown", which the caller treats as "skip", so scrub
+        // previews were never generated for those sources at all.
+        return await probe("GET", range: true)
     }
 
     // MARK: - Pull-down info panel
@@ -5096,7 +5613,24 @@ extension PlayerViewModel: KSPlayerLayerDelegate {
             startThumbnailsIfNeeded()
 
             let resume = pendingResume ?? 0
-            let meaningfulResume = resume > 30 && (duration == 0 || resume < duration - 30)
+            var meaningfulResume = resume > 30 && (duration == 0 || resume < duration - 30)
+            // `startPlayTime` already opened the container at the resume point,
+            // so the engine is sitting there — seeking again would flush a
+            // buffer that is already in the right place and pay the cost this
+            // change exists to avoid. Only seek if the open didn't land near
+            // the target (an engine that ignores the option, or a container
+            // FFmpeg couldn't seek during open).
+            if meaningfulResume, currentOptions?.startPlayTime ?? 0 > 0 {
+                let landed = layer.player.currentPlaybackTime
+                if abs(landed - resume) < 10 {
+                    NSLog("[OrivioPlayer] resume: opened at %.0fs, no seek needed", landed)
+                    meaningfulResume = false
+                    pendingResume = nil
+                    sessionResumeFloor = max(sessionResumeFloor, resume)
+                    position = landed
+                    clock.position = landed
+                }
+            }
 
             if willPrecache {
                 // Auto-resume at the saved position (if any) and hold playback
@@ -5177,13 +5711,17 @@ extension PlayerViewModel: KSPlayerLayerDelegate {
                 if overlay == .none { showControls() }
             }
         case .buffering:
-            isPlaying = true
+            // NOT unconditionally true: the reader buffers while paused too.
+            isPlaying = !pauseIntent
             isBuffering = true
-            pausedAt = nil
+            // `pausedAt` drives the stale-socket reconnect on resume, so a
+            // buffer event must not erase how long we have actually been sat
+            // paused — only a real resume does.
+            if !pauseIntent { pausedAt = nil }
         case .bufferFinished:
-            isPlaying = true
+            isPlaying = !pauseIntent
             isBuffering = false
-            pausedAt = nil
+            if !pauseIntent { pausedAt = nil }
             // Some engines (notably the FFmpeg path) go straight to playing
             // without a `.readyToPlay`, so dismiss the loading backdrop here
             // too — unless the initial pre-cache is still holding playback.
@@ -5369,42 +5907,3 @@ final class DVEmbeddedSubtitleInfo: SubtitleInfo {
     }
 }
 
-/// Releases the display-mode pin AFTER the player is gone.
-///
-/// Used only when "Restore display mode on exit" is OFF. That setting means
-/// "don't fight the TV during teardown" — but it also left
-/// `preferredDisplayCriteria` pinned for the REST OF THE APP'S LIFE, because
-/// `displayCriteriaApplied` lives on the player view model and dies with it
-/// and nothing else ever cleared the pin. The Apple TV therefore stayed in the
-/// video's HDR/DV mode and the whole SDR interface rendered washed out — the
-/// "screen goes grey after exiting, even on non-DV content" report. (Non-DV
-/// too, because Match Frame Rate alone applies criteria.) The setting's own
-/// description said tvOS would move the display back on its own terms; it
-/// cannot, while the pin is held.
-///
-/// So the pin IS released — just not during the teardown race. Waiting until
-/// the player is dismissed and the home UI has been static for a beat is the
-/// sequencing difference that matters on panels which mis-handshake a switch
-/// made over a video surface being destroyed.
-@MainActor
-enum DisplayModeRestorer {
-    private static var pending: Task<Void, Never>?
-
-    /// A new playback just claimed the display — abandon any pending release,
-    /// or it would yank the mode out from under the video that just started.
-    static func cancelPending() {
-        pending?.cancel()
-        pending = nil
-    }
-
-    static func scheduleRelease(after delay: Double = 3) {
-        cancelPending()
-        pending = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-            guard !Task.isCancelled else { return }
-            UIApplication.shared.ks_keyWindow?.avDisplayManager.preferredDisplayCriteria = nil
-            NSLog("[OrivioDisplay] released the display-mode pin after exit")
-            pending = nil
-        }
-    }
-}

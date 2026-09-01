@@ -535,20 +535,6 @@ struct MetaVideo: Codable, Identifiable, Hashable {
         return ymd.date(from: String(released.prefix(10)))
     }
 
-    func withDisplaySeason(_ season: Int, episode: Int) -> MetaVideo {
-        MetaVideo(
-            id: id,
-            title: title,
-            season: season,
-            episode: episode,
-            thumbnail: thumbnail,
-            overview: overview,
-            released: released,
-            originalSeason: originalSeason ?? self.season,
-            originalEpisode: originalEpisode ?? self.episode
-        )
-    }
-
     /// Air date formatted for display ("Jun 25, 2021"), or nil if unknown.
     var airedText: String? {
         guard let released, !released.isEmpty else { return nil }
@@ -994,6 +980,21 @@ struct StreamEntry: Identifiable, Hashable {
     let id = UUID()
     let addonName: String
     let stream: Stream
+
+    /// Identity that survives between sessions, for remembering a link the
+    /// viewer walked out on. NOT the URL: a debrid link is freshly signed on
+    /// every resolve, so keying on it would never match twice. An infoHash is
+    /// the same torrent forever; a filename is the same file; the display
+    /// strings are the last resort.
+    var rejectionKey: String {
+        if let hash = stream.infoHash?.lowercased(), !hash.isEmpty {
+            return "hash:\(hash)#\(stream.fileIdx ?? -1)"
+        }
+        if let file = stream.behaviorHints?.filename, !file.isEmpty {
+            return "file:\(addonName)|\(file)"
+        }
+        return "name:\(addonName)|\(displayName)|\(displayDetail)"
+    }
     /// Display strings PRECOMPUTED here, once per entry: computing them in
     /// row bodies (regex + string builds, × every visible row × every focus
     /// move) was the main Sources-page scroll cost.
@@ -1085,6 +1086,3 @@ struct AnyIgnorable: Codable {
     }
 }
 
-struct ManifestEnvelope: Codable {
-    let manifest: AddonManifest?
-}

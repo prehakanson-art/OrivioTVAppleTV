@@ -273,6 +273,15 @@ final class DVSampleEngine {
     /// Repeats+skips from the last completed vsync window — the servo's
     /// evidence gate (never steer a healthy presentation).
     private var dlLastWindowDamage = 0
+    /// The last vsync census, in the same words `dvDiag` logs it.
+    ///
+    /// The census is the only direct measurement of whether frames are
+    /// actually reaching the glass on cadence, and it was DEBUG-only NSLog —
+    /// invisible once the moment has passed. Judder reported after the fact
+    /// could not be attributed to repeats, to clock drift or to decode stalls,
+    /// because none of it survived. Mirrored here so the periodic trail entry
+    /// can carry it into `dev.dvTrail`, which is readable off the device.
+    private(set) var lastVsyncCensus = ""
 
     // Phase steering: slo-mo footage of the panel proved real repeat+catch-up
     // pairs (~3/s) with a mathematically perfect clock — the signature of
@@ -351,6 +360,11 @@ final class DVSampleEngine {
             dvDiag("vsync probe: %d refreshes, %d repeats, %d skips, clock %+.0fppm, avSkew=%.2fs, decodeStalls=%d (worst %dms)",
                   dlTicks, dlRepeats, dlSkips, ppm, lastQueuedVideoPTS - lastQueuedAudioPTS,
                   pullGapCount, pullGapWorstMs)
+            lastVsyncCensus = String(
+                format: "vsync %d/%dr/%ds clk%+.0fppm skew%.2f stalls%d(%dms)",
+                dlTicks, dlRepeats, dlSkips, ppm,
+                lastQueuedVideoPTS - lastQueuedAudioPTS, pullGapCount, pullGapWorstMs
+            )
             pullGapCount = 0
             pullGapWorstMs = 0
             dlLastWindowDamage = dlRepeats + dlSkips
@@ -365,6 +379,29 @@ final class DVSampleEngine {
     private var lastProbeWall: CFAbsoluteTime = 0
     private var lastProbeMedia: Double = 0
     private var demuxEOF = false
+    /// End-of-stream is reported exactly ONCE per playback.
+    ///
+    /// Both drain paths below compute `ended` inside a
+    /// `requestMediaDataWhenReady` block, which AVFoundation re-invokes for as
+    /// long as the layer wants media. With the queues empty and EOF set, every
+    /// one of those invocations fired `onEnded` again — and on the other end
+    /// that is `handlePlayedToEnd`, which saves progress (a published store
+    /// write) and re-assigns the post-play overlay. Dozens of times a second,
+    /// for as long as the movie sat at its end. That is the app locking up when
+    /// a film finishes: not a missing case, a repeating one.
+    private var didSignalEnd = false
+
+    /// Report the end once, and stop asking for media. Without the stop, the
+    /// display layer keeps re-invoking the feed block against an empty queue —
+    /// a spin on the feed queue for the whole time the finished movie is on
+    /// screen, on top of the repeated callbacks.
+    private func signalEndOnce() {
+        guard !didSignalEnd else { return }
+        didSignalEnd = true
+        displayLayer.stopRequestingMediaData()
+        audioRenderer.stopRequestingMediaData()
+        DispatchQueue.main.async { [weak self] in self?.onEnded?() }
+    }
 
     @Atomic private var cancelled = false
     /// Total stream bytes demuxed (packet payloads) — probe reads the delta
@@ -1677,7 +1714,7 @@ final class DVSampleEngine {
             let draining = demuxEOF && compressedEmpty
             guard depth > 0, draining || depth > reorderHoldback else {
                 decodedLock.unlock()
-                if ended { DispatchQueue.main.async { [weak self] in self?.onEnded?() } }
+                if ended { signalEndOnce() }
                 return
             }
             let frame = decodedHeap.removeFirst()
@@ -1748,7 +1785,7 @@ final class DVSampleEngine {
             queueLock.broadcast()
             queueLock.unlock()
             guard let sample else {
-                if ended { DispatchQueue.main.async { [weak self] in self?.onEnded?() } }
+                if ended { signalEndOnce() }
                 return
             }
             if video { displayLayer.enqueue(sample) } else { audioRenderer.enqueue(sample) }

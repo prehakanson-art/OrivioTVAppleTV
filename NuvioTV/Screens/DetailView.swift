@@ -141,11 +141,20 @@ private extension View {
     /// Adds a hold-Select "Play Manually" menu to the Play button when Auto
     /// Link Selector is on; a no-op otherwise (Play already opens the list).
     @ViewBuilder
-    func playManuallyMenu(enabled: Bool, action: @escaping () -> Void) -> some View {
+    func playManuallyMenu(enabled: Bool,
+                          action: @escaping () -> Void,
+                          infuse: (() -> Void)? = nil) -> some View {
         if enabled {
             contextMenu {
                 Button(action: action) {
                     Label("Play Manually", systemImage: "list.and.film")
+                }
+                // Only offered when Infuse is actually installed — a menu entry
+                // that opens nothing is worse than no entry.
+                if let infuse, ExternalPlayers.isInfuseInstalled {
+                    Button(action: infuse) {
+                        Label("Play in Infuse", systemImage: "arrow.up.forward.app.fill")
+                    }
                 }
             }
         } else {
@@ -171,6 +180,8 @@ struct DetailView: View {
     let onPlay: (MetaItem, MetaVideo?) -> Void
     /// Open the manual source list, bypassing Auto Link Selector (hold-Play).
     var onPlayManually: (MetaItem, MetaVideo?) -> Void = { _, _ in }
+    /// Resolve the auto-picked link and hand it to Infuse (hold-Play).
+    var onPlayInInfuse: (MetaItem, MetaVideo?) -> Void = { _, _ in }
     let onPlayFromBeginning: (MetaItem, MetaVideo?) -> Void
     var onSelectItem: (MetaItem) -> Void = { _ in }
     var onSelectPerson: (Int, String) -> Void = { _, _ in }
@@ -189,6 +200,7 @@ struct DetailView: View {
         item: MetaItem,
         onPlay: @escaping (MetaItem, MetaVideo?) -> Void,
         onPlayManually: @escaping (MetaItem, MetaVideo?) -> Void = { _, _ in },
+        onPlayInInfuse: @escaping (MetaItem, MetaVideo?) -> Void = { _, _ in },
         onPlayFromBeginning: @escaping (MetaItem, MetaVideo?) -> Void = { _, _ in },
         onSelectItem: @escaping (MetaItem) -> Void = { _ in },
         onSelectPerson: @escaping (Int, String) -> Void = { _, _ in },
@@ -197,6 +209,7 @@ struct DetailView: View {
         _viewModel = StateObject(wrappedValue: DetailViewModel(item: item))
         self.onPlay = onPlay
         self.onPlayManually = onPlayManually
+        self.onPlayInInfuse = onPlayInInfuse
         self.onPlayFromBeginning = onPlayFromBeginning
         self.onSelectItem = onSelectItem
         self.onSelectPerson = onSelectPerson
@@ -389,9 +402,11 @@ struct DetailView: View {
                         }
                         // Auto Link Selector on: hold Play to pick a source
                         // manually instead of auto-playing the best match.
-                        .playManuallyMenu(enabled: autoLinkOn) {
-                            onPlayManually(viewModel.meta, target)
-                        }
+                        .playManuallyMenu(
+                            enabled: autoLinkOn,
+                            action: { onPlayManually(viewModel.meta, target) },
+                            infuse: { onPlayInInfuse(viewModel.meta, target) }
+                        )
                         // Start Over sits right next to Resume: replay the
                         // in-progress episode from 0:00.
                         if episodeInProgress(target) {
@@ -404,9 +419,11 @@ struct DetailView: View {
                     PlayActionButton(title: playButtonTitle) {
                         onPlay(viewModel.meta, nil)
                     }
-                    .playManuallyMenu(enabled: autoLinkOn) {
-                        onPlayManually(viewModel.meta, nil)
-                    }
+                    .playManuallyMenu(
+                        enabled: autoLinkOn,
+                        action: { onPlayManually(viewModel.meta, nil) },
+                        infuse: { onPlayInInfuse(viewModel.meta, nil) }
+                    )
                     // Movie with saved progress → offer a fresh start.
                     if playButtonTitle == "Resume" {
                         CircleIconButton(systemName: "gobackward", active: false) {
@@ -823,8 +840,7 @@ struct CastChip: View {
             }
         }
         .frame(width: 170)
-        .scaleEffect(isFocused ? 1.08 : 1)
-        .animation(.spring(response: 0.32, dampingFraction: 0.82), value: isFocused)
+        .focusLift(NuvioFocus.card, isFocused)
     }
 }
 
@@ -845,8 +861,7 @@ struct CompanyLogo: View {
                 RoundedRectangle(cornerRadius: NuvioRadius.md, style: .continuous)
                     .strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 4)
             )
-            .scaleEffect(isFocused ? 1.06 : 1)
-            .animation(.spring(response: 0.32, dampingFraction: 0.82), value: isFocused)
+            .focusLift(NuvioFocus.card, isFocused)
     }
 }
 
@@ -894,8 +909,7 @@ struct CommentCard: View {
                 .strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 3)
         )
         .focusable()
-        .scaleEffect(isFocused ? 1.03 : 1)
-        .animation(.spring(response: 0.32, dampingFraction: 0.82), value: isFocused)
+        .focusLift(NuvioFocus.row, isFocused)
     }
 }
 
@@ -938,8 +952,7 @@ private struct CircleIconLabel: View {
             // Fusion accent focus glow.
             .shadow(color: isFocused ? theme.effectiveFocusGlow : .clear,
                     radius: theme.isAppleTVTheme && isFocused ? 22 : 0)
-            .scaleEffect(isFocused ? 1.06 : 1)
-            .animation(theme.isAppleTVTheme ? FusionMotion.focusEntry : .spring(response: 0.3, dampingFraction: 0.8), value: isFocused)
+            .focusLift(NuvioFocus.control, isFocused)
     }
 }
 
@@ -962,69 +975,6 @@ struct PlayActionButton: View {
     }
 }
 
-/// Bookmark toggle that adds/removes the title from the synced library.
-struct LibraryToggleButton: View {
-    @EnvironmentObject private var theme: ThemeManager
-    @EnvironmentObject private var library: LibraryStore
-    let meta: MetaItem
-
-    var body: some View {
-        let saved = library.contains(meta)
-        Button {
-            library.toggle(meta)
-        } label: {
-            Label(saved ? "In Library" : "Add to Library", systemImage: saved ? "checkmark" : "plus")
-                .font(.system(size: 28, weight: .bold))
-                .foregroundStyle(theme.palette.textPrimary)
-                .padding(.horizontal, NuvioSpacing.xl)
-                .padding(.vertical, NuvioSpacing.md)
-                .background(LibraryToggleCapsule(saved: saved))
-        }
-        .buttonStyle(PlainCardButtonStyle())
-    }
-}
-
-private struct LibraryToggleCapsule: View {
-    @EnvironmentObject private var theme: ThemeManager
-    @Environment(\.isFocused) private var isFocused
-    let saved: Bool
-
-    var body: some View {
-        Capsule(style: .continuous)
-            .fill(isFocused ? theme.palette.focusBackground : .white.opacity(0.12))
-            .overlay(
-                Capsule(style: .continuous)
-                    .strokeBorder(isFocused ? theme.palette.focusRing
-                                  : (saved ? theme.palette.secondary : .clear), lineWidth: 3)
-            )
-            .scaleEffect(isFocused ? 1.05 : 1)
-            .animation(.spring(response: 0.3, dampingFraction: 0.8), value: isFocused)
-    }
-}
-
-/// Movie-level watched toggle that records/removes a watched-history entry.
-struct WatchedToggleButton: View {
-    @EnvironmentObject private var theme: ThemeManager
-    @EnvironmentObject private var watched: WatchedStore
-    let meta: MetaItem
-
-    var body: some View {
-        let isWatched = watched.isWatched(meta)
-        Button {
-            watched.toggleMovie(meta)
-        } label: {
-            Label(isWatched ? "Watched" : "Mark Watched",
-                  systemImage: isWatched ? "checkmark.circle.fill" : "checkmark.circle")
-                .font(.system(size: 28, weight: .bold))
-                .foregroundStyle(theme.palette.textPrimary)
-                .padding(.horizontal, NuvioSpacing.xl)
-                .padding(.vertical, NuvioSpacing.md)
-                .background(LibraryToggleCapsule(saved: isWatched))
-        }
-        .buttonStyle(PlainCardButtonStyle())
-    }
-}
-
 /// Capsule background that brightens and rings while its button is focused.
 private struct FocusAwareCapsule: View {
     @EnvironmentObject private var theme: ThemeManager
@@ -1038,8 +988,7 @@ private struct FocusAwareCapsule: View {
                     .strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 3)
             )
             .shadow(color: theme.palette.secondary.opacity(isFocused ? 0.55 : 0), radius: 22, y: 8)
-            .scaleEffect(isFocused ? 1.05 : 1)
-            .animation(.spring(response: 0.3, dampingFraction: 0.8), value: isFocused)
+            .focusLift(NuvioFocus.card, isFocused)
     }
 }
 
@@ -1064,8 +1013,7 @@ struct SeasonChip: View {
                 Capsule(style: .continuous)
                     .strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 2.5)
             )
-            .scaleEffect(isFocused ? 1.06 : 1)
-            .animation(.spring(response: 0.3, dampingFraction: 0.8), value: isFocused)
+            .focusLift(NuvioFocus.card, isFocused)
     }
 }
 
@@ -1259,7 +1207,7 @@ private struct RatingPickerOverlay: View {
                                     RoundedRectangle(cornerRadius: 14, style: .continuous)
                                         .strokeBorder(focus == n ? theme.palette.secondary : .clear, lineWidth: 4)
                                 )
-                                .scaleEffect(focus == n ? 1.08 : 1)
+                                .focusLift(NuvioFocus.control, focus == n)
                         }
                         .buttonStyle(.plain)
                         .focused($focus, equals: n)

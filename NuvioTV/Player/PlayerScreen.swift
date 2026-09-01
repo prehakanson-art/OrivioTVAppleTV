@@ -148,22 +148,17 @@ struct PlayerScreen: View {
             // Peek bar (light tap): position + when you started / when you'll
             // finish — no menu. Click drops into scrub to edit the time.
             if viewModel.peekVisible, viewModel.overlay == .none, !viewModel.isScrubbing {
-                PeekBar(clock: viewModel.clock)
-                    .transition(.opacity)
+                // Fusion shows its OWN bar here rather than the stock peek bar,
+                // so a light tap — and the quick-seek below — look like the
+                // controls you get a moment later instead of a different player.
+                FusionInertOverlay(viewModel: viewModel).transition(.opacity)
             }
 
 
             scrubHUD
 
             if viewModel.overlay == .controls {
-                // Player overlay is an independent LOOK axis (Settings → Themes →
-                // Player Layout), selectable regardless of the app theme.
-                switch theme.playerStyle {
-                case .hbo:
-                    NativePlayerControlsOverlay(viewModel: viewModel).transition(.opacity)
-                case .classic:
-                    PlayerControlsOverlay(viewModel: viewModel).transition(.opacity)
-                }
+                FusionPlayerControlsOverlay(viewModel: viewModel).transition(.opacity)
                 if viewModel.settings.osdClockEnabled {
                     OSDClock()
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
@@ -183,14 +178,34 @@ struct PlayerScreen: View {
             // snapping in as a block before the panel slid into it.
             sidePanels
 
-            if viewModel.overlay == .info {
+            // The sheet is ALWAYS MOUNTED and simply parked above the top of
+            // the screen, sliding down on a plain `.offset`. It is never
+            // inserted or removed, so there is no transition at all.
+            //
+            // That is the point. A transition needs an animation transaction to
+            // drive it, and this subtree sits inside the player ZStack's own
+            // `.animation(value: viewModel.overlay)` as well as this one — two
+            // transactions, two different durations, both firing on the same
+            // state change. SwiftUI ran the transition twice, which is why two
+            // copies of the sheet were on screen a few points apart and the
+            // title looked ghosted. Neither shortening the travel nor measuring
+            // it could fix that, because the duplication was never about the
+            // distance. With the view permanently mounted there is nothing to
+            // insert, nothing to remove, and only one animatable value.
+            //
+            // Cost: the panel's artwork loads once when playback starts rather
+            // than on first pull-down. It is the same poster and cast row the
+            // Detail page already cached, and it buys a slide that cannot
+            // desync.
+            if viewModel.hasStartedPlayback {
                 VStack(spacing: 0) {
                     InfoPullDownPanel(viewModel: viewModel)
-                        // The sheet is its own height and slides down from the
-                        // top edge as ONE rigid unit (poster + text together).
-                        .transition(.move(edge: .top))
+                        .offset(y: viewModel.overlay == .info ? 0 : -900)
+                        .animation(.easeOut(duration: 0.3),
+                                   value: viewModel.overlay == .info)
                     Spacer(minLength: 0)
                 }
+                .allowsHitTesting(viewModel.overlay == .info)
             }
 
             if viewModel.overlay == .upNext {
@@ -238,8 +253,12 @@ struct PlayerScreen: View {
             // Quick-seek HUD: shown while accumulating D-pad skips over the
             // bare video (controls hidden). Reflects the running total.
             if viewModel.pendingSeekDelta != 0, viewModel.overlay != .controls, !viewModel.isScrubbing {
-                SeekHUD(clock: viewModel.clock, delta: viewModel.pendingSeekDelta)
-                    .transition(.opacity)
+                // Not drawn twice: the peek bar above already renders this
+                // same block, and a skip over bare video is exactly when a
+                // light tap may also have raised it.
+                if !viewModel.peekVisible {
+                    FusionInertOverlay(viewModel: viewModel).transition(.opacity)
+                }
             }
 
             // "Skip Intro" pill while inside an intro-like chapter.
@@ -449,6 +468,10 @@ struct PlayerScreen: View {
             // handled by the pan recognizer (which sets moveSuppressed). So
             // ONLY a real directional CLICK gets past here.
             if viewModel.moveSuppressed { return }
+            // Fine-tune has the pad locked: swallow the move commands a
+            // circling thumb generates at the edges rather than letting them
+            // through to the jump/seek paths below.
+            if viewModel.wheelEngaged { return }
             if viewModel.isScrubbing {
                 switch direction {
                 case .left: viewModel.scrubJump(-Double(viewModel.settings.scrubJumpSeconds))
@@ -539,14 +562,10 @@ struct PlayerScreen: View {
     @ViewBuilder
     private var scrubHUD: some View {
         if viewModel.isScrubbing {
-            InfuseScrubHUD(
-                clock: viewModel.clock,
-                title: viewModel.displayTitle,
-                episodeLine: viewModel.episodeLine,
-                previewProvider: { viewModel.thumbnail(at: $0) },
-                wheelEngaged: viewModel.wheelEngaged
-            )
-            .transition(.opacity)
+            // Fusion draws the scrub view itself, using the SAME bottom block
+            // as its controls — that is what keeps the title from dropping when
+            // you enter a preview.
+            FusionInertOverlay(viewModel: viewModel, forcedScrub: true).transition(.opacity)
         }
     }
 
@@ -927,6 +946,12 @@ struct PostPlayOverlay: View {
 struct InfoPullDownPanel: View {
     @EnvironmentObject private var theme: ThemeManager
     @ObservedObject var viewModel: PlayerViewModel
+    /// File Info is assembled from the live player — track lists, the decision
+    /// log, performance counters. Built straight into `body` it was rebuilt on
+    /// every pass, including each frame of the tab cross-fade. Snapshot it when
+    /// the tab opens instead; the panel is transient and the numbers are a
+    /// point-in-time read anyway.
+    @State private var infoSections: [PlayerViewModel.MediaInfoSection] = []
 
     /// Bottom-rounded sheet shape: the top edge bleeds off-screen.
     private var sheetShape: UnevenRoundedRectangle {
@@ -950,28 +975,35 @@ struct InfoPullDownPanel: View {
             }
             .animation(.easeOut(duration: 0.18), value: viewModel.infoTab)
         }
+        .task(id: viewModel.infoTab) {
+            guard viewModel.infoTab == 1 else { return }
+            infoSections = viewModel.mediaInfoSections()
+        }
         .padding(.horizontal, NuvioSpacing.huge)
         .padding(.top, NuvioSpacing.xl)
         .padding(.bottom, NuvioSpacing.lg)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
-            // System-player look: dark material sheet, hairline edge, soft
-            // drop shadow onto the video. The whole sheet — background and
-            // content — is one unit that moves together. On the A8 the material
-            // is a live blur of the moving video under the sheet, re-run every
-            // frame the controls are up; since it already sits under a 55% black
-            // wash the blur is barely visible, so drop it for a solid dark fill.
-            Group {
-                if PerformanceProfile.isLowPower {
-                    sheetShape.fill(Color(hex: 0x0C0E12).opacity(0.9))
-                } else {
-                    sheetShape
-                        .fill(.ultraThinMaterial)
-                        .overlay(sheetShape.fill(Color.black.opacity(0.55)))
-                }
-            }
-            .overlay(sheetShape.strokeBorder(.white.opacity(0.08), lineWidth: 1))
-            .shadow(color: .black.opacity(0.55), radius: PerformanceProfile.isLowPower ? 0 : 28, y: 12)
+            // System-player look: dark sheet, hairline edge, soft drop shadow
+            // onto the video. The whole sheet — background and content — is one
+            // unit that moves together.
+            //
+            // NO material here, on any device. `.ultraThinMaterial` is a LIVE
+            // blur of the moving video behind a full-width sheet: the
+            // compositor re-samples and re-blurs it every single frame of the
+            // slide, which is what made the pull-down stutter on its way in.
+            // The A8 already opted out, and its comment said why — under a 55%
+            // black wash the blur is barely visible. That is just as true on
+            // the 4K boxes, so the blur was paying a per-frame cost for an
+            // effect nobody can see.
+            sheetShape
+                .fill(Color(hex: 0x0C0E12).opacity(0.92))
+                .overlay(sheetShape.strokeBorder(.white.opacity(0.08), lineWidth: 1))
+                // Flatten before the shadow, so it is cast once for the whole
+                // sheet instead of per layer underneath it.
+                .compositingGroup()
+                .shadow(color: .black.opacity(0.5),
+                        radius: PerformanceProfile.isLowPower ? 0 : 16, y: 10)
         )
         // Bleed past the top/side safe area as part of the sheet itself, so
         // the slide-in offsets the entire sheet uniformly.
@@ -1120,7 +1152,7 @@ struct InfoPullDownPanel: View {
     /// Tab 2 — live technical sections in a row of compact cards.
     private var fileInfoTab: some View {
         HStack(alignment: .top, spacing: NuvioSpacing.md) {
-            ForEach(viewModel.mediaInfoSections()) { section in
+            ForEach(infoSections) { section in
                 VStack(alignment: .leading, spacing: NuvioSpacing.sm) {
                     Text(section.title.uppercased())
                         .font(.system(size: 15, weight: .bold))
@@ -1280,7 +1312,6 @@ private struct SkipIntroPillLabel: View {
                 lineWidth: 1
             )
         )
-        .scaleEffect(isFocused ? 1.06 : 1)
-        .animation(.spring(response: 0.26, dampingFraction: 0.82), value: isFocused)
+        .focusLift(NuvioFocus.card, isFocused)
     }
 }

@@ -102,15 +102,85 @@ final class ScrubThumbnailer: @unchecked Sendable {
 
     @Atomic private var cancelled = false
 
+    /// One frame per this many seconds of runtime, which is what the scrub
+    /// preview is specified in. `frameCount(forDuration:)` turns it into a
+    /// count, clamped so a long film can't blow the memory budget.
+    static let secondsPerFrame: Double = 30
+    /// Ceiling on frames held in memory. At 256x144 RGBA a frame is ~147 KB, so
+    /// 240 is ~35 MB — the most this is worth spending next to a live decode.
+    /// A film longer than 2 hours simply gets a coarser spacing than 30s.
+    static let maxFrames = 240
+
+    /// Frames for a runtime, at one every `secondsPerFrame`.
+    static func frameCount(forDuration duration: Double) -> Int {
+        guard duration.isFinite, duration > 0 else { return 36 }
+        return max(12, min(Int(duration / secondsPerFrame), maxFrames))
+    }
+
+    /// Fine-tune pass: one frame every two seconds, matching the wheel's own
+    /// resolution (24 seconds a turn), over a window either side of the
+    /// playhead.
+    static let fineSecondsPerFrame: Double = 2
+    static let fineWindowSeconds: Double = 90
+
+    /// The order to visit frame slots in: progressive refinement, not front to
+    /// back. Yields 0, ½, ¼, ¾, ⅛, ⅜ … so the film is covered COARSELY FIRST
+    /// and then filled in.
+    ///
+    /// This matters because the pass is bounded by a wall-clock budget and each
+    /// frame costs a network seek. Walking 0…N sequentially meant that when the
+    /// budget ran out — which on a remote source it reliably did — every frame
+    /// collected was from the front of the film and everything after the
+    /// cut-off had none at all. Scrub into the back half and the nearest frame
+    /// was half an hour away: present, but showing the wrong scene. Visiting
+    /// slots in this order means whenever the pass stops, what it has is spread
+    /// evenly over the whole runtime.
+    static func scanOrder(_ count: Int) -> [Int] {
+        guard count > 0 else { return [] }
+        var order: [Int] = []
+        var seen = Set<Int>()
+        var step = count
+        while step > 1 {
+            var i = 0
+            while i < count {
+                if seen.insert(i).inserted { order.append(i) }
+                i += step
+            }
+            step /= 2
+        }
+        for i in 0 ..< count where seen.insert(i).inserted { order.append(i) }
+        return order
+    }
+
+    /// Seconds of runtime to cover, or nil for the whole file. A bounded range
+    /// is what the fine-tune pass uses: a frame every two seconds over a window
+    /// around the playhead, which is far too dense to run across a whole film.
+    private let range: ClosedRange<Double>?
+
+    /// Polled between frames: false means "playback needs the bandwidth and the
+    /// CPU right now", and the pass waits rather than competing.
+    ///
+    /// This exists because the pass is a SECOND connection and a SECOND FFmpeg
+    /// decoder running against live playback. It used to be held behind a gate
+    /// that waited for the playback cache to fill, which made previews arrive
+    /// minutes late (or never); removing that gate got the previews but handed
+    /// the stutter back. Yielding per frame keeps both: previews start
+    /// immediately and step aside whenever the buffer dips.
+    private let shouldProceed: (@Sendable () -> Bool)?
+
     init(
         url: URL, count: Int = 36, thumbWidth: Int32 = 256,
-        budgetSeconds: TimeInterval = 60, headers: [String: String]? = nil
+        budgetSeconds: TimeInterval = 60, headers: [String: String]? = nil,
+        range: ClosedRange<Double>? = nil,
+        shouldProceed: (@Sendable () -> Bool)? = nil
     ) {
         self.url = url
         self.count = count
         self.thumbWidth = thumbWidth
         self.budgetSeconds = budgetSeconds
         self.headers = headers
+        self.range = range
+        self.shouldProceed = shouldProceed
     }
 
     /// Aborts promptly even from a blocked network read (the interrupt callback
@@ -119,10 +189,15 @@ final class ScrubThumbnailer: @unchecked Sendable {
 
     /// Generate the frames off the caller's thread. Returns whatever was
     /// produced before the budget, the end of the file, or a cancel.
-    func generate() async -> [ScrubThumbnail] {
+    ///
+    /// `onProgress` is called from the worker thread with the frames so far,
+    /// sorted, every time a new one lands — the pass can run for minutes on a
+    /// long film, and the preview is far more useful filling in as it goes than
+    /// arriving all at once at the end.
+    func generate(onProgress: (([ScrubThumbnail]) -> Void)? = nil) async -> [ScrubThumbnail] {
         await withCheckedContinuation { continuation in
             let thread = Thread { [self] in
-                continuation.resume(returning: run())
+                continuation.resume(returning: run(onProgress: onProgress))
             }
             thread.name = "ScrubThumbnailer"
             thread.qualityOfService = .utility
@@ -132,7 +207,7 @@ final class ScrubThumbnailer: @unchecked Sendable {
 
     // MARK: - Worker thread
 
-    private func run() -> [ScrubThumbnail] {
+    private func run(onProgress: (([ScrubThumbnail]) -> Void)? = nil) -> [ScrubThumbnail] {
         let deadline = Date().addingTimeInterval(budgetSeconds)
         var thumbnails: [ScrubThumbnail] = []
 
@@ -229,12 +304,37 @@ final class ScrubThumbnailer: @unchecked Sendable {
             timeBase
         )
         guard duration > 0 else { return [] }
-        let interval = duration / Int64(count)
         let startTime = videoStream.pointee.start_time == Int64.min ? 0 : videoStream.pointee.start_time
 
-        for index in 0 ..< count {
+        // Whole file, or the window the caller asked for — converted from
+        // seconds into the stream's own time base.
+        let perSecond = Int64((1.0 / av_q2d(timeBase)).rounded())
+        let spanStart: Int64
+        let spanLength: Int64
+        if let range {
+            let lo = max(Int64(range.lowerBound) * perSecond, 0)
+            let hi = min(Int64(range.upperBound) * perSecond, duration)
+            spanStart = lo
+            spanLength = max(hi - lo, 1)
+        } else {
+            spanStart = 0
+            spanLength = duration
+        }
+        let interval = max(spanLength / Int64(count), 1)
+
+        for index in Self.scanOrder(count) {
             if cancelled || Date() >= deadline { break }
-            let target = interval * Int64(index) + startTime
+            // Stand aside while playback is struggling. Checked BEFORE the seek,
+            // because a seek is the expensive part: a fresh range request on the
+            // second connection, competing with the one feeding the screen.
+            while let shouldProceed, !shouldProceed(), !cancelled, Date() < deadline {
+                Thread.sleep(forTimeInterval: 1)
+            }
+            if cancelled || Date() >= deadline { break }
+            // A short breath between frames regardless, so a healthy buffer
+            // isn't hammered flat by a back-to-back run of seeks either.
+            Thread.sleep(forTimeInterval: 0.08)
+            let target = spanStart + interval * Int64(index) + startTime
             avcodec_flush_buffers(codecCtx)
             guard av_seek_frame(formatCtx, Int32(videoIndex), target, AVSEEK_FLAG_BACKWARD) >= 0
             else { break }
@@ -277,6 +377,9 @@ final class ScrubThumbnailer: @unchecked Sendable {
                         ? target : frame.pointee.best_effort_timestamp
                     let seconds = Double(stamp - startTime) * av_q2d(timeBase)
                     thumbnails.append(ScrubThumbnail(image: image, time: max(seconds, 0)))
+                    if !cancelled {
+                        onProgress?(thumbnails.sorted { $0.time < $1.time })
+                    }
                 }
                 break
             }

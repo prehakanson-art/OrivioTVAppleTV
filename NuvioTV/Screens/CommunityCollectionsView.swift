@@ -740,7 +740,6 @@ private struct CoverStylePill: View {
                                : (isFocused ? theme.palette.focusBackground : Color.white.opacity(0.08)))
             )
             .overlay(Capsule().strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 2))
-            .scaleEffect(isFocused ? 1.05 : 1)
-            .animation(.spring(response: 0.3, dampingFraction: 0.8), value: isFocused)
+            .focusLift(NuvioFocus.card, isFocused)
     }
 }

@@ -697,40 +697,6 @@ final class NuvioSyncManager: ObservableObject {
         NuvioSyncDiagnostics.record(.success, area: "Orivio", "Watch history cleared for profile \(pid).")
     }
 
-    private func clearWatchHistoryIfNeeded() async throws -> Bool {
-        guard account.accessToken != nil else { return false }
-        guard !UserDefaults.standard.bool(forKey: clearedWatchHistoryKey()) else { return false }
-
-        NuvioSyncDiagnostics.record(.warning, area: "Orivio", "Clearing watch history for profile \(pid).")
-
-        await reconcileProgressDeletesBeforePull()
-        try await pullWatchProgress()
-        await reconcileWatchedDeletesBeforePull()
-        try await pullWatchedItems()
-
-        WatchHistoryClearState.markClearedNow()
-        let progressKeys = progressStore.clearAllProgress(notify: false)
-        let watchedItems = watchedStore.clearAll(notify: false)
-
-        if !progressKeys.isEmpty {
-            deleteWatchProgress(keys: progressKeys)
-            await drainPendingDeletes()
-        }
-        if !watchedItems.isEmpty {
-            deleteWatchedItems(watchedItems)
-            await drainPendingWatchedDeletes()
-        }
-
-        if loadPendingDeletes().isEmpty && loadPendingWatchedDeletes().isEmpty {
-            UserDefaults.standard.set(true, forKey: clearedWatchHistoryKey())
-            NuvioSyncDiagnostics.record(.success, area: "Orivio", "Watch history cleared for profile \(pid).")
-        } else {
-            NuvioSyncDiagnostics.record(.warning, area: "Orivio", "Watch history clear is queued and will retry while deletes are pending.")
-        }
-
-        return true
-    }
-
     private func pushWatchProgressAll() async throws {
         guard account.accessToken != nil else { return }
         // Serialize OFF the main actor: this runs on every periodic progress
@@ -1562,9 +1528,13 @@ final class NuvioSyncManager: ObservableObject {
 
     private func pushHomeCatalogSettings() async throws {
         guard account.accessToken != nil else { return }
+        // The account-wide LIBRARY, not `collections` (this profile's visible
+        // subset). The home-catalog blob is shared by every profile and device,
+        // so exporting the visible subset let a profile that hides a collection
+        // delete that collection's row position for all the others.
         let payload = homeCatalogSettings.exportPayload(
             addons: addonManager.catalogAddons,
-            collections: collectionsStore.collections
+            collections: collectionsStore.library
         )
         guard let encoded = try? JSONEncoder().encode(payload),
               let localJSON = try? JSONSerialization.jsonObject(with: encoded) as? [String: Any] else { return }

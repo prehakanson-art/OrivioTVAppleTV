@@ -127,6 +127,34 @@ struct WatchProgress: Codable, Identifiable, Hashable {
 final class ProgressStore: ObservableObject {
     @Published private(set) var items: [String: WatchProgress] = [:]
 
+    /// Rows written by `updateTransient` (the periodic in-playback save) that
+    /// are NOT yet reflected in `items` — by design, since publishing them
+    /// would re-render Home behind the player.
+    ///
+    /// They have to be remembered, though, because `items` is what every other
+    /// `save()` encodes. Without this, any unrelated write during playback — a
+    /// sync pull landing, marking something watched, removing a row — reached
+    /// disk carrying the position from when the movie STARTED and silently
+    /// undid every periodic save since. A crash then lost the whole session,
+    /// which is exactly what the periodic save exists to prevent.
+    private var transientOverrides: [String: WatchProgress] = [:]
+
+    /// Monotonic stamp for persistence writes. Encode + write happen off the
+    /// main actor, so two saves in flight could otherwise land out of order
+    /// and leave the OLDER snapshot on disk.
+    private var saveSequence: UInt64 = 0
+
+    /// Hand a snapshot to the serializing writer.
+    private func persist(_ snapshot: [String: WatchProgress],
+                         shelf: [TopShelfExporter.Entry]?) {
+        saveSequence += 1
+        let sequence = saveSequence
+        let key = storageKey
+        Task.detached(priority: .utility) {
+            await ProgressPersister.shared.write(snapshot, key: key, sequence: sequence, shelf: shelf)
+        }
+    }
+
     /// Called after a local progress change so account sync can push. Not
     /// fired while merging remote data (guarded by `suppressChange`).
     var onLocalUpdate: (() -> Void)?
@@ -173,10 +201,6 @@ final class ProgressStore: ObservableObject {
     /// snapshot contains the key (the push landed) it's pruned, so a removal
     /// made on another device can still propagate here afterwards.
     private var awaitingServerAck: Set<String> = []
-
-    /// Whether a progress row originally arrived from an external source
-    /// (Trakt) rather than local playback.
-    func wasExternallyMerged(_ id: String) -> Bool { externallyMerged.contains(id) }
 
     private func pruneTombstones() {
         let cutoff = Date().addingTimeInterval(-Self.tombstoneGrace)
@@ -235,10 +259,32 @@ final class ProgressStore: ObservableObject {
     private static let serviceSyncSources: Set<String> = ["local", "nuvio", "stremio", "trakt"]
 
     func serviceBackedForSync() -> [WatchProgress] {
-        items.values.filter { item in
+        // Fold in the periodic in-playback saves, exactly as `save()` does.
+        // Without this the account was pushed the position from when the film
+        // STARTED: the row in `items` is only refreshed by the publishing
+        // `update()`, which during playback never runs. A title watched for
+        // forty minutes and still playing looked, to every other device, like
+        // it had never been touched.
+        var merged = items
+        for (key, transient) in transientOverrides {
+            guard let live = merged[key] else { merged[key] = transient; continue }
+            if transient.updatedAt > live.updatedAt { merged[key] = transient }
+        }
+        return merged.values.filter { item in
             guard let source = item.syncSource else { return false }
             return Self.serviceSyncSources.contains(source)
         }
+    }
+
+    /// Ask account sync to push what the periodic saves have written, WITHOUT
+    /// publishing. `update()` would refresh `items` and re-render every view
+    /// observing this store — including the Home screen sitting behind the
+    /// player, which is the periodic playback hiccup this store works hard to
+    /// avoid. The data is already on disk and in `transientOverrides`; this
+    /// just tells the sync manager to send it.
+    func requestSyncPush() {
+        guard !suppressChange else { return }
+        onLocalUpdate?()
     }
 
     func importEntries(_ entries: [WatchProgress]) {
@@ -705,11 +751,8 @@ final class ProgressStore: ObservableObject {
             updatedAt: Date(),
             syncSource: "nuvio"
         )
-        let storage = storageKey
-        Task.detached(priority: .utility) {
-            guard let data = try? JSONEncoder().encode(snapshot) else { return }
-            UserDefaults.standard.set(data, forKey: storage)
-        }
+        transientOverrides[key] = snapshot[key]
+        persist(snapshot, shelf: nil)
     }
 
     func remove(id: String) {
@@ -834,15 +877,37 @@ final class ProgressStore: ObservableObject {
         // Encode + persist OFF the main thread: serializing the whole history
         // and writing UserDefaults on main was part of the periodic playback
         // hiccup (this runs every 30s while a video plays).
-        let snapshot = items
-        let key = storageKey
+        // Fold in any periodic in-playback saves `items` doesn't know about,
+        // but never over a row `items` has more recent news about (the exit
+        // path publishes a real update, and a remote merge can supersede too).
+        var snapshot = items
+        for (key, transient) in transientOverrides {
+            guard let live = snapshot[key] else { snapshot[key] = transient; continue }
+            if transient.updatedAt > live.updatedAt { snapshot[key] = transient }
+        }
         // Top Shelf mirrors the Continue Watching row — snapshot the entries
         // here (cheap) and write them in the same background hop.
         let shelf = TopShelfExporter.entries(from: continueWatching)
-        Task.detached(priority: .utility) {
-            guard let data = try? JSONEncoder().encode(snapshot) else { return }
-            UserDefaults.standard.set(data, forKey: key)
-            TopShelfExporter.write(shelf)
-        }
+        persist(snapshot, shelf: shelf)
+    }
+}
+
+
+/// Serializes progress writes off the main actor. Encoding and writing happen
+/// outside the main actor (serializing the whole history on main was itself a
+/// playback hiccup), so two saves can be in flight at once — an actor plus a
+/// monotonic sequence keeps the OLDER snapshot from landing last and undoing
+/// the newer one.
+private actor ProgressPersister {
+    static let shared = ProgressPersister()
+    private var lastSequence: UInt64 = 0
+
+    func write(_ snapshot: [String: WatchProgress], key: String,
+               sequence: UInt64, shelf: [TopShelfExporter.Entry]?) {
+        guard sequence > lastSequence else { return }
+        lastSequence = sequence
+        guard let data = try? JSONEncoder().encode(snapshot) else { return }
+        UserDefaults.standard.set(data, forKey: key)
+        if let shelf { TopShelfExporter.write(shelf) }
     }
 }

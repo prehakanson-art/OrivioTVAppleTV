@@ -65,6 +65,9 @@ enum Route: Hashable {
     /// Source picker forced into manual mode (hold-Play / "Play Manually"):
     /// always shows the list, even when Auto Link Selector is on.
     case streamsManual(MetaItem, MetaVideo?)
+    /// Auto Link Selector resolves the best source as usual, then hands the
+    /// finished URL to Infuse instead of the in-app player (hold-Play).
+    case streamsInfuse(MetaItem, MetaVideo?)
     /// Source picker that plays from 0:00 (the Detail page's Start Over).
     case streamsFromStart(MetaItem, MetaVideo?)
     /// Continue Watching resume: re-scrape fresh sources and auto-play the one
@@ -110,9 +113,6 @@ struct RootView: View {
     @State private var searchPath = NavigationPath()
     @State private var libraryPath = NavigationPath()
     @State private var liveTVPath = NavigationPath()
-    /// Stremio-only sections (Discover / Addons) that aren't app tabs.
-    @State private var discoverPath = NavigationPath()
-    @State private var addonsPath = NavigationPath()
     // Persisted here (not inside HomeView) so switching tabs and coming back
     // doesn't rebuild it and re-trigger the catalog load / loading spinner.
     @StateObject private var homeViewModel = HomeViewModel()
@@ -141,13 +141,8 @@ struct RootView: View {
     /// stray Menu that otherwise opens the sidebar right after backing out.
     @State private var lastHomePopAt: Date?
     @FocusState private var sidebarFocus: Int?
-    /// Focus for the Netflix theme's custom top navigation (its ground-up
-    /// chrome — see netflixLayout). nil while content holds focus; a tab id
-    /// (or -1, the profile chip) while the bar does. Setting it is how Back
-    /// at a page root moves focus up to the bar (§18).
-    @FocusState private var netflixNavFocus: Int?
-    /// The sidebar is briefly non-focusable at launch so initial focus lands in
-    /// the CONTENT (the APK boots with the sidebar collapsed and a card focused).
+    /// The rail is briefly non-focusable at launch so initial focus lands in
+    /// the CONTENT (the app boots with the rail collapsed and a card focused).
     @State private var sidebarEnabled = false
 
     var body: some View {
@@ -240,9 +235,6 @@ struct RootView: View {
                     if args.contains("-liveTVDemo") { selectedTab = 4 }
                     if args.contains("-searchDemo") { selectedTab = 1 }
                     if args.contains("-libraryDemo") { selectedTab = 2 }
-                    // Stremio-only sections.
-                    if args.contains("-stremioDiscoverDemo") { selectedTab = 10 }
-                    if args.contains("-stremioAddonsDemo") { selectedTab = 11 }
                     if args.contains("-discoverDemo") {
                         selectedTab = 1
                         searchPath.append(Route.discover)
@@ -278,17 +270,6 @@ struct RootView: View {
                     if let p = args.first(where: { $0.hasPrefix("-profile:") })?
                         .replacingOccurrences(of: "-profile:", with: ""), let id = Int(p) {
                         profiles.setActive(id)
-                    }
-                    // Dev: pick a theme exactly as Settings does (persisted AND
-                    // marked as an explicit choice), so the "does my pick
-                    // survive a sync/profile switch" path can be exercised
-                    // without driving the tvOS UI. Distinct from -onyxTheme &c,
-                    // which force a theme for the session only.
-                    if let picked = args.first(where: { $0.hasPrefix("-pickTheme:") })?
-                        .replacingOccurrences(of: "-pickTheme:", with: ""),
-                       let match = AppThemes.all.first(where: { $0.id == picked }) {
-                        theme.setAppTheme(match)
-                        NSLog("[OrivioTheme] -pickTheme applied: %@", match.id)
                     }
                     // Dev: jump straight to the profile gate.
                     if args.contains("-profileGateDemo") { showProfileGate = true }
@@ -348,14 +329,7 @@ struct RootView: View {
                 // The gate now only SELECTS a profile; account + Manage Profiles
                 // live in Settings → Account. The design is an independent look
                 // axis (Settings → Themes → Profile Screen).
-                Group {
-                    let done: () -> Void = { showProfileGate = false; deferSidebarAfterProfileGate() }
-                    switch theme.profileStyle {
-                    case .orivio: ProfileGateView(onSelected: done)
-                    case .marquee: ThemedProfileGate(variant: .marquee, onSelected: done)
-                    case .streamline: ThemedProfileGate(variant: .streamline, onSelected: done)
-                    }
-                }
+                ProfileGateView(onSelected: { showProfileGate = false; deferSidebarAfterProfileGate() })
                 .environmentObject(theme)
                 .environmentObject(profiles)
                 .environmentObject(account)
@@ -377,23 +351,6 @@ struct RootView: View {
                 guard scenePhase == .active, selectedTab == 0, playback == nil else { return }
                 sync?.refreshContinueWatching()
             }
-    }
-
-    /// The sidebar's cold-launch fallback timers (3s in SidebarNav, 800ms from
-    /// Home's onContentReady) keep running while the profile gate covers the
-    /// screen, so by the time the user finishes picking a profile — which
-    /// usually takes longer than that — `sidebarEnabled` is often already
-    /// true. Without this, the instant the gate dismisses the focus engine
-    /// lands on the nearest focusable view for the newly-revealed screen,
-    /// which is the sidebar rail, popping it open instead of landing on Home.
-    /// Briefly disable it again and re-enable after a beat, same pattern as
-    /// the cold-launch path, so focus goes to Home's content first.
-    private func deferSidebarAfterProfileGate() {
-        sidebarEnabled = false
-        Task {
-            try? await Task.sleep(nanoseconds: 800_000_000)
-            sidebarEnabled = true
-        }
     }
 
     /// Dev-only: `-playerDemo` opens the player with Apple's public HLS test
@@ -470,39 +427,8 @@ struct RootView: View {
         return AnyView(mainContent)
     }
 
-    /// Whether the current tab is at its root grid (no pushed screen). When a
-    /// Detail/Streams/etc. is pushed, the sidebar hides so that screen is
-    /// full-bleed, exactly like the APK.
-    private var showSidebar: Bool {
-        switch selectedTab {
-        case 0: return homePath.isEmpty
-        case 1: return searchPath.isEmpty
-        case 2: return libraryPath.isEmpty
-        case 4: return liveTVPath.isEmpty
-        case 10: return discoverPath.isEmpty   // Stremio Discover
-        case 11: return addonsPath.isEmpty     // Stremio Addons
-        default: return true   // Settings keeps the rail
-        }
-    }
-
     private var mainContent: some View {
-        Group {
-            if theme.isNetflixTheme {
-                netflixLayout
-            } else if theme.isStremioTheme {
-                stremioLayout
-            } else if theme.isCinemaTheme {
-                cinemaLayout
-            } else if theme.isOnyxTheme {
-                onyxLayout
-            } else if theme.isMaxTheme {
-                maxLayout
-            } else if theme.isHuluTheme {
-                huluLayout
-            } else {
-                classicLayout
-            }
-        }
+        tabLayout
         // Developer FPS read-out over the whole UI (Settings → Performance).
         .overlay {
             if perf.settings.showFPSOverlay { FPSOverlay() }
@@ -539,623 +465,149 @@ struct RootView: View {
         .onChange(of: colorScheme) { _, scheme in theme.systemIsDark = scheme == .dark }
     }
 
-    /// The Apple TV theme's root: a native top tab bar (Liquid Glass on
-    /// tvOS 26, the standard bar before that) over a soft clear backdrop —
-    /// the Omni/Fusion-style layout. Same tabs, paths and view models as the
-    /// Classic sidebar, so switching themes never loses state.
-    private var atvLayout: some View {
-        TabView(selection: $selectedTab) {
-            NavigationStack(path: $homePath) {
-                homeRoot
-                    // Back at a tab ROOT is a no-op here (swallowed) so it
-                    // doesn't quit the app — the TV/Home button exits. Pushed
-                    // screens still pop normally via the NavigationStack.
-                    .onExitCommand { }
-                    .navigationDestination(for: Route.self) { destination(for: $0, path: $homePath) }
-            }
-            .tabItem { Label("Home", systemImage: "house.fill") }
-            .tag(0)
+    /// Whether the current tab is at its root (no pushed screen). When a
+    /// Detail/Streams/etc. is pushed the rail hides so that screen runs
+    /// full-bleed.
+    private var showSidebar: Bool {
+        switch selectedTab {
+        case 0: return homePath.isEmpty
+        case 1: return searchPath.isEmpty
+        case 2: return libraryPath.isEmpty
+        case 4: return liveTVPath.isEmpty
+        default: return true   // Settings keeps the rail
+        }
+    }
 
-            NavigationStack(path: $searchPath) {
-                searchRoot
-                    .onExitCommand { }
-                    .navigationDestination(for: Route.self) { destination(for: $0, path: $searchPath) }
-            }
-            .tabItem { Label("Search", systemImage: "magnifyingglass") }
-            .tag(1)
-
-            NavigationStack(path: $libraryPath) {
-                libraryRoot
-                    .onExitCommand { }
-                    .navigationDestination(for: Route.self) { destination(for: $0, path: $libraryPath) }
-            }
-            .tabItem { Label("Library", systemImage: "bookmark.fill") }
-            .tag(2)
-
-            NavigationStack {
-                ATVSettingsView(onOpenProfiles: { showProfileGate = true })
-                    .onExitCommand { }
-            }
-            .tabItem { Label("Settings", systemImage: "gearshape.fill") }
-            .tag(3)
-
-            // Conditional tab declared LAST so toggling Live TV doesn't re-diff
-            // (and reset) the Settings tab that would otherwise follow it.
-            if liveTV.enabled {
-                NavigationStack(path: $liveTVPath) {
-                    liveTVRoot
-                        .onExitCommand { }
-                        .navigationDestination(for: Route.self) { destination(for: $0, path: $liveTVPath) }
+    /// The app's single root: an always-visible Liquid Glass rail floating at
+    /// the left edge over full-bleed content. OVERLAY layout (not an HStack)
+    /// so the expanding panel just draws over the dimmed content — the content
+    /// column never re-lays-out during the spring.
+    private var tabLayout: some View {
+        ZStack(alignment: .leading) {
+            selectedContent
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .overlay {
+                    // Dim the content while the rail is expanded/focused, so
+                    // the glass panel reads above it.
+                    Color.black.opacity(0.55)
+                        .ignoresSafeArea()
+                        .allowsHitTesting(false)
+                        .opacity(sidebarFocus != nil && showSidebar ? 1 : 0)
                 }
-                .tabItem { Label("Live TV", systemImage: "tv.fill") }
-                .tag(4)
+                // Home runs full-bleed (hero art sweeps under the floating
+                // pill); other tabs clear the rail.
+                .padding(.leading, showSidebar && selectedTab != 0 ? GlassSidebar.collapsedWidth : 0)
+                .focusSection()
+
+            if showSidebar {
+                GlassSidebar(selected: $selectedTab, focusBinding: $sidebarFocus,
+                             onProfileTap: { showProfileGate = true },
+                             onTabSelected: { newTab in selectTab(newTab) })
+                    .focusSection()
+                    .disabled(!sidebarEnabled)
+                    // Back while IN the rail collapses it into content instead
+                    // of falling through to the system (which quit the app).
+                    .onExitCommand { collapseSidebarFromExit() }
+                    // Swipe/press RIGHT exits into content: the content's focus
+                    // section is UNDER the panel (overlapping, not beside it),
+                    // so the engine sees no candidate to the right — catch it
+                    // and run the same collapse Back uses.
+                    .onMoveCommand { direction in
+                        if direction == .right { collapseSidebarFromExit() }
+                    }
+                    .transition(.move(edge: .leading).combined(with: .opacity))
+                    // Stays non-focusable until Home has content to hold
+                    // initial focus (onContentReady); timer is the fallback.
+                    .task {
+                        try? await Task.sleep(nanoseconds: 3_000_000_000)
+                        sidebarEnabled = true
+                    }
             }
         }
+        .animation(perf.sidebarAnimationEffective
+                   ? .spring(response: 0.34, dampingFraction: 0.86) : nil, value: showSidebar)
+        .animation(perf.sidebarAnimationEffective
+                   ? .spring(response: 0.34, dampingFraction: 0.86) : nil, value: sidebarFocus != nil)
         .background(ATVBackground())
     }
 
-    /// The Cinema theme's root. A native top tab bar (a system component, not
-    /// Modern's `atvLayout`); the Home tab renders `CinemaHomeView` — a from-
-    /// scratch home with its OWN hero + rows + cards, including its own Continue
-    /// Watching row (so the hold menu works). Search/Library/Live TV/Settings
-    /// reuse the SHARED roots (not part of Modern/Nova).
-    private var cinemaLayout: some View {
-        TabView(selection: $selectedTab) {
-            NavigationStack(path: $homePath) {
-                cinemaRoot
-                    .onExitCommand { }
-                    .navigationDestination(for: Route.self) { destination(for: $0, path: $homePath) }
-            }
-            .tabItem { Label("Home", systemImage: "house.fill") }
-            .tag(0)
-
-            NavigationStack(path: $searchPath) {
-                searchRoot
-                    .onExitCommand { }
-                    .navigationDestination(for: Route.self) { destination(for: $0, path: $searchPath) }
-            }
-            .tabItem { Label("Search", systemImage: "magnifyingglass") }
-            .tag(1)
-
-            NavigationStack(path: $libraryPath) {
-                libraryRoot
-                    .onExitCommand { }
-                    .navigationDestination(for: Route.self) { destination(for: $0, path: $libraryPath) }
-            }
-            .tabItem { Label("Library", systemImage: "bookmark.fill") }
-            .tag(2)
-
-            NavigationStack {
-                SettingsView()
-                    .onExitCommand { }
-            }
-            .tabItem { Label("Settings", systemImage: "gearshape.fill") }
-            .tag(3)
-
-            // Live TV is the ONLY conditional tab, so it must be declared LAST:
-            // toggling it then adds/removes the final child, leaving every other
-            // tab's structural position (and NavigationStack identity) intact.
-            // Declared before Settings, toggling it re-created the Settings stack
-            // and reset the pane mid-use.
-            if liveTV.enabled {
-                NavigationStack(path: $liveTVPath) {
-                    liveTVRoot
-                        .onExitCommand { }
-                        .navigationDestination(for: Route.self) { destination(for: $0, path: $liveTVPath) }
-                }
-                .tabItem { Label("Live TV", systemImage: "tv.fill") }
-                .tag(4)
-            }
-        }
-        .background(theme.palette.background.ignoresSafeArea())
-    }
-
-    private var cinemaRoot: some View {
-        CinemaHomeView(
-            viewModel: homeViewModel,
-            onSelect: { homePath.append(Route.detail($0)) },
-            onResume: { resume($0) },
-            onResumeFromStart: { resume($0, fromBeginning: true) },
-            onPlayManually: { meta, video in playManually(meta, video) },
-            onSeeAll: { addon, catalog, title in
-                homePath.append(Route.catalogSeeAll(addon: addon, catalog: catalog, title: title))
-            },
-            onOpenCollection: { homePath.append(Route.collection($0)) }
-        )
-    }
-
-    /// The Onyx theme's root: a faithful port of bobsupra/NuvioTVOS — the native
-    /// collapsible sidebar (`.sidebarAdaptable`) over the near-black stage, with
-    /// its own `OnyxHomeView`. Reuses the same shared tab roots + path bindings
-    /// as every other layout, so switching themes never loses state.
-    private var onyxLayout: some View {
-        TabView(selection: $selectedTab) {
-            NavigationStack(path: $homePath) {
-                onyxRoot
-                    .onExitCommand { }
-                    .navigationDestination(for: Route.self) { destination(for: $0, path: $homePath) }
-            }
-            .tabItem { Label("Home", systemImage: "house") }
-            .tag(0)
-
-            NavigationStack(path: $searchPath) {
-                searchRoot
-                    .onExitCommand { }
-                    .navigationDestination(for: Route.self) { destination(for: $0, path: $searchPath) }
-            }
-            .tabItem { Label("Search", systemImage: "magnifyingglass") }
-            .tag(1)
-
-            NavigationStack(path: $libraryPath) {
-                libraryRoot
-                    .onExitCommand { }
-                    .navigationDestination(for: Route.self) { destination(for: $0, path: $libraryPath) }
-            }
-            .tabItem { Label("Library", systemImage: "bookmark") }
-            .tag(2)
-
-            NavigationStack {
-                SettingsView()
-                    .onExitCommand { }
-            }
-            .tabItem { Label("Settings", systemImage: "gearshape") }
-            .tag(3)
-
-            // Conditional tab declared LAST so toggling Live TV doesn't re-diff
-            // (and reset) the Settings tab that would otherwise follow it.
-            if liveTV.enabled {
-                NavigationStack(path: $liveTVPath) {
-                    liveTVRoot
-                        .onExitCommand { }
-                        .navigationDestination(for: Route.self) { destination(for: $0, path: $liveTVPath) }
-                }
-                .tabItem { Label("Live TV", systemImage: "tv") }
-                .tag(4)
-            }
-        }
-        .modifier(OnyxSidebarTabStyle())
-        .background(theme.palette.background.ignoresSafeArea())
-    }
-
-    private var onyxRoot: some View {
-        OnyxHomeView(
-            viewModel: homeViewModel,
-            onSelect: { homePath.append(Route.detail($0)) },
-            onResume: { resume($0) },
-            onResumeFromStart: { resume($0, fromBeginning: true) },
-            onPlayManually: { meta, video in playManually(meta, video) },
-            onSeeAll: { addon, catalog, title in
-                homePath.append(Route.catalogSeeAll(addon: addon, catalog: catalog, title: title))
-            },
-            onOpenCollection: { homePath.append(Route.collection($0)) }
-        )
-    }
-
-    /// The Netflix-inspired theme's root: GROUND-UP chrome (like Fusion vs
-    /// Classic) — a custom §17 top navigation floating over the black stage,
-    /// one NavigationStack per tab. The tab roots and path bindings are the
-    /// same shared ones the other layouts use, so switching themes never
-    /// loses state; only the chrome differs.
-    private var netflixLayout: some View {
-        ZStack(alignment: .top) {
-            NetflixBackground()
-
-            netflixContent
-                // Pages other than Home start below the floating bar; Home
-                // stays full-bleed so the billboard art runs under it (§21).
-                .padding(.top, selectedTab == 0 ? 0 : 120)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .focusSection()
-
-            // Hidden while a screen is pushed, same rule as the sidebar —
-            // pushed screens run full-bleed (§18 Back pops them instead).
-            if showSidebar {
-                NetflixTopNav(
-                    selected: $selectedTab,
-                    focusBinding: $netflixNavFocus,
-                    onProfileTap: { showProfileGate = true },
-                    onTabSelected: { newTab in
-                        // No sidebar collapse dance here — the bar is always
-                        // visible at roots; focus stays on it until the user
-                        // presses Down into the fresh page.
-                        selectedTab = newTab
-                    }
-                )
-                .focusSection()
-            }
-        }
-    }
-
-    /// The selected tab's screen for the Netflix layout. Back at a tab ROOT
-    /// moves focus up to the top navigation (§18); pushed screens hold focus
-    /// themselves, so their Back pops the NavigationStack instead.
+    /// The screen for the selected rail tab, each in its own NavigationStack
+    /// so per-tab back-stacks stay independent. Back at a tab ROOT moves focus
+    /// to the rail (expanding it); pushed screens hold focus themselves, so
+    /// their Back pops the NavigationStack instead.
     @ViewBuilder
-    private var netflixContent: some View {
+    private var selectedContent: some View {
         switch selectedTab {
         case 1:
             NavigationStack(path: $searchPath) {
                 searchRoot
-                    .onExitCommand { netflixNavFocus = 1 }
+                    .onExitCommand { sidebarFocus = 1 }
                     .navigationDestination(for: Route.self) { destination(for: $0, path: $searchPath) }
             }
         case 2:
             NavigationStack(path: $libraryPath) {
                 libraryRoot
-                    .onExitCommand { netflixNavFocus = 2 }
+                    .onExitCommand { sidebarFocus = 2 }
                     .navigationDestination(for: Route.self) { destination(for: $0, path: $libraryPath) }
             }
         case 3:
-            // Interim settings surface (§79 restyle is a later session);
-            // pushes the same shared detail panes as the other themes.
             NavigationStack {
                 ATVSettingsView(onOpenProfiles: { showProfileGate = true })
-                    .onExitCommand { netflixNavFocus = 3 }
+                    .onExitCommand { sidebarFocus = 3 }
             }
         case 4:
             NavigationStack(path: $liveTVPath) {
                 liveTVRoot
-                    .onExitCommand { netflixNavFocus = 4 }
+                    .onExitCommand { sidebarFocus = 4 }
                     .navigationDestination(for: Route.self) { destination(for: $0, path: $liveTVPath) }
             }
         default:
             NavigationStack(path: $homePath) {
                 homeRoot
                     .onExitCommand {
-                        // Same lingering-Menu guard as the Classic layout: a
-                        // second Menu delivered right after popping back from
-                        // a pushed screen must not yank focus to the bar.
+                        // Ignore a Menu that lands right after popping back from
+                        // a pushed screen — tvOS sometimes delivers a lingering
+                        // second Menu, which would spuriously open the rail.
                         if let popped = lastHomePopAt, Date().timeIntervalSince(popped) < 1.0 { return }
-                        netflixNavFocus = 0
+                        sidebarFocus = 0
                     }
                     .onChange(of: homePath.count) { oldCount, newCount in
-                        if newCount < oldCount { lastHomePopAt = Date() }
+                        guard newCount < oldCount else { return }
+                        lastHomePopAt = Date()
+                        // Popping all the way back to Home: keep the rail
+                        // non-focusable for a beat so focus lands on a card
+                        // instead of the rail springing open.
+                        if newCount == 0 {
+                            sidebarEnabled = false
+                            Task {
+                                try? await Task.sleep(nanoseconds: 900_000_000)
+                                sidebarEnabled = true
+                            }
+                        }
                     }
                     .navigationDestination(for: Route.self) { destination(for: $0, path: $homePath) }
             }
         }
     }
 
-    /// The Stremio theme's root: its left icon TabBar (`StremioNav`) beside
-    /// FULLY CUSTOM Stremio screens (`stremioContent` — its own Board,
-    /// Settings, Search, Library, none of them the shared Classic screens).
-    /// Reuses only the sidebar focus machinery (`sidebarFocus`,
-    /// `sidebarEnabled`, `selectTab`) so navigation works unchanged.
-    private var stremioLayout: some View {
-        ZStack(alignment: .leading) {
-            StremioSurfaces.background.ignoresSafeArea()
-
-            stremioContent
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .overlay {
-                    Color.black.opacity(0.55)
-                        .ignoresSafeArea()
-                        .allowsHitTesting(false)
-                        .opacity(sidebarFocus != nil && showSidebar ? 1 : 0)
-                }
-                .padding(.leading, showSidebar ? StremioNav.collapsedWidth : 0)
-                .focusSection()
-
-            if showSidebar {
-                StremioNav(selected: $selectedTab, focusBinding: $sidebarFocus,
-                           onProfileTap: { showProfileGate = true },
-                           onTabSelected: { newTab in selectTab(newTab) })
-                    .focusSection()
-                    .disabled(!sidebarEnabled)
-                    .onExitCommand { collapseSidebarFromExit() }
-                    .onMoveCommand { direction in
-                        if direction == .right { collapseSidebarFromExit() }
-                    }
-                    .transition(.move(edge: .leading).combined(with: .opacity))
-                    .task {
-                        try? await Task.sleep(nanoseconds: 3_000_000_000)
-                        sidebarEnabled = true
-                    }
-            }
-        }
-        .animation(perf.sidebarAnimationEffective
-                   ? .spring(response: 0.32, dampingFraction: 0.85) : nil, value: showSidebar)
-        .animation(perf.sidebarAnimationEffective
-                   ? .spring(response: 0.32, dampingFraction: 0.85) : nil, value: sidebarFocus != nil)
-        .background(StremioSurfaces.background)
-    }
-
-    /// Stremio's custom per-tab screens, each in its own NavigationStack so
-    /// pushes (StremioDetailView etc.) stay within the tab. Back at a tab root
-    /// opens the tab bar (`sidebarFocus`).
-    @ViewBuilder
-    private var stremioContent: some View {
-        switch selectedTab {
-        case 1:
-            NavigationStack(path: $searchPath) {
-                StremioSearchView(
-                    viewModel: searchViewModel,
-                    onSelect: { searchPath.append(Route.detail($0)) },
-                    onBackAtRoot: { sidebarFocus = 1 }
-                )
-                .navigationDestination(for: Route.self) { destination(for: $0, path: $searchPath) }
-            }
-        case 2:
-            NavigationStack(path: $libraryPath) {
-                StremioLibraryView(
-                    onSelect: { libraryPath.append(Route.detail($0)) },
-                    onResume: { resume($0) },
-                    onBackAtRoot: { sidebarFocus = 2 }
-                )
-                .navigationDestination(for: Route.self) { destination(for: $0, path: $libraryPath) }
-            }
-        case 3:
-            NavigationStack {
-                StremioSettingsView(
-                    onOpenProfiles: { showProfileGate = true },
-                    onBackAtRoot: { sidebarFocus = 3 }
-                )
-            }
-        case 10:
-            NavigationStack(path: $discoverPath) {
-                StremioDiscoverView(
-                    onSelect: { discoverPath.append(Route.detail($0)) },
-                    onBackAtRoot: { sidebarFocus = 10 }
-                )
-                .navigationDestination(for: Route.self) { destination(for: $0, path: $discoverPath) }
-            }
-        case 11:
-            NavigationStack(path: $addonsPath) {
-                StremioAddonsView(onBackAtRoot: { sidebarFocus = 11 })
-                    .navigationDestination(for: Route.self) { destination(for: $0, path: $addonsPath) }
-            }
-        default:
-            NavigationStack(path: $homePath) {
-                StremioBoardView(
-                    viewModel: homeViewModel,
-                    onSelect: { homePath.append(Route.detail($0)) },
-                    onResume: { resume($0) },
-                    onSeeAll: { row in
-                        if let addon = row.addon, let catalog = row.catalog {
-                            homePath.append(Route.catalogSeeAll(addon: addon, catalog: catalog, title: row.title))
-                        }
-                    },
-                    onContentReady: {
-                        Task { try? await Task.sleep(nanoseconds: 800_000_000); sidebarEnabled = true }
-                    },
-                    onBackAtRoot: {
-                        if let popped = lastHomePopAt, Date().timeIntervalSince(popped) < 1.0 { return }
-                        sidebarFocus = 0
-                    }
-                )
-                .onChange(of: homePath.count) { oldCount, newCount in
-                    guard newCount < oldCount else { return }
-                    lastHomePopAt = Date()
-                    // Rail parity with Classic: popping all the way back to the
-                    // Board keeps the icon rail non-focusable for a beat so focus
-                    // lands on a Board card instead of the rail springing open.
-                    if newCount == 0 {
-                        sidebarEnabled = false
-                        Task {
-                            try? await Task.sleep(nanoseconds: 900_000_000)
-                            sidebarEnabled = true
-                        }
-                    }
-                }
-                .navigationDestination(for: Route.self) { destination(for: $0, path: $homePath) }
-            }
-        }
-    }
-
-    /// The Max theme's root: the ported MaxTV UI (`MaxRootView`) driven by Orivio
-    /// data, inside the shared home NavigationStack so selecting a title pushes
-    /// Orivio's real DetailView / streams / player. All browse navigation (the
-    /// sidebar, sections, category drill-down) is self-contained in MaxRootView.
-    private var maxLayout: some View {
-        NavigationStack(path: $homePath) {
-            MaxRootView(
-                homeViewModel: homeViewModel,
-                searchViewModel: searchViewModel,
-                onSelect: { homePath.append(Route.detail($0)) },
-                onOpenProfiles: { showProfileGate = true },
-                onOpenChannel: { homePath.append(Route.streams($0, nil)) },
-                onOpenCollection: { homePath.append(Route.collection($0)) }
-            )
-            .navigationDestination(for: Route.self) { destination(for: $0, path: $homePath) }
-        }
-        .background(MaxStyle.stage.ignoresSafeArea())
-    }
-
-    /// The "Streamline" (Hulu) theme's root: the ported HuluTV UI (`HuluRootView`)
-    /// driven by Orivio data, inside the shared home NavigationStack. The hero
-    /// PLAY pushes the stream picker; DETAILS/cards push DetailView.
-    private var huluLayout: some View {
-        NavigationStack(path: $homePath) {
-            HuluRootView(
-                homeViewModel: homeViewModel,
-                searchViewModel: searchViewModel,
-                onSelect: { homePath.append(Route.detail($0)) },
-                onPlay: { homePath.append(Route.streams($0, nil)) },
-                onResume: { resume($0) },
-                onOpenProfiles: { showProfileGate = true },
-                onOpenCollection: { homePath.append(Route.collection($0)) }
-            )
-            .navigationDestination(for: Route.self) { destination(for: $0, path: $homePath) }
-        }
-        .background(HuluStyle.stage.ignoresSafeArea())
-    }
-
-    private var classicLayout: some View {
-        // OVERLAY layout, not an HStack: when the sidebar expanded inside an
-        // HStack its width change re-laid-out the ENTIRE content column (every
-        // Home row) on every frame of the spring — the "sidebar isn't smooth"
-        // jank on the A10X. Now the content is fixed (padded past the
-        // collapsed rail) and the expanding panel just draws OVER the dimmed
-        // content; the only things animating are the panel's own width and
-        // the dim's opacity.
-        ZStack(alignment: .leading) {
-            contentColumn
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .overlay {
-                    // Dim the content while the sidebar is expanded/focused (APK
-                    // behavior). The dim STARTS at the sidebar's own tone right
-                    // at the expanded panel's seam (fixed coordinates now — the
-                    // content no longer moves) and eases into the dim, so
-                    // there's no hard bright/dark two-tone line at the edge.
-                    // Always mounted with an animated opacity (not an insert
-                    // transition) so it fades in IN LOCKSTEP with the sidebar's
-                    // expansion instead of popping in ahead of it.
-                    LinearGradient(
-                        stops: [
-                            // Everything left of ~0.11 sits UNDER the expanded
-                            // panel (tvOS is a fixed 1920pt layout: the panel
-                            // edge lands at (270-64)/(1920-64) ≈ 0.11 of the
-                            // content width).
-                            .init(color: theme.palette.backgroundElevated, location: 0),
-                            .init(color: theme.palette.backgroundElevated, location: 0.111),
-                            .init(color: .black.opacity(0.55), location: 0.20),
-                            .init(color: .black.opacity(0.55), location: 1)
-                        ],
-                        startPoint: .leading, endPoint: .trailing
-                    )
-                    .ignoresSafeArea()
-                    .allowsHitTesting(false)
-                    .opacity(sidebarFocus != nil && showSidebar ? 1 : 0)
-                }
-                // HOME runs full-bleed (hero to the edge, icons float over it
-                // on the soft background column below). Every OTHER tab keeps
-                // the original 64pt inset so its content sits beside the rail,
-                // not under it — that also keeps left-navigation into the
-                // sidebar clean (Library was letting focus slip into the panel
-                // when its grid ran full-bleed under the rail). Pushed screens
-                // (showSidebar == false) stay full-bleed as before.
-                .padding(.leading, showSidebar && selectedTab != 0 ? SidebarNav.collapsedWidth : 0)
-                .focusSection()
-
-            // Home only: a soft left column in the BACKGROUND colour behind the
-            // icons. Grounds them over the hero art without the contrasting
-            // grey the old reserved strip had — it IS the background, fading
-            // into the content. Solid over the icons (~0-90pt), fully clear by
-            // ~135pt — BEFORE the content's leading edge (~145pt) so the hero
-            // text / row labels / posters don't get darkened by the fade.
-            if selectedTab == 0 && showSidebar {
-                LinearGradient(
-                    stops: [
-                        .init(color: theme.palette.background, location: 0),
-                        .init(color: theme.palette.background, location: 0.66),
-                        .init(color: .clear, location: 1)
-                    ],
-                    startPoint: .leading, endPoint: .trailing
-                )
-                // Anchored at the very left edge, narrow enough that the fade
-                // completes before the content — the earlier 230pt column ran
-                // its tail across the first posters/labels.
-                .frame(width: 135)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-                .ignoresSafeArea()
-                .allowsHitTesting(false)
-            }
-
-            if showSidebar {
-                SidebarNav(selected: $selectedTab, focusBinding: $sidebarFocus,
-                           onProfileTap: { showProfileGate = true },
-                           onTabSelected: { newTab in selectTab(newTab) })
-                    // Nudge the collapsed icons left (clip-safe, moves with the
-                    // rail's clip region). ~48pt ≈ 1.2in on a 55" panel — was
-                    // -8, moved another ~40pt (≈1in) left. Snaps back to 0 when
-                    // the panel expands so labels aren't pushed off the edge.
-                    .offset(x: sidebarFocus == nil ? -48 : 0)
-                    .focusSection()
-                    .disabled(!sidebarEnabled)
-                    // Back while IN the sidebar collapses it into content
-                    // instead of falling through to the system (which quit the
-                    // app). Exit the app with the Siri remote's TV/Home button.
-                    // NOT the same helper as picking a tab: nothing is being
-                    // freshly mounted here (you're just closing the panel on
-                    // the tab you're already on), so this always uses the fast
-                    // fixed-delay re-enable — never waits on onContentReady,
-                    // which wouldn't fire again since Home isn't reloading.
-                    .onExitCommand { collapseSidebarFromExit() }
-                    // Swipe/press RIGHT exits into content. In the overlay
-                    // layout the content's focus section is UNDER the panel
-                    // (overlapping, not beside it), so the focus engine sees
-                    // no candidate "to the right" and the move dies — catch
-                    // it and run the same collapse Back uses.
-                    .onMoveCommand { direction in
-                        if direction == .right { collapseSidebarFromExit() }
-                    }
-                    .transition(.move(edge: .leading).combined(with: .opacity))
-                    // The sidebar stays non-focusable until Home has content to
-                    // hold initial focus (onContentReady) — otherwise the app
-                    // boots with the sidebar expanded over an empty screen. The
-                    // timer is only a fallback if Home never loads (or another
-                    // tab is the demo entry point).
-                    .task {
-                        try? await Task.sleep(nanoseconds: 3_000_000_000)
-                        sidebarEnabled = true
-                    }
-            }
-        }
-        // Matches SidebarNav's own expand spring so the width change, the
-        // content reflow, and the dim all move together as one motion.
-        // (nil when "Sidebar animation" is off in Settings → Performance:
-        // the sidebar and its dim snap instantly.)
-        .animation(perf.sidebarAnimationEffective
-                   ? .spring(response: 0.34, dampingFraction: 0.86) : nil, value: showSidebar)
-        .animation(perf.sidebarAnimationEffective
-                   ? .spring(response: 0.34, dampingFraction: 0.86) : nil, value: sidebarFocus != nil)
-        .background(theme.palette.background)
-    }
-
-    /// Handles tapping a sidebar tab. Two things happen together:
-    /// 1. Clear `sidebarFocus` — this collapses the panel (expanded and the dim
-    ///    both key off it) and stops the still-set focus state from yanking
-    ///    focus back to the sidebar when it re-enables. Clearing it ALONE just
-    ///    re-lands focus on the nearest sidebar item (an icon / the profile
-    ///    button), so also:
-    /// 2. Make the whole sidebar momentarily unfocusable, so the focus engine
-    ///    is forced onto the only remaining candidates — the tab's content.
-    ///
-    /// `newTab` arrives BEFORE `selectedTab` is mutated (SidebarNav fires this
-    /// first), so `selectedTab` here still holds the tab we're coming FROM —
-    /// that's what lets us tell a genuine tab change apart from re-tapping the
-    /// tab already on screen (see the comment below on why that distinction
-    /// matters).
+    /// Handles tapping a rail tab: collapse the panel and force focus into the
+    /// fresh tab's content by making the rail momentarily unfocusable.
     private func selectTab(_ newTab: Int) {
         let enteringHomeFresh = selectedTab != 0 && newTab == 0
         selectedTab = newTab
         sidebarFocus = nil
         sidebarEnabled = false
-
-        // Switching TO Home FROM another tab rebuilds HomeView from scratch
-        // (the switch in `selectedContent` tears it down when you're on
-        // another tab), and its rows/hero backdrop can take a beat longer to
-        // lay out and become focusable than a blind fixed-delay guess —
-        // especially right after a full rebuild. If a timer re-enabled the
-        // sidebar before Home's content is actually focusable, the sidebar is
-        // the only focusable thing left and reclaims focus.
-        //
-        // Home already reports real readiness via `onContentReady` (fired
-        // after its reload completes, with its own grace period) — so ONLY
-        // for a genuine transition into Home, skip the timer and let that be
-        // the sole re-enabler.
-        //
-        // Critically, this must NOT apply when Home was already on screen
-        // (e.g. re-tapping the Home icon just to close the panel): HomeView
-        // isn't reloading in that case, so `onContentReady` will never fire
-        // again and `sidebarEnabled` would be stuck `false` forever — the
-        // sidebar would become permanently unreachable. That's why this reads
-        // `enteringHomeFresh`, captured before the mutation above, rather than
-        // just checking `selectedTab == 0`.
+        // Entering Home fresh rebuilds HomeView; its onContentReady is the
+        // sole re-enabler there (a blind timer could beat the rows to
+        // focusability and the rail would reclaim focus).
         guard enteringHomeFresh else {
             scheduleSidebarReenable()
             return
         }
     }
 
-    /// Closes the panel when Back is pressed WHILE IT'S the one focused —
-    /// i.e. you opened it but didn't pick anything. No tab change happens
-    /// here and nothing is being freshly mounted, so this always uses the
-    /// fast fixed-delay re-enable regardless of which tab is active — it must
-    /// NOT defer to Home's `onContentReady`, which won't fire again since
-    /// nothing is reloading (this was the bug behind "I can no longer get
-    /// into the side panel" after a few Back presses: relying on Home's
-    /// reload signal here latched `sidebarEnabled` false with nothing left to
-    /// ever flip it back true).
+    /// Back pressed while the rail itself is focused: close the panel. Always
+    /// the fast fixed-delay re-enable — nothing is being freshly mounted.
     private func collapseSidebarFromExit() {
         sidebarFocus = nil
         sidebarEnabled = false
@@ -1169,17 +621,19 @@ struct RootView: View {
         }
     }
 
-    /// The sidebar-opening Back handler is attached to each tab's ROOT screen
-    /// (see `selectedContent`), NOT here — wrapping the whole NavigationStack
-    /// made `onExitCommand` swallow Back at every depth, so a pushed screen
-    /// (e.g. a detail opened from Discovery) could never pop.
-    private var contentColumn: some View {
-        selectedContent
+    /// The rail's cold-launch fallback timer keeps running while the profile
+    /// gate covers the screen, so once the gate dismisses the focus engine
+    /// would land on the rail and pop it open. Briefly disable it again so
+    /// focus goes to Home's content first.
+    private func deferSidebarAfterProfileGate() {
+        sidebarEnabled = false
+        Task {
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            sidebarEnabled = true
+        }
     }
 
-    // MARK: - Shared tab roots (used by BOTH the Classic sidebar layout and
-    // the Apple TV top-bar layout, so the two themes stay in behavioral
-    // lockstep — only the chrome around them differs).
+    // MARK: - Tab roots
 
     private var homeRoot: some View {
         HomeView(
@@ -1193,21 +647,17 @@ struct RootView: View {
                 homePath.append(Route.catalogSeeAll(addon: addon, catalog: catalog, title: title))
             },
             onContentReady: {
-                // Give the freshly-loaded rows a beat to render and
-                // take initial focus before the sidebar becomes
-                // focusable, or the focus engine grabs the top-left
-                // (sidebar) and boots the app with it expanded.
+                // Give the freshly-loaded rows a beat to render and take
+                // initial focus before the rail becomes focusable.
                 Task {
                     try? await Task.sleep(nanoseconds: 800_000_000)
                     sidebarEnabled = true
                 }
             },
-            // Back at the start of a row: Classic opens the sidebar; Netflix
-            // focuses its custom top bar (§18); Fusion is a no-op (tvOS
-            // doesn't expose programmatic focus of a native tab bar).
+            // Back at the start of a row opens the rail.
             onHomeBack: {
-                if theme.isNetflixTheme { netflixNavFocus = 0 }
-                else if !theme.isAppleTVTheme { sidebarFocus = 0 }
+                if let popped = lastHomePopAt, Date().timeIntervalSince(popped) < 1.0 { return }
+                sidebarFocus = 0
             }
         )
     }
@@ -1224,13 +674,7 @@ struct RootView: View {
         LibraryView(
             onSelect: { libraryPath.append(Route.detail($0)) },
             onOpenCloud: { libraryPath.append(Route.cloudLibrary) },
-            // At the top of the grid, Back leaves: Classic opens the sidebar,
-            // Netflix focuses its top bar, Fusion is a no-op (focus rises to
-            // the native tab bar on the next Up).
-            onBackAtRoot: {
-                if theme.isNetflixTheme { netflixNavFocus = 2 }
-                else if !theme.isAppleTVTheme { sidebarFocus = 2 }
-            }
+            onBackAtRoot: { sidebarFocus = 2 }
         )
     }
 
@@ -1241,101 +685,22 @@ struct RootView: View {
         )
     }
 
-    /// The screen for the selected sidebar tab, each in its own NavigationStack
-    /// so per-tab back-stacks stay independent.
-    @ViewBuilder
-    private var selectedContent: some View {
-        switch selectedTab {
-        case 1:
-            NavigationStack(path: $searchPath) {
-                searchRoot
-                    // Back at the tab ROOT opens the sidebar; when a screen is
-                    // pushed, focus is in that screen (not here) so the
-                    // NavigationStack pops instead.
-                    .onExitCommand { sidebarFocus = 1 }
-                    .navigationDestination(for: Route.self) { destination(for: $0, path: $searchPath) }
-            }
-        case 2:
-            NavigationStack(path: $libraryPath) {
-                libraryRoot
-                    .onExitCommand { sidebarFocus = 2 }
-                    .navigationDestination(for: Route.self) { destination(for: $0, path: $libraryPath) }
-            }
-        case 3:
-            SettingsView()
-                .onExitCommand { sidebarFocus = 3 }
-        case 4:
-            NavigationStack(path: $liveTVPath) {
-                liveTVRoot
-                    .onExitCommand { sidebarFocus = 4 }
-                    .navigationDestination(for: Route.self) { destination(for: $0, path: $liveTVPath) }
-            }
-        default:
-            NavigationStack(path: $homePath) {
-                homeRoot
-                .onExitCommand {
-                    // Ignore a Menu press that lands right after popping back
-                    // from a pushed screen (detail / streams). tvOS sometimes
-                    // delivers a lingering second Menu to Home after the pop,
-                    // which would spuriously open the sidebar.
-                    if let popped = lastHomePopAt, Date().timeIntervalSince(popped) < 1.0 { return }
-                    sidebarFocus = 0
-                }
-                .onChange(of: homePath.count) { oldCount, newCount in
-                    guard newCount < oldCount else { return }
-                    lastHomePopAt = Date()
-                    // Popping all the way back to Home: keep the sidebar
-                    // non-focusable for a beat so the focus engine lands on a
-                    // Home card instead of grabbing the rail (which springs the
-                    // sidebar open). Same trick as the cold-launch path.
-                    if newCount == 0 {
-                        sidebarEnabled = false
-                        Task {
-                            try? await Task.sleep(nanoseconds: 900_000_000)
-                            sidebarEnabled = true
-                        }
-                    }
-                }
-                .navigationDestination(for: Route.self) { destination(for: $0, path: $homePath) }
-            }
-        }
-    }
-
     /// Shared navigation destinations. `path` is the binding for whichever
     /// tab's stack is presenting, so nested pushes stay within that tab.
     @ViewBuilder
     private func destination(for route: Route, path: Binding<NavigationPath>) -> some View {
         switch route {
         case .detail(let item):
-            // Stremio always uses its own MetaDetails. Otherwise the detail page
-            // is an independent look axis (Settings → Themes → Detail Page).
-            if theme.isStremioTheme {
-                StremioDetailView(
+            DetailView(
                     item: item,
                     onPlay: { meta, video in path.wrappedValue.append(Route.streams(meta, video)) },
                     onPlayManually: { meta, video in path.wrappedValue.append(Route.streamsManual(meta, video)) },
-                    onPlayFromBeginning: { meta, video in path.wrappedValue.append(Route.streamsFromStart(meta, video)) },
-                    onSelectItem: { path.wrappedValue.append(Route.detail($0)) }
-                )
-            } else if theme.detailStyle != .orivio {
-                ThemedDetailView(
-                    variant: theme.detailStyle,
-                    item: item,
-                    onPlay: { meta, video in path.wrappedValue.append(Route.streams(meta, video)) },
-                    onPlayFromBeginning: { meta, video in path.wrappedValue.append(Route.streamsFromStart(meta, video)) },
-                    onSelectItem: { path.wrappedValue.append(Route.detail($0)) }
-                )
-            } else {
-                DetailView(
-                    item: item,
-                    onPlay: { meta, video in path.wrappedValue.append(Route.streams(meta, video)) },
-                    onPlayManually: { meta, video in path.wrappedValue.append(Route.streamsManual(meta, video)) },
+                    onPlayInInfuse: { meta, video in path.wrappedValue.append(Route.streamsInfuse(meta, video)) },
                     onPlayFromBeginning: { meta, video in path.wrappedValue.append(Route.streamsFromStart(meta, video)) },
                     onSelectItem: { path.wrappedValue.append(Route.detail($0)) },
                     onSelectPerson: { id, name in path.wrappedValue.append(Route.person(id: id, name: name)) },
                     onSelectCompany: { id, name in path.wrappedValue.append(Route.tmdbCompany(id: id, name: name)) }
-                )
-            }
+            )
         case .collection(let collection):
             CollectionView(collection: collection) { path.wrappedValue.append(Route.detail($0)) }
         case .person(let id, let name):
@@ -1369,6 +734,17 @@ struct RootView: View {
                     allEntries: all,
                     resumePosition: progressStore.progress(for: key)?.positionSeconds
                 ))
+            }
+        case .streamsInfuse(let meta, let video):
+            // Same auto-pick path as .streams — the source still has to be
+            // resolved (a debrid torrent has no playable URL until it is) —
+            // but the finished link is handed off rather than played here.
+            StreamsView(
+                meta: meta, video: video,
+                onAutoDismiss: { pendingAutoPlayPop = true }
+            ) { entry, _ in
+                guard let url = entry.stream.url else { return }
+                ExternalPlayers.openInInfuse(urlString: url)
             }
         case .streamsManual(let meta, let video):
             StreamsView(meta: meta, video: video, forceManual: true) { entry, all in

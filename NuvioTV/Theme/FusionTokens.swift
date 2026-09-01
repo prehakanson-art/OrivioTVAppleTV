@@ -18,7 +18,6 @@ enum FusionType {
     static func bodyText(_ f: AppFont) -> Font { .system(size: 23, weight: .regular, design: body(f)) }
     static func metadata(_ f: AppFont) -> Font { .system(size: 20, weight: .medium, design: body(f)) }
     static func button(_ f: AppFont) -> Font { .system(size: 23, weight: .semibold, design: body(f)) }
-    static func sidebarLabel(_ f: AppFont) -> Font { .system(size: 24, weight: .semibold, design: body(f)) }
     static func badge(_ f: AppFont) -> Font { .system(size: 15, weight: .bold, design: body(f)) }
     /// Technical stream data — always monospaced regardless of font choice
     /// (§8: "Technical source data may look especially appropriate in this mode").
@@ -58,15 +57,12 @@ enum FusionMotion {
     static let focusMoveFast = enter(0.16)     // during rapid directional input
     static let pressDown = enter(0.085)
     static let pressRelease = exit(0.13)
-    static let sidebarExpand = enter(0.28)
-    static let sidebarCollapse = exit(0.23)
     static let pageEnter = enter(0.32)
     static let pageExit = exit(0.22)
     static let heroCrossfade = enter(0.40)
     static let heroSlide = enter(0.48)
     static let dialogEnter = enter(0.24)
     static let dialogExit = exit(0.18)
-    static let quickMenu = enter(0.21)
     static let toastEnter = enter(0.22)
     static let toastExit = exit(0.20)
     static let controlsAppear = enter(0.18)
@@ -81,8 +77,6 @@ enum FusionMotion {
     /// move so the growth reads as deliberate rather than snapped.
     static let rowExpand: Animation = .smooth(duration: 0.45)
 
-    /// Background-focus debounce and toast dwell (§12), in seconds.
-    static let backgroundFocusDelay: Double = 0.16
     static let toastVisibleSeconds: Double = 2.6
 }
 
@@ -121,6 +115,4 @@ enum FusionFocus {
 enum FusionMaterials {
     static let sidebar = Color(hex: 0x080A0D, alpha: 0.88)
     static let dialog = Color(hex: 0x14171D, alpha: 0.94)
-    static let heroButton = Color(hex: 0x12151A, alpha: 0.72)
-    static let settingsPanel = Color(hex: 0x11141A, alpha: 0.92)
 }

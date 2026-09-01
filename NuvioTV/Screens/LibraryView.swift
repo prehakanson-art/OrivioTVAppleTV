@@ -186,7 +186,7 @@ private struct LibrarySegment: View {
                                : (isFocused ? theme.palette.focusBackground : Color.white.opacity(0.08)))
             )
             .overlay(Capsule().strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 3))
-            .scaleEffect(PerformanceSettingsStore.shared.buttonAnimationsEffective && isFocused ? 1.04 : 1)
+            .focusLift(NuvioFocus.card, isFocused)
             .animation(PerformanceSettingsStore.shared.buttonAnimationsEffective
                        ? .spring(response: 0.3, dampingFraction: 0.8) : nil, value: isFocused)
     }

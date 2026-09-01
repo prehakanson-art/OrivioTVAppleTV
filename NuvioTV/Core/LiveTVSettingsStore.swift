@@ -114,6 +114,4 @@ final class LiveTVSettingsStore: ObservableObject {
         .init(code: "zho", name: "Chinese"),
     ]
 
-    func countryName(_ code: String) -> String { Self.countries.first { $0.code == code }?.name ?? "All countries" }
-    func languageName(_ code: String) -> String { Self.languages.first { $0.code == code }?.name ?? "All languages" }
 }

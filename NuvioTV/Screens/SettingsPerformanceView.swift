@@ -5,6 +5,7 @@ import SwiftUI
 /// what the effect costs and what OFF looks like. All ON = the full look.
 struct PerformanceSettingsDetail: View {
     @EnvironmentObject private var theme: ThemeManager
+    @EnvironmentObject private var playerStore: PlayerSettingsStore
     @ObservedObject private var store = PerformanceSettingsStore.shared
 
     private var s: Binding<PerformanceSettingsStore.Settings> {
@@ -154,6 +155,23 @@ struct PerformanceSettingsDetail: View {
                     title: "Playback diagnostics HUD",
                     subtitle: "Live engine, fps, dropped frames, A/V drift, bitrate and buffer depth over the video. For chasing stutter on this box.",
                     isOn: s.showPlayerDiagnostics
+                )
+
+                // Lived under Playback → Seeking; it's a diagnostic overlay, so
+                // it belongs with the other two.
+                PerfToggleRow(
+                    icon: "photo.stack",
+                    title: "Scrub preview frames",
+                    subtitle: "Decode a frame every 30s so the progress bar can show the scene you're seeking to. Costs a second connection and decoder alongside playback — turn off if a stream stutters.",
+                    isOn: Binding(get: { playerStore.settings.scrubPreviewsEnabled },
+                                  set: { playerStore.settings.scrubPreviewsEnabled = $0 })
+                )
+                PerfToggleRow(
+                    icon: "ladybug.fill",
+                    title: "Show input debug",
+                    subtitle: "Overlay the last trackpad/remote event in the player, for tuning gestures on a real Apple TV.",
+                    isOn: Binding(get: { playerStore.settings.showInputDebug },
+                                  set: { playerStore.settings.showInputDebug = $0 })
                 )
             }
 

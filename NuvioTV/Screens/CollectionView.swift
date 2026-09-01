@@ -285,8 +285,7 @@ struct CollectionTileCard: View, Equatable {
                 .lineLimit(1)
                 .frame(width: cardSize.width, alignment: .leading)
         }
-        .scaleEffect(perf.focusZoomEffective && isFocused ? 1.06 : 1.0)
-        .animation(theme.isAppleTVTheme ? FusionMotion.focusMove : .spring(response: 0.32, dampingFraction: 0.82), value: isFocused)
+        .focusLift(NuvioFocus.card, isFocused)
     }
 
     private var glowEnabled: Bool { collection.focusGlowEnabled ?? true }
@@ -443,8 +442,7 @@ struct CollectionFolderCard: View, Equatable {
                     .frame(width: cardSize.width, alignment: .leading)
             }
         }
-        .scaleEffect(perf.focusZoomEffective && isFocused ? 1.06 : 1.0)
-        .animation(theme.isAppleTVTheme ? FusionMotion.focusMove : .spring(response: 0.32, dampingFraction: 0.82), value: isFocused)
+        .focusLift(NuvioFocus.card, isFocused)
     }
 }
 
@@ -1017,7 +1015,6 @@ struct FolderTabPill: View {
                                : (isFocused ? theme.palette.focusBackground : Color.white.opacity(0.08)))
             )
             .overlay(Capsule().strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 3))
-            .scaleEffect(isFocused ? 1.04 : 1)
-            .animation(.spring(response: 0.3, dampingFraction: 0.8), value: isFocused)
+            .focusLift(NuvioFocus.card, isFocused)
     }
 }

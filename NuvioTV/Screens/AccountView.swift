@@ -407,51 +407,6 @@ struct AccountView: View {
         .focusSection()
     }
 
-    private var signInPrompt: some View {
-        ScrollView(.vertical, showsIndicators: false) {
-            VStack(spacing: NuvioSpacing.xl) {
-                Image(systemName: "person.crop.circle.badge.plus")
-                    .font(.system(size: 76))
-                    .foregroundStyle(theme.palette.secondary)
-                Text("Accounts")
-                    .font(.system(size: 46, weight: .heavy))
-                    .foregroundStyle(theme.palette.textPrimary)
-                Text("Connect Orivio, Stremio, or both. When both are connected, this device merges matching data and syncs the combined add-ons, library, watched state, and Continue Watching into Orivio.")
-                    .font(.system(size: 23))
-                    .foregroundStyle(theme.palette.textSecondary)
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: 880)
-
-                VStack(spacing: NuvioSpacing.lg) {
-                    accountConnectionCard(
-                        title: "Orivio",
-                        subtitle: "Sync add-ons, profiles, settings, library, watched, and Continue Watching with your Orivio account.",
-                        status: "Not connected",
-                        icon: "person.crop.circle.badge.plus"
-                    ) {
-                        AccountPrimaryButton(title: "Sign In", systemImage: "qrcode") {
-                            account.startQRLogin()
-                        }
-                        .focused($focusedControl, equals: .orivioSignIn)
-                    }
-
-                    stremioConnectionCard
-                }
-                .frame(maxWidth: 980)
-                .focusSection()
-
-                if let error = account.errorMessage {
-                    errorLabel(error)
-                }
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, NuvioSpacing.xxl)
-            .focusSection()
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .onAppear { focusedControl = .orivioSignIn }
-    }
-
     private func accountConnectionCard<Controls: View>(
         title: String,
         subtitle: String,
@@ -642,124 +597,6 @@ struct AccountView: View {
             Text(text)
                 .font(.system(size: 24))
                 .foregroundStyle(theme.palette.textPrimary)
-        }
-    }
-
-    // MARK: - Signed in
-
-    private func signedIn(email: String) -> some View {
-        ScrollView(.vertical, showsIndicators: false) {
-            VStack(spacing: NuvioSpacing.xl) {
-                Image(systemName: "checkmark.circle.fill")
-                    .font(.system(size: 84))
-                    .foregroundStyle(NuvioPrimitives.success)
-                Text("Signed in")
-                    .font(.system(size: 46, weight: .heavy))
-                    .foregroundStyle(theme.palette.textPrimary)
-                Text(email)
-                    .font(.system(size: 26, weight: .medium))
-                    .foregroundStyle(theme.palette.textSecondary)
-
-                stremioConnectionCard
-                    .frame(maxWidth: 980)
-
-                // Manual full-account sync, sitting directly under the account it
-                // belongs to. Everything syncs automatically every
-                // `NuvioSyncManager.autoSyncInterval` seconds; this is for "do it
-                // now" after changing something on another device.
-                AccountPrimaryButton(
-                    title: syncing ? "Syncing..." : "Merge Sync",
-                    systemImage: "arrow.triangle.2.circlepath"
-                ) {
-                    runSyncAction(label: "Merge sync") { sync in
-                        await sync.syncNow()
-                    }
-                }
-                .focused($focusedControl, equals: .mergeSync)
-
-                HStack(spacing: NuvioSpacing.md) {
-                    AccountPrimaryButton(title: "Pull Updates", systemImage: "arrow.down.circle", filled: false) {
-                        runSyncAction(label: "Pull updates") { sync in
-                            await sync.pullAccountUpdates()
-                        }
-                    }
-                    .focused($focusedControl, equals: .pullUpdates)
-
-                    AccountPrimaryButton(title: "Push Device", systemImage: "arrow.up.circle", filled: false) {
-                        runSyncAction(label: "Device push") { sync in
-                            await sync.pushThisDevice()
-                        }
-                    }
-                    .focused($focusedControl, equals: .pushDevice)
-                }
-
-                if let syncStatus {
-                    Text(syncStatus)
-                        .font(.system(size: 20))
-                        .foregroundStyle(syncStatus.hasPrefix("Sync failed")
-                                         ? NuvioPrimitives.error : theme.palette.textTertiary)
-                        .multilineTextAlignment(.center)
-                        .frame(maxWidth: 760)
-                }
-
-                syncStatusPanel
-
-                HStack(spacing: NuvioSpacing.md) {
-                    AccountPrimaryButton(title: "Export Backup", systemImage: "square.and.arrow.up", filled: false) {
-                        backupText = NuvioLocalBackupService.exportBackup(
-                            addonManager: addonManager,
-                            plugins: plugins,
-                            library: library,
-                            progress: progress,
-                            watched: watched
-                        ) ?? ""
-                        showBackupExport = true
-                    }
-                    .focused($focusedControl, equals: .exportBackup)
-
-                    AccountPrimaryButton(title: "Import Backup", systemImage: "square.and.arrow.down", filled: false) {
-                        backupImportText = ""
-                        backupImportStatus = nil
-                        showBackupImport = true
-                    }
-                    .focused($focusedControl, equals: .importBackup)
-                }
-
-                AccountPrimaryButton(title: "Sign Out", systemImage: "rectangle.portrait.and.arrow.right", filled: false) {
-                    confirmSignOut = true
-                }
-                .focused($focusedControl, equals: .signOut)
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, NuvioSpacing.xxl)
-            .focusSection()
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .onAppear {
-            syncLog = NuvioSyncDiagnostics.entries()
-            focusedControl = stremio.isSignedIn ? .stremioSync : .stremioSignIn
-        }
-        // Signing out drops local account state — confirm so a stray click
-        // can't log the account out (matches the Android app's dialog).
-        .alert("Sign Out?", isPresented: $confirmSignOut) {
-            Button("Sign Out", role: .destructive) { account.signOut() }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("Your watch progress, library and add-ons stay on this device, but they'll stop syncing until you sign in again.")
-        }
-        .fullScreenCover(isPresented: $showBackupExport) {
-            AccountBackupExportView(text: backupText, onDone: { showBackupExport = false })
-                .environmentObject(theme)
-        }
-        .fullScreenCover(isPresented: $showBackupImport) {
-            AccountBackupImportView(
-                text: $backupImportText,
-                status: backupImportStatus,
-                importing: importingBackup,
-                onImport: importBackup,
-                onDone: { showBackupImport = false }
-            )
-            .environmentObject(theme)
         }
     }
 
@@ -1167,8 +1004,7 @@ private struct AccountMiniButton: View {
                     Capsule(style: .continuous)
                         .strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 2)
                 )
-                .scaleEffect(isFocused ? 1.05 : 1)
-                .animation(.spring(response: 0.25, dampingFraction: 0.82), value: isFocused)
+                .focusLift(NuvioFocus.card, isFocused)
         }
         .buttonStyle(.plain)
     }
@@ -1411,8 +1247,7 @@ private struct AccountButtonLabel: View {
                 Capsule(style: .continuous)
                     .strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 3)
             )
-            .scaleEffect(isFocused ? 1.05 : 1)
-            .animation(.spring(response: 0.3, dampingFraction: 0.8), value: isFocused)
+            .focusLift(NuvioFocus.card, isFocused)
     }
 
     private var background: Color {

@@ -202,7 +202,6 @@ private struct DropdownOptionRow: View {
                 .strokeBorder(isFocused ? theme.palette.focusRing : (selected ? theme.palette.secondary.opacity(0.5) : .clear),
                               lineWidth: isFocused ? 4 : 2)
         )
-        .scaleEffect(isFocused ? 1.02 : 1)
-        .animation(.easeInOut(duration: 0.14), value: isFocused)
+        .focusLift(NuvioFocus.row, isFocused)
     }
 }

@@ -25,8 +25,6 @@ enum NuvioPrimitives {
     static let neutral800 = Color(hex: 0x2D2D2D)
     static let neutral750 = Color(hex: 0x333333)
     static let neutral700 = Color(hex: 0x4D4D4D)
-    static let neutral650 = Color(hex: 0x6F6F6F)
-    static let neutral600 = Color(hex: 0x808080)
     static let neutral500 = Color(hex: 0x9E9E9E)
     static let neutral400 = Color(hex: 0xB3B3B3)
     static let neutral200 = Color(hex: 0xE0E0E0)
@@ -195,119 +193,6 @@ enum NuvioThemes {
     }
 }
 
-/// A full app THEME — the overall look/feel preset, distinct from the accent
-/// "Color Theme" in Appearance. Register new themes in `all`; the selected id
-/// lives on `ThemeManager.appThemeID` and syncs with the account. Rendering
-/// code that a theme restyles branches on `theme.appThemeID`.
-struct AppTheme: Identifiable, Equatable {
-    let id: String
-    let displayName: String
-    let summary: String
-    /// SF Symbol shown next to the theme in the picker.
-    var icon: String = "paintbrush.fill"
-}
-
-enum AppThemes {
-    static let classic = AppTheme(
-        id: "classic",
-        displayName: "Classic",
-        summary: "The original Orivio look."
-    )
-
-    /// "Modern" — the premium modular media-center look: deep graphite
-    /// backgrounds, artwork-driven environments, cinematic hero, reflective
-    /// focus, light/dark/AMOLED. Internal id stays "appletv" so existing
-    /// synced theme selections keep resolving to it.
-    static let appleTV = AppTheme(
-        id: "appletv",
-        displayName: "Modern",
-        summary: "A cinematic, customizable media center — deep graphite, artwork-driven, light & dark.",
-        icon: "square.stack.3d.up.fill"
-    )
-
-    /// "Theater" — a dark cinema look: pure-black stage, artwork emerging from
-    /// darkness, red accent states, dense fast rows, white Play button. Shares
-    /// the Modern top-nav chrome (see `ThemeManager.isAppleTVTheme`) and
-    /// restyles on top of it. Internal id stays "netflix" for synced selections.
-    static let netflix = AppTheme(
-        id: "netflix",
-        displayName: "Theater",
-        summary: "A dark theater: black stage, cinematic billboard, dense rows, red accent states.",
-        icon: "play.rectangle.fill"
-    )
-
-    /// "Aurora" — a dark navy-purple stage with a signature purple accent,
-    /// rounded cards, and a collapsible left icon rail. Internal id stays
-    /// "stremio" so existing synced theme selections keep resolving to it.
-    static let stremio = AppTheme(
-        id: "stremio",
-        displayName: "Aurora",
-        summary: "A navy-purple stage with a purple accent, rounded cards, and a left icon rail.",
-        icon: "puzzlepiece.extension.fill"
-    )
-
-    /// "Cinema" — a from-scratch cinematic media center (deep graphite stage,
-    /// big artwork hero, artwork-driven rows). Built entirely on its OWN screens
-    /// and components — reuses NOTHING from the retired Modern/Nova themes — so
-    /// every focus highlight and hold menu works. Routes to `cinemaLayout` +
-    /// `CinemaHomeView` and gates its look on `isCinemaTheme`.
-    static let cinema = AppTheme(
-        id: "cinema",
-        displayName: "Cinema",
-        summary: "A cinematic media center — deep graphite stage, big hero, artwork-driven rows.",
-        icon: "film.stack.fill"
-    )
-
-    /// "Onyx" — modelled on the bobsupra/NuvioTVOS tvOS client: a near-black
-    /// stage where focus is a crisp WHITE edge (no coloured ring, no glow, no
-    /// lift). Rides the shared Classic layout, restyled purely via
-    /// `OnyxPalette.adapt` (like Aurora) — its identity is the palette + focus
-    /// edge, so no custom layout is needed.
-    static let onyx = AppTheme(
-        id: "onyx",
-        displayName: "Onyx",
-        summary: "A near-black stage with a crisp white focus edge — clean, flat, minimal.",
-        icon: "viewfinder"
-    )
-
-    /// "Max" — a faithful port of the HBO Max / Max tvOS look: a pure-black
-    /// stage, white type, and WHITE focus (borders/fills/scale, no colour), a
-    /// collapsible left icon sidebar that expands over a scrim, an HBO max
-    /// lockup top-right, a left-scrimmed featured hero, and Top 10 rank
-    /// numerals. GROUND-UP chrome (`NuvioTVApp.maxLayout` + `MaxSidebarNav` +
-    /// `MaxHomeView`); the shared screens ride `MaxPalette`. Gates on
-    /// `ThemeManager.isMaxTheme`.
-    /// "Marquee" — a pure-black cinematic look (white focus, left icon sidebar,
-    /// big featured hero). Internal id stays "max" so existing synced theme
-    /// selections keep resolving to it.
-    static let max = AppTheme(
-        id: "max",
-        displayName: "Marquee",
-        summary: "A pure-black cinematic look — white focus, a left icon sidebar, and a big featured hero.",
-        icon: "rectangle.stack.badge.play.fill"
-    )
-
-    /// "Streamline" — a port of the Hulu tvOS look: a dark navy/teal stage, an
-    /// accent-coloured focus outline (follows the Color Theme), a left icon
-    /// sidebar, and PLAY/DETAILS hero buttons. Its own chrome
-    /// (`NuvioTVApp.huluLayout` + `HuluRootView`). Gates on
-    /// `ThemeManager.isHuluTheme`. Internal id "hulu".
-    static let hulu = AppTheme(
-        id: "hulu",
-        displayName: "Streamline",
-        summary: "A dark navy stage with an accent focus outline, a left icon sidebar, and Play/Details buttons.",
-        icon: "play.tv.fill"
-    )
-
-    /// Registration order = picker order. `appleTV` (Modern) is retired — kept
-    /// defined so lingering references compile, but removed from `all` so it is
-    /// no longer selectable and stored selections migrate to Classic.
-    static let all: [AppTheme] = [classic, cinema, netflix, stremio, onyx, max, hulu]
-    static let defaultID = classic.id
-
-    static func theme(id: String) -> AppTheme { all.first { $0.id == id } ?? classic }
-}
-
 /// Light/dark preference for the Apple TV theme (Classic is always dark).
 /// `system` follows the Apple TV's own Appearance setting.
 enum ATVAppearance: String, CaseIterable, Identifiable, Codable {
@@ -432,37 +317,38 @@ enum ThemeVariant: String, CaseIterable, Identifiable, Codable {
 }
 
 /// The player-overlay axis. Independent of `ThemeVariant` (which still drives the
-/// detail/profile axes): the player offers just two layouts — the default Orivio
-/// controls, and an "HBO"/native-style minimal transport modelled on Apple TV's
-/// own player chrome.
+/// detail/profile axes): the player offers the original Orivio controls and
+/// Fusion, an Apple-TV-style transport.
 enum PlayerLayout: String, CaseIterable, Identifiable {
-    case classic, hbo
+    case classic, fusion
     var id: String { rawValue }
     var displayName: String {
         switch self {
         case .classic: return "Classic"
-        case .hbo: return "HBO"
+        case .fusion: return "Fusion"
         }
     }
     var summary: String {
         switch self {
-        case .classic: return "The default Orivio playback controls."
-        case .hbo: return "Apple TV's native-style transport — a clean scrubber, minimal chrome."
+        case .classic: return "The original Orivio playback controls."
+        case .fusion: return "Apple TV\u{2011}style transport \u{2014} centred glass controls, a chapter-aware scrubber."
         }
     }
     var icon: String {
         switch self {
         case .classic: return "circle.grid.2x2.fill"
-        case .hbo: return "play.rectangle.fill"
+        case .fusion: return "play.circle.fill"
         }
     }
-    /// Map any stored/synced string onto the two current options — including the
-    /// retired values ("orivio"/"marquee"/"streamline") written while the player
-    /// axis still shared `ThemeVariant`. The old HBO-styled "Marquee" overlay
-    /// maps to `.hbo`; everything else falls back to `.classic`.
+    /// Map any stored/synced string onto the two current options. Covers the
+    /// retired values written while the player axis still shared `ThemeVariant`
+    /// ("orivio"/"marquee"/"streamline") and the retired plain-Apple-TV layout
+    /// ("hbo"). Anyone who had chosen the minimal Apple-TV transport lands on
+    /// Fusion — the closest thing to what they picked — rather than being
+    /// dropped back to Classic.
     init(stored raw: String?) {
         switch raw {
-        case "hbo", "marquee": self = .hbo
+        case "fusion", "hbo", "marquee": self = .fusion
         default: self = .classic
         }
     }
@@ -508,7 +394,7 @@ final class ThemeManager: ObservableObject {
             if !applyingRemote { onLocalChange?() }
         }
     }
-    /// AMOLED mode: force pure-black surfaces (APK "Use pure black for app backgrounds").
+    /// AMOLED mode: force pure-black surfaces.
     @Published var amoled: Bool {
         didSet {
             UserDefaults.standard.set(amoled, forKey: Self.amoledKey)
@@ -537,56 +423,11 @@ final class ThemeManager: ObservableObject {
             if !applyingRemote { onLocalChange?() }
         }
     }
-    /// Independent LOOK axes — a user can mix the detail page, profile screen and
-    /// player overlay of any theme regardless of the selected app theme.
-    @Published var detailStyle: ThemeVariant {
-        didSet {
-            UserDefaults.standard.set(detailStyle.rawValue, forKey: Self.detailStyleKey)
-            if !applyingRemote { onLocalChange?() }
-        }
-    }
-    @Published var profileStyle: ThemeVariant {
-        didSet {
-            UserDefaults.standard.set(profileStyle.rawValue, forKey: Self.profileStyleKey)
-            if !applyingRemote { onLocalChange?() }
-        }
-    }
-    @Published var playerStyle: PlayerLayout {
-        didSet {
-            UserDefaults.standard.set(playerStyle.rawValue, forKey: Self.playerStyleKey)
-            if !applyingRemote { onLocalChange?() }
-        }
-    }
-    /// Selected app theme (overall look preset). Currently only "classic";
-    /// more can be registered in `AppThemes.all`.
-    @Published var appThemeID: String {
-        didSet {
-            UserDefaults.standard.set(appThemeID, forKey: Self.appThemeKey)
-            rebuildPalette()
-            if !applyingRemote { onLocalChange?() }
-        }
-    }
-    /// Light/dark preference for the Apple TV theme. Ignored by Classic,
-    /// which is hard-dark.
-    @Published var atvAppearance: ATVAppearance {
-        didSet {
-            UserDefaults.standard.set(atvAppearance.rawValue, forKey: Self.atvAppearanceKey)
-            if !applyingRemote { onLocalChange?() }
-        }
-    }
-    /// The system's resolved scheme, fed in by the root view so `.system`
-    /// appearance can pick the right palette. Defaults dark (tvOS default).
+    /// The system's resolved scheme, fed in by the root view. Defaults dark.
     @Published var systemIsDark = true
 
-    /// The adapted palette, cached. `palette` used to recompute on every access;
-    /// under the Apple TV theme that means running `ATVPalettes.adapt` — which
-    /// rebuilds a ~20-field `ThemePalette` (every surface/text `Color(hex:)`
-    /// reallocated) plus an accent lookup. Since `theme.palette` is read 600+
-    /// times across the UI (many per view body, re-evaluated on every scroll and
-    /// focus-move frame), recomputing per-access was a large per-frame cost the
-    /// Classic theme never paid — there `palette` is just the stored base. The
-    /// adapted result only depends on the accent, AMOLED and the active theme, so
-    /// it's rebuilt only when one of those changes (see `rebuildPalette`).
+    /// The adapted palette, cached — rebuilt only when accent/AMOLED change,
+    /// never per read (`theme.palette` is read hundreds of times per frame).
     private var cachedPalette: ThemePalette = NuvioThemes.palette(id: "violet")
 
     /// Corner radius for settings rows under the current style.
@@ -603,273 +444,80 @@ final class ThemeManager: ObservableObject {
     private static let fontKey = "nuvio.theme.font"
     private static let experienceKey = "nuvio.theme.experience"
     private static let settingsStyleKey = "nuvio.theme.settingsstyle"
-    private static let appThemeKey = "nuvio.theme.appTheme"
-    private static let explicitAppThemeKey = "nuvio.theme.appTheme.chosenHere.v1"
-    private static let atvAppearanceKey = "nuvio.theme.atvAppearance"
-    private static let detailStyleKey = "nuvio.theme.detailStyle"
-    private static let profileStyleKey = "nuvio.theme.profileStyle"
-    private static let playerStyleKey = "nuvio.theme.playerStyle"
-
-    /// Dev-only launch-arg theme force (`-atvTheme` / `-classicTheme`) so the
-    /// sim can be driven into either look without navigating Settings. Also
-    /// wins over an account-synced snapshot for the session, since the synced
-    /// blob would otherwise stomp the forced theme seconds after launch.
-    private static var launchThemeOverride: String? {
-        let args = ProcessInfo.processInfo.arguments
-        if args.contains("-cinemaTheme") { return AppThemes.cinema.id }
-        if args.contains("-maxTheme") { return AppThemes.max.id }
-        if args.contains("-huluTheme") { return AppThemes.hulu.id }
-        if args.contains("-onyxTheme") { return AppThemes.onyx.id }
-        if args.contains("-netflixTheme") { return AppThemes.netflix.id }
-        if args.contains("-stremioTheme") { return AppThemes.stremio.id }
-        if args.contains("-classicTheme") { return AppThemes.classic.id }
-        return nil
-    }
-
-    /// Dev-only: force the look axes (detail/profile/player) for sim testing.
-    private static var launchLooksOverride: ThemeVariant? {
-        let a = ProcessInfo.processInfo.arguments
-        if a.contains("-marqueeLooks") { return .marquee }
-        if a.contains("-streamlineLooks") { return .streamline }
-        return nil
-    }
-
-    /// Dev-only: force the player layout for sim testing.
-    private static var launchPlayerOverride: PlayerLayout? {
-        let a = ProcessInfo.processInfo.arguments
-        if a.contains("-hboPlayer") { return .hbo }
-        if a.contains("-classicPlayer") { return .classic }
-        // The legacy looks flags still drive the player axis so existing test
-        // launches keep working (Marquee was the HBO-styled overlay → .hbo).
-        if a.contains("-marqueeLooks") { return .hbo }
-        if a.contains("-streamlineLooks") { return .classic }
-        return nil
-    }
-
-    /// Dev-only appearance force (`-atvLight` / `-atvDark`) — the tvOS sim
-    /// runtime can't switch system appearance, so light mode is otherwise
-    /// undrivable from the command line.
-    private static var launchAppearanceOverride: ATVAppearance? {
-        let args = ProcessInfo.processInfo.arguments
-        if args.contains("-atvLight") { return .light }
-        if args.contains("-atvDark") { return .dark }
-        return nil
-    }
 
     init() {
-        // Default to violet to match the Nuvio brand mark (cyan→purple play
-        // logo); the old "crimson" default matched the retired red icon.
         let saved = UserDefaults.standard.string(forKey: Self.key) ?? "violet"
         basePalette = NuvioThemes.palette(id: saved)
         amoled = UserDefaults.standard.bool(forKey: Self.amoledKey)
         font = AppFont(rawValue: UserDefaults.standard.string(forKey: Self.fontKey) ?? "") ?? .system
         experienceMode = ExperienceMode(rawValue: UserDefaults.standard.string(forKey: Self.experienceKey) ?? "") ?? .advanced
         settingsUiStyle = SettingsUiStyle(rawValue: UserDefaults.standard.string(forKey: Self.settingsStyleKey) ?? "") ?? .classic
-        // A persisted id for a removed theme (e.g. the retired "premiere")
-        // falls back to the default so the picker never rests on a phantom.
-        let savedThemeID = UserDefaults.standard.string(forKey: Self.appThemeKey)
-        appThemeID = Self.launchThemeOverride
-            ?? savedThemeID.flatMap { id in AppThemes.all.contains { $0.id == id } ? id : nil }
-            ?? AppThemes.defaultID
-        atvAppearance = Self.launchAppearanceOverride
-            ?? ATVAppearance(rawValue: UserDefaults.standard.string(forKey: Self.atvAppearanceKey) ?? "")
-            ?? .system
-        let looksOverride = Self.launchLooksOverride
-        detailStyle = looksOverride ?? ThemeVariant(rawValue: UserDefaults.standard.string(forKey: Self.detailStyleKey) ?? "") ?? .orivio
-        profileStyle = looksOverride ?? ThemeVariant(rawValue: UserDefaults.standard.string(forKey: Self.profileStyleKey) ?? "") ?? .orivio
-        playerStyle = Self.launchPlayerOverride ?? PlayerLayout(stored: UserDefaults.standard.string(forKey: Self.playerStyleKey))
-        // Seed the cache from the real inputs (the declaration default above is
-        // just a placeholder; didSet doesn't fire for the initial assignments).
         rebuildPalette()
     }
 
-    /// Current theme as a syncable snapshot.
+    /// Current theme as a syncable snapshot. The retired per-theme axes stay
+    /// nil so older devices simply keep whatever they had.
     var snapshot: ThemeSnapshot {
         ThemeSnapshot(
             paletteID: basePalette.id, amoled: amoled, font: font,
-            experienceMode: experienceMode, settingsUiStyle: settingsUiStyle,
-            appThemeID: appThemeID, atvAppearance: atvAppearance,
-            detailStyle: detailStyle, profileStyle: profileStyle, playerStyle: playerStyle
+            experienceMode: experienceMode, settingsUiStyle: settingsUiStyle
         )
     }
 
     /// Apply a snapshot pulled from the account without echoing it back up.
+    /// Theme/variant fields written by older builds are ignored — the app has
+    /// exactly one look now.
     func applyRemote(_ s: ThemeSnapshot) {
-        guard s != snapshot else { return }
         applyingRemote = true
         basePalette = NuvioThemes.palette(id: s.paletteID)
         amoled = s.amoled
         font = s.font
         experienceMode = s.experienceMode
         settingsUiStyle = s.settingsUiStyle
-        // Keep the CURRENT theme when the remote snapshot doesn't carry one
-        // (a blob from an older build, or one whose id this build doesn't
-        // know) — same rule as the look axes below. Falling back to the
-        // DEFAULT here meant a stale blob reverted a just-picked theme to
-        // Classic on the next pull.
-        // A theme chosen on this device wins over the blob's (see
-        // hasExplicitAppTheme). Without that, every profile switch — which runs
-        // a full sync — reapplied that profile's stored theme over the user's
-        // pick, and the push right after made the revert permanent.
-        if let forced = Self.launchThemeOverride {
-            appThemeID = forced
-        } else if !hasExplicitAppTheme,
-                  let remote = s.appThemeID,
-                  AppThemes.all.contains(where: { $0.id == remote }) {
-            appThemeID = remote
-        }
-        atvAppearance = Self.launchAppearanceOverride ?? s.atvAppearance ?? atvAppearance
-        // Keep the CURRENT (locally-chosen) look axes when the remote snapshot
-        // doesn't specify them — otherwise an older blob (nil fields) would stomp
-        // a selection the user just made in Settings back to Orivio.
-        let looks = Self.launchLooksOverride
-        detailStyle = looks ?? s.detailStyle ?? detailStyle
-        profileStyle = looks ?? s.profileStyle ?? profileStyle
-        playerStyle = Self.launchPlayerOverride ?? s.playerStyle ?? playerStyle
         applyingRemote = false
     }
 
-    /// The currently selected app theme.
-    var appTheme: AppTheme { AppThemes.theme(id: appThemeID) }
-    /// The user picking a theme in Settings — as opposed to one arriving from
-    /// the account. Records that THIS DEVICE has an explicit choice, which then
-    /// outranks anything a pulled blob carries (see `applyRemote`).
-    func setAppTheme(_ t: AppTheme) {
-        hasExplicitAppTheme = true
-        appThemeID = t.id
-    }
+    /// Root-level font design applied app-wide.
+    var rootFontDesign: Font.Design { font.design }
 
-    /// Whether someone has chosen a theme on this device.
-    ///
-    /// This matters because the theme is a DEVICE-level look but it rides the
-    /// per-PROFILE preferences blob. Switching profiles runs a full sync, whose
-    /// pull carries that profile's stored theme — so picking Cinema on one
-    /// profile and later switching to another silently reverted the look, and
-    /// the following push wrote the reverted value back. Once the user has
-    /// picked here, a pulled theme no longer overrides it; a device that has
-    /// never chosen still adopts the account's, so a fresh install looks right.
-    private(set) var hasExplicitAppTheme: Bool {
-        get { UserDefaults.standard.bool(forKey: Self.explicitAppThemeKey) }
-        set { UserDefaults.standard.set(newValue, forKey: Self.explicitAppThemeKey) }
-    }
-
-    /// Root-level font design applied app-wide. Fusion routes Serif to headings
-    /// ONLY (§8), so the global design stays sans when Serif is picked and the
-    /// serif face is applied per-heading via `FusionType`. Rounded/Monospaced
-    /// still apply everywhere. Classic keeps the global design for every choice.
-    var rootFontDesign: Font.Design {
-        if isAppleTVTheme && font == .serif { return .default }
-        return font.design
-    }
-
-    /// The retired Modern theme's style flag. `appleTV` is no longer in `all`,
-    /// so this is effectively always false — the shared components' `isAppleTVTheme`
-    /// branches are now dead. Kept so those branches still compile.
-    var isAppleTVTheme: Bool { appThemeID == AppThemes.appleTV.id }
-
-    /// True for the Cinema theme — routes to `cinemaLayout` and gates the Cinema
-    /// look/behaviour. Cinema owns all its screens/components (nothing shared
-    /// with the retired Modern/Nova).
-    var isCinemaTheme: Bool { appThemeID == AppThemes.cinema.id }
-
-    /// True for the Onyx theme — near-black stage + white focus edge. Rides the
-    /// shared Classic layout, restyled purely via `OnyxPalette` (like Aurora),
-    /// so this exists mainly for any future component that wants Onyx's exact
-    /// flat/no-glow focus treatment.
-    var isOnyxTheme: Bool { appThemeID == AppThemes.onyx.id }
-
-    /// True for the Max theme — a GROUND-UP port of the HBO Max look with its
-    /// own chrome (`NuvioTVApp.maxLayout` + `MaxSidebarNav` + `MaxHomeView`) and
-    /// its own player overlay skin. The shared screens ride `MaxPalette`.
-    var isMaxTheme: Bool { appThemeID == AppThemes.max.id }
-
-    /// True for the "Streamline" theme — a Hulu-look port with its own chrome
-    /// (`NuvioTVApp.huluLayout` + `HuluRootView`); accent-driven focus. Shared
-    /// screens ride `HuluPalette` (navy stage, keeps the user's accent).
-    var isHuluTheme: Bool { appThemeID == AppThemes.hulu.id }
-
-    /// True when the Netflix-inspired theme is active. A GROUND-UP theme (like
-    /// Fusion vs Classic): its own chrome (`NuvioTVApp.netflixLayout` + custom
-    /// `NetflixTopNav`), own background, own tokens — it deliberately does NOT
-    /// ride `isAppleTVTheme`, so every Netflix look/behavior gates on this.
-    var isNetflixTheme: Bool { appThemeID == AppThemes.netflix.id }
-
-    /// True when the Stremio theme is active. Reuses the Classic sidebar
-    /// layout, restyled via palette + `SidebarNav`/card focus branches.
-    var isStremioTheme: Bool { appThemeID == AppThemes.stremio.id }
-
-    /// Fusion is DARK-ONLY (the light appearance was removed) — its deep
-    /// graphite palette is the whole identity, so this is always false. Kept as
-    /// a single choke point in case a light option ever returns.
+    /// The app renders dark, always.
     var atvIsLight: Bool { false }
-
-    /// Both themes render dark. (Fusion dropped its light/automatic option; the
-    /// `atvAppearance` field is retained only so old synced blobs still decode.)
     var preferredColorScheme: ColorScheme? { .dark }
 
     /// The palette used across the app, with the AMOLED override applied.
-    /// Under the Apple TV theme the base accent survives but surfaces swap to
-    /// tvOS-style clear greys (light or dark).
     var palette: ThemePalette { cachedPalette }
 
-    /// Recompute and store the adapted palette. Called from the `didSet` of every
-    /// input that feeds it (accent, AMOLED, active theme). Cheap to call — it runs
-    /// only on an actual settings change, not per view read.
     private func rebuildPalette() {
-        cachedPalette = Self.buildPalette(appThemeID: appThemeID, base: basePalette, amoled: amoled)
-    }
-
-    /// Pure builder for the adapted palette (was the body of the old computed
-    /// `palette`). Static so `init` can seed the cache before `self` is fully set.
-    private static func buildPalette(appThemeID: String, base: ThemePalette, amoled: Bool) -> ThemePalette {
-        if appThemeID == AppThemes.netflix.id {
-            // Netflix-inspired: black theater stage + §6 accent tunings.
-            return NetflixPalettes.adapt(base, amoled: amoled)
+        var p = basePalette
+        if amoled {
+            p.background = NuvioPrimitives.black
+            p.backgroundElevated = Color(hex: 0x0A0A0A)
         }
-        if appThemeID == AppThemes.stremio.id {
-            // Stremio: navy-purple stage + purple accent.
-            return StremioPalettes.adapt(base, amoled: amoled)
-        }
-        if appThemeID == AppThemes.cinema.id {
-            // Cinema: a deep graphite dark stage (its own palette adapter).
-            return CinemaPalette.adapt(base, amoled: amoled)
-        }
-        if appThemeID == AppThemes.onyx.id {
-            // Onyx: near-black stage + white focus edge (bobsupra/NuvioTVOS look).
-            return OnyxPalette.adapt(base, amoled: amoled)
-        }
-        if appThemeID == AppThemes.max.id {
-            // Max: pure-black stage + white focus (HBO Max look).
-            return MaxPalette.adapt(base, amoled: amoled)
-        }
-        if appThemeID == AppThemes.hulu.id {
-            // Streamline: navy stage, keeps the user's accent (Hulu look).
-            return HuluPalette.adapt(base, amoled: amoled)
-        }
-        guard amoled else { return base }
-        var p = base
-        p.background = NuvioPrimitives.black
-        p.backgroundElevated = Color(hex: 0x0A0A0A)
-        return p
+        cachedPalette = p
     }
 
     /// Change the accent theme (keeps AMOLED state).
     func setPalette(_ palette: ThemePalette) { basePalette = palette }
 
-    /// The Fusion focus glow, but only when card shadows/glows are enabled.
-    /// A colored `.shadow(radius: 24–36)` on a focused card is an offscreen
-    /// blur pass recomputed on every focus change and all through the zoom
-    /// spring — the single most expensive per-focus effect on the A8 Apple TV
-    /// HD. Folding it into the "Card Shadows" performance switch means it turns
-    /// off wherever resting shadows do: automatically on the low/mid-power
-    /// tiers (see `PerformanceSettingsStore.tierDefaults`) and any time the user
-    /// disables shadows, while the cheap white focus BORDER still marks focus.
-    /// Non-Fusion (Classic) never had a glow, so it stays `.clear` there.
+    /// The focus glow, gated by the card-shadows performance switch — a
+    /// colored `.shadow(radius: 24–36)` on a focused card is an offscreen blur
+    /// pass recomputed through the whole zoom spring, the single most
+    /// expensive per-focus effect on the A8 Apple TV HD.
     var effectiveFocusGlow: Color {
-        guard isAppleTVTheme,
-              PerformanceSettingsStore.shared.settings.cardShadows else { return .clear }
+        guard PerformanceSettingsStore.shared.settings.cardShadows else { return .clear }
         return palette.focusGlow
     }
+
+    // MARK: Retired theme flags — every alternate theme was deleted; these
+    // stubs keep not-yet-redesigned screens on their default styling and get
+    // removed as each screen is swept.
+    var isAppleTVTheme: Bool { false }
+    var isNetflixTheme: Bool { false }
+    var isStremioTheme: Bool { false }
+    var isCinemaTheme: Bool { false }
+    var isOnyxTheme: Bool { false }
+    var isMaxTheme: Bool { false }
+    var isHuluTheme: Bool { false }
 }
 
 /// Spacing scale ported from Nuvio's SpacingTokens.

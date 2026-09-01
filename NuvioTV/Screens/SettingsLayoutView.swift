@@ -66,12 +66,6 @@ struct LayoutSettingsDetail: View {
                 ) { settings.posterCornerRadius = Int($0) ?? 12 }
 
                 SettingsToggleCard(
-                    title: "Fullscreen hero backdrop",
-                    subtitle: "Let the home hero image fill the screen behind the rows",
-                    isOn: $settings.fullscreenHero
-                )
-
-                SettingsToggleCard(
                     title: "Hide unreleased content",
                     subtitle: "Keep titles that haven't aired yet out of catalog rows",
                     isOn: $settings.hideUnreleasedContent
@@ -172,8 +166,7 @@ private struct PosterSizeChip: View {
                     .strokeBorder(isFocused ? theme.palette.focusRing : (selected ? theme.palette.secondary : .clear),
                                   lineWidth: isFocused ? 4 : 2)
             )
-            .scaleEffect(isFocused ? 1.05 : 1)
-            .animation(.spring(response: 0.28, dampingFraction: 0.85), value: isFocused)
+            .focusLift(NuvioFocus.card, isFocused)
     }
 
     private var foreground: Color {
@@ -188,9 +181,9 @@ private struct PosterSizeChip: View {
     }
 }
 
-/// The reorder / rename / show-hide list of home catalog rows. Shared by the
-/// Layout pane and the Addons → Catalog Order entry (the APK files catalog
-/// order under Add-ons).
+/// The reorder / rename / show-hide list of home catalog rows, shown at the
+/// bottom of the Layout pane. (There used to be a second, identical drill-in
+/// under Add-ons → Catalog Order; this is now the only one.)
 struct CatalogOrderSection: View {
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var addonManager: AddonManager
@@ -327,23 +320,6 @@ struct CatalogOrderSection: View {
             )
             .environmentObject(theme)
         }
-    }
-}
-
-/// Full-screen "Catalog Order" cover opened from the Addons screen. Menu/Back
-/// returns to the Addons list.
-struct CatalogOrderCoverView: View {
-    @EnvironmentObject private var theme: ThemeManager
-    let onDone: () -> Void
-
-    var body: some View {
-        ZStack {
-            theme.palette.background.ignoresSafeArea()
-            DetailScaffold(title: "Catalog Order", subtitle: "Reorder, rename and hide your home catalog rows") {
-                CatalogOrderSection()
-            }
-        }
-        .onExitCommand { onDone() }
     }
 }
 
@@ -509,8 +485,7 @@ private struct RowControlIcon: View {
             .frame(width: 56, height: 56)
             .background(Circle().fill(isFocused ? theme.palette.secondary : Color.white.opacity(0.1)))
             .overlay(Circle().strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 3))
-            .scaleEffect(isFocused ? 1.08 : 1)
-            .animation(.easeInOut(duration: 0.14), value: isFocused)
+            .focusLift(NuvioFocus.control, isFocused)
     }
 }
 
@@ -556,29 +531,12 @@ private struct RenameRowView: View {
 struct CollectionsSettingsDetail: View {
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var collections: CollectionsStore
-    @ObservedObject private var perf = PerformanceSettingsStore.shared
 
     @State private var editing: NuvioCollection?
     @State private var creating = false
 
     var body: some View {
         DetailScaffold(title: "Collections", subtitle: "Group catalogs into custom home rows") {
-            // Focus artwork sits ABOVE the collection list — it applies to all
-            // of them, and it's the first thing to reach for when a collection
-            // pack feels heavy. (Also mirrored in Settings → Performance.)
-            NuvioDropdown(
-                title: "Focus artwork",
-                subtitle: perf.settings.collectionGifQuality.summary,
-                icon: "sparkles.tv",
-                selection: perf.settings.collectionGifQuality.rawValue,
-                options: CollectionGifQuality.allCases.map {
-                    NuvioDropdownOption($0.rawValue, $0.displayName)
-                }
-            ) { raw in
-                perf.settings.collectionGifQuality =
-                    CollectionGifQuality(rawValue: raw) ?? .deviceDefault
-            }
-
             Button { creating = true } label: {
                 SettingsActionRow(
                     title: "New Collection",

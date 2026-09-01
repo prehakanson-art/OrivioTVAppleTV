@@ -13,7 +13,7 @@ struct ATVSettingsView: View {
     /// Categories that get a plain pushed row, in tvOS-Settings-ish order.
     /// Appearance/Themes are handled by the dedicated section up top.
     private var generalCategories: [SettingsCategory] {
-        let hidden: Set<SettingsCategory> = [.appearance, .themes, .account]
+        let hidden: Set<SettingsCategory> = [.appearance, .account]
         return SettingsCategory.allCases.filter {
             !hidden.contains($0) && (theme.experienceMode.isAdvanced || !$0.isAdvanced)
         }
@@ -28,14 +28,8 @@ struct ATVSettingsView: View {
                     .padding(.top, NuvioSpacing.xl)
 
                 ATVSettingsSection(title: "Appearance") {
-                    // Fusion is dark-only — no light/dark/auto row.
-                    NavigationLink(value: SettingsCategory.themes) {
-                        ATVRowLabel(title: "Theme", value: theme.appTheme.displayName)
-                    }
-                    .buttonStyle(ATVRowButtonStyle())
-
                     NavigationLink(value: SettingsCategory.appearance) {
-                        ATVRowLabel(title: "Accent & Font", value: paletteName)
+                        ATVRowLabel(title: "Appearance", value: theme.palette.displayName)
                     }
                     .buttonStyle(ATVRowButtonStyle())
                 }
@@ -69,29 +63,14 @@ struct ATVSettingsView: View {
         .navigationDestination(for: SettingsCategory.self) { pane(for: $0) }
     }
 
-    private var paletteName: String { theme.palette.displayName }
 
     /// Pushed detail pages reuse Classic's panes over the ATV backdrop.
     @ViewBuilder
     private func pane(for category: SettingsCategory) -> some View {
-        Group {
-            switch category {
-            case .account: AccountSettingsDetail()
-            case .appearance: AppearanceDetail()
-            case .themes: ThemesDetail()
-            case .layout: LayoutSettingsDetail()
-            case .contentDiscovery: ContentDiscoveryDetail()
-            case .integration: IntegrationsDetail()
-            case .plugins: PluginsSettingsDetail()
-            case .trakt: TraktDetail()
-            case .about: AboutDetail()
-            case .playback: PlaybackSettingsDetail()
-            case .performance: PerformanceSettingsDetail()
-            }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .padding(.horizontal, NuvioSpacing.huge)
-        .background(ATVBackground())
+        SettingsCategoryPane(category: category)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .padding(.horizontal, NuvioSpacing.huge)
+            .background(ATVBackground())
     }
 }
 
@@ -178,11 +157,8 @@ private struct ATVRowButtonStyle: ButtonStyle {
                 )
                 .shadow(color: .black.opacity(isFocused ? 0.28 : 0),
                         radius: isFocused ? 18 : 0, y: 8)
-                .scaleEffect(isFocused ? 1.015 : 1)
-                .scaleEffect(configuration.isPressed ? 0.995 : 1)
-                .animation(FusionMotion.focusEntry, value: isFocused)
-                .animation(configuration.isPressed ? FusionMotion.pressDown : FusionMotion.pressRelease,
-                           value: configuration.isPressed)
+                .focusLift(NuvioFocus.row, isFocused)
+                .cardPressDip(configuration.isPressed)
         }
     }
 }
