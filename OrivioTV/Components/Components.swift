@@ -941,8 +941,6 @@ struct GridPosterCell: View {
     var onPlayManually: (MetaItem, MetaVideo?) -> Void = { _, _ in }
     /// Optional external focus tracking (Discover's back-to-top uses it).
     var gridFocus: FocusState<String?>.Binding? = nil
-    @EnvironmentObject private var library: LibraryStore
-    @EnvironmentObject private var watched: WatchedStore
     @State private var focused = false
 
     var body: some View {
@@ -960,17 +958,14 @@ struct GridPosterCell: View {
 
     @ViewBuilder
     private var button: some View {
-        let base = HoldableCard(
-            actions: posterHoldActions(item: item, library: library, watched: watched) {
-                onSelect(item)
-            },
-            primary: { onSelect(item) },
-            label: {
-                PosterCard(item: item)
-                    .onFocusChange { focused = $0 }
-            },
-            menuTitle: item.name
-        )
+        let base = Button {
+            onSelect(item)
+        } label: {
+            PosterCard(item: item)
+                .onFocusChange { focused = $0 }
+        }
+        .mediaCardButtonStyle()
+        .posterHoldMenu(item) { onSelect(item) }
         .onPlayPauseCommand { onPlayManually(item, nil) }
 
         if let gridFocus {
