@@ -5,10 +5,11 @@ import SwiftUI
 // direct ViewModifiers that read their own stores from the environment, so they
 // drop onto any card without threading dependencies.
 //
-// NOTE on the Apple TV ("Modern") theme: the system `CardButtonStyle` (its
-// parallax platter) swallows `.contextMenu`, so cards that need a working hold
-// menu there use the flat card style instead (see `mediaCardButtonStyle`). The
-// parallax stays on the browse cards; only the Continue Watching row opts out.
+// NOTE: the system `CardButtonStyle` (the native parallax platter) swallows
+// `.contextMenu` on tvOS — a card styled with it never presents its hold menu.
+// `mediaCardButtonStyle` therefore never uses it; the raised look is drawn by
+// `FlatCardButtonStyle` instead. Don't put `.buttonStyle(CardButtonStyle())`
+// on anything that carries one of these menus.
 
 // MARK: - Poster hold menu (Details / Library / Watched)
 
