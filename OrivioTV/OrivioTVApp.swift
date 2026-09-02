@@ -164,6 +164,13 @@ struct RootView: View {
             .onChange(of: liveTV.enabled) { _, enabled in
                 if !enabled && selectedTab == 4 { selectedTab = 0 }
             }
+            // Install the hold trace when the setting is switched ON, not only
+            // in onAppear: turning "Hold menu probe" on mid-session used to
+            // bring up the HUD with nothing to report until the next relaunch.
+            // `install()` is idempotent, so a second call is free.
+            .onChange(of: perf.settings.showHoldProbe) { _, on in
+                if on { HoldInteractionTrace.install() }
+            }
             // Refresh a QR-linked Real-Debrid token at launch (its device-flow
             // access token is short-lived).
             .task { await debrid.refreshRealDebridIfNeeded() }
@@ -246,12 +253,16 @@ struct RootView: View {
                         guard !Task.isCancelled else { return }
                         CommunityCollections.runLaunchMigrations(collections: collections)
                     }
-                    // "Who's watching?" gate on cold launch when 2+ profiles.
+                    // "Who's watching?" gate on cold launch when 2+ profiles —
+                    // OR whenever the profile about to become active is PIN
+                    // locked. With only the count test, a device with a single
+                    // PIN-locked profile booted straight into it and the lock
+                    // the user had enabled protected nothing.
                     // Skipped in the demo modes so the screen isn't covered.
                     let args = ProcessInfo.processInfo.arguments
                     let demoArgs = ["-detailDemo", "-detailDemoSeries", "-homeDemo", "-settingsDemo", "-liveTVDemo", "-searchDemo", "-libraryDemo", "-discoverDemo", "-traktQRDemo", "-accountDemo", "-settingsTabDemo"]
                     let demoMode = demoArgs.contains { args.contains($0) }
-                    showProfileGate = profiles.profiles.count >= 2 && !demoMode
+                    showProfileGate = (profiles.profiles.count >= 2 || profiles.active.pinEnabled) && !demoMode
                     if args.contains("-settingsDemo") { selectedTab = 3 }
                     // Settings TAB (in-place, not the full-screen pane demo) —
                     // used to drive the ATV theme's settings in the sim.

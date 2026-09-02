@@ -131,8 +131,11 @@ struct LiveTVView: View {
 
     @State private var searchText = ""
     @State private var sortMode: ChannelSort = .defaultOrder
-    /// A group opened via "Show All". "" = the grouped rows view.
-    @State private var selectedGroup = ""
+    /// The `Section.id` of a group opened via "Show All". "" = the grouped rows
+    /// view. Keyed by id, not title: an add-on `tv` catalog and an M3U group
+    /// routinely share a title ("News", "Sports", "Movies"), so matching on the
+    /// title opened the wrong row's channels.
+    @State private var selectedGroupID = ""
 
     private var settingsKey: String { "\(liveSettings.countryCode)|\(liveSettings.languageCode)" }
 
@@ -144,7 +147,7 @@ struct LiveTVView: View {
         .task { await viewModel.loadIfNeeded(addonManager: addonManager) }
         // Reload the IPTV list when the location/language changes in Settings.
         .onChange(of: settingsKey) { _, _ in
-            selectedGroup = ""
+            selectedGroupID = ""
             Task { await viewModel.load(addonManager: addonManager) }
         }
     }
@@ -155,13 +158,17 @@ struct LiveTVView: View {
     }
 
     private var filtering: Bool {
-        !searchText.isEmpty || sortMode != .defaultOrder || !selectedGroup.isEmpty
+        !searchText.isEmpty || sortMode != .defaultOrder || !selectedGroupID.isEmpty
+    }
+
+    private var selectedSection: LiveTVViewModel.Section? {
+        viewModel.sections.first { $0.id == selectedGroupID }
     }
 
     private var displayChannels: [LiveChannel] {
-        var pool = selectedGroup.isEmpty
+        var pool = selectedGroupID.isEmpty
             ? viewModel.sections.flatMap(\.channels)
-            : (viewModel.sections.first { $0.title == selectedGroup }?.channels ?? [])
+            : (selectedSection?.channels ?? [])
         var seen = Set<String>()
         pool = pool.filter { seen.insert($0.id).inserted }
         if !searchText.isEmpty {
@@ -209,11 +216,11 @@ struct LiveTVView: View {
     /// and the group name so you can return to the grouped rows.
     @ViewBuilder
     private var gridContext: some View {
-        if !selectedGroup.isEmpty {
+        if !selectedGroupID.isEmpty {
             HStack(spacing: OrivioSpacing.md) {
-                Button { selectedGroup = "" } label: { SeeAllLabel(text: "‹ All Channels") }
+                Button { selectedGroupID = "" } label: { SeeAllLabel(text: "‹ All Channels") }
                     .buttonStyle(PlainCardButtonStyle())
-                Text(selectedGroup)
+                Text(selectedSection?.title ?? "")
                     .font(.system(size: 30, weight: .bold))
                     .foregroundStyle(theme.palette.textPrimary)
                 Spacer(minLength: 0)
@@ -295,7 +302,7 @@ struct LiveTVView: View {
                 RowHeader(title: section.title)
                 Spacer()
                 // Every row can open its full channel list.
-                Button { selectedGroup = section.title } label: {
+                Button { selectedGroupID = section.id } label: {
                     SeeAllLabel(text: "Show All")
                 }
                 .buttonStyle(PlainCardButtonStyle())
@@ -355,9 +362,6 @@ private struct ChannelCard: View, Equatable {
             )
             .shadow(color: .black.opacity(perf.settings.cardShadows && isFocused ? 0.65 : 0),
                     radius: perf.settings.cardShadows && isFocused ? 22 : 0, y: 10)
-            // Fusion accent focus glow.
-            .shadow(color: isFocused ? theme.effectiveFocusGlow : .clear,
-                    radius: theme.isAppleTVTheme && isFocused ? 26 : 0)
 
             MarqueeText(
                 text: channel.name,

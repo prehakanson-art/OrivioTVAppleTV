@@ -28,9 +28,15 @@ struct PosterHoldMenu: ViewModifier {
                 Label(library.contains(item) ? "Remove from Library" : "Add to Library",
                       systemImage: library.contains(item) ? "bookmark.slash" : "bookmark")
             }
-            Button { watched.toggleMovie(item) } label: {
-                Label(watched.isWatched(item) ? "Mark as Unwatched" : "Mark as Watched",
-                      systemImage: watched.isWatched(item) ? "eye.slash" : "checkmark.circle")
+            // Movies only. `WatchedStore.isWatched(_ meta:)` is hard-false for a
+            // series, so on a show poster this read "Mark as Watched" forever,
+            // never showed the tick, and wrote a show-level record nothing
+            // reads — a dead toggle. Series watched state lives per episode.
+            if !item.isSeries {
+                Button { watched.toggleMovie(item) } label: {
+                    Label(watched.isWatched(item) ? "Mark as Unwatched" : "Mark as Watched",
+                          systemImage: watched.isWatched(item) ? "eye.slash" : "checkmark.circle")
+                }
             }
         }
     }

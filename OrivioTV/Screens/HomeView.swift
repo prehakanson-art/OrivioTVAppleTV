@@ -186,6 +186,12 @@ final class HomeViewModel: ObservableObject {
         fingerprint.append(settings.disabledKeys.sorted().joined(separator: ","))
         fingerprint.append(settings.customTitles.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: ","))
         fingerprint.append("hideUnreleased=\(settings.hideUnreleasedContent)")
+        // Row titles are baked in at load time by rowTitle(), so the two
+        // switches that change them belong in the fingerprint. Without these,
+        // toggling "Show add-on name" or the type suffix left every row header
+        // stale until some unrelated refresh happened to rebuild Home.
+        fingerprint.append("addonName=\(settings.catalogAddonNameEnabled)")
+        fingerprint.append("typeSuffix=\(settings.catalogTypeSuffixEnabled)")
         fingerprint.append(collections.collections.map {
             "\($0.id)#\($0.folders.count)#\($0.title)#\($0.viewMode)#\($0.pinToTop)"
         }.joined(separator: ","))
@@ -823,6 +829,12 @@ struct HomeView: View {
         .onChange(of: homeCatalogSettings.orderKeys) { _, _ in Task { await reload() } }
         .onChange(of: homeCatalogSettings.disabledKeys) { _, _ in Task { await reload() } }
         .onChange(of: homeCatalogSettings.customTitles) { _, _ in Task { await reload() } }
+        // Same reason as the three above: these three change what the loader
+        // produces, and nothing else asked Home to rebuild when they flipped —
+        // the row titles (and the unreleased filter) stayed stale.
+        .onChange(of: homeCatalogSettings.catalogAddonNameEnabled) { _, _ in Task { await reload() } }
+        .onChange(of: homeCatalogSettings.catalogTypeSuffixEnabled) { _, _ in Task { await reload() } }
+        .onChange(of: homeCatalogSettings.hideUnreleasedContent) { _, _ in Task { await reload() } }
         .task(id: nextUpRefreshKey) { await refreshNextUpContinueItems() }
     }
 

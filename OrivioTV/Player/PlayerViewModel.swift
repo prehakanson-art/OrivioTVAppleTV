@@ -296,8 +296,11 @@ final class OrivioPlayerOptions: KSOptions {
     /// display mode" toggle is off.
     override func updateVideo(refreshRate: Float, isDovi _: Bool, formatDescription: CMFormatDescription?) {
         // A mismatched panel (or Match Frame Rate off) stays at its home rate
-        // (typically 60Hz): keep the pulldown softening on.
-        pulldown60Hz = true
+        // (typically 60Hz): keep the pulldown softening on. Only until this
+        // session has actually DECIDED, though — KSPlayer calls this 2–3× per
+        // load, and re-arming the softening on the later calls would undo a
+        // switch that already landed.
+        if lastAppliedRefreshRate == nil { pulldown60Hz = true }
         // THE INFUSE POLICY. Dolby Vision sessions may request the DV mode by
         // default (`nativeDV`) — that's the point of playing DV. Everything
         // else (HDR10/SDR via this path) stays hands-off unless the user opts
@@ -337,11 +340,6 @@ final class OrivioPlayerOptions: KSOptions {
         // player exists to avoid.
         var rate = refreshRate
         if (23.5...24.2).contains(rate) { rate = 23.976 }
-        // The panel is being driven TO the content's cadence, so there is no
-        // 3:2 pulldown to soften — leaving the softening on made
-        // videoClockSync fight a cadence that isn't there. Set BEFORE the
-        // de-dup guard so it's right even on the early return below.
-        pulldown60Hz = false
         guard lastAppliedDynamicRange != target.rawValue
             || lastAppliedRefreshRate != rate else { return }
         lastAppliedDynamicRange = target.rawValue
@@ -349,6 +347,14 @@ final class OrivioPlayerOptions: KSOptions {
         guard let criteria = AVDisplayCriteria(refreshRate: rate, videoDynamicRange: target.rawValue)
         else { return }
         guard SessionDisplayMode.applyOnce(criteria, via: displayManager, rate: rate) else { return }
+        // The panel is being driven TO the content's cadence, so there is no
+        // 3:2 pulldown to soften — leaving the softening on made
+        // videoClockSync fight a cadence that isn't there. Cleared ONLY when a
+        // switch actually happens: assigned before applyOnce it also fired when
+        // the session pin already held a DIFFERENT rate (60Hz pinned by an
+        // earlier title, this one 24fps), disabling the softening in exactly
+        // the case the flag exists for.
+        pulldown60Hz = false
         // The exit sequencing needs to know a real switch was requested this
         // SESSION (not just whether the toggle is on — native-DV sessions
         // switch with the toggle off), so it can wait out the switch-back
@@ -741,12 +747,18 @@ final class PlayerViewModel: ObservableObject {
         return haystack.range(of: "\\b(dv|dovi|dolby)\\b", options: .regularExpression) != nil
     }
 
+    /// True once the direct-sample session's first-tick setup has run for THIS
+    /// load. Cleared by every `startDVFirst`, exactly like `vlcSessionPrepared`
+    /// — see its note for why `hasStartedPlayback` can't stand in for it.
+    private var dvSessionPrepared = false
+
     /// Probe the header; if it's a remuxable DV file, start the remux and hand
     /// AVPlayer the playlist directly. Anything else falls back to the normal
     /// engine path.
     private func startDVFirst(entry: StreamEntry, url: URL) {
         dvFirstTried.insert(url.absoluteString)
         currentURL = url
+        dvSessionPrepared = false
         loadPhase = .loading
         NSLog("[OrivioDV] DV-first preflight: %@", url.host ?? "?")
         dvFirstTask?.cancel()
@@ -828,10 +840,19 @@ final class PlayerViewModel: ObservableObject {
                 self.clock.position = seconds
                 self.isPlaying = engine.isPlaying
                 self.isBuffering = false
-                if !self.hasStartedPlayback, seconds > resume + 0.2 {
-                    self.hasStartedPlayback = true
+                // Keyed off a PER-LOAD flag, not `hasStartedPlayback` (which
+                // nothing resets): a DV session that BEGINS mid-movie — a
+                // source switch or a failover onto a DV link — arrives with
+                // `hasStartedPlayback` already true, so this block never ran
+                // and `pendingResume` stayed set for the rest of the session.
+                // Same class of bug (and same fix) as `vlcSessionPrepared`.
+                if !self.dvSessionPrepared, seconds > resume + 0.2 {
+                    self.dvSessionPrepared = true
                     self.loadPhase = nil
-                    self.showControls()
+                    if !self.hasStartedPlayback {
+                        self.hasStartedPlayback = true
+                        self.showControls()
+                    }
                     // The resume is DELIVERED — stop clamping saves to it.
                     // Left set, max(position, pendingResume) meant Continue
                     // Watching could never record a position below the
@@ -843,10 +864,18 @@ final class PlayerViewModel: ObservableObject {
                 self.markPlaybackProgressed(currentTime: seconds)
                 self.saveProgressThrottled()
                 self.updateSkipIntro()
+                // The Up Next card has to arm from the TICK, like the KSPlayer
+                // and VLC paths do — armed only from `onEnded`, a DV session's
+                // card appeared after the file was over instead of over the
+                // credits.
+                self.maybeArmAutoNext()
                 // Addon subtitles: the model picks the cue for this instant;
                 // the overlay renders it. KSPlayer normally drives this from
                 // its own clock — the direct engine drives it from its ticks.
-                _ = self.subtitleModel.subtitle(currentTime: seconds + self.subtitleDelay)
+                // Pass the RAW time: SubtitleModel.subtitle(currentTime:)
+                // subtracts `subtitleDelay` itself, so adding it here cancelled
+                // it out and the delay control did nothing on DV sessions.
+                _ = self.subtitleModel.subtitle(currentTime: seconds)
             }
             engine.onBuffering = { [weak self, weak engine] buffering in
                 guard let self, let engine, self.dvDirectEngine === engine else { return }
@@ -3599,6 +3628,22 @@ final class PlayerViewModel: ObservableObject {
             // An explicit OFF is a choice too — remember it, or the on-by-
             // default logic re-enables subtitles on the next episode.
             PlaybackMemory.update(meta.id) { $0.subtitleLanguage = "off" }
+        } else {
+            // …and picking a REAL track has to retire that sentinel. Nothing
+            // cleared it before, so a single "Off" press permanently disabled
+            // subtitles-on-by-default for the title/show: applyDefaultSubtitle-
+            // IfNeeded reads "off" and returns early forever. Remember the
+            // language when the track NAMES it (deliberately the strict
+            // spelled-out match, not optionMatchesLanguage's bare two-letter
+            // contains — "Chinese" contains "es"); otherwise just clear it.
+            let name = track.displayName.lowercased()
+            let lang = PlayerSettings.subtitleLanguageOptions.first {
+                guard !$0.0.isEmpty,
+                      let localized = Locale.current.localizedString(forLanguageCode: $0.0)?.lowercased()
+                else { return false }
+                return name.contains(localized)
+            }?.0
+            PlaybackMemory.update(meta.id) { $0.subtitleLanguage = lang }
         }
         switch track.payload {
         case .subtitle(let info):
@@ -4303,9 +4348,17 @@ final class PlayerViewModel: ObservableObject {
         isSwitchingSource = true
         Task { [weak self] in
             guard let self else { return }
+            // A retry hands the rest of the chain to a FRESH attemptFailover
+            // (with its own Task), so this one must not clear the flags on its
+            // way out: the load watchdog gates on `!isFailingOver` and would
+            // start a second concurrent failover chain, and the "switching
+            // source" cover flickered off in the middle of the switch.
+            var handedOff = false
             defer {
-                self.isFailingOver = false
-                self.isSwitchingSource = false
+                if !handedOff {
+                    self.isFailingOver = false
+                    self.isSwitchingSource = false
+                }
             }
             // A bare Continue Watching session has no alternatives yet (and an
             // expired debrid link NEEDS a re-resolve) — fetch the list first.
@@ -4335,6 +4388,7 @@ final class PlayerViewModel: ObservableObject {
                       let resolved = await resolver(next.stream) else {
                     self.failedSourceIDs.insert(next.id)
                     if let u = next.stream.url { self.failedSourceURLs.insert(u) }
+                    handedOff = true
                     self.attemptFailoverRetry(afterError: error)
                     return
                 }
@@ -4346,6 +4400,7 @@ final class PlayerViewModel: ObservableObject {
                 if let u = resolved.url, self.failedSourceURLs.contains(u) {
                     self.failedSourceIDs.insert(next.id)
                     if let tu = next.stream.url { self.failedSourceURLs.insert(tu) }
+                    handedOff = true
                     self.attemptFailoverRetry(afterError: error)
                     return
                 }
@@ -4392,6 +4447,10 @@ final class PlayerViewModel: ObservableObject {
     }
 
     /// Re-enter the failover after a candidate was consumed without a load.
+    /// Callers must set their `handedOff` flag first: the chain continues in
+    /// the Task this spawns, so the caller's `defer` must leave `isFailingOver`
+    /// / `isSwitchingSource` alone (the re-entry below re-arms `isFailingOver`
+    /// synchronously, so there is no window for the watchdog to slip through).
     private func attemptFailoverRetry(afterError error: Error) {
         isFailingOver = false
         attemptFailover(afterError: error)
@@ -4540,7 +4599,10 @@ final class PlayerViewModel: ObservableObject {
 
         if !userInitiated, settings.stillWatchingEnabled,
            consecutiveAutoAdvances + 1 >= settings.stillWatchingEpisodeThreshold {
-            playerLayer?.pause()
+            // Engine-agnostic: pausing only `playerLayer` left VLC and DV
+            // sessions playing underneath the gate, and skipping the pause
+            // INTENT let the next buffering callback flip `isPlaying` back on.
+            enginePause()
             overlay = .stillWatching
             return
         }
@@ -4930,11 +4992,6 @@ final class PlayerViewModel: ObservableObject {
         loadWatchdogTask?.cancel()
         stallWatchdogTask?.cancel()
         UIApplication.shared.isIdleTimerDisabled = false
-        // Hand the audio session back so whatever the player interrupted (music
-        // from another app, a HomePod group) gets its shouldResume — the app
-        // never called setActive(false) anywhere, so interrupted audio stayed
-        // dead until manually restarted.
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         // Release the Siri-remote trackpad stream. `configureWheelTracking()`
         // installs this handler on the SHARED GCController, which outlives the
         // player — left in place it keeps firing (and keeps owning the pad's
@@ -4958,6 +5015,16 @@ final class PlayerViewModel: ObservableObject {
         vlcEngine?.stop()
         vlcEngine = nil
         dvDirectEngine?.stop()
+        // Hand the audio session back so whatever the player interrupted (music
+        // from another app, a HomePod group) gets its shouldResume — the app
+        // never called setActive(false) anywhere, so interrupted audio stayed
+        // dead until manually restarted.
+        //
+        // AFTER every engine is stopped, not before: deactivating a session
+        // with live I/O fails with AVAudioSessionErrorCodeIsBusy, and the
+        // `try?` swallowed it — so the hand-back this call exists for never
+        // actually happened while KSPlayer/VLC/DV were still running.
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         // Leak probes: 5s after teardown everything below should be freed.
         // Whichever line still prints ALIVE names the retention layer.
         #if DEBUG

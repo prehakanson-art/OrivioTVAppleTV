@@ -16,6 +16,10 @@ struct OrivioLocalBackup: Codable {
 }
 
 enum OrivioLocalBackupService {
+    /// Format version this build writes and is able to read. Bump only with a
+    /// reader that understands the older shape.
+    static let currentVersion = 1
+
     @MainActor
     static func exportBackup(
         addonManager: AddonManager,
@@ -25,14 +29,24 @@ enum OrivioLocalBackupService {
         watched: WatchedStore
     ) -> String? {
         let backup = OrivioLocalBackup(
-            version: 1,
+            version: currentVersion,
             createdAt: Date(),
             addons: addonManager.addons.map {
                 OrivioLocalBackup.AddonState(manifestURL: $0.manifestURL, enabled: $0.enabled)
             },
             pluginRepositoryURLs: plugins.repositories.map(\.url),
             library: library.allForSync(),
-            progress: progress.allForSync(),
+            // streamURL is stripped: a resume link is routinely a debrid
+            // "unrestricted" URL or otherwise carries the user's token, and the
+            // backup is a plain-text document the user copies off the box —
+            // while the export screen promises it holds no provider
+            // credentials. Resume positions survive; only the link is dropped
+            // (playback re-resolves a fresh one anyway).
+            progress: progress.allForSync().map { row in
+                var stripped = row
+                stripped.streamURL = nil
+                return stripped
+            },
             watched: watched.allForSync()
         )
         let encoder = JSONEncoder()
@@ -56,6 +70,12 @@ enum OrivioLocalBackupService {
         guard let data = text.data(using: .utf8),
               let backup = try? decoder.decode(OrivioLocalBackup.self, from: data) else {
             return "Couldn't read backup JSON."
+        }
+        // `version` was decoded and then ignored: a file written by a future
+        // build imported "successfully" while silently dropping whatever it
+        // added. Refuse it instead of half-restoring the user's data.
+        guard backup.version > 0, backup.version <= currentVersion else {
+            return "This backup was made by a newer version of Orivio (format \(backup.version)) — update the app first."
         }
 
         var addonInstalled = 0

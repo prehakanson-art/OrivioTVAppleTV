@@ -618,11 +618,6 @@ struct PosterCard: View {
             // A8/A10X boxes. One shadow (the focused pop) keeps the depth cue.
             .shadow(color: .black.opacity(perf.settings.cardShadows && isFocused && !atv ? 0.65 : 0),
                     radius: perf.settings.cardShadows && isFocused && !atv ? 22 : 0, y: 10)
-            // Fusion (§13.3): an accent focus glow beneath the native focus
-            // platter — the theme's signature "ambient lighting" on focus.
-            // Stremio: the same purple ambient glow marks focus.
-            .shadow(color: isFocused ? theme.effectiveFocusGlow : .clear,
-                    radius: atv && isFocused ? 30 : 0)
 
             if layout.showPosterLabels && !atv {
                 MarqueeText(
@@ -747,10 +742,6 @@ struct LandscapeCard: View {
                                       ? theme.palette.focusRing : .clear,
                                   lineWidth: 3)
             )
-            // Accent focus glow beneath the native platter.
-            .shadow(color: isFocused ? theme.effectiveFocusGlow : .clear,
-                    radius: isFocused ? 32 : 0)
-            // Stremio: purple ambient focus glow.
 
             if showsCaption {
                 caption

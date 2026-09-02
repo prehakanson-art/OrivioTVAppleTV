@@ -79,9 +79,6 @@ struct ThemePalette: Identifiable, Equatable {
     var textPrimary: Color = OrivioPrimitives.white
     var textSecondary: Color = OrivioPrimitives.neutral400
     var textTertiary: Color = OrivioPrimitives.neutral500
-    /// Ambient accent glow color used by the Fusion theme's focus glow (§13.3).
-    /// Clear by default so Classic components draw no glow.
-    var focusGlow: Color = .clear
 }
 
 enum OrivioThemes {
@@ -503,14 +500,10 @@ final class ThemeManager: ObservableObject {
     /// stage: graphite normally, near-black in Black Background mode.
     var stageBlend: Color { amoled ? Color(hex: 0x08080A) : ATVStage.blend }
 
-    /// The focus glow, gated by the card-shadows performance switch — a
-    /// colored `.shadow(radius: 24–36)` on a focused card is an offscreen blur
-    /// pass recomputed through the whole zoom spring, the single most
-    /// expensive per-focus effect on the A8 Apple TV HD.
-    var effectiveFocusGlow: Color {
-        guard PerformanceSettingsStore.shared.settings.cardShadows else { return .clear }
-        return palette.focusGlow
-    }
+    // NOTE: `effectiveFocusGlow` and `ThemePalette.focusGlow` were removed.
+    // `focusGlow` was only ever written by the never-called `ATVPalettes.adapt`,
+    // so it was always `.clear` and every `.shadow(color: effectiveFocusGlow)`
+    // in the app drew nothing. The no-op shadows went with it.
 
     // MARK: Retired theme flags — every alternate theme was deleted; these
     // stubs keep not-yet-redesigned screens on their default styling and get

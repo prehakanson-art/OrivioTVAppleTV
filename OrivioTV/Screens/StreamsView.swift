@@ -27,7 +27,11 @@ final class StreamsViewModel: ObservableObject {
     /// Installed addons that were NOT queried, with the reason — a broken
     /// manifest or an id-prefix mismatch used to be completely invisible,
     /// which made "why isn't my addon showing?" undiagnosable from the UI.
-    @Published var skippedAddons: [(name: String, reason: String)] = []
+    /// `id` is the add-on's manifest URL, not its name: two installed
+    /// configurations of the same add-on (two Torrentio/Comet setups) produce
+    /// two rows with the SAME name, and a duplicated ForEach id makes SwiftUI
+    /// drop or mis-render them.
+    @Published var skippedAddons: [(id: String, name: String, reason: String)] = []
     /// Addons whose stream request errored this load, with a short reason
     /// (HTTP code / timeout / …) — rendered as "Not working — <reason>" under
     /// the addon name, distinct from a healthy addon that returned no links.
@@ -336,14 +340,14 @@ final class StreamsViewModel: ObservableObject {
         }
         // Surface every enabled addon that is NOT being queried, with why —
         // and mirror it to the console for debugging.
-        var skipped: [(name: String, reason: String)] = []
+        var skipped: [(id: String, name: String, reason: String)] = []
         for addon in addonManager.addons where addon.enabled {
             let m = addon.manifest
             if m.isPlaceholder {
-                skipped.append((m.name, "Not working — couldn't load this add-on. Check its URL or refresh add-ons."))
+                skipped.append((addon.id, m.name, "Not working — couldn't load this add-on. Check its URL or refresh add-ons."))
             } else if m.providesStreams, !addon.handles(id: fetchID) {
                 let prefixes = (m.idPrefixes ?? []).joined(separator: ", ")
-                skipped.append((m.name, "Doesn't claim this title (id \(fetchID) vs prefixes [\(prefixes)])"))
+                skipped.append((addon.id, m.name, "Doesn't claim this title (id \(fetchID) vs prefixes [\(prefixes)])"))
             }
         }
         skippedAddons = skipped
@@ -665,6 +669,12 @@ struct StreamsView: View {
             // resuming, since the whole point of a resume is to re-connect fresh.
             if !didAutoAct, !forceManual, !resumeAutoPlay, s.reuseLastLinkEnabled,
                let last = await viewModel.freshLastLink(hours: s.reuseLastLinkCacheHours) {
+                // Re-test AFTER the await. `freshLastLink` suspends on the disk
+                // cache, and the early Auto-Link callback can fire during that
+                // suspension — the `!didAutoAct` test in the condition above had
+                // already passed, so both paths acted and two playback requests
+                // were issued for the same title.
+                guard !didAutoAct else { return }
                 didAutoAct = true
                 await loadTask.value
                 // Back was pressed while loading: this view is popped and the
@@ -777,7 +787,7 @@ struct StreamsView: View {
                     )
                     // Explain any addon that wasn't even queried, so an addon
                     // that silently failed to install isn't a mystery here.
-                    ForEach(viewModel.skippedAddons, id: \.name) { skip in
+                    ForEach(viewModel.skippedAddons, id: \.id) { skip in
                         Text("\(skip.name): \(skip.reason)")
                             .font(.system(size: 18, weight: .semibold))
                             .foregroundStyle(theme.palette.textSecondary)
@@ -1026,7 +1036,7 @@ struct StreamsView: View {
                 }
                 // Installed addons that were NOT queried, with why — a broken
                 // manifest or an id-prefix mismatch was previously invisible.
-                ForEach(viewModel.skippedAddons, id: \.name) { skip in
+                ForEach(viewModel.skippedAddons, id: \.id) { skip in
                     VStack(alignment: .leading, spacing: OrivioSpacing.sm) {
                         Text(skip.name.uppercased())
                             .font(.system(size: 24, weight: .heavy))
@@ -1165,9 +1175,6 @@ struct StreamRowView: View {
             RoundedRectangle(cornerRadius: OrivioRadius.md, style: .continuous)
                 .strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 2.5)
         )
-        // Fusion accent focus glow (a soft halo around the focused row).
-        .shadow(color: isFocused ? theme.effectiveFocusGlow : .clear,
-                radius: theme.isAppleTVTheme && isFocused ? 20 : 0)
         // No focus scale: scaling a row forces offscreen re-composition of
         // the whole card every focus move mid-scroll (stutter on the A10X);
         // the fill + ring change is plenty of focus affordance.

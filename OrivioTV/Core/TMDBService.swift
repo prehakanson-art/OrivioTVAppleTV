@@ -151,10 +151,12 @@ enum TMDBService {
     enum TMDBError: LocalizedError {
         case badResponse(Int)
         case missing
+        case badPath(String)
         var errorDescription: String? {
             switch self {
             case .badResponse(let code): return "TMDB returned HTTP \(code)"
             case .missing: return "TMDB item not found"
+            case .badPath(let path): return "TMDB request path is not a valid URL: \(path)"
             }
         }
     }
@@ -166,7 +168,15 @@ enum TMDBService {
     nonisolated(unsafe) static var preferredLanguage = "en"
 
     private static func get<T: Decodable>(_ path: String, query: [String: String] = [:]) async throws -> T {
-        var comps = URLComponents(string: base + path)!
+        // `path` embeds ids that come from add-ons, Trakt and synced rows (e.g.
+        // /find/<imdbID>) and URLComponents(string:) is strict — an id carrying
+        // a space or any other illegal character made this force-unwrap TRAP,
+        // taking the app down over one bad row. Escape what we can, then fail as
+        // an ordinary error rather than crashing.
+        guard var comps = URLComponents(string: base + path)
+            ?? path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed)
+                .flatMap({ URLComponents(string: base + $0) })
+        else { throw TMDBError.badPath(path) }
         var items = [URLQueryItem(name: "api_key", value: apiKey)]
         // Localize any request that didn't specify a language explicitly.
         if query["language"] == nil, preferredLanguage != "en" {
@@ -174,7 +184,8 @@ enum TMDBService {
         }
         items += query.map { URLQueryItem(name: $0.key, value: $0.value) }
         comps.queryItems = items
-        var request = URLRequest(url: comps.url!)
+        guard let url = comps.url else { throw TMDBError.badPath(path) }
+        var request = URLRequest(url: url)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         let (data, response) = try await session.data(for: request)
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {

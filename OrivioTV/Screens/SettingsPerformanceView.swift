@@ -65,8 +65,8 @@ struct PerformanceSettingsDetail: View {
             ) {
                 PerfToggleRow(
                     icon: "rectangle.fill.on.rectangle.fill",
-                    title: "Card shadows & glow",
-                    subtitle: "Soft drop shadows under posters, and the accent glow behind a focused card. Each is an offscreen blur that re-renders on every focus move — the biggest scroll cost on older boxes. Off: flat cards with just the focus border, same layout.",
+                    title: "Card shadows",
+                    subtitle: "Soft drop shadows under posters and behind a focused card. Each is an offscreen blur that re-renders on every focus move — the biggest scroll cost on older boxes. Off: flat cards with just the focus border, same layout.",
                     isOn: s.cardShadows
                 )
                 PerfToggleRow(
@@ -75,14 +75,20 @@ struct PerformanceSettingsDetail: View {
                     subtitle: "The focused card springs slightly larger. Off: only the highlight ring marks focus — the cheapest possible focus effect.",
                     isOn: s.focusZoom
                 )
-                if theme.isAppleTVTheme {
-                    PerfToggleRow(
-                        icon: "move.3d",
-                        title: "Card wiggle & lift",
-                        subtitle: "The native Apple TV card effect: the focused poster raises and tilts/parallaxes as you move on the trackpad, like a Home-screen icon. The system re-composites the whole focused card as your finger moves — the heaviest per-frame focus cost, and rough on older Apple TVs. Off: cards do a light scale on focus instead, no tilt.",
-                        isOn: s.cardParallax
-                    )
-                }
+                // No longer gated on `theme.isAppleTVTheme`: that flag is a
+                // retired stub that always returns false, so this row never
+                // rendered — yet `cardParallax` still drives the card button
+                // style and the Performance-mode summary. Apple TV HD users
+                // (where the migration forces it off) were stuck on the flat
+                // card style with no switch to turn it back on, and switching
+                // every VISIBLE effect off still reported Performance mode as
+                // OFF because of this hidden flag.
+                PerfToggleRow(
+                    icon: "move.3d",
+                    title: "Card wiggle & lift",
+                    subtitle: "The native Apple TV card effect: the focused poster raises and tilts/parallaxes as you move on the trackpad, like a Home-screen icon. The system re-composites the whole focused card as your finger moves — the heaviest per-frame focus cost, and rough on older Apple TVs. Off: cards do a light scale on focus instead, no tilt.",
+                    isOn: s.cardParallax
+                )
             }
 
             SettingsGroupCard(

@@ -734,12 +734,16 @@ enum StremioSync {
             ]
         }
         guard let progress else { return [:] }
+        // Stremio's datastore keeps EVERY duration in milliseconds. time_offset
+        // and duration were sent in ms but time_watched / overall_time_watched
+        // in seconds, so Stremio's own "time watched" stats for rows pushed by
+        // this app read 1000x low.
         var state: [String: Any] = [
             "time_offset": progress.positionSeconds * 1000,
             "duration": progress.durationSeconds * 1000,
             "last_watched": isoString(progress.updatedAt),
-            "time_watched": progress.positionSeconds,
-            "overall_time_watched": progress.positionSeconds,
+            "time_watched": progress.positionSeconds * 1000,
+            "overall_time_watched": progress.positionSeconds * 1000,
             "flagged_watched": 0
         ]
         if progress.type == "series" { state["video_id"] = progress.id }
@@ -819,12 +823,21 @@ enum StremioSync {
     }
 
     /// "<id>:<season>:<episode>" → (season, episode). nil for movies.
+    ///
+    /// The last two components are only a season/episode pair if the season
+    /// looks like one. Kitsu-style ids ("kitsu:7442:1") have the identical
+    /// shape but the middle component is the SHOW id, so Continue Watching
+    /// happily rendered "S7442 · E1". Nothing has hundreds of seasons, so an
+    /// implausible value means this isn't a season:episode id at all.
+    private static let maxPlausibleSeason = 100
+
     private static func parseVideoID(_ v: String?) -> (Int?, Int?) {
         guard let v else { return (nil, nil) }
         let parts = v.split(separator: ":")
         guard parts.count >= 3, let e = Int(parts[parts.count - 1]), let s = Int(parts[parts.count - 2]) else {
             return (nil, nil)
         }
+        guard s >= 0, s <= maxPlausibleSeason, e >= 0 else { return (nil, nil) }
         return (s, e)
     }
 

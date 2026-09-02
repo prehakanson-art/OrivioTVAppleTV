@@ -1016,7 +1016,10 @@ private struct AddonsManagementView: View {
                             Text("Install").font(.system(size: 23, weight: .semibold))
                         }
                     }
-                    .disabled(installing || newAddonURL.isEmpty)
+                    // Not disabled while installing: that disables the button
+                    // you just pressed and drops focus to an arbitrary row.
+                    // install() guards re-entry.
+                    .disabled(newAddonURL.isEmpty)
                 }
 
                 if let installMessage {
@@ -1168,6 +1171,7 @@ private struct AddonsManagementView: View {
     }
 
     private func install() {
+        guard !installing else { return }
         installing = true
         installMessage = nil
         let url = newAddonURL
@@ -1354,7 +1358,12 @@ private struct TrashCircle: View {
 struct AboutDetail: View {
     @EnvironmentObject private var theme: ThemeManager
     @State private var info: AboutInfo?
-    @State private var cacheLabel = DiagnosticsService.cacheSizeLabel()
+    // Starts empty and is filled by .task below. The default value used to be
+    // `DiagnosticsService.cacheSizeLabel()`, which walks the whole cache
+    // directory synchronously on the main thread — and a @State default is
+    // evaluated every time the view struct is built, not once, so opening
+    // About (and every redraw of it) stuttered.
+    @State private var cacheLabel = "…"
     @State private var clearing = false
 
     var body: some View {
@@ -1389,9 +1398,16 @@ struct AboutDetail: View {
                 Button {
                     guard !clearing else { return }
                     clearing = true
-                    DiagnosticsService.clearCaches()
-                    cacheLabel = DiagnosticsService.cacheSizeLabel()
-                    clearing = false
+                    // Off the main thread for the same reason as the initial
+                    // measurement: clearing and re-measuring both enumerate the
+                    // cache directory recursively.
+                    Task {
+                        await Task.detached(priority: .userInitiated) {
+                            DiagnosticsService.clearCaches()
+                        }.value
+                        cacheLabel = await Self.measureCache()
+                        clearing = false
+                    }
                 } label: {
                     SettingsValueCard(
                         title: "Clear cache",
@@ -1402,10 +1418,21 @@ struct AboutDetail: View {
                 }.buttonStyle(PlainCardButtonStyle())
             }
         }
+        .task {
+            // Measure the cache once the view is on screen, off the main
+            // thread — see cacheLabel above.
+            cacheLabel = await Self.measureCache()
+        }
         .fullScreenCover(item: $info) { item in
             AboutInfoView(info: item)
                 .environmentObject(theme)
         }
+    }
+
+    private static func measureCache() async -> String {
+        await Task.detached(priority: .utility) {
+            DiagnosticsService.cacheSizeLabel()
+        }.value
     }
 }
 
@@ -1481,7 +1508,9 @@ private struct AddonImportView: View {
                                 Text("Import").font(.system(size: 23, weight: .semibold))
                             }
                         }
-                        .disabled(importing || input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        // Stays enabled while importing (disabling the focused
+                        // button drops focus); importAddons() guards re-entry.
+                        .disabled(input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
                         Button("Done", action: onDone)
                             .font(.system(size: 23, weight: .semibold))

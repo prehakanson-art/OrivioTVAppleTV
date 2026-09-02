@@ -53,19 +53,23 @@ final class PluginStore: ObservableObject {
                 description: manifest.description, enabled: true, scraperCount: manifest.scrapers.count
             )
 
+            // A scraper whose JS body fails to download is REGISTERED anyway and
+            // its body fetched later (see jsBody(for:)). It used to be silently
+            // dropped while the repo stayed installed, and applyRemote skips a
+            // repo URL it already has — so one flaky download left that scraper
+            // permanently dead with nothing on screen to explain it and no way
+            // back short of removing and re-adding the repository.
             var newScrapers: [ScraperInfo] = []
+            var deferredBodies = 0
             for entry in manifest.scrapers {
                 let jsURL = Self.resolve(filename: entry.filename, against: manifestURL)
-                guard let jsURLObj = URL(string: jsURL),
-                      let (jsData, _) = try? await session.data(from: jsURLObj),
-                      let js = String(data: jsData, encoding: .utf8) else { continue }
                 let info = ScraperInfo(
                     id: "\(repoID)::\(entry.id)", repoID: repoID, scraperID: entry.id,
                     name: entry.name, version: entry.version,
                     supportedTypes: entry.supportedTypes, enabled: entry.enabled,
                     logo: entry.logo, sourceURL: jsURL
                 )
-                await Self.jsCache.store(js, for: info.id)
+                if await Self.downloadBody(for: info, session: session) == nil { deferredBodies += 1 }
                 newScrapers.append(info)
             }
             guard !newScrapers.isEmpty else { lastError = "No scrapers in this repository"; return }
@@ -75,6 +79,9 @@ final class PluginStore: ObservableObject {
             repositories.append(repo)
             scrapers.append(contentsOf: newScrapers)
             save(); notifyLocalChange()
+            if deferredBodies > 0 {
+                lastError = "\(deferredBodies) scraper(s) couldn't be downloaded — they'll be retried automatically."
+            }
         } catch {
             lastError = "Couldn't add repository: \(error.localizedDescription)"
         }
@@ -109,14 +116,33 @@ final class PluginStore: ObservableObject {
         // thread-safe, so PluginRuntime can't share one), and a JSContext is
         // several MB apiece. Running every enabled scraper at once is what makes
         // a long plugin list expensive rather than just slow.
-        let batches = await boundedConcurrentMap(scrapers, limit: AddonSweepLimits.plugins) { [runtime] scraper in
-            guard let js = await Self.jsCache.value(for: scraper.id, ttl: .greatestFiniteMagnitude) else { return [StreamEntry]() }
+        let batches = await boundedConcurrentMap(scrapers, limit: AddonSweepLimits.plugins) { [runtime, session] scraper in
+            guard let js = await Self.jsBody(for: scraper, session: session) else { return [StreamEntry]() }
             let results = await runtime.run(
                 scraperJS: js, tmdbID: tmdbID, mediaType: mediaType, season: season, episode: episode
             )
             return results.map { Self.entry(from: $0, scraperName: scraper.name) }
         }
         return batches.flatMap { $0 }
+    }
+
+    /// The scraper's JS body: the cached copy, or a fresh download when the
+    /// cache has none. The lazy re-download is what makes a failed install
+    /// recoverable — a scraper whose body didn't arrive is retried on every
+    /// later run instead of staying silently dead forever.
+    nonisolated private static func jsBody(for scraper: ScraperInfo, session: URLSession) async -> String? {
+        if let cached = await jsCache.value(for: scraper.id, ttl: .greatestFiniteMagnitude) { return cached }
+        return await downloadBody(for: scraper, session: session)
+    }
+
+    /// Download + cache a scraper's JS. nil = transient failure, try again later.
+    @discardableResult
+    nonisolated private static func downloadBody(for scraper: ScraperInfo, session: URLSession) async -> String? {
+        guard let url = URL(string: scraper.sourceURL),
+              let (data, _) = try? await session.data(from: url),
+              let js = String(data: data, encoding: .utf8), !js.isEmpty else { return nil }
+        await jsCache.store(js, for: scraper.id)
+        return js
     }
 
     nonisolated private static func entry(from result: ScraperResult, scraperName: String) -> StreamEntry {

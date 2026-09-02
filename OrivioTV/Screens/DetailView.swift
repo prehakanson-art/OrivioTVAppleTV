@@ -1196,9 +1196,6 @@ private struct CircleIconLabel: View {
             // Glass circle at rest, matching the rail.
             .liquidGlassIf(!isFocused && !active, in: Circle())
             .overlay(Circle().strokeBorder(isFocused ? Color.white.opacity(0.95) : .clear, lineWidth: 3))
-            // Accent focus glow.
-            .shadow(color: isFocused ? theme.effectiveFocusGlow : .clear,
-                    radius: isFocused ? 22 : 0)
             .focusLift(OrivioFocus.control, isFocused)
     }
 }

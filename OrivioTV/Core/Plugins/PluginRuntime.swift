@@ -123,6 +123,11 @@ final class PluginRuntime: @unchecked Sendable {
         context.setObject(console, forKeyedSubscript: "console" as NSString)
     }
 
+    /// Largest response body handed back to JS. A scraper is a text/JSON client;
+    /// without a ceiling a hostile (or just wrong) URL could pull a multi-GB
+    /// body into RAM and jetsam the box mid-browse.
+    private static let maxFetchBytes = 8 * 1024 * 1024
+
     /// `__nativeFetch(url, method, headersJson, body, resolve, reject)` runs a
     /// URLSession request and calls back into JS on the runtime queue.
     private func installFetch(_ context: JSContext, queue: DispatchQueue) {
@@ -130,6 +135,13 @@ final class PluginRuntime: @unchecked Sendable {
             [weak self] urlString, method, headersJson, body, resolve, reject in
             guard let self, let url = URL(string: urlString) else {
                 reject.call(withArguments: ["Bad URL"]); return
+            }
+            // http/https ONLY. This accepted any scheme, so a scraper — third
+            // party JS the user installed from a repo URL — could `fetch` a
+            // file:// path and read anything inside the app sandbox (the
+            // account token blob included) straight into its own results.
+            guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
+                reject.call(withArguments: ["Unsupported URL scheme"]); return
             }
             var request = URLRequest(url: url)
             request.httpMethod = method.isEmpty ? "GET" : method
@@ -144,17 +156,25 @@ final class PluginRuntime: @unchecked Sendable {
                     if let error {
                         reject.call(withArguments: [error.localizedDescription]); return
                     }
-                    let http = response as? HTTPURLResponse
-                    let status = http?.statusCode ?? 0
+                    // Insist on a real HTTP response: the body used to be handed
+                    // back whatever the response actually was, so a non-HTTP
+                    // load still delivered its contents to the script.
+                    guard let http = response as? HTTPURLResponse else {
+                        reject.call(withArguments: ["Non-HTTP response"]); return
+                    }
+                    if let data, data.count > Self.maxFetchBytes {
+                        reject.call(withArguments: ["Response too large"]); return
+                    }
+                    let status = http.statusCode
                     var headerMap: [String: String] = [:]
-                    http?.allHeaderFields.forEach { k, v in
+                    http.allHeaderFields.forEach { k, v in
                         headerMap[String(describing: k).lowercased()] = String(describing: v)
                     }
                     let payload: [String: Any] = [
                         "ok": (200..<300).contains(status),
                         "status": status,
                         "statusText": "",
-                        "url": http?.url?.absoluteString ?? urlString,
+                        "url": http.url?.absoluteString ?? urlString,
                         "body": data.flatMap { String(data: $0, encoding: .utf8) } ?? "",
                         "headers": headerMap
                     ]

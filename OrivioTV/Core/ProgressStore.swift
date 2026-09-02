@@ -855,14 +855,19 @@ final class ProgressStore: ObservableObject {
         transientOverrides.removeValue(forKey: oldID)
         tombstones[oldID] = Date()   // stale key is deleted server-side too
         tombstones.removeValue(forKey: newID)   // the canonical key is being (re)created
+        // Carry episodeThumbnail and hasNewEpisode too: rebuilding without them
+        // made a tmdb:→tt: migrated card drop back to the show poster (and lose
+        // its "new episode" pip) the moment the key was canonicalized.
         items[newID] = WatchProgress(
             id: newID, metaID: newMetaID, type: existing.type, name: existing.name,
             poster: existing.poster, background: existing.background, logo: existing.logo,
             season: existing.season, episode: existing.episode, episodeTitle: existing.episodeTitle,
+            episodeThumbnail: existing.episodeThumbnail,
             positionSeconds: existing.positionSeconds, durationSeconds: existing.durationSeconds,
             streamURL: existing.streamURL, streamSignature: existing.streamSignature,
             updatedAt: existing.updatedAt,
-            syncSource: existing.syncSource
+            syncSource: existing.syncSource,
+            hasNewEpisode: existing.hasNewEpisode
         )
         save()
         if !suppressChange {

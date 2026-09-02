@@ -44,7 +44,12 @@ enum AppGroupResolver {
     /// The shared container for the resolved group, or nil when app groups
     /// aren't available (a signer that stripped the entitlement) — every Top
     /// Shelf path treats nil as "no shelf", never a failure.
-    static var containerURL: URL? {
+    ///
+    /// Memoized (`static let`, resolved once) because this was a computed
+    /// property: with the app-group entitlement deliberately off (Top Shelf
+    /// disabled in project.yml) EVERY progress persist paid an XPC round trip
+    /// to containerURL(forSecurityApplicationGroupIdentifier:) and logged an
+    /// error, for a result that can never change during the process's life.
+    static let containerURL: URL? =
         FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: identifier)
-    }
 }

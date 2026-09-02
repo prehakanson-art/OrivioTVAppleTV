@@ -450,8 +450,21 @@ final class PlayerSettingsStore: ObservableObject {
         }
     }
 
+    /// Settings whose value describes THIS BOX's hardware, not the user's
+    /// preference — they must never ride in from another device. Their defaults
+    /// come from PerformanceProfile, and the wrong value doesn't just look
+    /// wrong: a 4 GB gen-3 syncing `dolbyVisionProfile7 = true` onto a 3 GB box
+    /// hangs it mid-play, and `hdr10PlusPassthrough` means nothing off an A15.
+    private func preservingDeviceCapabilities(_ new: PlayerSettings) -> PlayerSettings {
+        var merged = new
+        merged.dolbyVisionProfile7 = settings.dolbyVisionProfile7
+        merged.hdr10PlusPassthrough = settings.hdr10PlusPassthrough
+        return merged
+    }
+
     /// Apply settings pulled from the account without echoing them back up.
     func applyRemote(_ new: PlayerSettings) {
+        let new = preservingDeviceCapabilities(new)
         guard new != settings else { return }
         applyingRemote = true
         settings = new

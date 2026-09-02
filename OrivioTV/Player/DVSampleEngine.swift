@@ -45,7 +45,8 @@ final class DVSampleEngine {
 
     /// Fired on main ~2×/s with the current position (absolute source secs).
     var onTime: ((Double) -> Void)?
-    /// The demuxer reached EOF and both renderers drained.
+    /// The demuxer reached EOF and both renderers drained — see
+    /// `signalEndOnce` for how the renderers' own residue is waited out.
     var onEnded: (() -> Void)?
     /// Terminal failure after a successful start (decode/enqueue/network).
     var onError: ((String) -> Void)?
@@ -357,16 +358,21 @@ final class DVSampleEngine {
         if wall >= 10 {
             let mediaAdv = media - dlWindowStartMedia
             let ppm = (mediaAdv / wall - 1) * 1_000_000
+            // Take-and-reset in ONE locked hold each: reading and then zeroing
+            // as two separate locked accesses dropped every gap the feed queue
+            // recorded in between.
+            var gapCount = 0
+            var gapWorst = 0
+            $pullGapCount.mutate { gapCount = $0; $0 = 0 }
+            $pullGapWorstMs.mutate { gapWorst = $0; $0 = 0 }
             dvDiag("vsync probe: %d refreshes, %d repeats, %d skips, clock %+.0fppm, avSkew=%.2fs, decodeStalls=%d (worst %dms)",
                   dlTicks, dlRepeats, dlSkips, ppm, lastQueuedVideoPTS - lastQueuedAudioPTS,
-                  pullGapCount, pullGapWorstMs)
+                  gapCount, gapWorst)
             lastVsyncCensus = String(
                 format: "vsync %d/%dr/%ds clk%+.0fppm skew%.2f stalls%d(%dms)",
                 dlTicks, dlRepeats, dlSkips, ppm,
-                lastQueuedVideoPTS - lastQueuedAudioPTS, pullGapCount, pullGapWorstMs
+                lastQueuedVideoPTS - lastQueuedAudioPTS, gapCount, gapWorst
             )
-            pullGapCount = 0
-            pullGapWorstMs = 0
             dlLastWindowDamage = dlRepeats + dlSkips
             dlTicks = 0; dlRepeats = 0; dlSkips = 0
             dlWindowStartWall = link.timestamp
@@ -391,6 +397,21 @@ final class DVSampleEngine {
     /// a film finishes: not a missing case, a repeating one.
     private var didSignalEnd = false
 
+    /// End (PTS + duration) of the last sample handed to a RENDERER, on the
+    /// synchronizer's timeline. Written on `feedQueue`, read on `feedQueue`
+    /// when the end is signalled and reset on main by `seek` — hence atomic.
+    @Atomic private var lastRenderedEnd: Double = 0
+
+    /// Note a sample as handed off, so `signalEndOnce` knows how much media the
+    /// renderers are still sitting on.
+    private func noteHandedToRenderer(pts: CMTime, duration: CMTime) {
+        let start = CMTimeGetSeconds(pts)
+        guard start.isFinite else { return }
+        let dur = CMTimeGetSeconds(duration)
+        let end = start + (dur.isFinite && dur > 0 ? dur : 0)
+        $lastRenderedEnd.mutate { $0 = max($0, end) }
+    }
+
     /// Report the end once, and stop asking for media. Without the stop, the
     /// display layer keeps re-invoking the feed block against an empty queue —
     /// a spin on the feed queue for the whole time the finished movie is on
@@ -400,7 +421,25 @@ final class DVSampleEngine {
         didSignalEnd = true
         displayLayer.stopRequestingMediaData()
         audioRenderer.stopRequestingMediaData()
-        DispatchQueue.main.async { [weak self] in self?.onEnded?() }
+        // OUR queues running dry is not the end of playback: the display layer
+        // and the audio renderer still hold everything already handed to them —
+        // roughly a second of it — so reporting here raised the post-play / Up
+        // Next card over the last second of the film, and made the "both
+        // renderers drained" contract above a lie.
+        //
+        // Neither renderer exposes a drained callback, so measure the residue
+        // instead: the renderers consume what they hold in real time at the
+        // synchronizer's rate, so how far the last handed-off sample's END sits
+        // ahead of the synchronizer's clock IS the remaining play time. Clamped
+        // so a bad PTS can never strand the end of a movie behind a long wait.
+        let clock = CMTimeGetSeconds(synchronizer.currentTime())
+        let rate = Double(max(userRate, 0.25))
+        var remaining = (lastRenderedEnd - clock) / rate
+        if !remaining.isFinite { remaining = 0 }
+        remaining = min(max(remaining, 0), 5)
+        DispatchQueue.main.asyncAfter(deadline: .now() + remaining) { [weak self] in
+            self?.onEnded?()
+        }
     }
 
     @Atomic private var cancelled = false
@@ -503,8 +542,11 @@ final class DVSampleEngine {
     private var autoPausedAt = Date.distantPast
     private var recentUnderruns = 0
     private var lastUnderrunAt = Date.distantPast
-    /// True between a seek and its first resume: the refill after a seek is
-    /// a fresh start, not a stalled feed — take a 1s cushion and go.
+    /// True between a seek and the moment its refill has visibly landed: the
+    /// refill after a seek is a fresh start, not a stalled feed — take a 1s
+    /// cushion and go. Cleared either by the underrun resume or (the common
+    /// case — most seeks never underrun) by the healthy-queue check in the
+    /// tick timer.
     private var seekRefill = false
 
     /// FFmpeg's `AVERROR_EOF` / `AVERROR_EXIT`, which are macros and so do not
@@ -575,6 +617,9 @@ final class DVSampleEngine {
         recentUnderruns = 0
         lastUnderrunAt = .distantPast
         seekRefill = true
+        // The renderers are about to be flushed, so nothing they held counts
+        // towards the end-of-stream drain wait any more.
+        lastRenderedEnd = 0
         queueLock.lock()
         videoQueue.removeAll()
         audioQueue.removeAll()
@@ -868,6 +913,15 @@ final class DVSampleEngine {
         }
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            // `stop()` can land between avformat_find_stream_info and this hop.
+            // Without the check we installed feeders, spun the synchronizer up
+            // and created a CADisplayLink(target: self) plus a repeating Timer
+            // on an engine nothing will ever invalidate — stop() already ran,
+            // so both retained the engine and ticked for the app's lifetime.
+            guard !self.cancelled else {
+                self.startCompletion = nil   // and release the caller's closure
+                return
+            }
             self.startCompletion?(true, "")
             self.startCompletion = nil
             self.synchronizer.setRate(0, time: CMTime(seconds: self.startAt, preferredTimescale: 90000))
@@ -996,6 +1050,16 @@ final class DVSampleEngine {
                         }
                         self.onBuffering?(false)
                     }
+                }
+                // The post-seek refill is OVER once playback is rolling again
+                // on a healthy queue. Clearing it only on the underrun-resume
+                // path left the flag stuck true after any seek that never
+                // underran, so the next GENUINE underrun resumed on the small
+                // 24-AU seek cushion instead of escalating — exactly the
+                // machine-gun stop/go the escalation exists to prevent.
+                if self.seekRefill, !self.autoPaused, self.synchronizer.rate > 0,
+                   depth >= 24 {
+                    self.seekRefill = false
                 }
                 if self.audioRenderer.status == .failed, !self.reportedAudioFailure {
                     self.reportedAudioFailure = true
@@ -1783,6 +1847,7 @@ final class DVSampleEngine {
             decodedLock.unlock()
             if let display = makeDisplaySample(frame) {
                 displayLayer.enqueue(display)
+                noteHandedToRenderer(pts: frame.pts, duration: frame.duration)
             }
         }
     }
@@ -1814,8 +1879,11 @@ final class DVSampleEngine {
             if lastVideoPullAt > 0, synchronizer.rate > 0 {
                 let gapMs = Int((now - lastVideoPullAt) * 1000)
                 if gapMs > 100 {
-                    pullGapCount += 1
-                    if gapMs > pullGapWorstMs { pullGapWorstMs = gapMs }
+                    // Locked read-modify-write: `+=` on an @Atomic is two
+                    // separate locked accesses, so main's 10s reset could land
+                    // between them and swallow this gap.
+                    $pullGapCount.mutate { $0 += 1 }
+                    $pullGapWorstMs.mutate { $0 = max($0, gapMs) }
                 }
             }
             lastVideoPullAt = now
@@ -1827,8 +1895,11 @@ final class DVSampleEngine {
             if lastVideoPullAt > 0, synchronizer.rate > 0 {
                 let gapMs = Int((now - lastVideoPullAt) * 1000)
                 if gapMs > 100 {
-                    pullGapCount += 1
-                    if gapMs > pullGapWorstMs { pullGapWorstMs = gapMs }
+                    // Locked read-modify-write: `+=` on an @Atomic is two
+                    // separate locked accesses, so main's 10s reset could land
+                    // between them and swallow this gap.
+                    $pullGapCount.mutate { $0 += 1 }
+                    $pullGapWorstMs.mutate { $0 = max($0, gapMs) }
                 }
             }
             lastVideoPullAt = now
@@ -1851,6 +1922,8 @@ final class DVSampleEngine {
                 return
             }
             if video { displayLayer.enqueue(sample) } else { audioRenderer.enqueue(sample) }
+            noteHandedToRenderer(pts: CMSampleBufferGetPresentationTimeStamp(sample),
+                                 duration: CMSampleBufferGetDuration(sample))
         }
     }
 

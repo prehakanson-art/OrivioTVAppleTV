@@ -14,6 +14,10 @@ struct CloudLibraryView: View {
     @State private var files: [CloudFile] = []
     @State private var isLoading = false
     @State private var resolving = false
+    /// Set when this page is popped. Same guard as StreamsView: presenting the
+    /// player from a navigation entry that is already gone misbehaves badly,
+    /// and the resolve below is an unstructured Task that outlives the view.
+    @State private var isGone = false
     @FocusState private var focused: String?
 
     private var availableProviders: [DebridProvider] {
@@ -44,6 +48,7 @@ struct CloudLibraryView: View {
         }
         .task(id: provider?.rawValue) { await load() }
         .onAppear { if provider == nil { provider = debrid.resolverProvider ?? availableProviders.first } }
+        .onDisappear { isGone = true }
     }
 
     private var providerBar: some View {
@@ -112,7 +117,9 @@ struct CloudLibraryView: View {
         Task {
             let url = await CloudLibraryService.resolveURL(file, provider: provider, apiKey: debrid.key(for: provider))
             resolving = false
-            guard let url else { return }
+            // Back was pressed while the link resolved: don't hand a player to
+            // a torn-down navigation entry.
+            guard !isGone, let url else { return }
             let meta = MetaItem(id: "cloud:\(file.id)", type: "movie", name: file.name)
             let stream = Stream(name: file.name, title: file.name, description: file.sizeLabel,
                                 url: url, infoHash: nil, behaviorHints: nil)

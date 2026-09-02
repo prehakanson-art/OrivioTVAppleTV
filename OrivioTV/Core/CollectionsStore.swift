@@ -746,23 +746,37 @@ final class CollectionsStore: ObservableObject {
         return score
     }
 
+    /// Monotonic stamp for library writes — see CollectionsLibraryPersister.
+    private var saveSequence: UInt64 = 0
+
     private func saveLibrary() {
-        if library.isEmpty {
-            UserDefaults.standard.removeObject(forKey: Self.libraryKey)
-            try? FileManager.default.removeItem(at: Self.libraryFileURL)
-            return
-        }
         // Encode + write OFF the main thread. The merged library is ~700 KB of
         // nested JSON (493 folders); encoding it synchronously on the
         // @MainActor store stalled the UI on an A10X every time anything
         // touched collections. Persistence is fire-and-forget — the in-memory
         // `library` is the source of truth for this session.
+        //
+        // Ordered through a serializing actor (ProgressStore does the same with
+        // ProgressPersister): these were plain unordered detached tasks, so two
+        // mutations close together could finish in reverse and leave the OLDER
+        // snapshot on disk — a folder deleted, then re-added, came back wrong
+        // on the next launch. The delete path takes the same queue, or a clear
+        // could overtake a pending write and be undone by it.
+        saveSequence += 1
+        let sequence = saveSequence
+        let url = Self.libraryFileURL
+        let legacyKey = Self.libraryKey
+        guard !library.isEmpty else {
+            Task.detached(priority: .utility) {
+                await CollectionsLibraryPersister.shared
+                    .clear(url: url, legacyKey: legacyKey, sequence: sequence)
+            }
+            return
+        }
         let snapshot = library
         Task.detached(priority: .utility) {
-            guard let data = try? JSONEncoder().encode(snapshot) else { return }
-            try? data.write(to: Self.libraryFileURL, options: .atomic)
-            // Make sure the old oversized key can never come back.
-            UserDefaults.standard.removeObject(forKey: Self.libraryKey)
+            await CollectionsLibraryPersister.shared
+                .write(snapshot, to: url, legacyKey: legacyKey, sequence: sequence)
         }
     }
 
@@ -798,5 +812,32 @@ final class CollectionsStore: ObservableObject {
     private func save() {
         saveLibrary()
         saveHidden()
+    }
+}
+
+/// Serializes collection-library writes off the main actor, in submission
+/// order. `saveLibrary` fired an unordered `Task.detached` per save, so two
+/// quick mutations could land out of order and leave the OLDER ~700 KB
+/// snapshot on disk. Same monotonic-sequence pattern as ProgressPersister.
+private actor CollectionsLibraryPersister {
+    static let shared = CollectionsLibraryPersister()
+    private var lastSequence: UInt64 = 0
+
+    func write(_ snapshot: [OrivioCollection], to url: URL,
+               legacyKey: String, sequence: UInt64) {
+        guard sequence > lastSequence else { return }
+        lastSequence = sequence
+        guard let data = try? JSONEncoder().encode(snapshot) else { return }
+        try? data.write(to: url, options: .atomic)
+        // Make sure the old oversized key can never come back.
+        UserDefaults.standard.removeObject(forKey: legacyKey)
+    }
+
+    /// The empty-library case: a delete, ordered against the writes above.
+    func clear(url: URL, legacyKey: String, sequence: UInt64) {
+        guard sequence > lastSequence else { return }
+        lastSequence = sequence
+        UserDefaults.standard.removeObject(forKey: legacyKey)
+        try? FileManager.default.removeItem(at: url)
     }
 }

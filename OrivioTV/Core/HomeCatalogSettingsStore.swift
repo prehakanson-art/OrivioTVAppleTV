@@ -528,6 +528,29 @@ final class HomeCatalogSettingsStore: ObservableObject {
         )
     }
 
+    /// Every presentation pref back to its shipped default. Called by `load()`
+    /// for a profile that has no saved blob, so nothing carries over from the
+    /// profile we just switched away from.
+    private func applyPresentationDefaults() {
+        let d = HomePresentationSnapshot()
+        homeLayout = d.homeLayout
+        landscapePosters = d.landscapePosters
+        fullscreenHero = d.fullscreenHero
+        posterSize = d.posterSize
+        showPosterLabels = d.showPosterLabels
+        continueWatchingSortMode = d.continueWatchingSortMode
+        nextUpFromFurthestEpisode = d.nextUpFromFurthestEpisode
+        showUnairedNextUp = d.showUnairedNextUp
+        useEpisodeThumbnailsInCw = d.useEpisodeThumbnailsInCw
+        blurUnwatchedEpisodes = d.blurUnwatchedEpisodes
+        blurContinueWatchingNextUp = d.blurContinueWatchingNextUp
+        posterCornerRadius = d.posterCornerRadius
+        catalogAddonNameEnabled = d.catalogAddonNameEnabled
+        catalogTypeSuffixEnabled = d.catalogTypeSuffixEnabled
+        showFullReleaseDate = d.showFullReleaseDate
+        detailPageTrailerButtonEnabled = d.detailPageTrailerButtonEnabled
+    }
+
     /// Apply presentation prefs pulled from the account without echoing back up.
     func applyRemotePresentation(_ s: HomePresentationSnapshot) {
         guard s != presentationSnapshot else { return }
@@ -555,12 +578,18 @@ final class HomeCatalogSettingsStore: ObservableObject {
     private func load() {
         guard let data = UserDefaults.standard.data(forKey: storageKey),
               let decoded = try? JSONDecoder().decode(Persisted.self, from: data) else {
+            // A profile with no saved blob must reset EVERY field, not just
+            // order/disabled/titles/hideUnreleased/homeLayout: the presentation
+            // prefs used to keep the previous profile's values and then got
+            // written into the new profile's key on its first save — switching
+            // to a fresh profile silently inherited (and stole) the old
+            // profile's poster size, blur, CW sort, etc.
             orderKeys = []
             disabledKeys = []
             customTitles = [:]
             suppressChange = true
             hideUnreleasedContent = false
-            homeLayout = .modern
+            applyPresentationDefaults()
             suppressChange = false
             return
         }

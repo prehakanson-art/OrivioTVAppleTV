@@ -232,6 +232,12 @@ struct AnimatedGIFView: UIViewRepresentable {
         if context.coordinator.loadedURL == url, view.image != nil { return }
         context.coordinator.loadedURL = url
         view.image = nil
+        // Cancel BEFORE the cache-hit early return. This used to sit below it,
+        // so a cache hit for URL B left the in-flight download for URL A alive;
+        // it then landed on the reused tile, and because the view now had a
+        // non-nil image for B the dedupe check above early-returned forever —
+        // the wrong GIF stuck on the cell.
+        context.coordinator.task?.cancel()
 
         if let hit = GIFDecoder.cached(url) {
             view.image = hit
@@ -239,16 +245,22 @@ struct AnimatedGIFView: UIViewRepresentable {
             onLoaded?(true)
             return
         }
-        context.coordinator.task?.cancel()
         NSLog("[OrivioGIF] load start %@", url.suffix(40).description)
+        // Captured so every completion path can confirm the tile is still
+        // showing THIS url before touching the view or calling back — cell
+        // reuse retargets the coordinator while a load is in flight, and
+        // reporting failure for A's load told B's parent its GIF had failed
+        // after B had already reported success.
+        let coordinator = context.coordinator
         context.coordinator.task = Task { [weak view] in
             guard let remote = URL(string: url) else {
-                NSLog("[OrivioGIF] bad URL"); await MainActor.run { onLoaded?(false) }; return
+                NSLog("[OrivioGIF] bad URL")
+                await MainActor.run { if coordinator.loadedURL == url { onLoaded?(false) } }; return
             }
             guard let (data, _) = try? await URLSession.shared.data(from: remote), !Task.isCancelled
             else {
                 NSLog("[OrivioGIF] fetch FAILED %@", url.suffix(40).description)
-                await MainActor.run { onLoaded?(false) }; return
+                await MainActor.run { if coordinator.loadedURL == url { onLoaded?(false) } }; return
             }
             NSLog("[OrivioGIF] fetched %d bytes", data.count)
             // Decode off the main actor — a 100-frame GIF is real work.
@@ -261,7 +273,13 @@ struct AnimatedGIFView: UIViewRepresentable {
                     NSLog("[OrivioGIF] decode FAILED (cancelled=%@ decoded=%@ view=%@)",
                           Task.isCancelled ? "y" : "n", decoded == nil ? "nil" : "ok",
                           view == nil ? "nil" : "ok")
-                    onLoaded?(false); return
+                    if coordinator.loadedURL == url { onLoaded?(false) }; return
+                }
+                // The tile was reused for a different URL while this was in
+                // flight: cache what we decoded, but do NOT paint it.
+                guard coordinator.loadedURL == url else {
+                    GIFDecoder.store(decoded.image, cost: decoded.cost, for: url)
+                    return
                 }
                 NSLog("[OrivioGIF] playing: %d frames, %.2fs, %.1f MB",
                       decoded.image.images?.count ?? 0, decoded.image.duration,

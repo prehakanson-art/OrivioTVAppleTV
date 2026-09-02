@@ -189,7 +189,6 @@ private struct SearchBarIcon: View {
             }
             .liquidGlassIf(!isFocused, in: Circle())
             .overlay(Circle().strokeBorder(isFocused ? Color.white.opacity(0.95) : .clear, lineWidth: 3))
-            .shadow(color: isFocused ? theme.effectiveFocusGlow : .clear, radius: isFocused ? 22 : 0)
             .focusLift(OrivioFocus.card, isFocused)
             .animation(PerformanceSettingsStore.shared.buttonAnimationsEffective
                        ? .easeInOut(duration: 0.15) : nil, value: isFocused)

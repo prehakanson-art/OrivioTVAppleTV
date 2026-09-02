@@ -358,12 +358,16 @@ final class ProfileStore: ObservableObject {
         // Remote payloads never carry the device-local PIN hash or the Auto Link
         // Selector prefs (no backend columns) — carry them over so offline
         // unlock and each profile's auto-link config survive a sync.
-        let localHashes = Dictionary(uniqueKeysWithValues: profiles.compactMap { p in
+        // uniquingKeysWith, not uniqueKeysWithValues: a duplicate profile id in
+        // the list (a malformed local save, or a server that hands back two rows
+        // with the same id) used to TRAP here and take the app down mid-sync.
+        // First one wins — the list is already in stable id order.
+        let localHashes = Dictionary(profiles.compactMap { p in
             p.pinHash.map { (p.id, $0) }
-        })
-        let localAutoLink = Dictionary(uniqueKeysWithValues: profiles.compactMap { p in
+        }, uniquingKeysWith: { first, _ in first })
+        let localAutoLink = Dictionary(profiles.compactMap { p in
             p.autoLink.map { (p.id, $0) }
-        })
+        }, uniquingKeysWith: { first, _ in first })
         profiles = remote.sorted { $0.id < $1.id }.map { p in
             var merged = p
             merged.pinHash = merged.pinHash ?? localHashes[p.id]

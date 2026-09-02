@@ -112,8 +112,14 @@ final class OrivioAccountManager: ObservableObject {
         qrLogin = nil
     }
 
+    /// Consecutive failed polls. A single blip must not end the login (see
+    /// pollOnce); several in a row means something is actually wrong.
+    private var pollFailures = 0
+    private static let maxPollFailures = 5
+
     private func startPolling() {
         cancelPolling()
+        pollFailures = 0
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let interval = self?.qrLogin?.pollIntervalSeconds else { return }
@@ -136,6 +142,7 @@ final class OrivioAccountManager: ObservableObject {
                 endpoint: Endpoint.pollTvLogin,
                 body: ["p_code": state.code, "p_device_nonce": state.nonce]
             )
+            pollFailures = 0
             guard let result = rows.first else { return }
             let status = result.status.lowercased()
             if var updated = qrLogin {
@@ -160,8 +167,19 @@ final class OrivioAccountManager: ObservableObject {
                 break // pending — keep polling
             }
         } catch {
+            // ONE transient error (Wi-Fi blip, a 5xx, an RPC cold start) used to
+            // cancel polling while leaving the QR code on screen: the user
+            // approved it on their phone and the TV — no longer asking — sat
+            // there forever until it was backed out of. Keep polling; give up
+            // only after several consecutive failures.
+            pollFailures += 1
+            guard pollFailures >= Self.maxPollFailures else {
+                qrLogin?.statusText = "Trouble reaching the server — retrying…"
+                return
+            }
             cancelPolling()
             errorMessage = friendlyError(error)
+            qrLogin = nil
         }
     }
 
@@ -194,8 +212,29 @@ final class OrivioAccountManager: ObservableObject {
         authState = .signedOut
     }
 
+    /// The in-flight refresh, if any. Supabase ROTATES the refresh token on
+    /// every use, and every sync call that meets a 401 calls this — so a token
+    /// expiring mid-sync fired several refreshes with the same refresh token at
+    /// once. The first won; the rest got a 400 for a token the server had
+    /// already rotated away and, reading that as "your session is dead",
+    /// signed the user out. Concurrent callers now share one refresh.
+    /// (Same serialization TraktSyncManager.validToken() uses.)
+    private var refreshTask: Task<Bool, Never>?
+
     @discardableResult
     func refreshSession() async -> Bool {
+        if let existing = refreshTask { return await existing.value }
+        guard session?.refreshToken != nil else { return false }
+        let task = Task { [weak self] () -> Bool in
+            await self?.performRefresh() ?? false
+        }
+        refreshTask = task
+        let result = await task.value
+        refreshTask = nil
+        return result
+    }
+
+    private func performRefresh() async -> Bool {
         guard let refreshToken = session?.refreshToken else { return false }
         do {
             let data = try await post(endpoint: Endpoint.refresh, body: ["refresh_token": refreshToken])

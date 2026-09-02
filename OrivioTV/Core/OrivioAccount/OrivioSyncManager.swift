@@ -692,6 +692,10 @@ final class OrivioSyncManager: ObservableObject {
             // Reassert not-yet-confirmed removals so the pull can't resurrect
             // them, push the deletes to the server, THEN pull the snapshot.
             await self.reconcileProgressDeletesBeforePull()
+            // Still-pending deletes postpone the pull so it can't resurrect
+            // them. This is no longer permanent: a key the server keeps
+            // rejecting is quarantined by drainPendingDeletes (see
+            // maxDeleteAttempts) instead of blocking every future refresh.
             guard self.loadPendingDeletes().isEmpty else { return }
             try? await self.pullWatchProgress()
             await self.reconcileLibraryDeletesBeforePull()
@@ -713,6 +717,36 @@ final class OrivioSyncManager: ObservableObject {
     private func savePendingDeletes(_ set: Set<String>) {
         if set.isEmpty { UserDefaults.standard.removeObject(forKey: pendingDeletesKey()) }
         else { UserDefaults.standard.set(Array(set), forKey: pendingDeletesKey()) }
+    }
+
+    /// How many SERVER REJECTIONS a queued delete survives before it is
+    /// quarantined. A key the server refuses can never drain, and both
+    /// `refreshContinueWatching` and the pre-pull reconcile stall while the
+    /// queue is non-empty — so one permanently-rejected key stopped Continue
+    /// Watching from ever refreshing again for that profile. Transport failures
+    /// (offline, timeout, 5xx) don't count, so a week off the network still
+    /// retries everything forever.
+    private static let maxDeleteAttempts = 5
+
+    private func pendingDeleteAttemptsKey() -> String {
+        "orivio.sync.pendingWatchProgressDeleteAttempts.p\(pid)"
+    }
+
+    private func loadPendingDeleteAttempts() -> [String: Int] {
+        (UserDefaults.standard.dictionary(forKey: pendingDeleteAttemptsKey()) as? [String: Int]) ?? [:]
+    }
+
+    private func savePendingDeleteAttempts(_ counts: [String: Int]) {
+        if counts.isEmpty { UserDefaults.standard.removeObject(forKey: pendingDeleteAttemptsKey()) }
+        else { UserDefaults.standard.set(counts, forKey: pendingDeleteAttemptsKey()) }
+    }
+
+    /// A refusal the server will keep repeating. 401/403 (auth), 408/429 (come
+    /// back later) and every 5xx are transient and must not burn an attempt.
+    private static func isPermanentRejection(_ error: Error) -> Bool {
+        guard case OrivioAuthError.http(let code, _) = error else { return false }
+        return (400..<500).contains(code)
+            && code != 401 && code != 403 && code != 408 && code != 429
     }
 
     /// Queue a Continue Watching removal for durable server deletion. Persists
@@ -754,8 +788,37 @@ final class OrivioSyncManager: ObservableObject {
             var latest = loadPendingDeletes()
             latest.subtract(pending)   // keep any queued while this call was in flight
             savePendingDeletes(latest)
+            var attempts = loadPendingDeleteAttempts()
+            for key in pending { attempts[key] = nil }
+            savePendingDeleteAttempts(attempts)
         } catch {
-            // Leave the queue intact — a later drain retries it.
+            // Leave the queue intact — a later drain retries it. UNLESS the
+            // server is rejecting the batch outright: those keys can never
+            // drain, and a stuck queue blocks every Continue Watching refresh
+            // for this profile forever. Count rejections and quarantine a key
+            // once it has been refused maxDeleteAttempts times, so the refresh
+            // can run again. (The row may reappear from the server snapshot —
+            // visibly wrong beats silently frozen, and the user can remove it
+            // again.)
+            guard Self.isPermanentRejection(error) else { return }
+            var attempts = loadPendingDeleteAttempts()
+            var quarantined: Set<String> = []
+            for key in pending {
+                let count = (attempts[key] ?? 0) + 1
+                if count >= Self.maxDeleteAttempts {
+                    quarantined.insert(key)
+                    attempts[key] = nil
+                } else {
+                    attempts[key] = count
+                }
+            }
+            savePendingDeleteAttempts(attempts)
+            guard !quarantined.isEmpty else { return }
+            savePendingDeletes(loadPendingDeletes().subtracting(quarantined))
+            OrivioSyncDiagnostics.record(
+                .warning, area: "Orivio",
+                "Gave up on \(quarantined.count) Continue Watching removal(s) the server keeps rejecting; they no longer block refreshes."
+            )
         }
     }
 
@@ -1981,6 +2044,26 @@ final class OrivioSyncManager: ObservableObject {
         }
     }
 
+    /// JSON → snapshot on a background thread; nil on any decode failure.
+    nonisolated private static func decodeAppPreferences(_ json: String) async -> AppPreferencesSnapshot? {
+        await Task.detached(priority: .userInitiated) {
+            try? JSONDecoder().decode(AppPreferencesSnapshot.self, from: Data(json.utf8))
+        }.value
+    }
+
+    /// Snapshot → JSON on a background thread, for the same reason as the
+    /// decode above: this blob carries the whole collections library.
+    nonisolated private static func encodeAppPreferences(_ snapshot: AppPreferencesSnapshot) async -> String? {
+        await Task.detached(priority: .userInitiated) {
+            guard let data = try? JSONEncoder().encode(snapshot) else { return nil }
+            return String(data: data, encoding: .utf8)
+        }.value
+    }
+
+    /// The payload this session last successfully pushed, with the profile it
+    /// belonged to — lets an identical repeat push skip its two round trips.
+    private var lastPushedAppPrefs: (profile: Int, json: String)?
+
     /// Pull the tvOS preferences feature (if present) and apply it to the three
     /// stores. Best-effort: any decode failure leaves local settings untouched.
     private func pullAppPreferences() async {
@@ -1997,15 +2080,24 @@ final class OrivioSyncManager: ObservableObject {
         guard let data = try? await authedPost(
             RPC.url(RPC.pullProfileSettingsBlob),
             body: ["p_profile_id": pid, "p_platform": Self.settingsBlobPlatform]
-        ),
-            let blob = Self.settingsBlob(from: data),
-            let features = blob["features"] as? [String: Any],
-            let feature = features[Self.appPrefsFeatureKey] as? [String: Any],
-            let json = Self.preferenceString(feature["value"]),
-            let snapshot = try? JSONDecoder().decode(
-                AppPreferencesSnapshot.self, from: Data(json.utf8)
-            )
-        else { return }
+        ) else { return }
+        guard let blob = Self.settingsBlob(from: data),
+              let features = blob["features"] as? [String: Any],
+              let feature = features[Self.appPrefsFeatureKey] as? [String: Any],
+              let json = Self.preferenceString(feature["value"])
+        else {
+            // The account carries no tvOS-preferences blob for this profile (a
+            // fresh account, or it was cleared elsewhere). Forget what we last
+            // pushed so this sync's push re-uploads it in full instead of being
+            // skipped as "already up there".
+            lastPushedAppPrefs = nil
+            return
+        }
+        // Decode OFF the main actor. This blob embeds the entire collections
+        // library — the same ~700 KB of nested JSON whose synchronous main-thread
+        // decode froze the Apple TV at launch (see CollectionsStore.load()) —
+        // and a sync runs every 60-90s, so it was stalling the UI on a timer.
+        guard let snapshot = await Self.decodeAppPreferences(json) else { return }
         guard !appPreferencesDirty, appPrefsGeneration == generationAtStart else {
             OrivioSyncDiagnostics.record(
                 .info, area: "Orivio",
@@ -2068,8 +2160,17 @@ final class OrivioSyncManager: ObservableObject {
             globalHiddenCollectionIDs: collectionsStore.globalHiddenCollectionIDsForSync,
             watchHistoryClearedAt: WatchHistoryClearState.clearedAt
         )
-        guard let data = try? JSONEncoder().encode(snapshot),
-              let json = String(data: data, encoding: .utf8) else { return }
+        guard let json = await Self.encodeAppPreferences(snapshot) else { return }
+        // syncNow flushes a dirty push BEFORE the pulls and pushes again at the
+        // END of the same run, so an unchanged blob — the whole collections
+        // library included — was read-merge-written to the account TWICE per
+        // sync. If the payload is byte-identical to the one this run already
+        // shipped, the account already holds exactly this; skip both round
+        // trips. (Keyed by profile: the blob is per-profile.)
+        if let last = lastPushedAppPrefs, last.profile == pid, last.json == json {
+            if appPrefsGeneration == generationAtStart { appPreferencesDirty = false }
+            return
+        }
 
         var blob: [String: Any] = ["version": 1, "features": [String: Any]()]
         if let existingData = try? await authedPost(
@@ -2090,11 +2191,15 @@ final class OrivioSyncManager: ObservableObject {
             "p_platform": Self.settingsBlobPlatform,
             "p_origin_client_id": clientID,
         ]
-        if (try? await authedPost(RPC.url(RPC.pushProfileSettingsBlob), body: body)) != nil,
-           appPrefsGeneration == generationAtStart {
-            // Clear only if no NEWER edit arrived while this push was in
-            // flight — that edit's own flag/push must survive.
-            appPreferencesDirty = false
+        if (try? await authedPost(RPC.url(RPC.pushProfileSettingsBlob), body: body)) != nil {
+            // Remember what the account now holds, so a second push in the same
+            // sync with identical content is a no-op (see the check above).
+            lastPushedAppPrefs = (pid, json)
+            if appPrefsGeneration == generationAtStart {
+                // Clear only if no NEWER edit arrived while this push was in
+                // flight — that edit's own flag/push must survive.
+                appPreferencesDirty = false
+            }
         }
     }
 

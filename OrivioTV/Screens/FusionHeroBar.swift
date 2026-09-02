@@ -134,8 +134,6 @@ struct FusionHeroBar: View {
                     ? .black.opacity(focusedInside ? 0.5 : 0.28) : .clear,
                 radius: perf.settings.cardShadows ? (focusedInside ? 34 : 18) : 0,
                 y: focusedInside ? 16 : 8)
-        .shadow(color: focusedInside ? theme.effectiveFocusGlow : .clear,
-                radius: perf.settings.cardShadows ? 36 : 0)
         .focusLift(OrivioFocus.card, focusedInside)
         .offset(y: focusedInside ? -8 : 0)
         .animation(FusionMotion.focusEntry, value: focusedInside)

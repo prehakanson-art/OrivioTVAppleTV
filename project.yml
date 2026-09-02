@@ -57,7 +57,12 @@ targets:
         # "not a valid iOS app". Harmless on tvOS (ignored); the binary stays a
         # real AppleTVOS/arm64 app and installs to the Apple TV normally.
         LSRequiresIPhoneOS: true
-        # Tracks the Android APK release this port mirrors (v0.7.15-beta).
+        # Version, from the build settings below rather than xcodegen's "1.0"/"1"
+        # defaults — those literals landed in Config/Info.plist and MARKETING_VERSION
+        # was never used, so About reported "Version 1.0 (1)" on every build.
+        # Same place the (disabled) Top Shelf target sets its version.
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         UIUserInterfaceStyle: Dark
         # Plus Jakarta Sans — bundled for the Stremio theme's chrome typography.
         UIAppFonts:

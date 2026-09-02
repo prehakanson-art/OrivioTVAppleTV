@@ -209,17 +209,57 @@ final class TraktSyncManager: ObservableObject {
             .filter { $0.syncSource != "trakt" }
             .filter { $0.durationSeconds > 0 }
             .filter { let f = $0.positionSeconds / $0.durationSeconds; return f > 0.01 && f < 0.95 }
+            // Rows Trakt has already refused repeatedly are parked, not retried
+            // (see rejectedScrobbles).
+            .filter { !isScrobbleRejected($0.id) }
             .sorted { $0.updatedAt > $1.updatedAt }
             .prefix(30)
         for row in localOnly {
-            _ = await TraktService.scrobble(
+            let ok = await TraktService.scrobble(
                 action: .pause, imdbID: row.metaID, type: row.type,
                 season: row.season, episode: row.episode,
                 progress: row.positionSeconds / row.durationSeconds * 100,
                 accessToken: token
             )
+            noteScrobbleResult(ok, for: row.id)
         }
         return rows.count
+    }
+
+    // MARK: - Rejected scrobbles
+
+    /// Continue Watching keys Trakt keeps refusing, with their failure count.
+    ///
+    /// Trakt answers a scrobble for an item it can't match (an id it doesn't
+    /// carry, a mis-numbered episode) with the same non-2xx forever — and
+    /// nothing recorded that, so every full sync re-sent up to 30 of the exact
+    /// same doomed POSTs, for the life of the install. After
+    /// `maxScrobbleAttempts` failures the key is parked; a success clears it, so
+    /// a row that starts matching (Trakt added the episode) resumes normally.
+    /// Persisted, because "forever" spans launches.
+    private var rejectedScrobbles: [String: Int] =
+        (UserDefaults.standard.dictionary(forKey: rejectedScrobblesKey) as? [String: Int]) ?? [:]
+    private static let rejectedScrobblesKey = "orivio.trakt.rejectedScrobbles.v1"
+    private static let maxScrobbleAttempts = 3
+    /// Ceiling so the parked set can't grow without bound; blown away wholesale
+    /// (it simply re-learns) rather than tracked with per-key timestamps.
+    private static let maxRejectedScrobbles = 500
+
+    private func isScrobbleRejected(_ key: String) -> Bool {
+        (rejectedScrobbles[key] ?? 0) >= Self.maxScrobbleAttempts
+    }
+
+    private func noteScrobbleResult(_ ok: Bool, for key: String) {
+        if ok {
+            guard rejectedScrobbles.removeValue(forKey: key) != nil else { return }
+        } else {
+            if rejectedScrobbles.count >= Self.maxRejectedScrobbles { rejectedScrobbles = [:] }
+            rejectedScrobbles[key, default: 0] += 1
+            if rejectedScrobbles[key] == Self.maxScrobbleAttempts {
+                NSLog("[OrivioTrakt] parking %@ — Trakt rejected it %d times", key, Self.maxScrobbleAttempts)
+            }
+        }
+        UserDefaults.standard.set(rejectedScrobbles, forKey: Self.rejectedScrobblesKey)
     }
 
     /// The user removed a title from Continue Watching — delete its playback
