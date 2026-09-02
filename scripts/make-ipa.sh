@@ -13,7 +13,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 DIST_ID="com.orivio.tv.appletv"
-VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" Config/Info.plist 2>/dev/null || echo "0.0.0")
+# Config/Info.plist holds $(MARKETING_VERSION), so PlistBuddy would return the
+# literal variable (or a stale 1.0). project.yml is the real source.
+VERSION=$(grep -m1 'MARKETING_VERSION:' project.yml | sed 's/.*: *"\(.*\)"/\1/')
+[ -n "$VERSION" ] || VERSION="0.0.0"
 OUT_DIR="ipa_out"
 WORK=$(mktemp -d)
 
