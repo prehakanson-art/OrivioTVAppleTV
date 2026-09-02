@@ -100,6 +100,84 @@ final class OrivioSyncManager: ObservableObject {
     /// (profile 1) so the same sources are available on every profile.
     private var pid: Int { profileStore.activeProfileID }
 
+    /// Thrown when the active profile changes part-way through a sync run.
+    ///
+    /// Everything after `applyActiveProfileScope()` is scoped to ONE profile:
+    /// the stores have been pointed at it and every RPC reads `pid` fresh. A
+    /// switch mid-run therefore merged one profile's server data into another
+    /// profile's store, and the pushes at the end uploaded THAT under the new
+    /// profile's id with replace semantics — overwriting it for good. Syncs run
+    /// every 30s and take a comparable time, so the overlap is routine.
+    private struct ProfileChangedMidSync: Error {
+        let from: Int
+        let to: Int
+    }
+
+    private func ensureProfile(_ expected: Int) throws {
+        guard pid == expected else {
+            throw ProfileChangedMidSync(from: expected, to: pid)
+        }
+    }
+
+    /// The account this device last synced. See `handleAccountIdentityChange`.
+    private static let lastAccountUserKey = "orivio.account.lastUser.v1"
+
+    /// Drop every piece of per-account sync bookkeeping: seeded flags, the
+    /// pending delete queues, the cleared-watch-history horizon and repair
+    /// stamps, and the persisted app-preferences dirty bit. Touches NO user
+    /// content — only the state that records what this device has already
+    /// agreed with one particular account.
+    private func resetSyncBookkeeping() {
+        let defaults = UserDefaults.standard
+        // The device id and the diagnostics log are not account state.
+        let preserved: Set<String> = ["orivio.sync.client.v1", "orivio.sync.log.v1"]
+        for key in defaults.dictionaryRepresentation().keys
+        where key.hasPrefix("orivio.sync.") && !preserved.contains(key) {
+            defaults.removeObject(forKey: key)
+        }
+        addonsDirty = false
+        progressDirty = false
+        libraryDirty = false
+        profilesDirty = false
+        pluginsDirty = false
+        appPreferencesDirty = false
+    }
+
+    /// Drop credentials belonging to the PREVIOUS account. Both stores are
+    /// account-synced and both `applyRemote` implementations only ever ADD, so
+    /// without this the next `pushProviderCredentials` uploads the previous
+    /// user's Trakt tokens and debrid API keys into the new user's account.
+    /// Safe against wiping the new account's server rows: that push skips an
+    /// empty credential set entirely.
+    private func resetAccountScopedCredentials() {
+        traktStore?.signOut()
+        if let debridStore {
+            for provider in DebridProvider.allCases {
+                debridStore.setKey("", for: provider)
+            }
+        }
+    }
+
+    /// Retire the previous account's state when a DIFFERENT user signs in.
+    /// Signing out cleared only the Supabase tokens, so the next account
+    /// inherited the last one's seeded flags, queued deletes and credentials.
+    private func handleAccountIdentityChange() {
+        guard let current = account.currentUserID else { return }
+        let defaults = UserDefaults.standard
+        let previous = defaults.string(forKey: Self.lastAccountUserKey)
+        defaults.set(current, forKey: Self.lastAccountUserKey)
+        // First account on this device: nothing to retire, and clearing the
+        // owner's locally-entered debrid keys here would be a regression.
+        guard let previous, previous != current else { return }
+        NSLog("[OrivioSync] a different account signed in — retiring the previous account's sync state")
+        OrivioSyncDiagnostics.record(
+            .info, area: "Orivio",
+            "A different account signed in; cleared the previous account's sync state and provider credentials."
+        )
+        resetSyncBookkeeping()
+        resetAccountScopedCredentials()
+    }
+
     /// Stable per-device id so the backend can avoid echoing our own writes.
     private let clientID: String = {
         let key = "orivio.sync.client.v1"
@@ -296,6 +374,9 @@ final class OrivioSyncManager: ObservableObject {
                 return
             }
             profileStore.accountAvailable = true
+            // Before anything can push, make sure no state belonging to a
+            // previous account is still resident on this device.
+            handleAccountIdentityChange()
             startAutoSync()
             guard !wasSignedIn else { return }
             wasSignedIn = true
@@ -304,9 +385,19 @@ final class OrivioSyncManager: ObservableObject {
             // but launch must stay responsive even with a large saved library.
             OrivioSyncDiagnostics.record(.info, area: "Orivio", "Account sync will run after launch or when requested.")
         case .signedOut:
+            // Only a REAL sign-out, not the launch-time "no stored session" or a
+            // failed session restore — both of those also publish `.signedOut`,
+            // and wiping the bookkeeping there would drop pending deletes the
+            // same user still needs when they sign back in.
+            let leftAnAccount = wasSignedIn
             wasSignedIn = false
             profileStore.accountAvailable = false
             stopAutoSync()
+            // Nothing queued for the account we just left may be allowed to run
+            // against whichever account signs in next: the pending delete queues
+            // would delete THAT user's rows, and the seeded flags would put its
+            // first pull straight into reconcile mode.
+            if leftAnAccount { resetSyncBookkeeping() }
         case .loading:
             break
         }
@@ -383,6 +474,11 @@ final class OrivioSyncManager: ObservableObject {
             // to the active profile before pulling its data.
             try await pullProfiles()
             applyActiveProfileScope()
+            // Everything below is scoped to THIS profile. Pin it and re-check at
+            // each step: a switch part-way through would otherwise merge this
+            // profile's server data into the newly-selected profile's store and
+            // then push the result back up under the new profile's id.
+            let runProfile = pid
             repairAccidentalWatchHistoryClearState()
             // Pull first so remote wins on first login, then push the merged
             // set — but flush a pending add-on edit first. `addonsDirty` exists
@@ -392,6 +488,7 @@ final class OrivioSyncManager: ObservableObject {
             // removed back onto the device, and then push it up again.
             if addonsDirty { try await pushAddons() }
             try await pullAddons()
+            try ensureProfile(runProfile)
             // Flush local progress edits before pulling. The account pull is a
             // full snapshot, so pulling first can interpret a just-watched row
             // as remotely deleted before its upload lands.
@@ -400,13 +497,16 @@ final class OrivioSyncManager: ObservableObject {
             // tombstone them, so a not-yet-deleted row can't come back here.
             await reconcileProgressDeletesBeforePull()
             try await pullWatchProgress()
+            try ensureProfile(runProfile)
             await reconcileLibraryDeletesBeforePull()
             try await pullLibrary()
+            try ensureProfile(runProfile)
             await reconcileWatchedDeletesBeforePull()
             try await pullWatchedItems()
             // Collections ride the tvOS-preferences blob (pullAppPreferences).
             // The dedicated RPC is best-effort — if the backend lacks it a
             // throw here must NOT abort the rest of the sync.
+            try ensureProfile(runProfile)
             try? await pullCollections()
             try await pullHomeCatalogSettings()
             await pullBadgeSettings()   // best-effort; badge chips are cosmetic
@@ -425,6 +525,10 @@ final class OrivioSyncManager: ObservableObject {
             // still inside its debounce is restored and then re-uploaded.
             if pluginsDirty { try? await pushPlugins() }
             await pullPlugins()              // plugin repos (Android table)
+            // Last and most important gate: every push below REPLACES the
+            // account's copy for `pid`, so one that runs after a switch
+            // overwrites the newly-selected profile with this one's data.
+            try ensureProfile(runProfile)
             try await pushProfiles()
             try await pushAddons()
             try await pushWatchProgressAll()
@@ -435,6 +539,16 @@ final class OrivioSyncManager: ObservableObject {
             await pushAppPreferences()
             await pushProviderCredentials()  // dual-write to the Android table
             try? await pushPlugins()
+        } catch let change as ProfileChangedMidSync {
+            // Not a failure: the user moved to another profile, and that switch
+            // schedules its own sync. Abandoning here is the point.
+            NSLog("[OrivioSync] syncNow abandoned — profile switched %d -> %d mid-run",
+                  change.from, change.to)
+            OrivioSyncDiagnostics.record(
+                .info, area: "Orivio",
+                "Sync for profile \(change.from) abandoned because the active profile changed to \(change.to); the new profile syncs on its own."
+            )
+            return
         } catch {
             // A full-sync failure used to vanish into `lastSyncError` with no
             // console trace, so "my stuff isn't syncing" was undiagnosable from
@@ -1424,6 +1538,16 @@ final class OrivioSyncManager: ObservableObject {
         let previous = fullSyncTask
         fullSyncTask = Task { [weak self] in
             await previous?.value
+            // An auto-sync tick is NOT tracked by `fullSyncTask`, so waiting on
+            // `previous` alone can still land inside a running sync — whose
+            // `guard !isSyncing` would silently drop this one and leave the
+            // newly-selected profile unsynced until the next 30s tick. Wait for
+            // the in-flight run to clear; it abandons itself as soon as it
+            // notices the switch, so this is a short wait in practice.
+            for _ in 0..<100 {
+                guard let self, self.isSyncing else { break }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
             await self?.syncNow()
         }
     }

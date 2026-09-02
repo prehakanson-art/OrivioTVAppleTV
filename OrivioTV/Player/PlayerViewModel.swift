@@ -715,6 +715,11 @@ final class PlayerViewModel: ObservableObject {
     /// engine path, which still has the mid-play switch as an upgrade).
     private var dvFirstTried: Set<String> = []
     private var dvFirstTask: Task<Void, Never>?
+    /// Bumped by every `load()` and every `startDVFirst`. The DV-first probe
+    /// takes seconds, and cancellation alone is not enough once the task is past
+    /// its cancellation check — the generation tells a probe whose entry has been
+    /// superseded to do nothing at all.
+    private var dvFirstGeneration = 0
 
     /// Cheap synchronous gates for the direct-DV start.
     private func shouldTryDVFirst(url: URL) -> Bool {
@@ -745,13 +750,22 @@ final class PlayerViewModel: ObservableObject {
         loadPhase = .loading
         NSLog("[OrivioDV] DV-first preflight: %@", url.host ?? "?")
         dvFirstTask?.cancel()
+        dvFirstGeneration += 1
+        let generation = dvFirstGeneration
         dvFirstTask = Task { [weak self] in
             let probe = await StreamProbe.inspect(
                 url: url.absoluteString,
                 needsStyledASS: false, needsHDR10Plus: false,
                 needsDolbyVision: true, timeoutSeconds: 5
             )
-            guard let self, !Task.isCancelled, !self.isExiting else { return }
+            guard let self, !Task.isCancelled, !self.isExiting,
+                  // A newer load (source switch, episode change) superseded this
+                  // probe while it was in flight. Acting now would either revert
+                  // the viewer's switch through the fallback `load(entry:)`
+                  // below — saving progress under the wrong link — or stack a DV
+                  // engine on top of the stream already playing, doubling audio.
+                  self.dvFirstGeneration == generation
+            else { return }
             let p7ok = self.activeMode == .fidelity || self.settings.dolbyVisionProfile7
             // profile 0 = plain HEVC (HDR10/HDR10+/SDR) — the engine plays it
             // natively with every bitstream SEI intact, so a DV-hinted title
@@ -1799,6 +1813,12 @@ final class PlayerViewModel: ObservableObject {
         clock.buffered = 0
         isBuffering = true
         pausedAt = nil
+        // Any DV-first probe still in flight belongs to the PREVIOUS entry.
+        // Left alone, its completion either reverts this load or installs a
+        // second engine underneath it. `startDVFirst` re-arms below when this
+        // load is itself a DV-first one.
+        dvFirstTask?.cancel()
+        dvFirstGeneration += 1
 
         // VLC engine path: self-contained, skips all the KSPlayer/FFmpeg setup.
         // (Never for the DV playlist — that must ride the native pipeline.)
@@ -2273,6 +2293,17 @@ final class PlayerViewModel: ObservableObject {
 
     // MARK: - VLC engine path
 
+    /// Cleared by every `loadViaVLC`, so a mid-session switch INTO VLC runs the
+    /// same first-play setup a cold start does.
+    ///
+    /// This block used to key off `hasStartedPlayback`, which nothing ever resets
+    /// — so switching engine mid-film (or the automatic styled-ASS reroute, which
+    /// fires after playback has started) skipped the resume seek, the track
+    /// lists, the addon subtitles and the speed: the movie restarted at 0 with
+    /// empty audio/subtitle pickers, and `pendingResume` stayed set so every
+    /// later save floored progress at the switch point.
+    private var vlcSessionPrepared = false
+
     private func loadViaVLC(url: URL) {
         // Tear down any KSPlayer instance so the two engines never coexist.
         playerLayer?.stop()
@@ -2296,6 +2327,7 @@ final class PlayerViewModel: ObservableObject {
         autoSkippedChapters = []
         dismissedIntroStart = nil
         engineName = "VLC"
+        vlcSessionPrepared = false
         if !hasStartedPlayback {
             loadPhase = .loading   // VLC never enters the .caching hold
             cacheProgress = 0
@@ -2369,7 +2401,8 @@ final class PlayerViewModel: ObservableObject {
             pausedAt = Date()
         }
 
-        if playing, !hasStartedPlayback {
+        if playing, !vlcSessionPrepared {
+            vlcSessionPrepared = true
             hasStartedPlayback = true
             loadPhase = nil
             videoRefreshID = UUID()   // re-attach the VLC drawable view
@@ -2823,6 +2856,20 @@ final class PlayerViewModel: ObservableObject {
         let connectionLikelyStale = idleSeconds >= staleResumeThreshold
         let canReconnectBySeek = usingVLC || (playerLayer?.player.seekable ?? false)
         if connectionLikelyStale, canReconnectBySeek {
+            // engineSeek autoplays but BYPASSES enginePlay, so the intent has to
+            // be cleared here — exactly as `seek(to:)` does for the same reason.
+            // Without it the buffer events that follow read `pauseIntent` as
+            // "still paused" and pin `isPlaying` false while the picture is
+            // actually running: the idle timer stays armed (screensaver over a
+            // playing film), the controls never auto-hide, and the next
+            // Play/Pause press resumes AGAIN instead of pausing — the transport
+            // stays stuck until some other path clears the flag.
+            pauseIntent = false
+            // A real resume is also the one thing allowed to reset the pause
+            // clock (see the `.buffering` handler); those callbacks only do it
+            // when the intent is already clear, so do it here for the case
+            // where no buffer event follows a warm seek.
+            pausedAt = nil
             engineSeek(to: max(position - resumeRewindSeconds, 0), autoPlay: true)
         } else {
             enginePlay()
@@ -3985,6 +4032,18 @@ final class PlayerViewModel: ObservableObject {
     @Published private(set) var sessionEngine: PlayerEngine?
     var effectiveEngine: PlayerEngine { sessionEngine ?? settings.playerEngine }
 
+    /// Where a reload has to come back to.
+    ///
+    /// NOT raw `position`: `load()` zeroes it and it only ticks again once the
+    /// new engine plays, so a switch made while a load is still in flight reads
+    /// 0, wipes `pendingResume`, and restarts the title from the beginning.
+    /// `switchEngine` guarded against this; `switchSource` did not, so changing
+    /// source while the first one was still opening lost the resume point and
+    /// the throttled saves then wrote the new small positions over it.
+    private var resumeTargetForReload: Double {
+        max(max(position, pendingResume ?? 0), sessionResumeFloor)
+    }
+
     /// Reload the current stream through a different engine, keeping position.
     func switchEngine(_ engine: PlayerEngine) {
         guard engine != effectiveEngine else {
@@ -3994,11 +4053,7 @@ final class PlayerViewModel: ObservableObject {
         sessionEngine = engine
         PlaybackMemory.update(meta.id) { $0.engine = engine.rawValue }
         overlay = .none
-        // NOT raw `position`: load() zeroes it and it only ticks again once
-        // the new engine plays, so a second switch made while a load is still
-        // in flight read 0, wiped pendingResume, and restarted the movie from
-        // the beginning. Same guard the exit path uses.
-        let resumeAt = max(max(position, pendingResume ?? 0), sessionResumeFloor)
+        let resumeAt = resumeTargetForReload
         countdownTask?.cancel()
         upNextCountdown = nil
         pendingResume = resumeAt > 10 ? resumeAt : nil
@@ -4356,7 +4411,7 @@ final class PlayerViewModel: ObservableObject {
             }
             overlay = .none
             isSwitchingSource = true
-            let resumeAt = position
+            let resumeAt = resumeTargetForReload
             Task { [weak self] in
                 guard let self else { return }
                 defer { self.isSwitchingSource = false }
@@ -4378,7 +4433,7 @@ final class PlayerViewModel: ObservableObject {
             }
             return
         }
-        let resumeAt = position
+        let resumeAt = resumeTargetForReload
         currentEntry = entry
         overlay = .none
         // Same episode, new source — keep the auto-next arming state as-is
@@ -4539,6 +4594,10 @@ final class PlayerViewModel: ObservableObject {
         upNextEpisode = nil
         autoAdvanceArmed = false
         consecutiveAutoAdvances = 0
+        // Replaying restarts the evidence for this link at zero; otherwise the
+        // verdict is measured against the position the session resumed from and
+        // comes out negative (clamped to 0 = "rejected").
+        sessionStartPosition = 0
         // Seek only — it autoplays on completion. A second, synchronous play()
         // here ran inside the seek's flush and left the picture frozen with the
         // audio running (see scanCommit / `.readyToPlay` for the full story).
@@ -4667,6 +4726,13 @@ final class PlayerViewModel: ObservableObject {
             // New episode = new timeline; the previous episode's resume target
             // must not follow it into a failover.
             sessionResumeFloor = 0
+            // `recordLinkVerdict` measures how much of THIS session was watched
+            // from here. Left at the previous episode's resume point, finishing
+            // an episode resumed at 40:00 and then watching 25 minutes of the
+            // next one computed 1500 - 2400 -> clamped to 0, so the link that
+            // had just played fine was REJECTED for the title and skipped next
+            // time.
+            sessionStartPosition = pendingResume ?? 0
 
             if let preferred, !presentSources {
                 currentEntry = preferred

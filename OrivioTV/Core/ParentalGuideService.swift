@@ -39,12 +39,25 @@ enum ParentalGuideService {
         ("FRIGHTENING_INTENSE_SCENES", "Frightening"),
     ]
 
-    /// In-memory cache; advisories don't change within a session.
+    /// In-memory cache; advisories don't change within a session. Guarded by
+    /// `cacheLock` — `guide` is called from concurrent detail-load Tasks and a
+    /// plain Swift Dictionary is not thread-safe (concurrent mutation →
+    /// EXC_BAD_ACCESS). Same pattern as TMDBService.
+    private static let cacheLock = NSLock()
     private static var cache: [String: [ParentalGuideEntry]] = [:]
+
+    private static func cached(_ key: String) -> [ParentalGuideEntry]? {
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        return cache[key]
+    }
+    private static func store(_ value: [ParentalGuideEntry], for key: String) {
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        cache[key] = value
+    }
 
     static func guide(imdbID: String) async -> [ParentalGuideEntry] {
         guard imdbID.hasPrefix("tt") else { return [] }
-        if let hit = cache[imdbID] { return hit }
+        if let hit = cached(imdbID) { return hit }
         guard let url = URL(string: "https://api.tiffara.com/titles/\(imdbID)/parentsGuide") else { return [] }
         guard let (data, resp) = try? await session.data(from: url),
               let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode),
@@ -59,7 +72,7 @@ enum ParentalGuideService {
             guard let category = byCategory[key], let severity = dominantSeverity(category) else { continue }
             out.append(ParentalGuideEntry(label: label, severity: severity))
         }
-        cache[imdbID] = out
+        store(out, for: imdbID)
         return out
     }
 

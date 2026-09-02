@@ -142,7 +142,7 @@ final class StremioSyncManager: ObservableObject {
                 await onMergedFromStremio?()
                 progress.removeLocalOnlyProgress()
                 let clears = pendingProgressClears
-                let pushResult = await StremioSync.pushCombined(
+                let push = await StremioSync.pushCombined(
                     authKey: key,
                     addonManager: addonManager,
                     library: library,
@@ -150,12 +150,15 @@ final class StremioSyncManager: ObservableObject {
                     watched: watched,
                     clearedProgressIDs: clears
                 )
-                // Only drop the queue once the push actually reported success;
-                // a failure keeps them for the next run.
-                if !clears.isEmpty, !pushResult.hasPrefix("Couldn't") {
+                // Only drop the queue once the LIBRARY push actually landed —
+                // the cleared ids ride in that payload. This used to test the
+                // summary string for a "Couldn't" prefix that `pushCombined`
+                // never produces, so a failed push still emptied the queue and
+                // the title the user removed came back on the next pull.
+                if !clears.isEmpty, push.libraryPushed {
                     pendingProgressClears.subtract(clears)
                 }
-                finalResult = "\(pullResult) · \(pushResult)"
+                finalResult = "\(pullResult) · \(push.summary)"
             }
             stremio.setStatus(finalResult)
             stremio.setSyncing(false)

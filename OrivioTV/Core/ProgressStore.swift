@@ -249,6 +249,9 @@ final class ProgressStore: ObservableObject {
         profileID = id
         suppressChange = true
         items = [:]
+        // The in-playback overrides belong to the profile we are LEAVING. Left
+        // in place, the next save/push folds them into the new profile's data.
+        transientOverrides.removeAll()
         load()
         suppressChange = false
     }
@@ -267,6 +270,8 @@ final class ProgressStore: ObservableObject {
         // it had never been touched.
         var merged = items
         for (key, transient) in transientOverrides {
+            // Never push back a key the user just removed/finished.
+            if tombstones[key] != nil { continue }
             guard let live = merged[key] else { merged[key] = transient; continue }
             if transient.updatedAt > live.updatedAt { merged[key] = transient }
         }
@@ -678,6 +683,11 @@ final class ProgressStore: ObservableObject {
         let key = Self.key(metaID: meta.id, video: video)
         if position / duration >= 0.95 {
             let removed = items.removeValue(forKey: key) != nil
+            // Retire the periodic row too. Without this, `save()` below folds it
+            // back into the snapshot and the finished title returns to Continue
+            // Watching on the next launch — and `serviceBackedForSync()` pushes
+            // it back to the account right after `onRemove` asked for a delete.
+            transientOverrides.removeValue(forKey: key)
             if removed { tombstones[key] = Date() }
             if !suppressChange {
                 if removed { onRemove?([key]) }
@@ -706,6 +716,9 @@ final class ProgressStore: ObservableObject {
                 updatedAt: Date(),
                 syncSource: "nuvio"
             )
+            // `items` now carries the newest position for this key, so the
+            // periodic override is stale — retire it instead of accumulating.
+            transientOverrides.removeValue(forKey: key)
         }
         save()
         if !suppressChange { onLocalUpdate?() }
@@ -731,6 +744,12 @@ final class ProgressStore: ObservableObject {
               position > 0,
               position / duration < 0.95 else { return }
         let key = Self.key(metaID: meta.id, video: video)
+        // Watching it again clears the removal tombstone, exactly as the
+        // publishing `update()` does. Without this, a title removed and then
+        // immediately re-played stayed tombstoned for the full grace period,
+        // and the guards in `save()` / `serviceBackedForSync()` would skip its
+        // periodic rows — losing the very in-playback progress they persist.
+        tombstones.removeValue(forKey: key)
         var snapshot = items
         snapshot[key] = WatchProgress(
             id: key,
@@ -757,6 +776,7 @@ final class ProgressStore: ObservableObject {
 
     func remove(id: String) {
         guard items.removeValue(forKey: id) != nil else { return }
+        transientOverrides.removeValue(forKey: id)
         tombstones[id] = Date()
         save()
         if !suppressChange {
@@ -774,11 +794,15 @@ final class ProgressStore: ObservableObject {
         items.removeAll()
         externallyMerged.removeAll()
         awaitingServerAck.removeAll()
+        // Periodic in-playback rows are part of "all progress" too — leaving
+        // them behind let the very next save re-materialise the history the
+        // user just cleared.
+        transientOverrides.removeAll()
         rebuildContinueFractions()
-        UserDefaults.standard.removeObject(forKey: storageKey)
-        Task.detached(priority: .utility) {
-            TopShelfExporter.write([])
-        }
+        // Go through the serializing writer instead of clearing the key
+        // directly: a save queued moments ago would otherwise land AFTER this
+        // and restore the cleared history.
+        persist([:], shelf: [])
         if notify && !suppressChange {
             onRemove?(removedKeys)
             onLocalUpdate?()
@@ -794,6 +818,7 @@ final class ProgressStore: ObservableObject {
     func recanonicalize(oldID: String, newID: String, newMetaID: String) {
         guard oldID != newID, let existing = items[oldID] else { return }
         items.removeValue(forKey: oldID)
+        transientOverrides.removeValue(forKey: oldID)
         tombstones[oldID] = Date()   // stale key is deleted server-side too
         tombstones.removeValue(forKey: newID)   // the canonical key is being (re)created
         items[newID] = WatchProgress(
@@ -825,6 +850,7 @@ final class ProgressStore: ObservableObject {
         let now = Date()
         for key in removedKeys {
             items.removeValue(forKey: key)
+            transientOverrides.removeValue(forKey: key)
             tombstones[key] = now
         }
         save()
@@ -882,6 +908,8 @@ final class ProgressStore: ObservableObject {
         // path publishes a real update, and a remote merge can supersede too).
         var snapshot = items
         for (key, transient) in transientOverrides {
+            // Never re-persist a key the user just removed/finished.
+            if tombstones[key] != nil { continue }
             guard let live = snapshot[key] else { snapshot[key] = transient; continue }
             if transient.updatedAt > live.updatedAt { snapshot[key] = transient }
         }

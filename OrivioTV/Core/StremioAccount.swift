@@ -502,14 +502,26 @@ enum StremioSync {
         return "Pulled \(addonStates.count) add-ons · \(saved.count) library · \(continueWatching.count) in-progress · \(watchedItems.count) watched"
     }
 
+    /// Outcome of a combined push. The summary is the human status line; the
+    /// flag is what callers must branch on. The summary is NOT a success
+    /// signal — it always reads "Pushed …", so a caller testing it for a
+    /// failure prefix could never see one.
+    struct PushOutcome {
+        let summary: String
+        /// False when the library PUT failed. The cleared-progress ids ride in
+        /// that payload, so on failure they must stay queued for the next run.
+        let libraryPushed: Bool
+    }
+
     @MainActor
     static func pushCombined(authKey: String,
                              addonManager: AddonManager,
                              library: LibraryStore,
                              progress: ProgressStore,
                              watched: WatchedStore,
-                             clearedProgressIDs: Set<String> = []) async -> String {
+                             clearedProgressIDs: Set<String> = []) async -> PushOutcome {
         var warnings: [String] = []
+        var libraryPushed = true
 
         do {
             try await StremioAccountService.setAddonCollection(authKey: authKey, addons: addonManager.addons)
@@ -530,13 +542,19 @@ enum StremioSync {
         do {
             try await StremioAccountService.putLibrary(authKey: authKey, items: items)
         } catch {
+            libraryPushed = false
             warnings.append("library")
             OrivioSyncDiagnostics.record(.warning, area: "Stremio", "Library push to Stremio failed: \(error.localizedDescription)")
         }
 
         let summary = "Pushed combined \(addonManager.addons.count) add-ons · \(library.allForSync().count) library · \(serviceProgress.count) in-progress · \(watched.allForSync().count) watched"
-        guard !warnings.isEmpty else { return summary }
-        return "\(summary) · Stremio push failed for \(warnings.joined(separator: ", "))"
+        guard !warnings.isEmpty else {
+            return PushOutcome(summary: summary, libraryPushed: libraryPushed)
+        }
+        return PushOutcome(
+            summary: "\(summary) · Stremio push failed for \(warnings.joined(separator: ", "))",
+            libraryPushed: libraryPushed
+        )
     }
 
     private static func metadataTypes(for type: String, id: String) -> [String] {
@@ -805,7 +823,19 @@ enum StremioSync {
     private static func playbackSeconds(offset: Double?, duration: Double?) -> (Double, Double) {
         let rawOffset = offset ?? 0
         let rawDuration = duration ?? 0
-        let scale = rawDuration > 86_400 ? 1000.0 : 1.0
+        // Duration is the reliable signal, but it is very often ABSENT (see the
+        // import note in `pull`). Keying the scale off duration alone then let a
+        // millisecond offset through as seconds: a 50-minute resume point became
+        // 3,000,000 "seconds", `enrichContinueWatching` computed a fraction far
+        // past 1.0 and dropped the row as finished — silently discarding most
+        // duration-less resume points on import. With no duration, fall back to
+        // the offset's own magnitude: no movie or episode runs for a day.
+        let scale: Double
+        if rawDuration > 0 {
+            scale = rawDuration > 86_400 ? 1000.0 : 1.0
+        } else {
+            scale = rawOffset > 86_400 ? 1000.0 : 1.0
+        }
         return (rawOffset / scale, rawDuration / scale)
     }
 }

@@ -14,9 +14,31 @@ final class RatingsStore: ObservableObject {
     var onTraktUnrate: ((_ metaID: String, _ type: String) -> Void)?
     private var suppressChange = false
 
-    private static let key = "orivio.ratings.v1"
+    /// Active profile scope. Profile 1 keeps the original (unsuffixed) key so
+    /// existing ratings survive this change; other profiles get a namespace.
+    ///
+    /// Ratings used to be device-wide while Trakt sign-in can be PER-PROFILE, so
+    /// a sync pulled profile A's Trakt ratings into the shared store and then
+    /// pushed them into profile B's different Trakt account.
+    private static let baseKey = "orivio.ratings.v1"
+    private var profileID = 1
+    private var storageKey: String {
+        profileID == 1 ? Self.baseKey : "\(Self.baseKey).p\(profileID)"
+    }
 
     init() { load() }
+
+    /// Switch to another profile's ratings. The current profile is already
+    /// persisted, so just re-point storage and reload.
+    func setProfile(_ id: Int) {
+        guard id != profileID else { return }
+        profileID = id
+        suppressChange = true
+        ratings = [:]
+        types = [:]
+        load()
+        suppressChange = false
+    }
 
     func rating(for metaID: String) -> Int? { ratings[metaID] }
 
@@ -60,7 +82,7 @@ final class RatingsStore: ObservableObject {
     private struct Persisted: Codable { var ratings: [String: Int]; var types: [String: String] }
 
     private func load() {
-        guard let data = UserDefaults.standard.data(forKey: Self.key),
+        guard let data = UserDefaults.standard.data(forKey: storageKey),
               let p = try? JSONDecoder().decode(Persisted.self, from: data) else { return }
         ratings = p.ratings
         types = p.types
@@ -68,6 +90,6 @@ final class RatingsStore: ObservableObject {
 
     private func save() {
         guard let data = try? JSONEncoder().encode(Persisted(ratings: ratings, types: types)) else { return }
-        UserDefaults.standard.set(data, forKey: Self.key)
+        UserDefaults.standard.set(data, forKey: storageKey)
     }
 }

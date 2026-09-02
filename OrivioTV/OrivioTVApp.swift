@@ -178,8 +178,13 @@ struct RootView: View {
             .task {
                 if sync == nil {
                     // Finishing a title records it in watched history.
-                    progressStore.onFinished = { [weak watched] meta, video in
+                    progressStore.onFinished = { [weak watched, finishedThisSession] meta, video in
                         watched?.mark(meta: meta, video: video)
+                        // Remember it for the stop scrobble: the row this fires
+                        // for has just been DELETED from the progress store.
+                        finishedThisSession.keys.insert(
+                            ProgressStore.key(metaID: meta.id, video: video)
+                        )
                     }
                     let orivioSync = OrivioSyncManager(
                         account: account,
@@ -208,7 +213,13 @@ struct RootView: View {
                     // Trakt scoping must survive being signed out of Orivio:
                     // the sync manager owns profile scoping for every other
                     // store, but it only runs while signed in.
-                    profiles.onSwitchLocal = { [weak trakt] id in trakt?.setProfile(id) }
+                    // Ratings are per-profile for the same reason Trakt is: a
+                    // profile with its own Trakt account must not push another
+                    // profile's ratings into it.
+                    profiles.onSwitchLocal = { [weak trakt, weak ratings] id in
+                        trakt?.setProfile(id)
+                        ratings?.setProfile(id)
+                    }
                     profiles.onProfileDeleted = { [weak trakt] id in trakt?.forgetProfile(id) }
                     traktSync = TraktSyncManager(
                         trakt: trakt, watched: watched, progress: progressStore,
@@ -849,6 +860,20 @@ struct RootView: View {
     /// gated on sign-in + the scrobble toggle; only tt… ids scrobble.
     @State private var scrobblingItem: (meta: MetaItem, video: MetaVideo?)?
 
+    /// Progress keys that crossed the "finished" threshold during playback.
+    ///
+    /// `ProgressStore.update` DELETES the row at >=95%, so by the time the player
+    /// dismisses and the stop scrobble runs there is nothing left to read a final
+    /// fraction from. It reported 0% — and Trakt reads a stop under 80% as a
+    /// PAUSE, so every title the viewer actually finished landed back on their
+    /// account as a 0% in-progress row (which "Sync Continue Watching" then
+    /// pulled straight back into the Continue Watching row).
+    ///
+    /// A reference box rather than a plain `Set` because the store's `onFinished`
+    /// callback is installed once and has to write somewhere the view can read.
+    final class FinishedKeys { var keys: Set<String> = [] }
+    @State private var finishedThisSession = FinishedKeys()
+
     private func scrobbleForPlaybackChange() {
         guard trakt.isSignedIn, trakt.scrobbleEnabled, let token = trakt.accessToken else {
             scrobblingItem = nil
@@ -857,6 +882,10 @@ struct RootView: View {
         if let request = playback {
             // Playback started.
             scrobblingItem = (request.meta, request.video)
+            let startKey = ProgressStore.key(metaID: request.meta.id, video: request.video)
+            // A re-watch starts fresh: last session's "finished" must not make
+            // this one report 100% if the viewer bails out after five minutes.
+            finishedThisSession.keys.remove(startKey)
             let fraction = request.resumePosition.flatMap { pos -> Double? in
                 let key = ProgressStore.key(metaID: request.meta.id, video: request.video)
                 guard let duration = progressStore.progress(for: key)?.durationSeconds, duration > 0 else { return nil }
@@ -873,7 +902,17 @@ struct RootView: View {
             // Playback ended — report final progress.
             scrobblingItem = nil
             let key = ProgressStore.key(metaID: item.meta.id, video: item.video)
-            let fraction = (progressStore.progress(for: key)?.fraction ?? 0) * 100
+            // A live row wins; otherwise a row that vanished because it FINISHED
+            // reports complete, and one that never existed reports 0.
+            let fraction: Double
+            if let live = progressStore.progress(for: key)?.fraction {
+                fraction = live * 100
+            } else if finishedThisSession.keys.contains(key) {
+                fraction = 100
+            } else {
+                fraction = 0
+            }
+            finishedThisSession.keys.remove(key)
             Task {
                 await TraktService.scrobble(
                     action: .stop, imdbID: item.meta.id, type: item.meta.type,

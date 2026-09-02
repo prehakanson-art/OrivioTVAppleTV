@@ -507,6 +507,23 @@ final class DVSampleEngine {
     /// a fresh start, not a stalled feed — take a 1s cushion and go.
     private var seekRefill = false
 
+    /// FFmpeg's `AVERROR_EOF` / `AVERROR_EXIT`, which are macros and so do not
+    /// import into Swift. Both are FFERRTAG values: the negated four-character
+    /// code, i.e. -MKTAG('E','O','F',' ') and -MKTAG('E','X','I','T').
+    private static let averrorEOF: Int32 = -541_478_725
+    private static let averrorExit: Int32 = -1_414_092_869
+    /// `AVERROR(EAGAIN)` on Darwin (EAGAIN is 35): a non-blocking read with
+    /// nothing ready yet, not a failure.
+    private static let averrorEAGAIN: Int32 = -35
+
+    private static func describeAVError(_ code: Int32) -> String {
+        var buf = [CChar](repeating: 0, count: 256)
+        if av_strerror(code, &buf, 256) == 0 {
+            return String(cString: buf)
+        }
+        return "error \(code)"
+    }
+
     private func underrunResumeDepth(eof: Bool) -> Int {
         if eof { return 1 }
         if seekRefill { return 24 }
@@ -937,27 +954,43 @@ final class DVSampleEngine {
                     }
                     return
                 }
-                if !eof {
+                // Entering a hold only makes sense while more data is coming.
+                if !eof, (depth == 0 || aqDepth == 0), !self.autoPaused,
+                   self.userRate > 0, self.synchronizer.rate > 0 {
                     // EITHER queue running dry means a hold: the vsync probe
                     // caught the audio renderer starving (aq=0 while vq>0)
                     // during feed micro-dips — its clock lurched ±1800ppm and
                     // dragged video into visible repeats/skips, because the
                     // synchronizer slaves everything to the audio clock. The
                     // old check watched only video.
-                    if (depth == 0 || aqDepth == 0), !self.autoPaused, self.userRate > 0, self.synchronizer.rate > 0 {
-                        self.autoPaused = true
-                        self.autoPausedAt = Date()
-                        if Date().timeIntervalSince(self.lastUnderrunAt) > 90 { self.recentUnderruns = 0 }
-                        self.recentUnderruns += 1
-                        self.lastUnderrunAt = Date()
-                        NSLog("[DVSample] underrun #%d — holding clock (vq=%d aq=%d)",
-                              self.recentUnderruns, depth, aqDepth)
-                        self.synchronizer.setRate(0, time: self.synchronizer.currentTime())
-                        self.onBuffering?(true)
-                    } else if self.autoPaused, depth >= self.underrunResumeDepth(eof: eof), aqDepth >= 4 {
+                    self.autoPaused = true
+                    self.autoPausedAt = Date()
+                    if Date().timeIntervalSince(self.lastUnderrunAt) > 90 { self.recentUnderruns = 0 }
+                    self.recentUnderruns += 1
+                    self.lastUnderrunAt = Date()
+                    NSLog("[DVSample] underrun #%d — holding clock (vq=%d aq=%d)",
+                          self.recentUnderruns, depth, aqDepth)
+                    self.synchronizer.setRate(0, time: self.synchronizer.currentTime())
+                    self.onBuffering?(true)
+                } else if self.autoPaused {
+                    // LEAVING a hold has to be evaluated at EOF too. This used to
+                    // sit inside the `!eof` branch, so an underrun still holding
+                    // when the demuxer reached the end of the file could never be
+                    // lifted: rate stayed 0, the buffering spinner stayed up, the
+                    // tail never played, and `onEnded` never fired because the
+                    // queues were not empty. `underrunResumeDepth(eof:)` already
+                    // returns 1 for the EOF case — dead code until now, and the
+                    // giveaway that this was always meant to run.
+                    //
+                    // At EOF the audio cushion is waived: the last packets of a
+                    // file routinely number fewer than four, and demanding them
+                    // would strand the ending.
+                    let audioCushion = eof ? 0 : 4
+                    if depth >= self.underrunResumeDepth(eof: eof), aqDepth >= audioCushion {
                         self.autoPaused = false
                         self.seekRefill = false
-                        NSLog("[DVSample] underrun over — resuming with vq=%d", depth)
+                        NSLog("[DVSample] underrun over — resuming with vq=%d (eof=%@)",
+                              depth, eof ? "true" : "false")
                         if self.userRate > 0 {
                             self.synchronizer.setRate(self.userRate, time: self.synchronizer.currentTime())
                         }
@@ -980,6 +1013,8 @@ final class DVSampleEngine {
         var pkt: UnsafeMutablePointer<AVPacket>? = packet
         defer { av_packet_free(&pkt) }
         var myGeneration = seekGeneration
+        // Consecutive AVERROR(EAGAIN) reads; reset by any successful read.
+        var eagainRetries = 0
 
         while !cancelled {
             // A seek moved the goalposts: reposition and keep reading.
@@ -1007,9 +1042,36 @@ final class DVSampleEngine {
             }
             let readResult = av_read_frame(ictx, packet)
             if readResult < 0 {
+                if cancelled { break }
+                // Nothing ready on a non-blocking read: not an error, not the
+                // end. Yield briefly and keep going — but BOUNDED, so a demuxer
+                // that never becomes ready cannot spin this thread forever.
+                // Past the bound it falls through and is reported as a failure.
+                if readResult == Self.averrorEAGAIN, eagainRetries < 200 {
+                    eagainRetries += 1
+                    usleep(10_000)
+                    continue
+                }
+                // A genuine end of stream is the ONLY case that may set
+                // `demuxEOF`. Treating every negative result as EOF meant a
+                // network stall or a failed reconnect (rw_timeout is 20s)
+                // drained the pipeline and reported "played to the end": the app
+                // saved the title as finished, armed Up Next and auto-advanced
+                // to the next episode — because the connection dropped. Route
+                // real failures to `onError`, which tears the direct engine down
+                // and reloads the same source on the normal FFmpeg path.
+                if readResult != Self.averrorEOF, readResult != Self.averrorExit {
+                    let detail = Self.describeAVError(readResult)
+                    NSLog("[DVSample] demux read failed (%d): %@", readResult, detail)
+                    DispatchQueue.main.async { [weak self] in
+                        self?.onError?("stream read failed: \(detail)")
+                    }
+                    break
+                }
                 queueLock.lock(); demuxEOF = true; queueLock.broadcast(); queueLock.unlock()
                 break
             }
+            eagainRetries = 0
             defer { av_packet_unref(packet) }
             let index = packet.pointee.stream_index
             let activeAudio = desiredAudioIndex
