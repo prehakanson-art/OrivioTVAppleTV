@@ -1385,6 +1385,7 @@ private struct HomePosterCell: View, Equatable {
     }
 
     var body: some View {
+        let _ = HoldProbe.renderTick("poster \(item.name)")
         VStack(alignment: .leading, spacing: 0) {
             Button {
                 onSelect(item)
@@ -1550,18 +1551,19 @@ private struct ContinueWatchingCell: View, Equatable {
     }
 
     var body: some View {
+        let _ = HoldProbe.renderTick("CW \(progress.name)")
         VStack(alignment: .leading, spacing: 0) {
             Button {
                 onResume(progress)
             } label: {
-                        LandscapeCard(
-                            imageURL: imageURL,
-                            title: progress.name,
-                            subtitle: subtitle,
-                            progress: progress.fraction,
-                            remainingText: progress.remainingTimeText,
-                            hasNewEpisode: progress.hasNewEpisode == true,
-                            blurImage: blur,
+                LandscapeCard(
+                    imageURL: imageURL,
+                    title: progress.name,
+                    subtitle: subtitle,
+                    progress: progress.fraction,
+                    remainingText: progress.remainingTimeText,
+                    hasNewEpisode: progress.hasNewEpisode == true,
+                    blurImage: blur,
                     // Caption goes BELOW the platter (see below) so it isn't
                     // bridged to the still by the slab.
                     showsCaption: false
@@ -1577,17 +1579,19 @@ private struct ContinueWatchingCell: View, Equatable {
                     if isFocused, drivesHero { hero.focus(heroItemFor(progress)) }
                 }
             }
-            // Was FlatCardButtonStyle, on the belief that the native platter
-            // "swallows contextMenu" on landscape cards. On device the reverse
-            // is true: catalog posters (native platter) open their menu, and
-            // this card — the only one using the flat style — never did. Same
-            // style as every other card now, which also restores its lift and
-            // sheen.
+            // Was FlatCardButtonStyle, under a comment claiming the native
+            // platter "swallows contextMenu" on landscape cards. That claim was
+            // wrong, but so was the theory that replaced it: the button style
+            // had nothing to do with the hold menu (see the FusionHeroBar
+            // artwork note — a hit-testable backdrop was covering this row).
+            // Kept on the platter purely so this card lifts and catches the
+            // sheen like every other one.
             .mediaCardButtonStyle()
             .holdProbe("CW \(progress.name)", enabled: PerformanceSettingsStore.shared.settings.showHoldProbe)
-            .continueHoldMenu(progress, onDetails: onDetails,
-                              onPlayManually: onPlayManuallyMenu,
-                              onResumeFromStart: onResumeFromStartMenu)
+            // A/B DIAGNOSTIC (revert after): the poster menu demonstrably
+            // presents, so putting it on this cell holds the cell constant and
+            // varies only the menu.
+            .posterHoldMenu(heroItemFor(progress)) { onDetails() }
             // ⏯ resumes instantly from a focused CW card too.
             .onPlayPauseCommand { onResume(progress) }
 
@@ -1767,7 +1771,12 @@ private struct FusionHeroHeader: View {
             // never match the stage's bloom and always left a seam line.
             GeometryReader { geo in
                 if let art = hero.item?.background ?? hero.item?.poster {
+                    // Decorative — see the FusionHeroBar note. A full-bleed
+                    // RemoteImage overflows the frame it is clipped to and stays
+                    // hit-testable, which swallows a neighbouring card's
+                    // context-menu hit test.
                     RemoteImage(url: art)
+                        .allowsHitTesting(false)
                         .frame(width: geo.size.width, height: geo.size.height)
                         .clipped()
                         // Left readability wash rides INSIDE the mask so it

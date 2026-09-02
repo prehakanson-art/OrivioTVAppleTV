@@ -170,6 +170,7 @@ struct RootView: View {
             .onAppear {
                 NSLog("[OrivioPlayer] RootView content onAppear")
                 FocusTrace.installIfRequested()
+                if perf.settings.showHoldProbe { HoldInteractionTrace.install() }
                 startPlayerDemoIfRequested()
                 startDetailDemoIfRequested()
                 ScrubThumbnailer.runSelfTestIfRequested()

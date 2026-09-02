@@ -35,11 +35,23 @@ final class HoldProbe: ObservableObject {
     /// Safe to call from anywhere, including inside a ViewBuilder: the append
     /// is deferred so it never mutates state during a view update.
     nonisolated static func log(_ text: String) {
+        // Also to the console, so the probe can be watched over a device log
+        // stream and not only on the HUD.
+        NSLog("[HoldProbe] %@", text)
         Task { @MainActor in
             let probe = HoldProbe.shared
             probe.events.append(Event(at: Date(), text: text))
             if probe.events.count > 12 { probe.events.removeFirst(probe.events.count - 12) }
         }
+    }
+
+    /// Body-evaluation counter. Prints a per-second rate so a row that
+    /// rebuilds under an in-flight hold is visible without any holding.
+    private static let renderCounts = RenderCounter()
+    @MainActor
+    static func renderTick(_ label: String) {
+        guard PerformanceSettingsStore.shared.settings.showHoldProbe else { return }
+        renderCounts.tick(label)
     }
 
     func clear() { events.removeAll() }
@@ -87,16 +99,124 @@ struct HoldPressProbe: UIViewRepresentable {
 extension View {
     @ViewBuilder
     func holdProbe(_ label: String, enabled: Bool) -> some View {
-        if enabled {
-            self
-                .background(HoldPressProbe(label: label))
-                .simultaneousGesture(
-                    LongPressGesture(minimumDuration: 0.5)
-                        .onEnded { _ in HoldProbe.log("longpress ≥0.5s (SwiftUI) — \(label)") }
-                )
-        } else {
-            self
+        // PASSIVE ON PURPOSE. The first version added a SwiftUI
+        // LongPressGesture here; it fired on every hold, but on tvOS it
+        // competes with the long-press .contextMenu uses internally, so the
+        // probe could suppress the menu it was meant to observe. The UIKit
+        // recognizer in HoldPressProbe never fired at all (a background
+        // representable is not in the focused view's press chain), so nothing
+        // is lost by dropping both. Focus logging and the MENU BUILT lines
+        // inside each .contextMenu body remain.
+        self
+    }
+}
+
+/// Answers the only question that matters: does the focused card actually have
+/// a UIContextMenuInteraction attached? `.contextMenu` compiles and its body
+/// runs whether or not SwiftUI ends up installing the interaction, so the
+/// source alone cannot tell a working card from a broken one. This reads the
+/// live view hierarchy instead.
+@MainActor
+enum HoldInteractionTrace {
+    private static var token: NSObjectProtocol?
+
+    static func install() {
+        guard token == nil else { return }
+        token = NotificationCenter.default.addObserver(
+            forName: UIFocusSystem.didUpdateNotification, object: nil, queue: .main
+        ) { note in
+            guard let ctx = note.userInfo?[UIFocusSystem.focusUpdateContextUserInfoKey]
+                    as? UIFocusUpdateContext,
+                  let view = ctx.nextFocusedItem as? UIView else { return }
+            var chain: [String] = []
+            var found = "none"
+            var node: UIView? = view
+            var depth = 0
+            while let v = node, depth < 10 {
+                let menus = v.interactions.filter { $0 is UIContextMenuInteraction }
+                chain.append("\(type(of: v))\(menus.isEmpty ? "" : "[MENU]")")
+                if !menus.isEmpty, found == "none" { found = "depth \(depth) \(type(of: v))" }
+                node = v.superview
+                depth += 1
+            }
+            NSLog("[HoldTrace] contextMenuInteraction: %@ | chain: %@",
+                  found, chain.joined(separator: " < "))
         }
+        installWindowPressWatch()
+    }
+
+    /// Observes Select presses at the WINDOW, so the card's own gesture is
+    /// untouched: it never cancels touches, never delays them, and recognises
+    /// simultaneously with everything. The earlier per-card probe was the
+    /// opposite of this and could suppress the menu it measured.
+    private static var pressWatch: UILongPressGestureRecognizer?
+    private static let watchDelegate = SimultaneousDelegate()
+
+    private static func installWindowPressWatch() {
+        guard pressWatch == nil else { return }
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        guard let window = scenes.flatMap(\.windows).first(where: { $0.isKeyWindow })
+                ?? scenes.flatMap(\.windows).first else { return }
+        let g = UILongPressGestureRecognizer(target: watchDelegate,
+                                             action: #selector(SimultaneousDelegate.handle(_:)))
+        g.minimumPressDuration = 0.05
+        g.allowedPressTypes = [NSNumber(value: UIPress.PressType.select.rawValue)]
+        g.allowedTouchTypes = []
+        g.cancelsTouchesInView = false
+        g.delaysTouchesBegan = false
+        g.delaysTouchesEnded = false
+        g.delegate = watchDelegate
+        window.addGestureRecognizer(g)
+        pressWatch = g
+        NSLog("[HoldTrace] window press watch installed")
+    }
+
+    /// Walks the live hierarchy for views carrying a UIContextMenuInteraction
+    /// and reports the focused view's frame. Distinguishes "SwiftUI never
+    /// installed the interaction" from "installed but refusing to present" —
+    /// the one thing the source cannot tell us.
+    static func dumpMenuInteractions() {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        guard let window = scenes.flatMap(\.windows).first(where: { $0.isKeyWindow })
+                ?? scenes.flatMap(\.windows).first else { return }
+        var frames: [String] = []
+        func walk(_ v: UIView) {
+            if v.interactions.contains(where: { $0 is UIContextMenuInteraction }) {
+                let f = v.convert(v.bounds, to: window)
+                frames.append(String(format: "%@(%.0f,%.0f %.0fx%.0f)",
+                                     "\(type(of: v))", f.origin.x, f.origin.y, f.width, f.height))
+            }
+            v.subviews.forEach(walk)
+        }
+        walk(window)
+        let focusedFrame: String
+        if let f = UIFocusSystem.focusSystem(for: window)?.focusedItem {
+            let r = f.frame
+            focusedFrame = String(format: "(%.0f,%.0f %.0fx%.0f)",
+                                  r.origin.x, r.origin.y, r.width, r.height)
+        } else { focusedFrame = "nil" }
+        NSLog("[MenuScan] views with contextMenuInteraction: %d | focused item frame: %@ | %@",
+              frames.count, focusedFrame, frames.prefix(6).joined(separator: " "))
+    }
+
+    final class SimultaneousDelegate: NSObject, UIGestureRecognizerDelegate {
+        @objc func handle(_ g: UILongPressGestureRecognizer) {
+            switch g.state {
+            case .began:
+                NSLog("[Press] HOLD BEGAN")
+                HoldInteractionTrace.dumpMenuInteractions()
+            case .ended:     NSLog("[Press] hold ended")
+            case .cancelled: NSLog("[Press] hold CANCELLED (something took the gesture)")
+            case .failed:    NSLog("[Press] hold failed")
+            default: break
+            }
+        }
+        func gestureRecognizer(_ g: UIGestureRecognizer,
+                               shouldRecognizeSimultaneouslyWith o: UIGestureRecognizer) -> Bool { true }
+        func gestureRecognizer(_ g: UIGestureRecognizer,
+                               shouldRequireFailureOf o: UIGestureRecognizer) -> Bool { false }
+        func gestureRecognizer(_ g: UIGestureRecognizer,
+                               shouldBeRequiredToFailBy o: UIGestureRecognizer) -> Bool { false }
     }
 }
 
@@ -133,5 +253,28 @@ struct HoldProbeHUD: View {
         let f = DateFormatter()
         f.dateFormat = "HH:mm:ss.SS"
         return f.string(from: d)
+    }
+}
+
+
+/// Thread-safe tally of view-body evaluations, flushed once a second.
+final class RenderCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var counts: [String: Int] = [:]
+    private var lastFlush = Date()
+
+    func tick(_ label: String) {
+        lock.lock()
+        counts[label, default: 0] += 1
+        let now = Date()
+        guard now.timeIntervalSince(lastFlush) >= 1.0 else { lock.unlock(); return }
+        let snapshot = counts
+        counts.removeAll()
+        lastFlush = now
+        lock.unlock()
+        let cw = snapshot.filter { $0.key.hasPrefix("CW ") }.values.reduce(0, +)
+        if cw > 0 { NSLog("[Rebuild] CW cells rebuilt: %d", cw) }
+        let poster = snapshot.filter { $0.key.hasPrefix("poster ") }.values.reduce(0, +)
+        NSLog("[RenderRate] CW bodies/s: %d | poster bodies/s: %d", cw, poster)
     }
 }

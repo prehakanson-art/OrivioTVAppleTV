@@ -369,7 +369,11 @@ struct DetailView: View {
     private var backdrop: some View {
         GeometryReader { geo in
             ZStack {
+                // Decorative backdrop — kept out of hit testing so it cannot
+                // swallow the action row's context-menu hit test (the same bug
+                // the home Featured bar caused for Continue Watching).
                 RemoteImage(url: viewModel.meta.background ?? viewModel.meta.poster)
+                    .allowsHitTesting(false)
                     .frame(width: geo.size.width, height: geo.size.height)
                 if showBackdropTrailer, let player = backdropPlayer {
                     BackdropVideoView(player: player)

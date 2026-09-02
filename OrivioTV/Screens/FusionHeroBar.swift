@@ -72,6 +72,15 @@ struct FusionHeroBar: View {
                     // overlay is a plain alpha composite with the same read
                     // (cf. PosterCard's unfocused dim); nothing draws focused.
                     .overlay(Color.black.opacity(focusedInside ? 0 : 0.10))
+                    // REQUIRED, not cosmetic. RemoteImage fills its frame, so
+                    // this view overflows the box it is visually clipped to and
+                    // stayed hit-testable across the Continue Watching row above
+                    // it. On tvOS focus is NOT hit-tested but context menus ARE,
+                    // so focus, Select and Play/Pause all worked on those cards
+                    // while hold-Select never opened their menu. Bisected on
+                    // device: the menu returns the moment this artwork is
+                    // absent, shrunk, or taken out of hit testing.
+                    .allowsHitTesting(false)
             } else {
                 theme.palette.backgroundCard
             }
