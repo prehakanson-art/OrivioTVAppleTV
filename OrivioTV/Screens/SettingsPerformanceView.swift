@@ -79,7 +79,7 @@ struct PerformanceSettingsDetail: View {
                     PerfToggleRow(
                         icon: "move.3d",
                         title: "Card wiggle & lift",
-                        subtitle: "The focused poster lifts and floats on a soft shadow, like a Home-screen icon. Off: cards do a light scale on focus instead — the cheapest path on older Apple TVs.",
+                        subtitle: "The native Apple TV card effect: the focused poster raises and tilts/parallaxes as you move on the trackpad, like a Home-screen icon. The system re-composites the whole focused card as your finger moves — the heaviest per-frame focus cost, and rough on older Apple TVs. Off: cards do a light scale on focus instead, no tilt.",
                         isOn: s.cardParallax
                     )
                 }

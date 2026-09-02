@@ -22,8 +22,6 @@ struct FusionHeroBar: View {
 
     @State private var index = 0
     @State private var playFocused = false
-    @State private var prevFocused = false
-    @State private var nextFocused = false
     @State private var lastInteraction = Date()
     /// When the bar last advanced — so each title dwells for a readable beat
     /// instead of flipping on every timer tick.
@@ -42,7 +40,7 @@ struct FusionHeroBar: View {
     /// Near-black graphite used by the left readability scrim (§4.3).
     private static let scrim = Color(hex: 0x06080A)
 
-    private var focusedInside: Bool { playFocused || prevFocused || nextFocused }
+    private var focusedInside: Bool { playFocused }
     private var current: MetaItem? { items.indices.contains(index) ? items[index] : nil }
     private var radius: CGFloat { FusionRadius.heroBar(homeCatalogSettings.posterCornerRadius) }
 
@@ -108,17 +106,16 @@ struct FusionHeroBar: View {
                 .padding(.leading, OrivioSpacing.xl + OrivioSpacing.lg)
                 .padding(.bottom, OrivioSpacing.md)
 
-            // §18 manual prev/next chevrons at the bar edges.
-            heroChevrons(width: width)
         }
         .frame(width: width, height: height)
         .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
-        // §21.2 focus: a bold white edge + accent glow. The edge does NOT ride
-        // the Card Shadows perf switch (the glow below does), so the bar always
-        // reads as clearly focused even on the low tier where shadows are off.
+        // Focus: an accent-colored edge (the user's chosen accent, like every
+        // other card's ring) + accent glow. The edge does NOT ride the Card
+        // Shadows perf switch (the glow below does), so the bar always reads
+        // as clearly focused even on the low tier where shadows are off.
         .overlay(
             RoundedRectangle(cornerRadius: radius, style: .continuous)
-                .strokeBorder(focusedInside ? Color.white : .clear, lineWidth: focusedInside ? 5 : 0)
+                .strokeBorder(focusedInside ? theme.palette.focusRing : .clear, lineWidth: focusedInside ? 5 : 0)
         )
         // Both shadows ride the Card Shadows switch: a resting radius-18 blur
         // under a near-full-width bar is an offscreen pass recomposited on every
@@ -234,32 +231,6 @@ struct FusionHeroBar: View {
         .padding(.top, OrivioSpacing.xs)
     }
 
-    /// §18 manual navigation chevrons — vertically centered at the bar edges,
-    /// shown only while the hero is focused (reached via Left/Right from the
-    /// action buttons) so they don't clutter the resting state or overlap text.
-    @ViewBuilder
-    private func heroChevrons(width: CGFloat) -> some View {
-        if items.count > 1 && focusedInside {
-            HStack {
-                Button { advance(by: -1) } label: {
-                    Image(systemName: "chevron.left")
-                }
-                .buttonStyle(FusionChevronStyle())
-                .onFocusChange { prevFocused = $0; if $0 { lastInteraction = Date() } }
-
-                Spacer()
-
-                Button { advance(by: 1) } label: {
-                    Image(systemName: "chevron.right")
-                }
-                .buttonStyle(FusionChevronStyle())
-                .onFocusChange { nextFocused = $0; if $0 { lastInteraction = Date() } }
-            }
-            .padding(.horizontal, OrivioSpacing.md)
-            .frame(width: width, height: height, alignment: .center)
-            .transition(.opacity)
-        }
-    }
 
     @ViewBuilder
     private var paginationDots: some View {

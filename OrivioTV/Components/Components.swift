@@ -976,56 +976,50 @@ struct GridPosterCell: View {
     }
 }
 
-/// Card-button chrome for every media card (poster / landscape).
-///
-/// NEVER the native tvOS `CardButtonStyle`. Its platter owns the Select press
-/// (that is how it draws the press-down and the trackpad tilt), and on tvOS a
-/// `.contextMenu` attached to such a button never presents — holding Select
-/// on a card did nothing. Every card here carries a hold menu, and the
-/// pre-redesign app (where holding worked) never used the platter: its cards
-/// were plain borderless buttons. So the raised look is drawn HERE instead —
-/// lift + drop shadow while focused — and the hold menu keeps working. The
-/// one thing the platter had that this can't reproduce is the trackpad
-/// tilt/parallax.
+/// Card-button chrome per app theme. The Apple TV theme uses the native tvOS
+/// `CardButtonStyle` — the raised platter with the trackpad tilt/wiggle
+/// parallax, exactly like home-screen icons — while Classic keeps the
+/// borderless style so cards draw their own focus ring. Reads the theme from
+/// the environment so call sites don't need a ThemeManager in scope.
 private struct MediaCardButtonStyleModifier: ViewModifier {
+    @EnvironmentObject private var theme: ThemeManager
     @ObservedObject private var perf = PerformanceSettingsStore.shared
     var onPressChanged: ((Bool) -> Void)?
 
+    @ViewBuilder
     func body(content: Content) -> some View {
-        // "Card wiggle & lift" (Settings → Performance) now toggles the
-        // platter-style shadow; off is the cheap scale-only path for the A8.
-        content.buttonStyle(FlatCardButtonStyle(raised: perf.cardParallaxEffective,
-                                                onPressChanged: onPressChanged))
+        if perf.cardParallaxEffective {
+            // Native platter: raised card + trackpad tilt/parallax.
+            content.buttonStyle(CardButtonStyle())
+        } else {
+            // "Card wiggle & lift" off (Settings → Performance): a lightweight
+            // scale-only focus that never re-composites the card as the finger
+            // moves — the cheap path for the A8. Cards still respond to focus;
+            // their own glow/border (drawn off \.isFocused) still shows.
+            content.buttonStyle(FlatCardButtonStyle(onPressChanged: onPressChanged))
+        }
     }
 }
 
-/// Focus is a scale lift (and, when `raised`, a floating drop shadow like the
-/// native platter) with no `CardButtonStyle` — so `.contextMenu` hold menus
-/// work and there's no per-frame tilt recomposition of the focused poster.
-/// The card's own focus glow/border still render (they read `\.isFocused`,
-/// which this style leaves intact).
+/// Apple TV theme, parallax OFF: focus is a plain scale (like Classic's
+/// PlainCardButtonStyle) with no native platter — so there's no per-frame tilt
+/// recomposition of the focused poster. The card's own focus glow/border still
+/// render (they read `\.isFocused`, which this style leaves intact).
 struct FlatCardButtonStyle: ButtonStyle {
-    var raised: Bool = false
     var onPressChanged: ((Bool) -> Void)? = nil
 
     func makeBody(configuration: Configuration) -> some View {
-        Chrome(configuration: configuration, raised: raised, onPressChanged: onPressChanged)
+        Chrome(configuration: configuration, onPressChanged: onPressChanged)
     }
 
     private struct Chrome: View {
         @Environment(\.isFocused) private var isFocused
-        @ObservedObject private var perf = PerformanceSettingsStore.shared
         let configuration: ButtonStyle.Configuration
-        let raised: Bool
         let onPressChanged: ((Bool) -> Void)?
 
         var body: some View {
             configuration.label
-                // Platter-style float: a soft shadow that appears with the lift.
-                .shadow(color: .black.opacity(raised && isFocused ? 0.55 : 0),
-                        radius: raised && isFocused ? 24 : 0, y: raised && isFocused ? 14 : 0)
-                .animation(perf.motion(OrivioFocus.animation), value: isFocused)
-                .focusLift(raised ? OrivioFocus.platter : OrivioFocus.card, isFocused)
+                .focusLift(OrivioFocus.card, isFocused)
                 .cardPressDip(configuration.isPressed)
                 .onChange(of: configuration.isPressed) { _, pressed in
                     onPressChanged?(pressed)
@@ -1095,9 +1089,6 @@ enum OrivioFocus {
     /// The default for anything card-shaped: posters, tiles, episode cards,
     /// chips, pills and ordinary buttons.
     static let card: CGFloat = 1.05
-    /// Media cards drawing the platter-style raised focus themselves (the
-    /// native CardButtonStyle lifts about this much).
-    static let platter: CGFloat = 1.08
     /// Small circular icon controls — trash, reorder, player transport, keypad
     /// keys. Small targets need a larger fraction to read as focused at all.
     static let control: CGFloat = 1.08
