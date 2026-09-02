@@ -23,10 +23,24 @@ WORK=$(mktemp -d)
 echo "==> Building Release…"
 xcodebuild -project OrivioTV.xcodeproj -scheme OrivioTV \
   -destination 'generic/platform=tvOS' -configuration Release \
-  -allowProvisioningUpdates build 2>&1 | grep -E "error:|BUILD (SUCCEEDED|FAILED)" || true
+  -allowProvisioningUpdates build 2>&1 | grep -E "error:|BUILD (SUCCEEDED|FAILED)"
 
-APP=$(ls -d ~/Library/Developer/Xcode/DerivedData/OrivioTV-*/Build/Products/Release-appletvos/OrivioTV.app 2>/dev/null | head -1)
-[ -d "$APP" ] || { echo "!! Release .app not found — build failed?"; exit 1; }
+# `ls DerivedData/OrivioTV-*/… | head -1` used to pick an ARBITRARY (often
+# months-stale) derived-data dir, so a failed build still packaged an old .app.
+# Ask xcodebuild where it actually put this configuration's product.
+BUILT=$(xcodebuild -project OrivioTV.xcodeproj -scheme OrivioTV \
+  -destination 'generic/platform=tvOS' -configuration Release \
+  -showBuildSettings 2>/dev/null \
+  | awk -F' = ' '/ BUILT_PRODUCTS_DIR = /{print $2; exit}')
+APP="$BUILT/OrivioTV.app"
+[ -d "$APP" ] || { echo "!! Release .app not found at $APP"; exit 1; }
+
+# A build that failed leaves the PREVIOUS .app in place, so freshness is the
+# only thing separating a real artifact from a stale one.
+if [ -n "$(find "$APP" -maxdepth 0 -mmin +10)" ]; then
+  echo "!! $APP is over 10 minutes old — the build did not produce it. Refusing."
+  exit 1
+fi
 
 echo "==> Packaging from $APP"
 mkdir -p "$WORK/Payload"

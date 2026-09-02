@@ -85,6 +85,8 @@ final class PerformanceSettingsStore: ObservableObject {
         /// Developer: live FPS counter overlaid on the app. Off by default,
         /// never set by the tier defaults — a diagnostic, not an effect.
         var showFPSOverlay = false
+        /// On-screen tracing for the hold-Select menus (see HoldProbe).
+        var showHoldProbe = false
         /// In-player diagnostics HUD: engine, fps, dropped frames, A/V drift,
         /// bitrate, buffer depth. Answers "why is this stuttering" on the
         /// couch, without a Mac attached.
@@ -96,7 +98,7 @@ final class PerformanceSettingsStore: ObservableObject {
         init() {}
 
         private enum CodingKeys: String, CodingKey {
-            case heroBackdrop, heroCrossfade, cardShadows, focusZoom, cardParallax
+            case heroBackdrop, heroCrossfade, cardShadows, focusZoom, cardParallax, showHoldProbe
             case artworkPrefetch, artworkFadeIn
             case sidebarAnimation, buttonAnimations, showFPSOverlay, showPlayerDiagnostics
             case collectionGifQuality
@@ -117,6 +119,7 @@ final class PerformanceSettingsStore: ObservableObject {
             sidebarAnimation = (try? c.decode(Bool.self, forKey: .sidebarAnimation)) ?? true
             buttonAnimations = (try? c.decode(Bool.self, forKey: .buttonAnimations)) ?? true
             showFPSOverlay = (try? c.decode(Bool.self, forKey: .showFPSOverlay)) ?? false
+            showHoldProbe = (try? c.decode(Bool.self, forKey: .showHoldProbe)) ?? false
             showPlayerDiagnostics = (try? c.decode(Bool.self, forKey: .showPlayerDiagnostics)) ?? false
             collectionGifQuality = (try? c.decode(CollectionGifQuality.self, forKey: .collectionGifQuality))
                 ?? .deviceDefault

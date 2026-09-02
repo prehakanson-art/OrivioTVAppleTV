@@ -1404,10 +1404,14 @@ private struct HomePosterCell: View, Equatable {
                 }
                 .onFocusChange { isFocused in
                     focused = isFocused
+                    if isFocused, PerformanceSettingsStore.shared.settings.showHoldProbe {
+                        HoldProbe.log("focus — poster \(item.name)")
+                    }
                     if isFocused && heroFollowsFocus { hero.focus(item) }
                 }
             }
             .mediaCardButtonStyle()
+            .holdProbe("poster \(item.name)", enabled: PerformanceSettingsStore.shared.settings.showHoldProbe)
             .posterHoldMenu(item) { onSelect(item) }
             .onPlayPauseCommand { onPlayManually(item, nil) }
 
@@ -1567,10 +1571,20 @@ private struct ContinueWatchingCell: View, Equatable {
                 // focusable Button, not around it.
                 .onFocusChange { isFocused in
                     focused = isFocused
+                    if isFocused, PerformanceSettingsStore.shared.settings.showHoldProbe {
+                        HoldProbe.log("focus — CW \(progress.name)")
+                    }
                     if isFocused, drivesHero { hero.focus(heroItemFor(progress)) }
                 }
             }
+            // Was FlatCardButtonStyle, on the belief that the native platter
+            // "swallows contextMenu" on landscape cards. On device the reverse
+            // is true: catalog posters (native platter) open their menu, and
+            // this card — the only one using the flat style — never did. Same
+            // style as every other card now, which also restores its lift and
+            // sheen.
             .mediaCardButtonStyle()
+            .holdProbe("CW \(progress.name)", enabled: PerformanceSettingsStore.shared.settings.showHoldProbe)
             .continueHoldMenu(progress, onDetails: onDetails,
                               onPlayManually: onPlayManuallyMenu,
                               onResumeFromStart: onResumeFromStartMenu)

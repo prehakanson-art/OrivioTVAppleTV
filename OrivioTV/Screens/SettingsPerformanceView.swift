@@ -151,6 +151,13 @@ struct PerformanceSettingsDetail: View {
                 )
 
                 PerfToggleRow(
+                    icon: "hand.tap",
+                    title: "Hold menu probe",
+                    subtitle: "Trace hold-Select on screen: whether a card takes focus, whether the press reaches the app, whether a long press is recognised, and whether tvOS actually builds the menu. For diagnosing hold menus that do nothing.",
+                    isOn: s.showHoldProbe
+                )
+
+                PerfToggleRow(
                     icon: "waveform.path.ecg",
                     title: "Playback diagnostics HUD",
                     subtitle: "Live engine, fps, dropped frames, A/V drift, bitrate and buffer depth over the video. For chasing stutter on this box.",

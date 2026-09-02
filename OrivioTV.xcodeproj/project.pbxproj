@@ -49,6 +49,7 @@
 		3EA4E4F978DE16D7EDE66BCC /* LibraryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0B1171B30A9B7C0990BFE3CF /* LibraryView.swift */; };
 		40CD01278A170E0F9A840801 /* PlaybackMemory.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CDC06B1C4E03B40E71C6410 /* PlaybackMemory.swift */; };
 		411DD0D82D57FBB2E6682FE6 /* PluginModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5CA198F36F37592385AC7183 /* PluginModels.swift */; };
+		4403742198FE376DC48717CA /* HoldProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = BED9E0C97DCB4240CADEDF48 /* HoldProbe.swift */; };
 		45571C4D63C8AEB59E298E03 /* PerformanceProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5CBA50043F25BC04985DBBC6 /* PerformanceProfile.swift */; };
 		4694BFEFF559416E06F702F5 /* PlayerSettingsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D2952EE61E74C62C1F3FB32 /* PlayerSettingsStore.swift */; };
 		46EE7C8E36D17F83A22607C0 /* FusionPlayerControlsOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8EA3C25F1387DD8419906339 /* FusionPlayerControlsOverlay.swift */; };
@@ -220,6 +221,7 @@
 		B872284504BE4D777519FDCD /* TraktService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TraktService.swift; sourceTree = "<group>"; };
 		BAF88678B45876C22D86E134 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
 		BE5E11578BD4FB26384437DB /* SettingsLayoutView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsLayoutView.swift; sourceTree = "<group>"; };
+		BED9E0C97DCB4240CADEDF48 /* HoldProbe.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HoldProbe.swift; sourceTree = "<group>"; };
 		BF1C7D8BA869EFA883242A6D /* PlayerTempSweep.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerTempSweep.swift; sourceTree = "<group>"; };
 		C036F9B662E506AB37E1DC31 /* CommunityCollectionsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CommunityCollectionsView.swift; sourceTree = "<group>"; };
 		C0915B91E4F1CD9254E8E8F5 /* SettingsStremioView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsStremioView.swift; sourceTree = "<group>"; };
@@ -383,6 +385,7 @@
 				979CBF8CDEFEA7486B3DAED0 /* DeepLinkService.swift */,
 				8A9D51722BFE9BE21746795F /* DiagnosticsService.swift */,
 				1481D5DA93138EF519229BD0 /* ExternalPlayers.swift */,
+				BED9E0C97DCB4240CADEDF48 /* HoldProbe.swift */,
 				65E0E4F5D1EDBE641A28EA18 /* HomeCatalogSettingsStore.swift */,
 				566DD166887289DA3E16AEC5 /* LibraryStore.swift */,
 				9845B0EA1C787B090833EDC4 /* LiveTVSettingsStore.swift */,
@@ -673,6 +676,7 @@
 				46EE7C8E36D17F83A22607C0 /* FusionPlayerControlsOverlay.swift in Sources */,
 				1A62D4292E890705C6BC22DE /* FusionTokens.swift in Sources */,
 				9C21BB9AF284ECF2C59E8CE9 /* GlassSidebar.swift in Sources */,
+				4403742198FE376DC48717CA /* HoldProbe.swift in Sources */,
 				E0BE3820BDB022ACC16AD04D /* HomeCatalogSettingsStore.swift in Sources */,
 				D987A89C54B10CF806337C0D /* HomeView.swift in Sources */,
 				6B400962DD5E6385BD53E357 /* LibraryStore.swift in Sources */,

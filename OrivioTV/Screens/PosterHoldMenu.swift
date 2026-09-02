@@ -20,6 +20,9 @@ struct PosterHoldMenu: ViewModifier {
 
     func body(content: Content) -> some View {
         content.contextMenu {
+            // tvOS only evaluates this closure when it is about to PRESENT the
+            // menu, so reaching this line proves the hold was accepted.
+            let _ = HoldProbe.log("MENU BUILT — poster \(item.name)")
             Button { onDetails() } label: { Label("Go to Details", systemImage: "info.circle") }
             Button { library.toggle(item) } label: {
                 Label(library.contains(item) ? "Remove from Library" : "Add to Library",
@@ -94,6 +97,7 @@ struct ContinueHoldMenu: ViewModifier {
 
     func body(content: Content) -> some View {
         content.contextMenu {
+            let _ = HoldProbe.log("MENU BUILT — CW \(progress.name)")
             Button { onPlayManually() } label: { Label("Play Manually", systemImage: "list.and.film") }
             Button { onDetails() } label: { Label("Go to Details", systemImage: "info.circle") }
             Button { onResumeFromStart() } label: { Label("Start Over", systemImage: "gobackward") }

@@ -474,6 +474,7 @@ struct RootView: View {
         // Developer FPS read-out over the whole UI (Settings → Performance).
         .overlay {
             if perf.settings.showFPSOverlay { FPSOverlay() }
+            if perf.settings.showHoldProbe { HoldProbeHUD() }
         }
         // App-wide toast (Fusion): Added to Library / Marked Watched / etc.
         .overlay { FusionToastHost() }
@@ -1274,7 +1275,7 @@ struct RootView: View {
 }
 
 
-#if DEBUG
+// NOTE: intentionally NOT #if DEBUG — the call sites above are unconditional.
 /// Dev: `-focusLog` logs every focus update and every FAILED move (the focus
 /// engine found no candidate) app-wide. Sim key delivery is flaky and
 /// screenshots only show styled focus, so this is the only reliable truth
@@ -1318,4 +1319,4 @@ enum FocusTrace {
         return String(format: "%@ @(%.0f,%.0f %.0fx%.0f) in %@", cls, frame.minX, frame.minY, frame.width, frame.height, parent)
     }
 }
-#endif
+// (end -focusLog tracer)
