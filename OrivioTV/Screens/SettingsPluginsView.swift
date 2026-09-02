@@ -17,6 +17,11 @@ struct PluginsSettingsDetail: View {
                     Button {
                         let url = repoInput.trimmingCharacters(in: .whitespaces)
                         guard !url.isEmpty, !plugins.isBusy else { return }
+                        // Guard re-entry here rather than with `.disabled`:
+                        // disabling the button the user just pressed removes it
+                        // from the tvOS focus tree mid-action and drops focus to
+                        // an arbitrary row.
+                        guard !plugins.isBusy else { return }
                         Task {
                             await plugins.addRepository(url)
                             if plugins.lastError == nil { repoInput = "" }
@@ -25,7 +30,7 @@ struct PluginsSettingsDetail: View {
                         if plugins.isBusy { ProgressView() } else { SeeAllLabel(text: "Add") }
                     }
                     .buttonStyle(PlainCardButtonStyle())
-                    .disabled(plugins.isBusy)
+                    .disabled(repoInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
                 if let error = plugins.lastError {
                     Text(error)

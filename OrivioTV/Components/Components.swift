@@ -570,7 +570,16 @@ struct PosterCard: View {
     /// unavailable, fall back to the ring: a single stroked outline is one
     /// vector stroke — no offscreen pass, nothing recomposited per frame.
     private var showsFocusRing: Bool {
-        isFocused && (!atv || !perf.settings.cardShadows)
+        guard isFocused else { return false }
+        if !atv { return true }
+        // The glow this used to defer to no longer exists (it was always
+        // `.clear` and has been removed), and the black drop shadow below is
+        // disabled on this style too — so "shadows are on" can no longer stand
+        // in for a focus cue. Ring unless something else actually moves the
+        // card: the platter's raise/wiggle, or the zoom. With Reduce Motion on,
+        // BOTH of those are suppressed while `cardShadows` stays on, which left
+        // a focused poster with no indicator at all.
+        return !(perf.cardParallaxEffective || perf.focusZoomEffective)
     }
 
     var body: some View {

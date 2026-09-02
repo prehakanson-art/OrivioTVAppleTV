@@ -125,7 +125,13 @@ struct ProfileGateView: View {
                             .buttonStyle(PlainCardButtonStyle())
                             .focused($focusedProfile, equals: profile.id)
                         }
-                        if profiles.canAddProfile {
+                        // Deliberately absent from the cold-launch gate (the one
+                        // with no cancel, shown because a profile is PIN-locked):
+                        // `addProfile` immediately activates the new profile and
+                        // dismisses, so the tile walked straight past the lock —
+                        // press Add and you are inside with an unlocked profile.
+                        // Adding a profile lives in Settings → Account.
+                        if profiles.canAddProfile, onCancel != nil {
                             Button { addProfile() } label: {
                                 GateTile(title: "Add") { DashedCircle(systemName: "plus") }
                             }

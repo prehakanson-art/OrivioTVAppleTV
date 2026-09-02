@@ -927,7 +927,12 @@ enum TMDBService {
         }
         let crewIDs = Set(detail.crew.map(\.id))
         castMembers.removeAll { crewIDs.contains($0.id) }
-        detail.cast = castMembers
+        // TMDB also lists one person twice within `cast` itself (dual roles, and
+        // "Self" / "Self - archive footage" in documentaries). Deduplicating
+        // crew against cast is not enough on its own: the row that renders
+        // `crew + cast` would still get a repeated identifier.
+        var seenCast = Set<Int>()
+        detail.cast = castMembers.filter { seenCast.insert($0.id).inserted }
         detail.director = crew.first { $0.job == "Director" }?.name
             ?? crew.first { $0.job == "Creator" }?.name
         detail.country = body.production_countries?.first?.name

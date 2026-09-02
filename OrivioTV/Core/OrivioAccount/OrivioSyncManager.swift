@@ -127,12 +127,35 @@ final class OrivioSyncManager: ObservableObject {
     /// stamps, and the persisted app-preferences dirty bit. Touches NO user
     /// content — only the state that records what this device has already
     /// agreed with one particular account.
-    private func resetSyncBookkeeping() {
+    /// - Parameter droppingPendingDeletes: only for a genuine ACCOUNT CHANGE.
+    ///   A plain sign-out must keep the queues: the same user signing back in
+    ///   still needs those removals to reach the server, and dropping them means
+    ///   every row they deleted offline comes back on the next pull.
+    private func resetSyncBookkeeping(droppingPendingDeletes: Bool) {
         let defaults = UserDefaults.standard
         // The device id and the diagnostics log are not account state.
-        let preserved: Set<String> = ["orivio.sync.client.v1", "orivio.sync.log.v1"]
+        //
+        // Neither is the watch-history repair stamp: it records a ONE-SHOT local
+        // data repair, not an agreement with a server. Wiping it let the repair
+        // run a second time on the next sign-in, which resets the user's clear
+        // horizon and pushes that loss to every other device — so the history
+        // they deliberately cleared floods back on the next import.
+        var preserved: Set<String> = ["orivio.sync.client.v1", "orivio.sync.log.v1"]
+        let preservedPrefixes = ["orivio.sync.repairedWatchHistoryClear."]
+        if !droppingPendingDeletes {
+            preserved.formUnion(
+                defaults.dictionaryRepresentation().keys.filter {
+                    $0.hasPrefix("orivio.sync.pendingWatchProgressDeletes.")
+                        || $0.hasPrefix("orivio.sync.pendingLibraryDeletes.")
+                        || $0.hasPrefix("orivio.sync.pendingWatchedDeletes.")
+                        || $0.hasPrefix("orivio.sync.pendingDeleteAttempts.")
+                }
+            )
+        }
         for key in defaults.dictionaryRepresentation().keys
-        where key.hasPrefix("orivio.sync.") && !preserved.contains(key) {
+        where key.hasPrefix("orivio.sync.")
+            && !preserved.contains(key)
+            && !preservedPrefixes.contains(where: { key.hasPrefix($0) }) {
             defaults.removeObject(forKey: key)
         }
         addonsDirty = false
@@ -143,6 +166,16 @@ final class OrivioSyncManager: ObservableObject {
         appPreferencesDirty = false
     }
 
+    /// Set while the previous account's state is being retired, so the store
+    /// callbacks that retirement fires cannot arm a push.
+    ///
+    /// Clearing a debrid key or signing out of Trakt calls `onLocalChange`, which
+    /// is wired to `scheduleAppPreferencesPush` / `scheduleProviderCredentialsPush`
+    /// — so retiring account A's credentials armed a push that then uploaded A's
+    /// collections library, theme and settings into account B's profile blob,
+    /// before B had been pulled even once.
+    private var isRetiringAccountState = false
+
     /// Drop credentials belonging to the PREVIOUS account. Both stores are
     /// account-synced and both `applyRemote` implementations only ever ADD, so
     /// without this the next `pushProviderCredentials` uploads the previous
@@ -150,6 +183,8 @@ final class OrivioSyncManager: ObservableObject {
     /// Safe against wiping the new account's server rows: that push skips an
     /// empty credential set entirely.
     private func resetAccountScopedCredentials() {
+        isRetiringAccountState = true
+        defer { isRetiringAccountState = false }
         traktStore?.signOut()
         if let debridStore {
             for provider in DebridProvider.allCases {
@@ -174,8 +209,20 @@ final class OrivioSyncManager: ObservableObject {
             .info, area: "Orivio",
             "A different account signed in; cleared the previous account's sync state and provider credentials."
         )
-        resetSyncBookkeeping()
+        // Credentials FIRST, then the bookkeeping: the reset fires store
+        // callbacks, and clearing the dirty flags afterwards is what guarantees
+        // none of them survives as a pending upload into the new account.
         resetAccountScopedCredentials()
+        // These queues belong to the account being left; running them against
+        // the new one would delete THAT user's rows.
+        resetSyncBookkeeping(droppingPendingDeletes: true)
+        // Likewise the collection removals: suppressing ids the previous user
+        // deleted would hide the NEW user's collections of the same id.
+        collectionsStore.forgetRemovalTombstones()
+        // Anything already armed before this point is also account A's.
+        pushAppPreferencesTask?.cancel()
+        pushProviderCredentialsTask?.cancel()
+        lastPushedAppPrefs = nil
     }
 
     /// Stable per-device id so the backend can avoid echoing our own writes.
@@ -397,7 +444,7 @@ final class OrivioSyncManager: ObservableObject {
             // against whichever account signs in next: the pending delete queues
             // would delete THAT user's rows, and the seeded flags would put its
             // first pull straight into reconcile mode.
-            if leftAnAccount { resetSyncBookkeeping() }
+            if leftAnAccount { resetSyncBookkeeping(droppingPendingDeletes: false) }
         case .loading:
             break
         }
@@ -744,9 +791,14 @@ final class OrivioSyncManager: ObservableObject {
     /// A refusal the server will keep repeating. 401/403 (auth), 408/429 (come
     /// back later) and every 5xx are transient and must not burn an attempt.
     private static func isPermanentRejection(_ error: Error) -> Bool {
-        guard case OrivioAuthError.http(let code, _) = error else { return false }
+        guard case OrivioAuthError.http(let code, let body) = error else { return false }
+        // A deployment that simply lacks the delete RPC answers 400/404 with a
+        // PGRST202 "could not find the function" body. That says nothing about
+        // the key, so burning attempts on it would silently drop every removal
+        // the user ever makes. `ignoresMissingRPC` recognises the same shape.
+        if Self.looksLikeMissingRPC(body) { return false }
         return (400..<500).contains(code)
-            && code != 401 && code != 403 && code != 408 && code != 429
+            && code != 401 && code != 403 && code != 404 && code != 408 && code != 429
     }
 
     /// Queue a Continue Watching removal for durable server deletion. Persists
@@ -1148,10 +1200,15 @@ final class OrivioSyncManager: ObservableObject {
 
     private func ignoresMissingRPC(_ error: Error) -> Bool {
         guard case OrivioAuthError.http(let status, let body) = error else { return false }
-        return [400, 404].contains(status)
-            && (body.localizedCaseInsensitiveContains("could not find the function")
-                || body.localizedCaseInsensitiveContains("pgrst202")
-                || body.localizedCaseInsensitiveContains("schema cache"))
+        return [400, 404].contains(status) && Self.looksLikeMissingRPC(body)
+    }
+
+    /// The body shape PostgREST returns when the function itself is absent from
+    /// the deployment, as opposed to a refusal about the arguments.
+    private static func looksLikeMissingRPC(_ body: String) -> Bool {
+        body.localizedCaseInsensitiveContains("could not find the function")
+            || body.localizedCaseInsensitiveContains("pgrst202")
+            || body.localizedCaseInsensitiveContains("schema cache")
     }
 
     private func staleAlternateLibraryDeleteKeys(for items: [SavedLibraryItem]) -> Set<String> {
@@ -1663,7 +1720,9 @@ final class OrivioSyncManager: ObservableObject {
             try await pullCollectionsForActiveProfile()
             return
         }
-        adoptedAllProfileCollections = true
+        // NOT set here: as a persisted flag, marking the scan done before the
+        // request could fail meant one flaky connection disabled the migration
+        // permanently, with no way to retrigger it short of signing out.
         // Collections are now an ACCOUNT-WIDE library. The backing table is
         // still keyed per profile (and Android writes it that way), so read
         // EVERY profile's row and merge them — that's what makes a pack added
@@ -1688,6 +1747,8 @@ final class OrivioSyncManager: ObservableObject {
             return out
         }.value
         NSLog("[OrivioCollections] one-time adoption: %d collections from all profiles", adopted.count)
+        // The scan completed: record it now, on the success path only.
+        adoptedAllProfileCollections = true
         guard !adopted.isEmpty else { return }
         let changed = collectionsStore.mergeIntoLibrary(adopted)
         NSLog("[OrivioCollections] shared library now %d collections (changed=%@)",
@@ -2034,6 +2095,7 @@ final class OrivioSyncManager: ObservableObject {
     private var appPrefsGeneration = 0
 
     private func scheduleAppPreferencesPush() {
+        guard !isRetiringAccountState else { return }
         appPreferencesDirty = true
         appPrefsGeneration += 1
         pushAppPreferencesTask?.cancel()
@@ -2212,6 +2274,7 @@ final class OrivioSyncManager: ObservableObject {
     ]
 
     private func scheduleProviderCredentialsPush() {
+        guard !isRetiringAccountState else { return }
         pushProviderCredentialsTask?.cancel()
         pushProviderCredentialsTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 1_500_000_000)

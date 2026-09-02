@@ -204,7 +204,7 @@ struct PerformanceSettingsDetail: View {
                 Text("Reduce Motion is on")
                     .font(.system(size: 23, weight: .semibold))
                     .foregroundStyle(theme.palette.textPrimary)
-                Text("Your system Accessibility setting is disabling the motion effects (hero crossfade, focus zoom, sidebar and button animations, artwork fade-in) regardless of the switches below.")
+                Text("Your system Accessibility setting is disabling the motion effects (card wiggle & lift, hero crossfade, focus zoom, sidebar and button animations, artwork fade-in) regardless of the switches below.")
                     .font(.system(size: 19))
                     .foregroundStyle(theme.palette.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)

@@ -21,7 +21,16 @@ final class RatingsStore: ObservableObject {
     /// a sync pulled profile A's Trakt ratings into the shared store and then
     /// pushed them into profile B's different Trakt account.
     private static let baseKey = "orivio.ratings.v1"
-    private var profileID = 1
+    /// Same key ProfileStore uses, read directly so the scope is right from
+    /// LAUNCH. `setProfile` is only called from `ProfileStore.onSwitchLocal`,
+    /// which fires on `setActive` — and `setActive` never runs at launch (the
+    /// active id is restored straight from defaults, and it early-returns when
+    /// the id is unchanged). Without this a device whose active profile is 3
+    /// booted holding profile 1's ratings and pushed them to profile 3's Trakt
+    /// account: exactly the leak the scoping was added to stop. TraktStore
+    /// solves it the same way.
+    private static let activeProfileKey = "orivio.profiles.active"
+    private var profileID = UserDefaults.standard.object(forKey: activeProfileKey) as? Int ?? 1
     private var storageKey: String {
         profileID == 1 ? Self.baseKey : "\(Self.baseKey).p\(profileID)"
     }

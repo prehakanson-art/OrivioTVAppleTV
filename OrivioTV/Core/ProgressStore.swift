@@ -583,7 +583,17 @@ final class ProgressStore: ObservableObject {
             if heldWins { losers.append(key) } else { best[id] = key; losers.append(current) }
         }
         guard !losers.isEmpty else { return [] }
-        for key in losers { items.removeValue(forKey: key) }
+        let now = Date()
+        for key in losers {
+            items.removeValue(forKey: key)
+            // The losing key may be the one currently playing, whose periodic
+            // row lives only in `transientOverrides`. Left behind, `save()`
+            // folds it straight back onto disk and the push re-uploads it right
+            // after `onRemove` asked the server to delete it — the duplicate
+            // card returns on the next launch.
+            transientOverrides.removeValue(forKey: key)
+            tombstones[key] = now
+        }
         save()
         if !suppressChange {
             // Delete the dropped keys from the account as well, or the next
@@ -714,6 +724,12 @@ final class ProgressStore: ObservableObject {
               position > 0 else { return }
         let key = Self.key(metaID: meta.id, video: video)
         if position / duration >= 0.95 {
+            // Finishing an episode is watching the show, so it lifts a previous
+            // "remove from Continue Watching" just as an in-progress save does.
+            // Without this, removing a show and later watching a new episode
+            // straight through left the dismissal in place for good and Next Up
+            // never offered that show again.
+            clearNextUpDismissal(metaID: meta.id)
             let removed = items.removeValue(forKey: key) != nil
             // Retire the periodic row too. Without this, `save()` below folds it
             // back into the snapshot and the finished title returns to Continue

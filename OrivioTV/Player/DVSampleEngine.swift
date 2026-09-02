@@ -432,11 +432,21 @@ final class DVSampleEngine {
         // synchronizer's rate, so how far the last handed-off sample's END sits
         // ahead of the synchronizer's clock IS the remaining play time. Clamped
         // so a bad PTS can never strand the end of a movie behind a long wait.
-        let clock = CMTimeGetSeconds(synchronizer.currentTime())
-        let rate = Double(max(userRate, 0.25))
-        var remaining = (lastRenderedEnd - clock) / rate
-        if !remaining.isFinite { remaining = 0 }
-        remaining = min(max(remaining, 0), 5)
+        // Use the SYNCHRONIZER's rate, not `userRate`: the renderers only
+        // consume while the clock is running. Reading `userRate` meant that
+        // reaching the end during an underrun hold or a pause — clock stopped,
+        // `userRate` still 1 — computed a residue as though playback were
+        // rolling, so the title was recorded finished from a stopped clock and
+        // the tail was never rendered. A stopped clock has no residue to wait
+        // out: whatever the renderers hold will play when it runs again.
+        let liveRate = Double(synchronizer.rate)
+        var remaining = 0.0
+        if liveRate > 0 {
+            let clock = CMTimeGetSeconds(synchronizer.currentTime())
+            remaining = (lastRenderedEnd - clock) / liveRate
+            if !remaining.isFinite { remaining = 0 }
+            remaining = min(max(remaining, 0), 5)
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + remaining) { [weak self] in
             self?.onEnded?()
         }
@@ -1039,8 +1049,15 @@ final class DVSampleEngine {
                     // At EOF the audio cushion is waived: the last packets of a
                     // file routinely number fewer than four, and demanding them
                     // would strand the ending.
-                    let audioCushion = eof ? 0 : 4
-                    if depth >= self.underrunResumeDepth(eof: eof), aqDepth >= audioCushion {
+                    // At EOF there is nothing left to wait FOR: the demuxer has
+                    // exited and the queues can never refill, so requiring a
+                    // video AU here left the hold in place forever whenever the
+                    // queues drained before the tick observed them — which is
+                    // the stuck spinner at the end of a film this branch exists
+                    // to prevent.
+                    let cushionMet = eof
+                        || (depth >= self.underrunResumeDepth(eof: eof) && aqDepth >= 4)
+                    if cushionMet {
                         self.autoPaused = false
                         self.seekRefill = false
                         NSLog("[DVSample] underrun over — resuming with vq=%d (eof=%@)",
@@ -1111,8 +1128,15 @@ final class DVSampleEngine {
                 // end. Yield briefly and keep going — but BOUNDED, so a demuxer
                 // that never becomes ready cannot spin this thread forever.
                 // Past the bound it falls through and is reported as a failure.
-                if readResult == Self.averrorEAGAIN, eagainRetries < 200 {
+                if readResult == Self.averrorEAGAIN, eagainRetries < 2_000 {
                     eagainRetries += 1
+                    // Report it as buffering first (~2s) and only treat it as
+                    // terminal after ~20s. Falling straight through to `onError`
+                    // tore the session down and restarted the source on the
+                    // FFmpeg path for what is usually a passing stall.
+                    if eagainRetries == 200 {
+                        DispatchQueue.main.async { [weak self] in self?.onBuffering?(true) }
+                    }
                     usleep(10_000)
                     continue
                 }

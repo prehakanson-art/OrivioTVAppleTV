@@ -47,7 +47,13 @@ struct CloudLibraryView: View {
             }
         }
         .task(id: provider?.rawValue) { await load() }
-        .onAppear { if provider == nil { provider = debrid.resolverProvider ?? availableProviders.first } }
+        .onAppear {
+            if provider == nil { provider = debrid.resolverProvider ?? availableProviders.first }
+            // The player cover triggers `onDisappear` on the view beneath it, so
+            // without this reset the guard latched permanently and every later
+            // play from this page was a silent no-op for the rest of the session.
+            isGone = false
+        }
         .onDisappear { isGone = true }
     }
 

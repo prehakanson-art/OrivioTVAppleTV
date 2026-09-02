@@ -405,7 +405,11 @@ enum DebridService {
         }
         return .success(DebridAuthSuccess(
             apiKey: token.access_token,
-            refresh: RDRefresh(clientID: creds.client_id, clientSecret: creds.client_secret, refreshToken: token.refresh_token)
+            // Record the expiry, or the token this login just minted is treated
+            // as stale and refreshed on its very first use.
+            refresh: RDRefresh(clientID: creds.client_id, clientSecret: creds.client_secret,
+                               refreshToken: token.refresh_token,
+                               expiresAt: Date().addingTimeInterval(TimeInterval(token.expires_in)))
         ))
     }
 

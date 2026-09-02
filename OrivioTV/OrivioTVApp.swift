@@ -819,6 +819,10 @@ struct RootView: View {
                 onAutoDismiss: { pendingAutoPlayPop = true }
             ) { entry, _ in
                 guard let url = entry.stream.url else { return }
+                // Like the external branch of `startPlayback`: no in-app cover
+                // opens here, so nothing would ever consume a deferred auto-play
+                // pop and it would fire against the wrong screen later.
+                consumePendingAutoPlayPop()
                 ExternalPlayers.openInInfuse(urlString: url)
             }
         case .streamsManual(let meta, let video):

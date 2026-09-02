@@ -1079,7 +1079,14 @@ struct HomeView: View {
     private func mergedContinueItems() -> [WatchProgress] {
         let active = progressStore.continueWatching(sortMode: homeCatalogSettings.continueWatchingSortMode)
         let activeMetaIDs = Set(active.map(\.metaID))
-        let additions = nextUpContinueItems.filter { !activeMetaIDs.contains($0.metaID) }
+        // Also filtered here, not only in the async refresh: `removeShow` on a
+        // synthesised card has no progress rows to delete, so the card would sit
+        // on screen until the refresh re-ran — and that does up to twenty
+        // sequential metadata fetches first.
+        let additions = nextUpContinueItems.filter {
+            !activeMetaIDs.contains($0.metaID)
+                && !progressStore.dismissedNextUpShows.contains($0.metaID)
+        }
         return active + additions
     }
 

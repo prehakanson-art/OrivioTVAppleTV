@@ -300,6 +300,9 @@ final class OrivioPlayerOptions: KSOptions {
         // session has actually DECIDED, though — KSPlayer calls this 2–3× per
         // load, and re-arming the softening on the later calls would undo a
         // switch that already landed.
+        // Re-arm only when nothing has been pinned yet this stint; re-arming on
+        // every call would undo the clear below on KSPlayer's 2nd/3rd
+        // `updateVideo` for the same load.
         if lastAppliedRefreshRate == nil { pulldown60Hz = true }
         // THE INFUSE POLICY. Dolby Vision sessions may request the DV mode by
         // default (`nativeDV`) — that's the point of playing DV. Everything
@@ -340,6 +343,15 @@ final class OrivioPlayerOptions: KSOptions {
         // player exists to avoid.
         var rate = refreshRate
         if (23.5...24.2).contains(rate) { rate = 23.976 }
+        // The pin may ALREADY hold this content's cadence — a previous title at
+        // the same rate in this foreground stint. The panel is therefore running
+        // at the content rate and the 3:2 softening must be off, even though no
+        // switch happens on this call and the dedupe guard below returns first.
+        // Clearing it only after a successful `applyOnce` left the second and
+        // every later 24fps title fighting a cadence that was not there.
+        if let pinned = lastAppliedRefreshRate, abs(pinned - rate) <= 1.5 {
+            pulldown60Hz = false
+        }
         guard lastAppliedDynamicRange != target.rawValue
             || lastAppliedRefreshRate != rate else { return }
         lastAppliedDynamicRange = target.rawValue
@@ -1848,6 +1860,16 @@ final class PlayerViewModel: ObservableObject {
         // load is itself a DV-first one.
         dvFirstTask?.cancel()
         dvFirstGeneration += 1
+        // A load always starts a stream that is meant to PLAY, so a stale pause
+        // intent must not survive into it. Nothing else in the load path cleared
+        // it, which made two situations stick: the Still Watching gate pauses via
+        // `enginePause()` and its "Continue" resumes by LOADING the next episode,
+        // and pausing before an in-player source or engine switch does the same.
+        // In both, the buffering callbacks then read the stale intent and pinned
+        // `isPlaying` false over a running picture — the screensaver coming up
+        // mid-film, controls that never auto-hide, and a Play press that resumed
+        // again instead of pausing.
+        pauseIntent = false
 
         // VLC engine path: self-contained, skips all the KSPlayer/FFmpeg setup.
         // (Never for the DV playlist — that must ride the native pipeline.)
@@ -2621,7 +2643,7 @@ final class PlayerViewModel: ObservableObject {
         }
         guard let pick = chosen else { return }
         subtitleAutoApplied = true
-        selectSubtitle(pick)
+        selectSubtitle(pick, userInitiated: false)
     }
 
     private func optionMatchesLanguage(_ option: TrackOption, _ code: String) -> Bool {
@@ -3622,12 +3644,16 @@ final class PlayerViewModel: ObservableObject {
         }
     }
 
-    func selectSubtitle(_ track: TrackOption) {
+    /// - Parameter userInitiated: false for the automatic default-subtitle
+    ///   pick. `PlaybackMemory` is meant to hold the viewer's OWN choices, and
+    ///   writing an automatic pick there contradicts that — the automatic path
+    ///   would record a language the viewer never selected.
+    func selectSubtitle(_ track: TrackOption, userInitiated: Bool = true) {
         selectedSubtitleID = track.id
         if track.id == "sub-off" {
             // An explicit OFF is a choice too — remember it, or the on-by-
             // default logic re-enables subtitles on the next episode.
-            PlaybackMemory.update(meta.id) { $0.subtitleLanguage = "off" }
+            if userInitiated { PlaybackMemory.update(meta.id) { $0.subtitleLanguage = "off" } }
         } else {
             // …and picking a REAL track has to retire that sentinel. Nothing
             // cleared it before, so a single "Off" press permanently disabled
@@ -3643,7 +3669,7 @@ final class PlayerViewModel: ObservableObject {
                 else { return false }
                 return name.contains(localized)
             }?.0
-            PlaybackMemory.update(meta.id) { $0.subtitleLanguage = lang }
+            if userInitiated { PlaybackMemory.update(meta.id) { $0.subtitleLanguage = lang } }
         }
         switch track.payload {
         case .subtitle(let info):

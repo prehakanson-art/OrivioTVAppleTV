@@ -211,7 +211,7 @@ final class TraktSyncManager: ObservableObject {
             .filter { let f = $0.positionSeconds / $0.durationSeconds; return f > 0.01 && f < 0.95 }
             // Rows Trakt has already refused repeatedly are parked, not retried
             // (see rejectedScrobbles).
-            .filter { !isScrobbleRejected($0.id) }
+            .filter { [self] row in expireRejectedScrobblesIfStale(); return !isScrobbleRejected(row.id) }
             .sorted { $0.updatedAt > $1.updatedAt }
             .prefix(30)
         for row in localOnly {
@@ -244,6 +244,34 @@ final class TraktSyncManager: ObservableObject {
     /// Ceiling so the parked set can't grow without bound; blown away wholesale
     /// (it simply re-learns) rather than tracked with per-key timestamps.
     private static let maxRejectedScrobbles = 500
+    /// Parking EXPIRES. `TraktService.scrobble` returns false for a network
+    /// failure as well as a refusal, so a few minutes offline could park every
+    /// row — and a parked row is filtered out before the loop that would clear
+    /// it, making the "a success clears it" promise unreachable. Expiring the
+    /// whole set periodically means the worst case is a delay, not permanent
+    /// silent loss of Trakt push.
+    private static let rejectedScrobblesLife: TimeInterval = 7 * 24 * 60 * 60
+    private static let rejectedScrobblesStampKey = "orivio.trakt.rejectedScrobbles.stamp.v1"
+
+    /// Drop the parked set once it is older than its life, so parked rows get
+    /// another chance without the user doing anything.
+    private func expireRejectedScrobblesIfStale() {
+        let defaults = UserDefaults.standard
+        let stamp = defaults.object(forKey: Self.rejectedScrobblesStampKey) as? Double
+        guard let stamp else {
+            defaults.set(Date().timeIntervalSince1970, forKey: Self.rejectedScrobblesStampKey)
+            return
+        }
+        guard Date().timeIntervalSince1970 - stamp > Self.rejectedScrobblesLife else { return }
+        guard !rejectedScrobbles.isEmpty else {
+            defaults.set(Date().timeIntervalSince1970, forKey: Self.rejectedScrobblesStampKey)
+            return
+        }
+        NSLog("[OrivioTrakt] retrying %d parked scrobble(s) — parking expired", rejectedScrobbles.count)
+        rejectedScrobbles = [:]
+        defaults.removeObject(forKey: Self.rejectedScrobblesKey)
+        defaults.set(Date().timeIntervalSince1970, forKey: Self.rejectedScrobblesStampKey)
+    }
 
     private func isScrobbleRejected(_ key: String) -> Bool {
         (rejectedScrobbles[key] ?? 0) >= Self.maxScrobbleAttempts

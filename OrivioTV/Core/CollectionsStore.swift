@@ -395,8 +395,18 @@ final class CollectionsStore: ObservableObject {
     /// Account-wide, like the library itself. A tombstone is dropped as soon as
     /// the user re-adds that collection, or once a remote snapshot stops listing
     /// it — at which point the delete has propagated and it has done its job.
-    private var removedIDs: Set<String> = []
-    private static let removedKey = "orivio.collections.removed.v1"
+    ///
+    /// Timestamped and self-expiring. As a bare id set the only pruning path was
+    /// `applyRemote(collections:)`, which nothing calls — every live remote path
+    /// goes through `mergeIntoLibrary` — so a deleted collection was suppressed
+    /// on this device FOREVER: re-adding it on another client did nothing, and
+    /// the suppression even survived signing into a different account.
+    private var removedAt: [String: Date] = [:]
+    private var removedIDs: Set<String> { Set(removedAt.keys) }
+    /// Long enough to outlive any plausible delete propagation, short enough
+    /// that a genuine re-add later always wins.
+    private static let removalTombstoneLife: TimeInterval = 30 * 24 * 60 * 60
+    private static let removedKey = "orivio.collections.removed.v2"
 
     init() {
         load()
@@ -416,7 +426,7 @@ final class CollectionsStore: ObservableObject {
     /// it — including the ones that didn't add it.
     func add(_ collection: OrivioCollection) {
         // Adding it back is an explicit undo of the delete.
-        if removedIDs.remove(collection.id) != nil { saveRemoved() }
+        if removedAt.removeValue(forKey: collection.id) != nil { saveRemoved() }
         library.append(collection)
         save()
         recomputeVisible()
@@ -436,7 +446,7 @@ final class CollectionsStore: ObservableObject {
     func remove(id: String) {
         library.removeAll { $0.id == id }
         hiddenIDs.remove(id)
-        removedIDs.insert(id)
+        removedAt[id] = Date()
         saveRemoved()
         save()
         recomputeVisible()
@@ -507,8 +517,10 @@ final class CollectionsStore: ObservableObject {
         // Applies to the shared LIBRARY. Same guards as before: an empty remote
         // while we hold data is a race, not a clear-all; identical is a no-op.
         if remote.isEmpty && !library.isEmpty { return false }
+        expireRemovedTombstones()
         pruneRemovedTombstones(against: remote)
-        let filtered = removedIDs.isEmpty ? remote : remote.filter { !removedIDs.contains($0.id) }
+        let suppressed = removedIDs
+        let filtered = suppressed.isEmpty ? remote : remote.filter { !suppressed.contains($0.id) }
         guard filtered != library else { return false }
         suppressChange = true
         defer { suppressChange = false }
@@ -529,7 +541,9 @@ final class CollectionsStore: ObservableObject {
         // Never re-adopt something the user deleted: this path has no delete
         // semantics of its own, so a tombstone is the only thing standing
         // between a removed collection and its return on the next sync.
-        let incoming = removedIDs.isEmpty ? remote : remote.filter { !removedIDs.contains($0.id) }
+        expireRemovedTombstones()
+        let suppressed = removedIDs
+        let incoming = suppressed.isEmpty ? remote : remote.filter { !suppressed.contains($0.id) }
         guard !incoming.isEmpty else { return false }
         var byTitle: [String: OrivioCollection] = [:]
         var order: [String] = []
@@ -677,7 +691,9 @@ final class CollectionsStore: ObservableObject {
         hiddenFolderIDs = Set(UserDefaults.standard.stringArray(forKey: hiddenFoldersKey) ?? [])
         globalHiddenFolderIDs = Set(UserDefaults.standard.stringArray(forKey: Self.globalHiddenFoldersKey) ?? [])
         globalHiddenIDs = Set(UserDefaults.standard.stringArray(forKey: Self.globalHiddenCollectionsKey) ?? [])
-        removedIDs = Set(UserDefaults.standard.stringArray(forKey: Self.removedKey) ?? [])
+        let rawRemoved = UserDefaults.standard.dictionary(forKey: Self.removedKey) as? [String: Double] ?? [:]
+        removedAt = rawRemoved.mapValues { Date(timeIntervalSince1970: $0) }
+        expireRemovedTombstones()
 
         // The LIBRARY is not: ~700 KB of nested JSON (493 folders on a real
         // account). Decoding it synchronously here — this runs from the store's
@@ -792,20 +808,41 @@ final class CollectionsStore: ObservableObject {
     }
 
     private func saveRemoved() {
-        if removedIDs.isEmpty {
+        if removedAt.isEmpty {
             UserDefaults.standard.removeObject(forKey: Self.removedKey)
         } else {
-            UserDefaults.standard.set(Array(removedIDs), forKey: Self.removedKey)
+            let raw = removedAt.mapValues { $0.timeIntervalSince1970 }
+            UserDefaults.standard.set(raw, forKey: Self.removedKey)
         }
     }
 
     /// A remote snapshot that no longer lists a tombstoned id means our delete
     /// landed; keep only the tombstones still fighting a live remote row.
     private func pruneRemovedTombstones(against remote: [OrivioCollection]) {
-        guard !removedIDs.isEmpty else { return }
-        let survivors = removedIDs.intersection(Set(remote.map(\.id)))
-        guard survivors != removedIDs else { return }
-        removedIDs = survivors
+        guard !removedAt.isEmpty else { return }
+        let present = Set(remote.map(\.id))
+        let survivors = removedAt.filter { present.contains($0.key) }
+        guard survivors.count != removedAt.count else { return }
+        removedAt = survivors
+        saveRemoved()
+    }
+
+    /// Drop tombstones past their life. Called before every filter, so an id can
+    /// never be suppressed indefinitely.
+    private func expireRemovedTombstones() {
+        guard !removedAt.isEmpty else { return }
+        let cutoff = Date().addingTimeInterval(-Self.removalTombstoneLife)
+        let survivors = removedAt.filter { $0.value >= cutoff }
+        guard survivors.count != removedAt.count else { return }
+        removedAt = survivors
+        saveRemoved()
+    }
+
+    /// Forget every removal — the collections of a different account are not
+    /// this one's to suppress.
+    func forgetRemovalTombstones() {
+        guard !removedAt.isEmpty else { return }
+        removedAt = [:]
         saveRemoved()
     }
 
