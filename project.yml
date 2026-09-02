@@ -1,10 +1,10 @@
-name: NuvioTV
+name: OrivioTV
 options:
   deploymentTarget:
     tvOS: "17.0"
   createIntermediateGroups: true
 packages:
-  # VENDORED with two Nuvio patches (see "NUVIO PATCH" comments): a
+  # VENDORED with two Orivio patches (see "ORIVIO PATCH" comments): a
   # lost-wakeup fix in MEPlayerItem's reader teardown and a display-link
   # invalidation on engine swap in KSPlayerLayer — together they stop a dead
   # engine leaking ~400-500 MB per swap (jetsam killer on the 3 GB boxes).
@@ -22,11 +22,11 @@ packages:
     url: https://github.com/tylerjonesio/vlckit-spm
     from: 3.6.0
 targets:
-  NuvioTV:
+  OrivioTV:
     type: application
     platform: tvOS
     sources:
-      - NuvioTV
+      - OrivioTV
     dependencies:
       - package: KSPlayer
       - package: YouTubeKit
@@ -47,7 +47,7 @@ targets:
       # a paid Apple Developer Program membership ($99/yr). Do not
       # re-enable this without one — see the other two TOP SHELF spots
       # below, which must be re-enabled together.
-      # - target: NuvioTopShelf
+      # - target: OrivioTopShelf
     info:
       path: Config/Info.plist
       properties:
@@ -76,11 +76,11 @@ targets:
           # to it is the alternative to this app's own libdovi conversion (see
           # PlayerSettings.dolbyVisionProfile7) or the HDR10 fallback.
           - senplayer
-        # Deep links: nuvio:// (open a title) + stremio:// (install an addon).
+        # Deep links: orivio:// (open a title) + stremio:// (install an addon).
         CFBundleURLTypes:
-          - CFBundleURLName: tv.nuvio.deeplink
+          - CFBundleURLName: tv.orivio.deeplink
             CFBundleURLSchemes:
-              - nuvio
+              - orivio
               - stremio
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
@@ -97,7 +97,7 @@ targets:
         # generated pbxproj: Xcode's GUI writes the team into project.pbxproj,
         # where any xcodegen regeneration (or a git checkout of the file)
         # silently drops it — and a device build then dies with "Signing for
-        # 'NuvioTV' requires a development team".
+        # 'OrivioTV' requires a development team".
         DEVELOPMENT_TEAM: CYCSPZ5MTR
         CODE_SIGN_STYLE: Automatic
         SWIFT_VERSION: "5.9"
@@ -113,7 +113,7 @@ targets:
         # extension. OFF — Personal Team accounts can't provision App
         # Groups. Only uncomment with a paid Developer Program membership,
         # together with the other two TOP SHELF spots.
-        # CODE_SIGN_ENTITLEMENTS: Config/NuvioTV.entitlements
+        # CODE_SIGN_ENTITLEMENTS: Config/OrivioTV.entitlements
       configs:
         # DEVELOPMENT identity — used when you Run onto a real Apple TV from
         # Xcode. Building to a device REGISTERS the bundle id against your
@@ -166,17 +166,17 @@ targets:
   # from the shared app group written by TopShelfExporter. Uncomment this
   # whole block together with the other two TOP SHELF spots ONLY once
   # signed in with a paid Apple Developer Program membership.
-  # NuvioTopShelf:
+  # OrivioTopShelf:
   #   type: app-extension
   #   platform: tvOS
   #   sources:
-  #     - NuvioTopShelf
-  #     - path: NuvioTV/Core/AppGroupResolver.swift
+  #     - OrivioTopShelf
+  #     - path: OrivioTV/Core/AppGroupResolver.swift
   #       buildPhase: sources
   #   info:
-  #     path: NuvioTopShelf/Info.plist
+  #     path: OrivioTopShelf/Info.plist
   #     properties:
-  #       CFBundleDisplayName: NuvioTV
+  #       CFBundleDisplayName: OrivioTV
   #       CFBundleShortVersionString: "0.7.15"
   #       NSExtension:
   #         NSExtensionPointIdentifier: com.apple.tv-top-shelf
@@ -188,32 +188,32 @@ targets:
   #       TARGETED_DEVICE_FAMILY: "3"
   #       MARKETING_VERSION: "0.7.15"
   #       CURRENT_PROJECT_VERSION: "1"
-  #       CODE_SIGN_ENTITLEMENTS: NuvioTopShelf/NuvioTopShelf.entitlements
+  #       CODE_SIGN_ENTITLEMENTS: OrivioTopShelf/OrivioTopShelf.entitlements
   # UI-test target: drives the tvOS remote (XCUIRemote) to verify focus/menu
   # behavior, which osascript keystroke automation can't do. Simulator only.
-  NuvioTVUITests:
+  OrivioTVUITests:
     type: bundle.ui-testing
     platform: tvOS
     sources:
-      - NuvioTVUITests
+      - OrivioTVUITests
     dependencies:
-      - target: NuvioTV
+      - target: OrivioTV
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.orivio.tv.appletv.uitests
         SWIFT_VERSION: "5.9"
         TARGETED_DEVICE_FAMILY: "3"
-        TEST_TARGET_NAME: NuvioTV
+        TEST_TARGET_NAME: OrivioTV
         CODE_SIGNING_ALLOWED: "NO"
 schemes:
-  NuvioTV:
+  OrivioTV:
     build:
       targets:
-        NuvioTV: all
-        NuvioTVUITests: [test]
+        OrivioTV: all
+        OrivioTVUITests: [test]
     test:
       targets:
-        - NuvioTVUITests
+        - OrivioTVUITests
     run:
       config: Debug
       # KSPlayer's Metal renderer (MetalRender.textures) calls makeTexture and

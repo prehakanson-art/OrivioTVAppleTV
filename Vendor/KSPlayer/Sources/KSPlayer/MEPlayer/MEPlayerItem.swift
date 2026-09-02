@@ -448,7 +448,7 @@ extension MEPlayerItem {
         allPlayerItemTracks.forEach { $0.decode() }
         while [MESourceState.paused, .seeking, .reading].contains(state) {
             if state == .paused {
-                // NUVIO PATCH (lost-wakeup): the check-then-wait here is not
+                // ORIVIO PATCH (lost-wakeup): the check-then-wait here is not
                 // atomic against shutdown()'s single condition.signal() — a
                 // signal landing between the check and the wait() parked this
                 // thread FOREVER with state == .closed. Because closeOperation

@@ -114,7 +114,7 @@ open class KSPlayerLayer: NSObject {
                     ])
                 }
                 oldValue.view?.removeFromSuperview()
-                // NUVIO PATCH (display-link retain chain): the Metal view's
+                // ORIVIO PATCH (display-link retain chain): the Metal view's
                 // CADisplayLink is created with `target: self` and only ever
                 // invalidated in KSMEPlayer.deinit — but the runloop retains
                 // the link, the link retains the view, and the view retains

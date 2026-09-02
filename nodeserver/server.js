@@ -1,4 +1,4 @@
-// NuvioTV on-device torrent streaming server.
+// OrivioTV on-device torrent streaming server.
 //
 // Runs IN-PROCESS inside the tvOS app via nodejs-mobile (the same technique
 // Stremio uses: Node linked as a framework, no subprocess). Exposes a tiny
@@ -20,7 +20,7 @@
 const http = require('http');
 const torrentStream = require('torrent-stream');
 
-const PORT = Number(process.env.NUVIO_STREAM_PORT || 11470);
+const PORT = Number(process.env.ORIVIO_STREAM_PORT || 11470);
 const HOST = '127.0.0.1';
 const VIDEO_EXT = ['.mkv', '.mp4', '.avi', '.mov', '.m4v', '.ts', '.webm'];
 
@@ -162,5 +162,5 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`[nuvio-stream] listening on http://${HOST}:${PORT}`);
+  console.log(`[orivio-stream] listening on http://${HOST}:${PORT}`);
 });

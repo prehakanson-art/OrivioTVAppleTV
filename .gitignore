@@ -17,7 +17,12 @@ _player_backup_*/
 .obsidian/
 
 # Secrets — real keys live here, kept out of the repo.
-# Copy Secrets.example.swift → NuvioTV/Secrets.swift and fill it in.
+# Copy Secrets.example.swift → OrivioTV/Secrets.swift and fill it in.
+# BOTH paths are listed deliberately: during the Nuvio→Orivio rename the file
+# moved out from under a single-path rule, stopped being ignored, and got
+# committed with real keys in it. Keeping the old path covers any tree that
+# still has it there.
+OrivioTV/Secrets.swift
 NuvioTV/Secrets.swift
 
 # macOS

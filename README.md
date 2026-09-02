@@ -1,7 +1,7 @@
 # Orivio TV
 
 A native tvOS media player, rebuilt in SwiftUI with an Apple-TV-premium feel. Orivio TV
-is a from-scratch Apple TV port of [Nuvio](https://github.com/NuvioMedia/NuvioTV) — the
+is a from-scratch Apple TV port of [Orivio](https://github.com/OrivioMedia/OrivioTV) — the
 Android TV Stremio-addon player — and syncs with the same account. Licensed GPLv3,
 matching the upstream project.
 
@@ -29,7 +29,7 @@ directly; this is a from-scratch reimplementation of the same product:
 
 - **Stremio addon ecosystem** — Cinemeta ships installed; add any addon by pasting its
   `manifest.json` URL in Settings (`stremio://` links accepted).
-- **Nuvio design system** — the full color token set (all 7 accent themes: Crimson, Ocean,
+- **Orivio design system** — the full color token set (all 7 accent themes: Crimson, Ocean,
   Violet, Emerald, Amber, Rose, White), near-black surfaces, accent focus rings.
 - **Home** — hero backdrop that follows card focus (logo, IMDb badge, meta, description),
   addon catalog rows, Continue Watching row with resume.
@@ -49,7 +49,7 @@ Dual-engine playback with a fully custom UI:
   PGS/VobSub bitmap cues). If the native engine rejects a stream, playback fails over
   to FFmpeg automatically; the active engine shows in the "via" line of the controls.
 
-- **Nuvio-style controls** — title/episode/via lines, accent progress bar with buffered
+- **Orivio-style controls** — title/episode/via lines, accent progress bar with buffered
   fill that thickens on focus, circular icon buttons (play, next episode, subtitles,
   audio, sources, episodes, speed, aspect), elapsed/total readout.
 - **Infuse-style touchpad scrubbing** — with controls hidden, swipe the Siri remote
@@ -79,18 +79,18 @@ Requires Xcode 16+ with the tvOS platform installed, plus [XcodeGen](https://git
 Provider keys are kept out of source control (like the Android app's
 `local.properties`). Before building, copy the template and fill in any keys you
 have — all are optional; with them blank the app still browses and plays via
-addons, only the Nuvio account, Trakt, and TMDB enrichment need them:
+addons, only the Orivio account, Trakt, and TMDB enrichment need them:
 
 ```bash
 cp Secrets.example.swift NuvioTV/Secrets.swift   # then edit NuvioTV/Secrets.swift
 xcodegen generate
-xcodebuild -project NuvioTV.xcodeproj -scheme NuvioTV \
+xcodebuild -project OrivioTV.xcodeproj -scheme OrivioTV \
   -destination 'generic/platform=tvOS Simulator' build
 ```
 
 `NuvioTV/Secrets.swift` is gitignored, so your keys never enter the repo.
 
-To run on a real Apple TV, open `NuvioTV.xcodeproj` in Xcode, pick your signing team,
+To run on a real Apple TV, open `OrivioTV.xcodeproj` in Xcode, pick your signing team,
 and run on the device. Dev flags: launch with `-playerDemo` to open the player against
 Apple's public HLS test stream (`-playerDemoTour` walks the overlay states); `-detailDemo`
 jumps straight to a Detail screen so cast/trailers/more-like-this enrichment is visible

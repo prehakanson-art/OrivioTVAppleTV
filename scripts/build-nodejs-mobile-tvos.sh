@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Cross-compile nodejs-mobile into a tvOS xcframework for NuvioTV's on-device
+# Cross-compile nodejs-mobile into a tvOS xcframework for OrivioTV's on-device
 # P2P streaming server (the same runtime technique Stremio uses).
 #
 # nodejs-mobile ships NO tvOS prebuilt — only iOS — so we build our own from

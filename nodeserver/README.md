@@ -7,7 +7,7 @@
 > Everything below is the plan for finishing this, not a description of
 > shipped behaviour.
 
-NuvioTV can stream torrents **on-device**, peer-to-peer, the same way Stremio's
+OrivioTV can stream torrents **on-device**, peer-to-peer, the same way Stremio's
 tvOS app does: a Node.js runtime is linked into the app as a framework
 (nodejs-mobile) and runs a small streaming server **in-process** — no
 subprocess (which tvOS forbids), no external TorrServer.
@@ -43,17 +43,17 @@ Then:
 1. **project.yml** — link the framework and bundle the server:
    ```yaml
    targets:
-     NuvioTV:
+     OrivioTV:
        dependencies:
          - framework: Vendor/NodeMobile.xcframework
        sources:
-         - NuvioTV
+         - OrivioTV
          - path: nodeserver          # server.js + node_modules → app bundle
            buildPhase: resources
    ```
    `xcodegen generate` after.
 
-2. **NodeStreamingServer.swift** (new, in `NuvioTV/Core/`) — start Node in-process:
+2. **NodeStreamingServer.swift** (new, in `OrivioTV/Core/`) — start Node in-process:
    ```swift
    import Foundation
 
@@ -89,7 +89,7 @@ Then:
        }
    }
    ```
-   Call `NodeStreamingServer.shared.startIfNeeded()` from `NuvioTVApp` on launch.
+   Call `NodeStreamingServer.shared.startIfNeeded()` from `OrivioTVApp` on launch.
 
 3. **Route torrent playback to it.** `TorrServerService` is already the template:
    add an `OnDeviceP2P` resolver that `POST`s the magnet to

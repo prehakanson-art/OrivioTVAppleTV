@@ -1,7 +1,7 @@
 {
-  "name": "nuvio-stream-server",
+  "name": "orivio-stream-server",
   "version": "1.0.0",
-  "description": "On-device torrent streaming server for NuvioTV (runs in-process via nodejs-mobile)",
+  "description": "On-device torrent streaming server for OrivioTV (runs in-process via nodejs-mobile)",
   "main": "server.js",
   "license": "MIT",
   "dependencies": {

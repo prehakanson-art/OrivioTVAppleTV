@@ -18,11 +18,11 @@ OUT_DIR="ipa_out"
 WORK=$(mktemp -d)
 
 echo "==> Building Release…"
-xcodebuild -project NuvioTV.xcodeproj -scheme NuvioTV \
+xcodebuild -project OrivioTV.xcodeproj -scheme OrivioTV \
   -destination 'generic/platform=tvOS' -configuration Release \
   -allowProvisioningUpdates build 2>&1 | grep -E "error:|BUILD (SUCCEEDED|FAILED)" || true
 
-APP=$(ls -d ~/Library/Developer/Xcode/DerivedData/NuvioTV-*/Build/Products/Release-appletvos/NuvioTV.app 2>/dev/null | head -1)
+APP=$(ls -d ~/Library/Developer/Xcode/DerivedData/OrivioTV-*/Build/Products/Release-appletvos/OrivioTV.app 2>/dev/null | head -1)
 [ -d "$APP" ] || { echo "!! Release .app not found — build failed?"; exit 1; }
 
 echo "==> Packaging from $APP"
@@ -31,7 +31,7 @@ cp -R "$APP" "$WORK/Payload/"
 
 # Distribution identity: restore the historical bundle id.
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $DIST_ID" \
-  "$WORK/Payload/NuvioTV.app/Info.plist"
+  "$WORK/Payload/OrivioTV.app/Info.plist"
 
 mkdir -p "$OUT_DIR"
 IPA="$OUT_DIR/Orivio-TV-$VERSION.ipa"

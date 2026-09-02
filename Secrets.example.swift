@@ -6,20 +6,20 @@ import Foundation
 //      cp Secrets.example.swift NuvioTV/Secrets.swift
 //
 //  `NuvioTV/Secrets.swift` is gitignored, so your keys never enter the repo
-//  (same pattern as the official Nuvio app's `local.properties`). This template
+//  (same pattern as the official Orivio app's `local.properties`). This template
 //  lives at the repo root so it is NOT compiled into the app.
 //
 //  Every value is optional — the app still browses and plays via addons with
 //  them blank. What each unlocks:
-//    • supabase*        → the Nuvio account: QR login + cross-device sync
+//    • supabase*        → the Orivio account: QR login + cross-device sync
 //    • trakt*           → Trakt sign-in + scrobbling
 //    • tmdbAPIKey       → TMDB enrichment (cast, trailers, ratings, stills)
 //                         Get a free key at https://www.themoviedb.org/settings/api
 // ─────────────────────────────────────────────────────────────────────────────
 
 enum Secrets {
-    // Nuvio account backend (self-hosted Supabase). Leave blank to disable the
-    // Nuvio account; these point at Nuvio's own server and aren't reusable.
+    // Orivio account backend (self-hosted Supabase). Leave blank to disable the
+    // Orivio account; these point at Orivio's own server and aren't reusable.
     static let supabaseURL = ""
     static let supabaseFallbackURL = ""
     static let supabaseAnonKey = ""
