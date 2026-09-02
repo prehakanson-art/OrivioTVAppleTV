@@ -135,6 +135,9 @@ struct RootView: View {
     @State private var traktSync: TraktSyncManager?
     @State private var stremioSync: StremioSyncManager?
     @State private var showProfileGate = false
+    /// True when the gate was opened from the rail / Settings (Back closes
+    /// it); false for the cold-launch gate, where Back stays a no-op.
+    @State private var profileGateCancellable = false
     @State private var selectedTab = 0
     /// Polls the account every 30s while Home is up so Continue Watching stays
     /// live — removals and additions made on another device (or that failed to
@@ -154,6 +157,8 @@ struct RootView: View {
     var body: some View {
         content
             .onOpenURL { handleDeepLink($0) }
+            .onChange(of: sidebarFocus) { old, new in traceSidebar(old, new) }
+            .onChange(of: sidebarEnabled) { _, new in traceSidebarEnabled(new) }
             // If Live TV is turned off while you're on it (or via sync), drop
             // back to Home so you're not stranded on a now-hidden tab.
             .onChange(of: liveTV.enabled) { _, enabled in
@@ -164,6 +169,7 @@ struct RootView: View {
             .task { await debrid.refreshRealDebridIfNeeded() }
             .onAppear {
                 NSLog("[OrivioPlayer] RootView content onAppear")
+                FocusTrace.installIfRequested()
                 startPlayerDemoIfRequested()
                 startDetailDemoIfRequested()
                 ScrubThumbnailer.runSelfTestIfRequested()
@@ -345,7 +351,12 @@ struct RootView: View {
                 // The gate now only SELECTS a profile; account + Manage Profiles
                 // live in Settings → Account. The design is an independent look
                 // axis (Settings → Themes → Profile Screen).
-                ProfileGateView(onSelected: { showProfileGate = false; deferSidebarAfterProfileGate() })
+                ProfileGateView(
+                    onSelected: { showProfileGate = false; deferSidebarAfterProfileGate() },
+                    onCancel: profileGateCancellable
+                        ? { showProfileGate = false; deferSidebarAfterProfileGate() }
+                        : nil
+                )
                 .environmentObject(theme)
                 .environmentObject(profiles)
                 .environmentObject(account)
@@ -367,6 +378,21 @@ struct RootView: View {
                 guard scenePhase == .active, selectedTab == 0, playback == nil else { return }
                 sync?.refreshContinueWatching()
             }
+    }
+
+    private func traceSidebar(_ old: Int?, _ new: Int?) {
+        #if DEBUG
+        guard FocusTrace.enabled else { return }
+        NSLog("[FocusTrace] sidebarFocus %@ -> %@ (enabled=%d)",
+              old.map(String.init) ?? "nil", new.map(String.init) ?? "nil", sidebarEnabled ? 1 : 0)
+        #endif
+    }
+
+    private func traceSidebarEnabled(_ enabled: Bool) {
+        #if DEBUG
+        guard FocusTrace.enabled else { return }
+        NSLog("[FocusTrace] sidebarEnabled=%d", enabled ? 1 : 0)
+        #endif
     }
 
     /// Dev-only: `-playerDemo` opens the player with Apple's public HLS test
@@ -517,7 +543,7 @@ struct RootView: View {
 
             if showSidebar {
                 GlassSidebar(selected: $selectedTab, focusBinding: $sidebarFocus,
-                             onProfileTap: { showProfileGate = true },
+                             onProfileTap: { profileGateCancellable = true; showProfileGate = true },
                              onTabSelected: { newTab in selectTab(newTab) })
                     .focusSection()
                     .disabled(!sidebarEnabled)
@@ -557,24 +583,24 @@ struct RootView: View {
         case 1:
             NavigationStack(path: $searchPath) {
                 searchRoot
-                    .onExitCommand { sidebarFocus = 1 }
+                    .onExitCommand { focusSidebar(1) }
                     .navigationDestination(for: Route.self) { destination(for: $0, path: $searchPath) }
             }
         case 2:
             NavigationStack(path: $libraryPath) {
                 libraryRoot
-                    .onExitCommand { sidebarFocus = 2 }
+                    .onExitCommand { focusSidebar(2) }
                     .navigationDestination(for: Route.self) { destination(for: $0, path: $libraryPath) }
             }
         case 3:
             NavigationStack {
-                ATVSettingsView(onOpenProfiles: { showProfileGate = true })
-                    .onExitCommand { sidebarFocus = 3 }
+                ATVSettingsView(onOpenProfiles: { profileGateCancellable = true; showProfileGate = true })
+                    .onExitCommand { focusSidebar(3) }
             }
         case 4:
             NavigationStack(path: $liveTVPath) {
                 liveTVRoot
-                    .onExitCommand { sidebarFocus = 4 }
+                    .onExitCommand { focusSidebar(4) }
                     .navigationDestination(for: Route.self) { destination(for: $0, path: $liveTVPath) }
             }
         default:
@@ -585,20 +611,19 @@ struct RootView: View {
                         // a pushed screen — tvOS sometimes delivers a lingering
                         // second Menu, which would spuriously open the rail.
                         if let popped = lastHomePopAt, Date().timeIntervalSince(popped) < 1.0 { return }
-                        sidebarFocus = 0
+                        focusSidebar(0)
                     }
                     .onChange(of: homePath.count) { oldCount, newCount in
-                        guard newCount < oldCount else { return }
+                        // Only a pop that lands ON Home matters here.
+                        guard newCount < oldCount, newCount == 0 else { return }
                         lastHomePopAt = Date()
                         // Popping all the way back to Home: keep the rail
                         // non-focusable for a beat so focus lands on a card
                         // instead of the rail springing open.
-                        if newCount == 0 {
-                            sidebarEnabled = false
-                            Task {
-                                try? await Task.sleep(nanoseconds: 900_000_000)
-                                sidebarEnabled = true
-                            }
+                        sidebarEnabled = false
+                        Task {
+                            try? await Task.sleep(nanoseconds: 900_000_000)
+                            sidebarEnabled = true
                         }
                     }
                     .navigationDestination(for: Route.self) { destination(for: $0, path: $homePath) }
@@ -620,6 +645,16 @@ struct RootView: View {
             scheduleSidebarReenable()
             return
         }
+    }
+
+    /// Open the rail on `tab`. The rail is `.disabled` for short windows after
+    /// every tab switch / collapse / pop (so the engine seeds focus into the
+    /// content instead), and a focus request into a disabled view is silently
+    /// dropped — a Menu press in one of those windows did nothing. A deliberate
+    /// Back always wins: enable now, focus on the next tick.
+    private func focusSidebar(_ tab: Int) {
+        sidebarEnabled = true
+        DispatchQueue.main.async { sidebarFocus = tab }
     }
 
     /// Back pressed while the rail itself is focused: close the panel. Always
@@ -673,7 +708,7 @@ struct RootView: View {
             // Back at the start of a row opens the rail.
             onHomeBack: {
                 if let popped = lastHomePopAt, Date().timeIntervalSince(popped) < 1.0 { return }
-                sidebarFocus = 0
+                focusSidebar(0)
             }
         )
     }
@@ -690,7 +725,7 @@ struct RootView: View {
         LibraryView(
             onSelect: { libraryPath.append(Route.detail($0)) },
             onOpenCloud: { libraryPath.append(Route.cloudLibrary) },
-            onBackAtRoot: { sidebarFocus = 2 }
+            onBackAtRoot: { focusSidebar(2) }
         )
     }
 
@@ -1237,3 +1272,50 @@ struct RootView: View {
         homePath.append(Route.streamsResume(meta, video, fromStart: fromBeginning))
     }
 }
+
+
+#if DEBUG
+/// Dev: `-focusLog` logs every focus update and every FAILED move (the focus
+/// engine found no candidate) app-wide. Sim key delivery is flaky and
+/// screenshots only show styled focus, so this is the only reliable truth
+/// about where focus actually is.
+@MainActor
+enum FocusTrace {
+    private static var tokens: [NSObjectProtocol] = []
+    static let enabled = ProcessInfo.processInfo.arguments.contains("-focusLog")
+
+    static func installIfRequested() {
+        guard tokens.isEmpty, enabled else { return }
+        let center = NotificationCenter.default
+        tokens.append(center.addObserver(forName: UIFocusSystem.didUpdateNotification,
+                                         object: nil, queue: .main) { note in
+            guard let ctx = note.userInfo?[UIFocusSystem.focusUpdateContextUserInfoKey] as? UIFocusUpdateContext else { return }
+            NSLog("[FocusTrace] UPDATE %@ -> %@ (heading %ld)",
+                  describe(ctx.previouslyFocusedItem), describe(ctx.nextFocusedItem),
+                  ctx.focusHeading.rawValue)
+        })
+        tokens.append(center.addObserver(forName: UIFocusSystem.movementDidFailNotification,
+                                         object: nil, queue: .main) { note in
+            guard let ctx = note.userInfo?[UIFocusSystem.focusUpdateContextUserInfoKey] as? UIFocusUpdateContext else { return }
+            NSLog("[FocusTrace] MOVE FAILED from %@ heading %ld",
+                  describe(ctx.previouslyFocusedItem), ctx.focusHeading.rawValue)
+        })
+        NSLog("[FocusTrace] installed")
+    }
+
+    private static func describe(_ item: UIFocusItem?) -> String {
+        guard let item else { return "NONE" }
+        let cls = String(describing: type(of: item))
+        // UIFocusItem.frame is in the item's own coordinate space; convert via
+        // its container for a window-relative rectangle.
+        var frame = item.frame
+        if let view = item as? UIView, let win = view.window {
+            frame = view.convert(view.bounds, to: win)
+        } else if let container = item.parentFocusEnvironment as? UIView, let win = container.window {
+            frame = container.convert(frame, to: win)
+        }
+        let parent = item.parentFocusEnvironment.map { String(describing: type(of: $0)) } ?? "-"
+        return String(format: "%@ @(%.0f,%.0f %.0fx%.0f) in %@", cls, frame.minX, frame.minY, frame.width, frame.height, parent)
+    }
+}
+#endif

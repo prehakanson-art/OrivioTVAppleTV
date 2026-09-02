@@ -1256,11 +1256,12 @@ private struct AddonRowView: View {
             Spacer()
 
             // Reorder controls (dimmed + non-focusable at the ends).
-            RowActionCircle(icon: "chevron.up", action: onMoveUp)
-                .disabled(!canMoveUp)
+            // Dimmed at the ends but never `.disabled`: moving an add-on to
+            // the top disabled the chevron you were standing on and dropped
+            // focus. The actions no-op at the bounds instead.
+            RowActionCircle(icon: "chevron.up", action: { if canMoveUp { onMoveUp() } })
                 .opacity(canMoveUp ? 1 : 0.3)
-            RowActionCircle(icon: "chevron.down", action: onMoveDown)
-                .disabled(!canMoveDown)
+            RowActionCircle(icon: "chevron.down", action: { if canMoveDown { onMoveDown() } })
                 .opacity(canMoveDown ? 1 : 0.3)
 
             // Cinemeta is the bundled meta provider and can't be removed.

@@ -75,6 +75,9 @@ struct ProfileGateView: View {
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var profiles: ProfileStore
     let onSelected: () -> Void
+    /// Back handler when the gate is opened as a MODAL (rail profile chip,
+    /// Settings → Switch Profile). nil on cold launch, where Back is a no-op.
+    var onCancel: (() -> Void)? = nil
 
     @State private var pinProfile: UserProfile?
     // Open with focus on the profile you last used, so the trackpad starts on a
@@ -135,10 +138,11 @@ struct ProfileGateView: View {
                 .padding(OrivioSpacing.huge)
             }
         }
-        // This is the very first screen the app can show — there's nothing to
+        // On cold launch this is the very first screen — there's nothing to
         // go back to, so Back is a no-op instead of falling through to the
-        // system (which would otherwise exit the app).
-        .onExitCommand {}
+        // system (which would otherwise exit the app). Opened from the rail
+        // or Settings, Back closes it and keeps the current profile.
+        .onExitCommand { onCancel?() }
         .task { await profiles.loadAvatarCatalog() }
     }
 
@@ -306,7 +310,9 @@ struct PinEntryView: View {
                         actionButton(systemName: "xmark") { onCancel() }
                     }
                 }
-                .disabled(busy)
+                // Not `.disabled(busy)`: disabling the whole keypad mid-press
+                // dropped focus, and left the page's onExitCommand with no
+                // focused descendant. `append` ignores digits while busy.
             }
             .padding(OrivioSpacing.huge)
         }

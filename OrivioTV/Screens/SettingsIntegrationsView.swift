@@ -303,7 +303,9 @@ private struct DebridKeyEditor: View {
                         if validating { ProgressView().tint(theme.palette.onSecondary) }
                         else { Text("Verify & Save") }
                     }
-                    .disabled(validating || key.trimmingCharacters(in: .whitespaces).isEmpty)
+                    // Not disabled while validating: that disables the button
+                    // you just pressed and drops focus. The action guards.
+                    .disabled(key.trimmingCharacters(in: .whitespaces).isEmpty)
                     if !debrid.key(for: provider).isEmpty {
                         Button("Remove", role: .destructive) {
                             debrid.setKey("", for: provider)
@@ -330,6 +332,7 @@ private struct DebridKeyEditor: View {
     }
 
     private func verifyAndSave() {
+        guard !validating else { return }
         validating = true
         status = nil
         let trimmed = key.trimmingCharacters(in: .whitespaces)
@@ -418,6 +421,9 @@ private struct DebridConnectPage: View {
                 Text("Press Menu to cancel")
                     .font(.system(size: 20))
                     .foregroundStyle(theme.palette.textTertiary)
+                // The QR / starting states have no focusable view, so the
+                // onExitCommand below could never fire for them.
+                if errorText == nil { FocusAnchor() }
             }
             .padding(OrivioSpacing.huge)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -590,7 +596,7 @@ private struct MDBListKeyEditor: View {
                         if validating { ProgressView().tint(theme.palette.onSecondary) }
                         else { Text("Verify & Save") }
                     }
-                    .disabled(validating || key.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .disabled(key.trimmingCharacters(in: .whitespaces).isEmpty)
                     if !mdblist.settings.apiKey.isEmpty {
                         Button("Remove", role: .destructive) {
                             mdblist.settings.apiKey = ""
@@ -609,6 +615,7 @@ private struct MDBListKeyEditor: View {
     }
 
     private func verifyAndSave() {
+        guard !validating else { return }
         validating = true
         status = nil
         let trimmed = key.trimmingCharacters(in: .whitespaces)

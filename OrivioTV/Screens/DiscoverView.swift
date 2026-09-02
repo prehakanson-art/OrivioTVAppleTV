@@ -149,7 +149,9 @@ struct DiscoverView: View {
     /// Back deep in the grid scrolls to (and focuses) the first poster; a second
     /// Back — already at the top — pops back to the previous screen.
     private func backToTop(_ proxy: ScrollViewProxy) {
-        guard let first = viewModel.items.first?.id, focusedID != first else {
+        // `focusedID` is nil while the selector pills hold focus — Back from
+        // there pops the screen; it used to yank focus down into the grid.
+        guard let first = viewModel.items.first?.id, let focused = focusedID, focused != first else {
             dismiss(); return
         }
         withAnimation(FusionMotion.focusMove) { proxy.scrollTo(first, anchor: .top) }

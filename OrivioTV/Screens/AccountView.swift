@@ -1198,7 +1198,9 @@ private struct AccountBackupImportView: View {
 
                 HStack(spacing: OrivioSpacing.md) {
                     Button(importing ? "Importing..." : "Import", action: onImport)
-                        .disabled(importing || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        // Stays enabled while importing (disabling the focused
+                        // button drops focus); importBackup() guards re-entry.
+                        .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     Button("Done", action: onDone)
                 }
                 .font(.system(size: 24, weight: .bold))

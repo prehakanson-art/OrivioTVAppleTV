@@ -214,7 +214,10 @@ struct FusionHeroBar: View {
             }
             .buttonStyle(FusionHeroBarButtonStyle(prominent: true))
             .focused($playButtonFocus)
-            .onFocusChange { focused in
+            // NOT `.onFocusChange`: `\.isFocused` only resolves INSIDE the
+            // Button, so on the wrapper it never fired — the bar showed no
+            // focus ring, and kept auto-rotating under a focused button.
+            .onChange(of: playButtonFocus) { _, focused in
                 playFocused = focused
                 if focused { lastInteraction = Date() }
             }

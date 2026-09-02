@@ -217,6 +217,15 @@ struct DetailView: View {
     /// disarmed until they actually move again, so exiting doesn't bounce
     /// straight back into full-screen after the next 2 idle seconds.
     @State private var fullscreenCooldown = false
+    /// When full-screen was last exited; focus changes inside a short window
+    /// after it are the programmatic restore, not the user moving.
+    @State private var fullscreenExitedAt = Date.distantPast
+    /// True only while the muted backdrop trailer is actually rendering
+    /// frames. `showBackdropTrailer` flips as soon as the player is created,
+    /// long before the first frame — full-screen used to fade the chrome out
+    /// over the static backdrop, then eat the next press to come back.
+    @State private var backdropTrailerPlaying = false
+    @State private var backdropStatusObserver: NSKeyValueObservation?
     @FocusState private var fullscreenTrailerFocus: Bool
 
     init(
@@ -286,13 +295,16 @@ struct DetailView: View {
         }
         // Arm the idle → full-screen countdown whenever the trailer is up and
         // the user is resting in the header; any tracked interaction re-arms.
-        .task(id: "\(showBackdropTrailer)#\(interactionCount)#\(trailerFullscreen)") {
-            guard showBackdropTrailer, !trailerFullscreen, !fullscreenCooldown,
+        .task(id: "\(backdropTrailerPlaying)#\(interactionCount)#\(trailerFullscreen)") {
+            guard backdropTrailerPlaying, !trailerFullscreen, !fullscreenCooldown,
                   activeTrailer == nil, !showRatingPicker,
                   actionFocus != nil || teaserFocused else { return }
-            try? await Task.sleep(for: .seconds(2))
-            guard !Task.isCancelled, showBackdropTrailer, !trailerFullscreen,
-                  activeTrailer == nil, !showRatingPicker else { return }
+            // A real rest, not a reading pause: the first press after the
+            // chrome fades only brings it back, so this must never fire while
+            // someone is still deciding.
+            try? await Task.sleep(for: .seconds(6))
+            guard !Task.isCancelled, backdropTrailerPlaying, !trailerFullscreen,
+                  !fullscreenCooldown, activeTrailer == nil, !showRatingPicker else { return }
             // Un-muting needs a live audio session — the muted backdrop
             // deliberately runs without one (a raw AVPlayer can stall on tvOS
             // otherwise), so without this the full-screen trailer was SILENT.
@@ -411,6 +423,11 @@ struct DetailView: View {
             player?.play()
         }
         backdropPlayer = player
+        backdropStatusObserver?.invalidate()
+        backdropStatusObserver = player.observe(\.timeControlStatus, options: [.initial, .new]) { player, _ in
+            let playing = player.timeControlStatus == .playing
+            Task { @MainActor in backdropTrailerPlaying = playing }
+        }
         player.play()
         withAnimation(.easeInOut(duration: 0.6)) { showBackdropTrailer = true }
     }
@@ -419,6 +436,7 @@ struct DetailView: View {
     /// back on Play.
     private func exitTrailerFullscreen() {
         fullscreenCooldown = true
+        fullscreenExitedAt = Date()
         UIApplication.shared.isIdleTimerDisabled = false
         backdropPlayer?.isMuted = true
         // Give interrupted audio (another app's music) its shouldResume back —
@@ -427,10 +445,22 @@ struct DetailView: View {
         withAnimation(.easeInOut(duration: 0.35)) { trailerFullscreen = false }
         // AFTER the capture button leaves the tree and the focus engine's own
         // re-resolve has settled — set too early it gets overridden by the
-        // geometrically nearest item (the synopsis).
+        // geometrically nearest item (the synopsis). One request is not always
+        // honored either (the engine can re-resolve onto the synopsis a beat
+        // later), so keep asking for a few ticks until Play actually holds it.
         Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(150))
-            actionFocus = .play
+            for _ in 0..<4 {
+                try? await Task.sleep(for: .milliseconds(150))
+                guard !trailerFullscreen else { return }
+                if actionFocus == .play && !teaserFocused { return }
+                if actionFocus == .play {
+                    // Stale binding (focus moved on without SwiftUI noticing):
+                    // clear it on one tick so the next set is a real request.
+                    actionFocus = nil
+                    try? await Task.sleep(for: .milliseconds(30))
+                }
+                actionFocus = .play
+            }
         }
     }
 
@@ -440,6 +470,9 @@ struct DetailView: View {
             try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         }
         trailerFullscreen = false
+        backdropStatusObserver?.invalidate()
+        backdropStatusObserver = nil
+        backdropTrailerPlaying = false
         // Clear the item too, not just pause — otherwise the muted backdrop
         // player stays the system "Now Playing" item and the tvOS transport
         // overlay can pop up over Home when Play/Pause is pressed.
@@ -629,7 +662,14 @@ struct DetailView: View {
             // WITHIN the row (old != nil) are left alone.
             .onChange(of: actionFocus) { old, new in
                 interactionCount += 1
-                fullscreenCooldown = false
+                // Only a USER move re-arms full-screen. Leaving full-screen
+                // restores focus to Play programmatically; treating that as
+                // interaction cleared the cooldown, so the page went back to
+                // full-screen two seconds later and swallowed every other
+                // press — the details page felt dead.
+                if Date().timeIntervalSince(fullscreenExitedAt) > 1.0 {
+                    fullscreenCooldown = false
+                }
                 if old == nil, let new, new != .play {
                     actionFocus = .play
                 }

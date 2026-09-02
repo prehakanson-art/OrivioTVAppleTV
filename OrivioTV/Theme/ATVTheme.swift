@@ -145,7 +145,9 @@ extension View {
             // tone — identical shape and layout, no per-frame blur.
             self.background(FusionMaterials.dialog, in: shape)
         } else if #available(tvOS 26.0, *) {
-            self.glassEffect(.regular, in: shape)
+            // BACKGROUND glass, never wrapping: a `glassEffect` wrapped around
+            // focusable content can hide it from the focus engine.
+            self.background(Color.clear.glassEffect(.regular, in: shape))
         } else {
             self.background(.regularMaterial, in: shape)
         }

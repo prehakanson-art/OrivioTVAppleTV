@@ -1421,12 +1421,29 @@ struct HeroGradient: View {
 
 // MARK: - Loading / error states
 
+/// An invisible 1pt focusable. Put one in any state that would otherwise have
+/// NO focusable view (loading screens, QR sign-in pages): with nothing focused
+/// the tvOS focus engine has no responder, so `.onExitCommand` never fires and
+/// a Menu press falls through to the system — suspending the app at a root, or
+/// bypassing a page's own Back handling.
+struct FocusAnchor: View {
+    var body: some View {
+        Color.clear
+            .frame(width: 1, height: 1)
+            .focusable()
+            .accessibilityHidden(true)
+    }
+}
+
 struct OrivioLoadingView: View {
     @EnvironmentObject private var theme: ThemeManager
     var label: String = "Loading"
+    /// Hold focus while this is the only thing on screen (see FocusAnchor).
+    var holdsFocus: Bool = false
 
     var body: some View {
         VStack(spacing: OrivioSpacing.lg) {
+            if holdsFocus { FocusAnchor() }
             ProgressView()
                 .tint(theme.palette.secondary)
                 .scaleEffect(1.4)

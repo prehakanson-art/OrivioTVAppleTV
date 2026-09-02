@@ -158,7 +158,11 @@ struct FusionPlayerControlsOverlay: View {
             if viewModel.moveSuppressed { return }
             switch direction {
             case .down: focusedControl = .bar
-            case .up: viewModel.restartHideTimer()
+            // Up with the options panel open re-enters it — Down out of its
+            // last row lands here, and the panel was otherwise unreachable.
+            case .up:
+                if viewModel.optionsPopupVisible { focusedControl = .row(0) }
+                else { viewModel.restartHideTimer() }
             // Left/right still seek from here — the button isn't a mode you
             // have to escape first.
             case .left: viewModel.barDirectionalPress(forward: false)
@@ -204,7 +208,7 @@ struct FusionPlayerControlsOverlay: View {
             switch direction {
             case .left: viewModel.barDirectionalPress(forward: false)
             case .right: viewModel.barDirectionalPress(forward: true)
-            case .up: focusedControl = .options
+            case .up: focusedControl = viewModel.optionsPopupVisible ? .row(0) : .options
             // Down drops into the scrub view — the only route to the preview
             // frames and the fine-tune wheel from the controls.
             case .down: viewModel.beginScrub()

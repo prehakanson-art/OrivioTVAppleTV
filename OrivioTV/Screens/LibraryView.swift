@@ -121,7 +121,9 @@ struct LibraryView: View {
     /// Back deep in the grid scrolls to (and focuses) the first poster; a second
     /// Back — already at the top — leaves the screen via `onBackAtRoot`.
     private func backToTop(_ proxy: ScrollViewProxy) {
-        guard let first = firstItemID, focusedID != first else {
+        // `focusedID` is nil while the chips / Sort pill hold focus — Back from
+        // there leaves the screen; it used to yank focus down into the grid.
+        guard let first = firstItemID, let focused = focusedID, focused != first else {
             onBackAtRoot(); return
         }
         withAnimation(FusionMotion.focusMove) { proxy.scrollTo(first, anchor: .top) }

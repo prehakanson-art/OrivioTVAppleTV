@@ -639,7 +639,8 @@ private struct CommunityCollectionCard: View {
                 }
             }
             .buttonStyle(PlainCardButtonStyle())
-            .disabled(isInstalling)
+            // Not `.disabled(isInstalling)`: that disables the button you just
+            // pressed and drops focus; `install(_:)` already ignores re-presses.
         }
         .padding(OrivioSpacing.lg)
         .background(

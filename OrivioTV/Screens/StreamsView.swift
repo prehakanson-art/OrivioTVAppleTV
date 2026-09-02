@@ -762,11 +762,11 @@ struct StreamsView: View {
     @ViewBuilder
     private var sourcesPanel: some View {
         if autoLinkResolving {
-            OrivioLoadingView(label: "Finding the best source…")
+            OrivioLoadingView(label: "Finding the best source…", holdsFocus: true)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if viewModel.groups.isEmpty {
             if viewModel.isLoading {
-                OrivioLoadingView(label: streamCountLabel)
+                OrivioLoadingView(label: streamCountLabel, holdsFocus: true)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 VStack(spacing: OrivioSpacing.lg) {

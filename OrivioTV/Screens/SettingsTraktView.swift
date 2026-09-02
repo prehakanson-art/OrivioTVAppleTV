@@ -327,6 +327,9 @@ struct TraktConnectPage: View {
             Text("Press Menu to cancel")
                 .font(.system(size: 20))
                 .foregroundStyle(theme.palette.textTertiary)
+            // Nothing else here is focusable; without this Menu never reaches
+            // the presenter's onExitCommand.
+            FocusAnchor()
         }
         .padding(OrivioSpacing.huge)
         .frame(maxWidth: .infinity, maxHeight: .infinity)

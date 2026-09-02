@@ -747,6 +747,11 @@ struct HomeView: View {
     /// engine can end up holding NOTHING — then Menu falls through to tvOS and
     /// suspends the app.
     @FocusState private var heroPlayFocused: Bool
+    /// Initial focus is seeded ONCE per mount. `reload()` also runs on every
+    /// add-on / collection / catalog-settings change (account sync fires those
+    /// in the background), and re-seeding there yanked focus out of whatever
+    /// row you were browsing back up to the hero.
+    @State private var didSeedHeroFocus = false
     @State private var nextUpContinueItems: [WatchProgress] = []
 
     /// Drives the Apple TV hero's spotlight rotation. Ticks every 2s; the hero
@@ -878,7 +883,8 @@ struct HomeView: View {
         hero.setSpotlight(viewModel.spotlightItems(max: 10))
         onContentReady()
         // Land initial focus on the hero's Play button (see heroPlayFocused).
-        if hero.item != nil && perf.settings.heroBackdrop {
+        if !didSeedHeroFocus, hero.item != nil && perf.settings.heroBackdrop {
+            didSeedHeroFocus = true
             try? await Task.sleep(nanoseconds: 100_000_000)
             heroPlayFocused = true
         }
@@ -1599,6 +1605,9 @@ private struct HomeLoadingBackdrop: View {
         // .background (which doesn't affect layout) rather than a ZStack child,
         // where scaledToFill would blow past the strip and bleed over the rows.
         VStack(alignment: .leading, spacing: OrivioSpacing.md) {
+            // Holds focus while Home has nothing else to: with NOTHING focused a
+            // Menu press falls through to tvOS and suspends the app.
+            FocusAnchor()
             ForEach(Array(steps.enumerated()), id: \.offset) { index, label in
                 HStack(spacing: OrivioSpacing.md) {
                     icon(for: index)
@@ -1873,7 +1882,11 @@ private struct ATVHeroInfoView: View {
                     onPlay(item)
                 }
                 .focused(playFocus)
-                .onFocusChange { focused in
+                // NOT `.onFocusChange`: `\.isFocused` resolves inside the
+                // focusable Button, not on a modifier wrapped around it, so
+                // that never fired and the spotlight kept rotating under a
+                // focused Play button (Select then opened the wrong title).
+                .onChange(of: playFocus.wrappedValue) { _, focused in
                     hero.heroButtonFocused = focused
                     if focused { hero.markInteraction() }
                 }

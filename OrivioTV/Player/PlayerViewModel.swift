@@ -3372,7 +3372,13 @@ final class PlayerViewModel: ObservableObject {
     }
 
     func hideControls() {
-        if overlay == .controls { overlay = .none }
+        if overlay == .controls {
+            // Never leave the options panel flagged open under bare video: the
+            // next showControls would draw it with focus on the bar and no
+            // way back into it.
+            optionsPopupVisible = false
+            overlay = .none
+        }
     }
 
     func restartHideTimer() {
@@ -3394,7 +3400,10 @@ final class PlayerViewModel: ObservableObject {
             // Keep the transport up while a fast-forward/rewind preview is
             // active (so the moving playhead stays visible); otherwise hide once
             // idle + playing.
-            if overlay == .controls, isPlaying, scanPreview == nil {
+            // ...and never while the options panel is open — hiding then
+            // unmounts the panel with focus inside it and leaves it flagged
+            // visible, so it came back orphaned (drawn, unreachable).
+            if overlay == .controls, isPlaying, scanPreview == nil, !optionsPopupVisible {
                 overlay = .none
             }
         }
