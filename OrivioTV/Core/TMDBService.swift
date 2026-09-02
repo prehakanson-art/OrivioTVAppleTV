@@ -875,18 +875,48 @@ enum TMDBService {
         }
 
         var detail = Detail()
-        detail.cast = (body.credits?.cast ?? []).prefix(24).map {
+        var castMembers = (body.credits?.cast ?? []).prefix(24).map {
             CastMember(id: $0.id, name: $0.name, character: $0.character,
                        profileURL: imageURL($0.profile_path, size: "w300"))
         }
-        // Director + writers first (shown ahead of the cast in "Creator and Cast").
+        // Director + writers first (shown ahead of the cast in "Creator and
+        // Cast"), ONE ENTRY PER PERSON.
+        //
+        // TMDB lists a writer-director once per job, and a crew member can also
+        // be billed in the cast — so the row that renders `crew + cast` used to
+        // get duplicate identifiers for any auteur title (Nolan, the Coens, an
+        // actor-director like Eastwood), which is undefined behaviour in a
+        // SwiftUI ForEach. Merge each person's jobs into one label, fold in
+        // their acting credit, and take four PEOPLE rather than four credits.
         let crew = body.credits?.crew ?? []
         let importantJobs = ["Director", "Writer", "Screenplay", "Creator"]
-        detail.crew = crew
-            .filter { importantJobs.contains($0.job ?? "") }
-            .prefix(4)
-            .map { CastMember(id: $0.id, name: $0.name, character: $0.job,
-                              profileURL: imageURL($0.profile_path, size: "w300")) }
+        var crewOrder: [Int] = []
+        var crewJobs: [Int: [String]] = [:]
+        var crewInfo: [Int: (name: String, profile: String?)] = [:]
+        for member in crew where importantJobs.contains(member.job ?? "") {
+            let job = member.job ?? ""
+            if crewJobs[member.id] == nil {
+                crewOrder.append(member.id)
+                crewJobs[member.id] = [job]
+                crewInfo[member.id] = (member.name, imageURL(member.profile_path, size: "w300"))
+            } else if !(crewJobs[member.id]?.contains(job) ?? true) {
+                crewJobs[member.id]?.append(job)
+            }
+        }
+        detail.crew = crewOrder.prefix(4).compactMap { id -> CastMember? in
+            guard let info = crewInfo[id], let jobs = crewJobs[id] else { return nil }
+            var label = jobs.joined(separator: ", ")
+            // Also in the cast: keep the character here so nothing is lost when
+            // the duplicate entry is dropped below.
+            if let character = castMembers.first(where: { $0.id == id })?.character,
+               !character.isEmpty {
+                label += " · \(character)"
+            }
+            return CastMember(id: id, name: info.name, character: label, profileURL: info.profile)
+        }
+        let crewIDs = Set(detail.crew.map(\.id))
+        castMembers.removeAll { crewIDs.contains($0.id) }
+        detail.cast = castMembers
         detail.director = crew.first { $0.job == "Director" }?.name
             ?? crew.first { $0.job == "Creator" }?.name
         detail.country = body.production_countries?.first?.name

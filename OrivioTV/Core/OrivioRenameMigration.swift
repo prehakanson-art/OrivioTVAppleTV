@@ -32,13 +32,36 @@ enum OrivioRenameMigration {
     /// the new name always win (a newer build may already have written there).
     private static func migrateDefaults(_ defaults: UserDefaults) {
         var moved = 0
+        var reclaimed = 0
         for (key, value) in defaults.dictionaryRepresentation() where key.hasPrefix(legacyPrefix) {
             let newKey = currentPrefix + key.dropFirst(legacyPrefix.count)
-            guard defaults.object(forKey: newKey) == nil else { continue }
-            defaults.set(value, forKey: newKey)
-            moved += 1
+            if defaults.object(forKey: newKey) == nil {
+                defaults.set(value, forKey: newKey)
+                moved += 1
+            }
+            // Small settings keys stay behind so a downgrade still finds them.
+            // BIG ones cannot: this domain has already hit CFPreferences'
+            // TOO_MUCH_DATA abort at around a megabyte (see CollectionsStore),
+            // and keeping a second copy of the collections blob — ~900 KB on a
+            // real account — parks the app permanently next to that limit for
+            // the sake of a downgrade nobody performs.
+            if Self.byteSize(of: value) > 65_536 {
+                defaults.removeObject(forKey: key)
+                reclaimed += 1
+            }
         }
-        NSLog("[OrivioMigration] carried over %d preference keys", moved)
+        NSLog("[OrivioMigration] carried over %d preference keys, reclaimed %d oversized legacy ones",
+              moved, reclaimed)
+    }
+
+    /// Rough encoded size of a defaults value; only large blobs matter here.
+    private static func byteSize(of value: Any) -> Int {
+        if let data = value as? Data { return data.count }
+        if let string = value as? String { return string.utf8.count }
+        if let plist = try? PropertyListSerialization.data(
+            fromPropertyList: value, format: .binary, options: 0
+        ) { return plist.count }
+        return 0
     }
 
     /// Rename the disk caches so a warm install keeps its posters and its

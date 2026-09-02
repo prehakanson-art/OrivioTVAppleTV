@@ -21,6 +21,32 @@ struct ScraperManifestInfo: Codable, Hashable {
     var supportedTypes: [String] = ["movie", "tv"]
     var enabled: Bool = true
     var logo: String?
+
+    init(id: String, name: String, description: String? = nil, version: String,
+         filename: String, supportedTypes: [String] = ["movie", "tv"],
+         enabled: Bool = true, logo: String? = nil) {
+        self.id = id; self.name = name; self.description = description
+        self.version = version; self.filename = filename
+        self.supportedTypes = supportedTypes; self.enabled = enabled; self.logo = logo
+    }
+
+    /// Swift's SYNTHESIZED decoder ignores property defaults and demands every
+    /// non-optional key. These repo manifests are written for the Android/Gson
+    /// side, where the same fields are optional — so a manifest omitting
+    /// `enabled`, `supportedTypes` or `version` failed to decode and the user
+    /// saw "Couldn't add repository: The data couldn't be read", with no clue
+    /// which field was missing. Decode the optional-by-intent ones leniently.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        description = try c.decodeIfPresent(String.self, forKey: .description)
+        version = try c.decodeIfPresent(String.self, forKey: .version) ?? "0"
+        filename = try c.decode(String.self, forKey: .filename)
+        supportedTypes = try c.decodeIfPresent([String].self, forKey: .supportedTypes) ?? ["movie", "tv"]
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        logo = try c.decodeIfPresent(String.self, forKey: .logo)
+    }
 }
 
 struct PluginManifest: Codable {
@@ -29,6 +55,16 @@ struct PluginManifest: Codable {
     var description: String?
     var author: String?
     let scrapers: [ScraperManifestInfo]
+
+    /// Same leniency as above: only `name` and `scrapers` are truly required.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        version = try c.decodeIfPresent(String.self, forKey: .version) ?? "0"
+        description = try c.decodeIfPresent(String.self, forKey: .description)
+        author = try c.decodeIfPresent(String.self, forKey: .author)
+        scrapers = try c.decodeIfPresent([ScraperManifestInfo].self, forKey: .scrapers) ?? []
+    }
 }
 
 /// An installed scraper: manifest info + which repo it came from + local enable

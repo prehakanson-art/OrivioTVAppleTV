@@ -8,24 +8,41 @@ final class DiscoverViewModel: ObservableObject {
     private var seen = Set<String>()
     private var current: (addon: InstalledAddon, catalog: ManifestCatalog)?
     private var genre: String?
+    /// Bumped by every `reset`. The grid's "load the next page" trigger lives on
+    /// the last cell and fires an unstructured Task that nothing cancels, so a
+    /// page request routinely outlives the selection that started it.
+    private var generation = 0
 
     func reset(addon: InstalledAddon, catalog: ManifestCatalog, genre: String?) async {
+        generation += 1
         current = (addon, catalog)
         self.genre = genre
         items = []
         seen = []
         reachedEnd = false
+        // Deliberately NOT waiting on the in-flight page: `loadMore` is gated on
+        // `isLoading`, so leaving it set meant the new selection never fetched
+        // anything. The grid was then empty, and the only thing that retriggers
+        // a load is the last cell appearing — of which there were none, so
+        // "Nothing here" stuck until the selectors were changed again.
+        isLoading = false
         await loadMore()
     }
 
     func loadMore() async {
         guard let current, !isLoading, !reachedEnd else { return }
+        let token = generation
         isLoading = true
-        defer { isLoading = false }
         let page = (try? await StremioAPI.catalog(
             addon: current.addon, catalog: current.catalog,
             genre: genre, skip: items.count
         )) ?? []
+        // The selection changed while this page was loading. Its items belong to
+        // a catalog nobody is looking at, and its emptiness (a cancelled request
+        // returns []) must not mark the NEW selection as finished. Leave
+        // `isLoading` alone too — it now belongs to the newer request.
+        guard token == generation else { return }
+        isLoading = false
         let fresh = page.filter { seen.insert($0.id + $0.type).inserted }
         if fresh.isEmpty { reachedEnd = true } else { items.append(contentsOf: fresh) }
     }

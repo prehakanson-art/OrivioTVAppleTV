@@ -268,10 +268,21 @@ struct StremioAddonDescriptor: Codable {
         if value.hasPrefix("stremio://") {
             value = value.replacingOccurrences(of: "stremio://", with: "https://")
         }
+        // Split any query/fragment off BEFORE deciding. A configured addon's
+        // manifest routinely carries one (…/manifest.json?token=…), and
+        // appending to the whole string produced
+        // "…/manifest.json?token=…/manifest.json" — an addon that can never be
+        // installed, and whose `baseURL` then equals its manifest URL so every
+        // catalog/meta/stream request is malformed too.
+        var suffix = ""
+        if let mark = value.firstIndex(where: { $0 == "?" || $0 == "#" }) {
+            suffix = String(value[mark...])
+            value = String(value[value.startIndex..<mark])
+        }
         if !value.hasSuffix("manifest.json") {
             value = value.hasSuffix("/") ? value + "manifest.json" : value + "/manifest.json"
         }
-        return value
+        return value + suffix
     }
 }
 

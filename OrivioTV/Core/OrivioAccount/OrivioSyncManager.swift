@@ -1583,7 +1583,15 @@ final class OrivioSyncManager: ObservableObject {
     /// ~1000 folders on a real account) and is only needed to migrate packs
     /// that predate the shared library — repeating it on every 30s sync froze
     /// the Apple TV 4K gen 1.
-    private var adoptedAllProfileCollections = false
+    /// Persisted, not in-memory: as a plain property the "one-time" scan ran
+    /// again on every launch, re-adopting collections the user had since
+    /// deleted and re-reading every profile's row on the first sync each time.
+    /// Lives under `orivio.sync.` so a different account signing in re-adopts.
+    private static let adoptedCollectionsKey = "orivio.sync.adoptedAllProfileCollections.v1"
+    private var adoptedAllProfileCollections: Bool {
+        get { UserDefaults.standard.bool(forKey: Self.adoptedCollectionsKey) }
+        set { UserDefaults.standard.set(newValue, forKey: Self.adoptedCollectionsKey) }
+    }
 
     private func pullCollections() async throws {
         guard let userID = account.currentUserID else { return }

@@ -202,6 +202,13 @@ struct InstalledAddon: Codable, Identifiable, Hashable {
 
     var baseURL: String {
         var base = manifestURL
+        // Drop any query/fragment first. A configured addon's manifest can carry
+        // one, and without this the suffix test below failed, `baseURL` came
+        // back EQUAL to the manifest URL, and every resource request was built
+        // as "…/manifest.json?token=…/catalog/…".
+        if let mark = base.firstIndex(where: { $0 == "?" || $0 == "#" }) {
+            base = String(base[base.startIndex..<mark])
+        }
         if base.hasSuffix("/manifest.json") {
             base = String(base.dropLast("/manifest.json".count))
         }

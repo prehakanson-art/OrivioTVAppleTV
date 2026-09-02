@@ -158,7 +158,14 @@ enum SourceSelection {
     private static func dedupe(_ entries: [StreamEntry]) -> [StreamEntry] {
         var seen = Set<String>()
         return entries.filter { entry in
-            let key = entry.stream.url ?? entry.stream.infoHash ?? entry.id.uuidString
+            // `fileIdx` is part of the identity: two streams can share an
+            // infoHash and point at DIFFERENT files of the same torrent (season
+            // packs, multi-film collections). Keyed on the hash alone they
+            // collapsed to whichever came first, so the pack offered one episode.
+            var key = entry.stream.url ?? entry.stream.infoHash ?? entry.id.uuidString
+            if entry.stream.url == nil, let index = entry.stream.fileIdx {
+                key += "#\(index)"
+            }
             return seen.insert(key).inserted
         }
     }

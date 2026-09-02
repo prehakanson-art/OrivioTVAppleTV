@@ -210,8 +210,34 @@ final class ProfileStore: ObservableObject {
         profiles.removeAll { $0.id == id }
         onProfileDeleted?(id)
         saveList()
+        // Switch away BEFORE purging, so no store still pointed at this profile
+        // can write its keys back out after the sweep.
         if activeProfileID == id { setActive(1) }
+        purgeProfileData(id: id)
         notifyChange()
+    }
+
+    /// Retire every per-profile key belonging to a deleted profile.
+    ///
+    /// Each per-profile store namespaces its storage with a `.p<id>` suffix
+    /// (profile 1 keeps the original unsuffixed key, and cannot be deleted), so
+    /// one sweep covers all of it: watch progress, library, watched history,
+    /// collection visibility, home layout, ratings, that profile's Trakt login
+    /// and the account-sync bookkeeping.
+    ///
+    /// Without this the data outlived the profile while `addProfile` hands out
+    /// the LOWEST free id — so the next profile created inherited the deleted
+    /// one's Continue Watching, library and watch history.
+    private func purgeProfileData(id: Int) {
+        guard id != 1 else { return }
+        let suffix = ".p\(id)"
+        let defaults = UserDefaults.standard
+        var removed = 0
+        for key in defaults.dictionaryRepresentation().keys where key.hasSuffix(suffix) {
+            defaults.removeObject(forKey: key)
+            removed += 1
+        }
+        NSLog("[OrivioProfiles] deleted profile %d — retired %d stored keys", id, removed)
     }
 
     /// A second switch hook, for state that must rescope even when signed out

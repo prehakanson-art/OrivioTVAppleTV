@@ -877,7 +877,7 @@ struct StreamsView: View {
             // others (TorBox / RD / PM / AD).
             let (result, resolvedBy) = await DebridService.resolveAcross(
                 stream: entry.stream,
-                providers: debrid.orderedResolvers,
+                providers: await debrid.resolversRefreshingIfNeeded(),
                 season: viewModel.video?.season,
                 episode: viewModel.video?.episode
             )

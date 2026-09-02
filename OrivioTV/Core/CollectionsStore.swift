@@ -385,6 +385,19 @@ final class CollectionsStore: ObservableObject {
     private static let globalHiddenFoldersKey = "orivio.collections.hiddenFolders.global.v1"
     private static let globalHiddenCollectionsKey = "orivio.collections.hidden.global.v1"
 
+    /// Collections the user deleted from the account.
+    ///
+    /// Neither remote path carries a deletion: `mergeIntoLibrary` is a pure
+    /// union, and the legacy per-profile rows it serves keep arriving on every
+    /// sync (Android still writes them). Without a tombstone a deleted
+    /// collection simply came back on the next sync, on every device, forever.
+    ///
+    /// Account-wide, like the library itself. A tombstone is dropped as soon as
+    /// the user re-adds that collection, or once a remote snapshot stops listing
+    /// it — at which point the delete has propagated and it has done its job.
+    private var removedIDs: Set<String> = []
+    private static let removedKey = "orivio.collections.removed.v1"
+
     init() {
         load()
     }
@@ -402,6 +415,8 @@ final class CollectionsStore: ObservableObject {
     /// Add to the shared library. Visible on every profile that hasn't hidden
     /// it — including the ones that didn't add it.
     func add(_ collection: OrivioCollection) {
+        // Adding it back is an explicit undo of the delete.
+        if removedIDs.remove(collection.id) != nil { saveRemoved() }
         library.append(collection)
         save()
         recomputeVisible()
@@ -421,6 +436,8 @@ final class CollectionsStore: ObservableObject {
     func remove(id: String) {
         library.removeAll { $0.id == id }
         hiddenIDs.remove(id)
+        removedIDs.insert(id)
+        saveRemoved()
         save()
         recomputeVisible()
         notifyLocalChange()
@@ -490,10 +507,12 @@ final class CollectionsStore: ObservableObject {
         // Applies to the shared LIBRARY. Same guards as before: an empty remote
         // while we hold data is a race, not a clear-all; identical is a no-op.
         if remote.isEmpty && !library.isEmpty { return false }
-        guard remote != library else { return false }
+        pruneRemovedTombstones(against: remote)
+        let filtered = removedIDs.isEmpty ? remote : remote.filter { !removedIDs.contains($0.id) }
+        guard filtered != library else { return false }
         suppressChange = true
         defer { suppressChange = false }
-        library = remote
+        library = filtered
         save()
         recomputeVisible()
         return true
@@ -507,9 +526,14 @@ final class CollectionsStore: ObservableObject {
     @discardableResult
     func mergeIntoLibrary(_ remote: [OrivioCollection]) -> Bool {
         guard !remote.isEmpty else { return false }
+        // Never re-adopt something the user deleted: this path has no delete
+        // semantics of its own, so a tombstone is the only thing standing
+        // between a removed collection and its return on the next sync.
+        let incoming = removedIDs.isEmpty ? remote : remote.filter { !removedIDs.contains($0.id) }
+        guard !incoming.isEmpty else { return false }
         var byTitle: [String: OrivioCollection] = [:]
         var order: [String] = []
-        for c in library + remote {
+        for c in library + incoming {
             let key = c.title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             if let existing = byTitle[key] {
                 if Self.richness(c) > Self.richness(existing) { byTitle[key] = c }
@@ -653,6 +677,7 @@ final class CollectionsStore: ObservableObject {
         hiddenFolderIDs = Set(UserDefaults.standard.stringArray(forKey: hiddenFoldersKey) ?? [])
         globalHiddenFolderIDs = Set(UserDefaults.standard.stringArray(forKey: Self.globalHiddenFoldersKey) ?? [])
         globalHiddenIDs = Set(UserDefaults.standard.stringArray(forKey: Self.globalHiddenCollectionsKey) ?? [])
+        removedIDs = Set(UserDefaults.standard.stringArray(forKey: Self.removedKey) ?? [])
 
         // The LIBRARY is not: ~700 KB of nested JSON (493 folders on a real
         // account). Decoding it synchronously here — this runs from the store's
@@ -750,6 +775,24 @@ final class CollectionsStore: ObservableObject {
         write(hiddenFolderIDs, hiddenFoldersKey)
         write(globalHiddenFolderIDs, Self.globalHiddenFoldersKey)
         write(globalHiddenIDs, Self.globalHiddenCollectionsKey)
+    }
+
+    private func saveRemoved() {
+        if removedIDs.isEmpty {
+            UserDefaults.standard.removeObject(forKey: Self.removedKey)
+        } else {
+            UserDefaults.standard.set(Array(removedIDs), forKey: Self.removedKey)
+        }
+    }
+
+    /// A remote snapshot that no longer lists a tombstoned id means our delete
+    /// landed; keep only the tombstones still fighting a live remote row.
+    private func pruneRemovedTombstones(against remote: [OrivioCollection]) {
+        guard !removedIDs.isEmpty else { return }
+        let survivors = removedIDs.intersection(Set(remote.map(\.id)))
+        guard survivors != removedIDs else { return }
+        removedIDs = survivors
+        saveRemoved()
     }
 
     private func save() {

@@ -948,6 +948,16 @@ struct RootView: View {
     /// Selector auto-play, so backing out of the player returns to the title
     /// page. Safe here because the player has fully closed by now. The player
     /// covers the stack while it's up, so the top entry is still the source page.
+    /// Run a deferred auto-play pop now, for the paths that never open the
+    /// in-app player. Deferred by one runloop turn for the same reason the
+    /// player's `onDismiss` defers it: mutating the NavigationStack path while
+    /// the source view's own resolve Task is still unwinding desyncs the stack.
+    private func consumePendingAutoPlayPop() {
+        guard pendingAutoPlayPop else { return }
+        pendingAutoPlayPop = false
+        DispatchQueue.main.async { popActivePathForAutoPlay() }
+    }
+
     private func popActivePathForAutoPlay() {
         switch selectedTab {
         case 0: if !homePath.isEmpty { homePath.removeLast() }
@@ -964,6 +974,11 @@ struct RootView: View {
             let chosen = ExternalPlayers.player(id: playerSettings.settings.externalPlayerID)
             let target = (chosen?.isInstalled == true ? chosen : nil) ?? ExternalPlayers.installed.first
             if let target {
+                // No in-app player cover opens on this path, so nothing will
+                // ever consume a deferred auto-play pop. Left set, it fires
+                // against the WRONG screen the next time any in-app playback
+                // ends, throwing the viewer back one page too far.
+                consumePendingAutoPlayPop()
                 if playerSettings.settings.externalPlayerForwardSubtitles {
                     // Fetch a preferred-language subtitle, then hand off (async).
                     Task {

@@ -345,11 +345,14 @@ struct PlayerScreen: View {
             // switched to (and failed over to) mid-playback. Tries every
             // configured provider, preferred first, like the Sources page.
             if debrid.resolverProvider != nil {
-                let resolvers = debrid.orderedResolvers
-                viewModel.torrentResolver = { [weak viewModel] stream in
+                // Ask the store per call rather than snapshotting the keys here:
+                // a Real-Debrid token refreshed during a long session would
+                // otherwise leave this closure holding the expired one for the
+                // rest of playback.
+                viewModel.torrentResolver = { [weak viewModel, debrid] stream in
                     let (result, _) = await DebridService.resolveAcross(
                         stream: stream,
-                        providers: resolvers,
+                        providers: await debrid.resolversRefreshingIfNeeded(),
                         season: viewModel?.currentVideo?.season,
                         episode: viewModel?.currentVideo?.episode
                     )

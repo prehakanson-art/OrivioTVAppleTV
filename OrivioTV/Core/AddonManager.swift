@@ -35,10 +35,21 @@ final class AddonManager: ObservableObject {
         if s.hasPrefix("stremio://") {
             s = s.replacingOccurrences(of: "stremio://", with: "https://")
         }
+        // Split any query/fragment off BEFORE deciding. A configured addon's
+        // manifest routinely carries one (…/manifest.json?token=…), and
+        // appending to the whole string produced
+        // "…/manifest.json?token=…/manifest.json" — an addon that can never be
+        // installed, and whose `baseURL` then equals its manifest URL so every
+        // catalog/meta/stream request is malformed too.
+        var suffix = ""
+        if let mark = s.firstIndex(where: { $0 == "?" || $0 == "#" }) {
+            suffix = String(s[mark...])
+            s = String(s[s.startIndex..<mark])
+        }
         if !s.hasSuffix("manifest.json") {
             s = s.hasSuffix("/") ? s + "manifest.json" : s + "/manifest.json"
         }
-        return s
+        return s + suffix
     }
 
     /// Applies the account's addon list.

@@ -1060,7 +1060,8 @@ struct HomeView: View {
             .map(\.id)
             .sorted()
             .joined(separator: "|")
-        return "\(watchedKey)#\(progressKey)#\(homeCatalogSettings.showUnairedNextUp)"
+        let dismissedKey = progressStore.dismissedNextUpShows.sorted().joined(separator: "|")
+        return "\(watchedKey)#\(progressKey)#\(homeCatalogSettings.showUnairedNextUp)#\(dismissedKey)"
     }
 
     private func mergedContinueItems() -> [WatchProgress] {
@@ -1077,6 +1078,9 @@ struct HomeView: View {
             .sorted { $0.watchedAt > $1.watchedAt }
             .deduplicatedByContentID()
             .filter { !activeMetaIDs.contains($0.contentID) }
+            // Removed from Continue Watching means removed, including the
+            // synthesised suggestion that would otherwise replace the card.
+            .filter { !progressStore.dismissedNextUpShows.contains($0.contentID) }
             .prefix(20)
 
         var rows: [WatchProgress] = []
@@ -1098,14 +1102,21 @@ struct HomeView: View {
         func isWatched(_ episode: MetaVideo) -> Bool {
             watched.isWatched(contentID: meta.id, season: episode.season ?? 0, episode: episode.episode)
         }
+        // "Show unaired Next Up" was in this row's refresh key but never in the
+        // selection, so Home offered an episode airing next week — with no
+        // streams behind it — while Detail's Play button, which does honour the
+        // setting, offered something watchable for the very same show.
+        func isEligible(_ episode: MetaVideo) -> Bool {
+            homeCatalogSettings.showUnairedNextUp || episode.hasAired
+        }
 
         if homeCatalogSettings.nextUpFromFurthestEpisode,
            let furthestIndex = all.lastIndex(where: isWatched),
            furthestIndex + 1 < all.endIndex {
-            return all[(furthestIndex + 1)...].first
+            return all[(furthestIndex + 1)...].first(where: isEligible)
         }
 
-        return all.first { !isWatched($0) }
+        return all.first { !isWatched($0) && isEligible($0) }
     }
 
     private func nextUpProgress(meta: MetaItem, episode: MetaVideo, lastWatchedAt: Date) -> WatchProgress {

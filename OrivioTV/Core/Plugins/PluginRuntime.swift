@@ -13,9 +13,14 @@ import JavaScriptCore
 // through that queue hop. `@unchecked` because the compiler can't see that
 // confinement, only the code review can.
 final class PluginRuntime: @unchecked Sendable {
-    /// One serial queue owns the JSContext (JSCore isn't thread-safe); fetch
-    /// completions hop back onto it before touching JS values.
-    private let queue = DispatchQueue(label: "tv.nuvio.plugin.runtime")
+    // A serial queue owns each JSContext (JSCore isn't thread-safe) and fetch
+    // completions hop back onto it before touching JS values — but the queue is
+    // created PER RUN, not shared. One shared queue meant every scraper ran
+    // strictly one at a time (PluginStore's bounded concurrency did nothing),
+    // and a scraper doing long synchronous work blocked every other scraper
+    // behind it. tvOS does not expose JavaScriptCore's execution time limit, so
+    // a runaway script cannot be interrupted; isolating it to its own queue is
+    // what keeps it from taking the rest of the plugins down with it.
     private let session: URLSession = {
         let c = URLSessionConfiguration.default
         c.timeoutIntervalForRequest = 20
@@ -30,9 +35,11 @@ final class PluginRuntime: @unchecked Sendable {
         episode: Int?,
         timeout: TimeInterval = 25
     ) async -> [ScraperResult] {
-        await withCheckedContinuation { continuation in
+        let queue = DispatchQueue(label: "tv.nuvio.plugin.runtime.\(UUID().uuidString)")
+        return await withCheckedContinuation { continuation in
             queue.async { [weak self] in
                 self?.execute(
+                    queue: queue,
                     scraperJS: scraperJS, tmdbID: tmdbID, mediaType: mediaType,
                     season: season, episode: episode, timeout: timeout, continuation: continuation
                 )
@@ -43,19 +50,26 @@ final class PluginRuntime: @unchecked Sendable {
     // MARK: - Execution (runs on `queue`)
 
     private func execute(
+        queue: DispatchQueue,
         scraperJS: String, tmdbID: String, mediaType: String,
         season: Int?, episode: Int?, timeout: TimeInterval,
         continuation: CheckedContinuation<[ScraperResult], Never>
     ) {
         guard let context = JSContext() else { continuation.resume(returning: []); return }
 
+        // Guarded by a lock rather than by the runtime queue, so the safety
+        // timeout below can resume the continuation even when that queue is
+        // wedged by a synchronous script. Hopping onto the queue to resume was
+        // the reason a runaway scraper left its `run()` awaiting forever.
+        let finishLock = NSLock()
         var finished = false
-        let finish: ([ScraperResult]) -> Void = { [weak self] results in
-            self?.queue.async {
-                guard !finished else { return }
-                finished = true
-                continuation.resume(returning: results)
-            }
+        let finish: ([ScraperResult]) -> Void = { results in
+            finishLock.lock()
+            let already = finished
+            finished = true
+            finishLock.unlock()
+            guard !already else { return }
+            continuation.resume(returning: results)
         }
 
         context.exceptionHandler = { _, value in
@@ -63,8 +77,8 @@ final class PluginRuntime: @unchecked Sendable {
         }
 
         installConsole(context)
-        installFetch(context)
-        installTimers(context)
+        installFetch(context, queue: queue)
+        installTimers(context, queue: queue)
         installBase64(context)
 
         // Call args + result capture.
@@ -86,8 +100,13 @@ final class PluginRuntime: @unchecked Sendable {
         // Invoke it and capture the JSON result.
         context.evaluateScript(Self.callGlue)
 
-        // Safety timeout: if the scraper never resolves, return nothing.
-        queue.asyncAfter(deadline: .now() + timeout) { finish([]) }
+        // Safety timeout. Scheduled OFF the runtime queue: posted onto it, a
+        // scraper doing long synchronous work held the queue and its own timeout
+        // could never run — so its `run()` continuation never resumed and every
+        // plugin queued behind it was stuck until relaunch.
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout + 1) {
+            finish([])
+        }
     }
 
     // MARK: Host bindings
@@ -106,7 +125,7 @@ final class PluginRuntime: @unchecked Sendable {
 
     /// `__nativeFetch(url, method, headersJson, body, resolve, reject)` runs a
     /// URLSession request and calls back into JS on the runtime queue.
-    private func installFetch(_ context: JSContext) {
+    private func installFetch(_ context: JSContext, queue: DispatchQueue) {
         let fetch: @convention(block) (String, String, String, String, JSValue, JSValue) -> Void = {
             [weak self] urlString, method, headersJson, body, resolve, reject in
             guard let self, let url = URL(string: urlString) else {
@@ -121,7 +140,7 @@ final class PluginRuntime: @unchecked Sendable {
             if !body.isEmpty, method.uppercased() != "GET" { request.httpBody = body.data(using: .utf8) }
 
             self.session.dataTask(with: request) { data, response, error in
-                self.queue.async {
+                queue.async {
                     if let error {
                         reject.call(withArguments: [error.localizedDescription]); return
                     }
@@ -146,9 +165,9 @@ final class PluginRuntime: @unchecked Sendable {
         context.setObject(fetch, forKeyedSubscript: "__nativeFetch" as NSString)
     }
 
-    private func installTimers(_ context: JSContext) {
-        let setTimeout: @convention(block) (JSValue, Double) -> Void = { [weak self] fn, ms in
-            self?.queue.asyncAfter(deadline: .now() + max(0, ms) / 1000) {
+    private func installTimers(_ context: JSContext, queue: DispatchQueue) {
+        let setTimeout: @convention(block) (JSValue, Double) -> Void = { fn, ms in
+            queue.asyncAfter(deadline: .now() + max(0, ms) / 1000) {
                 fn.call(withArguments: [])
             }
         }

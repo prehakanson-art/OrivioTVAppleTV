@@ -32,26 +32,57 @@ enum DiagnosticsService {
             .appendingPathComponent("OrivioCache", isDirectory: true)
     }
 
-    /// Total bytes of the NuvioCache directory (source lists, meta, images…).
-    static func cacheSize() -> Int64 {
-        guard let e = FileManager.default.enumerator(
-            at: cacheRoot, includingPropertiesForKeys: [.fileSizeKey]
-        ) else { return 0 }
+    /// Entries under the cache root that are NOT caches.
+    ///
+    /// The collections library is the user's own content (a signed-out user has
+    /// no other copy), and the plugin JS bodies have no re-download path once
+    /// removed — `PluginStore.streams()` just returns [] for every scraper until
+    /// the repo is removed and re-added. "Clear cache" used to delete the whole
+    /// tree, so it silently wiped custom collections and disabled every plugin.
+    private static let protectedEntries: Set<String> = [
+        "collections-library.json",   // CollectionsStore.libraryFileURL
+        "scrapers"                    // PluginStore.jsCache — plugin JS bodies
+    ]
+
+    private static func size(of url: URL) -> Int64 {
+        let fm = FileManager.default
+        var isDirectory: ObjCBool = false
+        guard fm.fileExists(atPath: url.path, isDirectory: &isDirectory) else { return 0 }
+        guard isDirectory.boolValue else {
+            return Int64((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+        }
+        guard let e = fm.enumerator(at: url, includingPropertiesForKeys: [.fileSizeKey]) else { return 0 }
         var total: Int64 = 0
-        for case let url as URL in e {
-            total += Int64((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+        for case let child as URL in e {
+            total += Int64((try? child.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
         }
         return total
+    }
+
+    /// Bytes the "Clear cache" button would actually free — so the number the
+    /// user reads matches what pressing it does.
+    static func cacheSize() -> Int64 {
+        let contents = (try? FileManager.default.contentsOfDirectory(
+            at: cacheRoot, includingPropertiesForKeys: nil
+        )) ?? []
+        return contents
+            .filter { !protectedEntries.contains($0.lastPathComponent) }
+            .reduce(0) { $0 + size(of: $1) }
     }
 
     static func cacheSizeLabel() -> String {
         ByteCountFormatter.string(fromByteCount: cacheSize(), countStyle: .file)
     }
 
-    /// Clear all app caches: the on-disk NuvioCache tree + the shared URL cache.
+    /// Clear the app's caches: everything under the cache root EXCEPT the
+    /// entries above, plus the shared URL cache.
     static func clearCaches() {
-        try? FileManager.default.removeItem(at: cacheRoot)
-        try? FileManager.default.createDirectory(at: cacheRoot, withIntermediateDirectories: true)
+        let fm = FileManager.default
+        let contents = (try? fm.contentsOfDirectory(at: cacheRoot, includingPropertiesForKeys: nil)) ?? []
+        for url in contents where !protectedEntries.contains(url.lastPathComponent) {
+            try? fm.removeItem(at: url)
+        }
+        try? fm.createDirectory(at: cacheRoot, withIntermediateDirectories: true)
         URLCache.shared.removeAllCachedResponses()
     }
 }

@@ -376,18 +376,57 @@ final class TraktSyncManager: ObservableObject {
     /// A usable access token. If a health check fails we TRY to refresh, but if
     /// refresh isn't possible we still return the existing token and let the
     /// real calls run — a flaky settings check must not disable the whole sync.
+    /// The token most recently proven good, and when. Every push path calls
+    /// `validToken`, so without this a single sync fired a `/users/settings`
+    /// check per operation.
+    private var verifiedToken: String?
+    private var verifiedAt = Date.distantPast
+    private static let tokenHealthTTL: TimeInterval = 600
+
+    /// The in-flight refresh, if any. Trakt refresh tokens are SINGLE USE: the
+    /// independent Tasks here (mark, rate, watchlist, playback remove, full
+    /// sync) each called `validToken`, so a shared outage had them all refresh
+    /// at once — the losers received nothing and kept a token the server had
+    /// already rotated away, which reads to the user as "Trakt session expired,
+    /// sign in again" for good.
+    private var refreshTask: Task<String?, Never>?
+
     private func validToken() async -> String? {
         guard let token = trakt.accessToken else { return nil }
-        if await TraktService.fetchUsername(accessToken: token) != nil { return token }
+        // Recently proven good: skip the round trip entirely.
+        if token == verifiedToken, Date().timeIntervalSince(verifiedAt) < Self.tokenHealthTTL {
+            return token
+        }
+        if await TraktService.fetchUsername(accessToken: token) != nil {
+            verifiedToken = token
+            verifiedAt = Date()
+            return token
+        }
         NSLog("[OrivioTrakt] token health check failed — attempting refresh")
-        if let refresh = trakt.refreshToken,
-           let fresh = await TraktService.refreshToken(refresh) {
-            NSLog("[OrivioTrakt] token refreshed")
+        // Join an in-flight refresh instead of starting a competing one.
+        if let existing = refreshTask {
+            return await existing.value ?? trakt.accessToken
+        }
+        let task = Task { [trakt] () -> String? in
+            guard let refresh = trakt.refreshToken,
+                  let fresh = await TraktService.refreshToken(refresh) else { return nil }
             trakt.store(access: fresh.access, refresh: fresh.refresh)
             return fresh.access
         }
+        refreshTask = task
+        let refreshed = await task.value
+        refreshTask = nil
+        if let refreshed {
+            NSLog("[OrivioTrakt] token refreshed")
+            verifiedToken = refreshed
+            verifiedAt = Date()
+            return refreshed
+        }
+        // The check can fail for reasons that are nothing to do with auth — a
+        // timeout, DNS, a Trakt 5xx. Keep using the token we have rather than
+        // disabling the whole sync over a flaky network.
         NSLog("[OrivioTrakt] refresh unavailable — proceeding with existing token")
-        return token
+        return trakt.accessToken
     }
 
     // MARK: - ID mapping

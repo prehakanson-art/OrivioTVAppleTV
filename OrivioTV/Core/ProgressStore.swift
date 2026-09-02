@@ -224,6 +224,38 @@ final class ProgressStore: ObservableObject {
         profileID == 1 ? "orivio.progress.v1" : "orivio.progress.v1.p\(profileID)"
     }
 
+    /// Shows the user dismissed from the Next Up row.
+    ///
+    /// Home synthesises Next Up cards from WATCHED history, not from stored
+    /// progress, so "Remove from Continue Watching" on one had no rows to delete
+    /// and `removeShow` returned having done nothing — the card stayed put with
+    /// no way to get rid of it. The same gap let a show the user DID remove come
+    /// straight back as a Next Up suggestion a moment later.
+    ///
+    /// Cleared as soon as the show gets real progress again, so it can never
+    /// become a permanent blocklist.
+    @Published private(set) var dismissedNextUpShows: Set<String> = []
+    private var dismissedNextUpKey: String {
+        profileID == 1 ? "orivio.nextUp.dismissed.v1" : "orivio.nextUp.dismissed.v1.p\(profileID)"
+    }
+
+    /// Stop offering this show in the Next Up row.
+    func dismissNextUp(metaID: String) {
+        guard !dismissedNextUpShows.contains(metaID) else { return }
+        dismissedNextUpShows.insert(metaID)
+        UserDefaults.standard.set(Array(dismissedNextUpShows), forKey: dismissedNextUpKey)
+    }
+
+    /// Playing the show again undoes the dismissal.
+    private func clearNextUpDismissal(metaID: String) {
+        guard dismissedNextUpShows.remove(metaID) != nil else { return }
+        if dismissedNextUpShows.isEmpty {
+            UserDefaults.standard.removeObject(forKey: dismissedNextUpKey)
+        } else {
+            UserDefaults.standard.set(Array(dismissedNextUpShows), forKey: dismissedNextUpKey)
+        }
+    }
+
     private static let maxProgressSeconds: Double = 30 * 24 * 60 * 60
 
     private static func sanitized(_ entry: WatchProgress) -> WatchProgress? {
@@ -719,6 +751,8 @@ final class ProgressStore: ObservableObject {
             // `items` now carries the newest position for this key, so the
             // periodic override is stale — retire it instead of accumulating.
             transientOverrides.removeValue(forKey: key)
+            // Watching it again is an undo of "remove from Continue Watching".
+            clearNextUpDismissal(metaID: meta.id)
         }
         save()
         if !suppressChange { onLocalUpdate?() }
@@ -845,8 +879,21 @@ final class ProgressStore: ObservableObject {
     /// from Continue Watching") — it deletes the title's playback rows on the
     /// user's Trakt account, which no internal cleanup/migration should do.
     func removeShow(metaID: String, notifyTrakt: Bool = false) {
+        // Suppress the Next Up suggestion too, even when there is nothing
+        // stored to delete. A Next Up card is synthesised from watched history
+        // and has no progress row, so this method used to bail immediately and
+        // the card the user asked to remove simply stayed on screen.
+        // Only for a real user action — an internal merge/cleanup removing rows
+        // is not the user saying "stop suggesting this".
+        if !suppressChange { dismissNextUp(metaID: metaID) }
         let removedKeys = items.values.filter { $0.metaID == metaID }.map(\.id)
-        guard !removedKeys.isEmpty else { return }
+        guard !removedKeys.isEmpty else {
+            if !suppressChange {
+                if notifyTrakt { onTraktRemove?(metaID) }
+                onStremioClearProgress?(metaID)
+            }
+            return
+        }
         let now = Date()
         for key in removedKeys {
             items.removeValue(forKey: key)
@@ -880,6 +927,7 @@ final class ProgressStore: ObservableObject {
     }
 
     private func load() {
+        dismissedNextUpShows = Set(UserDefaults.standard.stringArray(forKey: dismissedNextUpKey) ?? [])
         defer {
             rebuildContinueFractions()
             // Refresh the Top Shelf snapshot on launch/profile switch so the

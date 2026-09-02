@@ -54,6 +54,10 @@ struct RDRefresh: Codable, Equatable {
     let clientID: String
     let clientSecret: String
     let refreshToken: String
+    /// When the access token this bundle last minted stops working. Optional so
+    /// bundles saved before it existed still decode — those count as expired,
+    /// which costs one refresh on next use.
+    var expiresAt: Date?
 }
 
 /// A pending device-login: what to show the user (code + QR) and the opaque
@@ -134,8 +138,29 @@ final class DebridStore: ObservableObject {
     /// Refresh the Real-Debrid access token (its device-flow token is short-
     /// lived). Call on launch so a QR-linked RD keeps working. No-op if RD isn't
     /// device-linked.
+    /// Whether the stored Real-Debrid access token is at or near expiry. A
+    /// bundle with no recorded expiry predates the field and counts as stale.
+    private var realDebridTokenIsStale: Bool {
+        guard let expiry = rdRefresh?.expiresAt else { return true }
+        return expiry.timeIntervalSinceNow < 300
+    }
+
+    /// The providers to try, refreshing a stale Real-Debrid token first.
+    ///
+    /// RD's device-flow access token lasts an hour, and the only refresh was a
+    /// single call at launch with no 401 handling anywhere — so after an hour of
+    /// uptime every RD resolve failed to decode and the source simply would not
+    /// play until the app was relaunched.
+    func resolversRefreshingIfNeeded() async -> [(provider: DebridProvider, apiKey: String)] {
+        await refreshRealDebridIfNeeded()
+        return orderedResolvers
+    }
+
     func refreshRealDebridIfNeeded() async {
         guard configuredProviders.contains(.realDebrid), let refresh = rdRefresh else { return }
+        // Only when it is actually near expiry: this now runs before every
+        // resolve, not just once at launch.
+        guard realDebridTokenIsStale else { return }
         guard let result = await DebridService.refreshRealDebrid(refresh) else { return }
         applyingRemote = true          // don't treat a token refresh as a user edit
         keys[.realDebrid] = result.token
@@ -338,7 +363,10 @@ enum DebridService {
     /// Returns the new access token (and updated refresh) or nil on failure.
     static func refreshRealDebrid(_ r: RDRefresh) async -> (token: String, refresh: RDRefresh)? {
         guard let t = try? await rdToken(clientID: r.clientID, clientSecret: r.clientSecret, code: r.refreshToken) else { return nil }
-        return (t.access_token, RDRefresh(clientID: r.clientID, clientSecret: r.clientSecret, refreshToken: t.refresh_token))
+        return (t.access_token,
+                RDRefresh(clientID: r.clientID, clientSecret: r.clientSecret,
+                          refreshToken: t.refresh_token,
+                          expiresAt: Date().addingTimeInterval(TimeInterval(t.expires_in))))
     }
 
     // Real-Debrid device flow ---------------------------------------------
