@@ -1588,10 +1588,9 @@ private struct ContinueWatchingCell: View, Equatable {
             // sheen like every other one.
             .mediaCardButtonStyle()
             .holdProbe("CW \(progress.name)", enabled: PerformanceSettingsStore.shared.settings.showHoldProbe)
-            // A/B DIAGNOSTIC (revert after): the poster menu demonstrably
-            // presents, so putting it on this cell holds the cell constant and
-            // varies only the menu.
-            .posterHoldMenu(heroItemFor(progress)) { onDetails() }
+            .continueHoldMenu(progress, onDetails: onDetails,
+                              onPlayManually: onPlayManuallyMenu,
+                              onResumeFromStart: onResumeFromStartMenu)
             // ⏯ resumes instantly from a focused CW card too.
             .onPlayPauseCommand { onResume(progress) }
 
