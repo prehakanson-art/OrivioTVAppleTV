@@ -12,40 +12,12 @@ import SwiftUI
 
 // MARK: - Poster hold menu (Details / Library / Watched)
 
-struct PosterHoldMenu: ViewModifier {
-    @EnvironmentObject private var library: LibraryStore
-    @EnvironmentObject private var watched: WatchedStore
-    let item: MetaItem
-    let onDetails: () -> Void
-
-    func body(content: Content) -> some View {
-        content.contextMenu {
-            Button { onDetails() } label: { Label("Go to Details", systemImage: "info.circle") }
-            Button { library.toggle(item) } label: {
-                Label(library.contains(item) ? "Remove from Library" : "Add to Library",
-                      systemImage: library.contains(item) ? "bookmark.slash" : "bookmark")
-            }
-            Button { watched.toggleMovie(item) } label: {
-                Label(watched.isWatched(item) ? "Mark as Unwatched" : "Mark as Watched",
-                      systemImage: watched.isWatched(item) ? "eye.slash" : "checkmark.circle")
-            }
-        }
-    }
-}
-
-extension View {
-    /// Standard poster hold-Select menu (Details / Library / Watched).
-    func posterHoldMenu(_ item: MetaItem, onDetails: @escaping () -> Void) -> some View {
-        modifier(PosterHoldMenu(item: item, onDetails: onDetails))
-    }
-
-    /// Optional-item variant — no-ops when a card has no resolved `MetaItem`
-    /// (some theme cards only carry a lightweight title until selected).
-    @ViewBuilder
-    func posterHoldMenu(ifAvailable item: MetaItem?, onDetails: @escaping () -> Void) -> some View {
-        if let item { posterHoldMenu(item, onDetails: onDetails) } else { self }
-    }
-}
+// The old `.contextMenu`-based modifiers lived here. They are gone: on tvOS 26
+// a context menu fails to present whenever any item carries a destructive role,
+// and its failures are silent, which is what made hold-Select work on some
+// cards and not others for so long. Every surface now uses `HoldableCard` /
+// `HoldPressDetector` (see HoldMenu.swift) with the action lists at the bottom
+// of this file.
 
 // MARK: - Shared watched badge
 
@@ -85,40 +57,46 @@ extension View {
 
 // MARK: - Continue Watching hold menu (Details / Play Manually / Restart / Remove)
 
-struct ContinueHoldMenu: ViewModifier {
-    @EnvironmentObject private var progressStore: ProgressStore
-    let progress: WatchProgress
-    let onDetails: () -> Void
-    let onPlayManually: () -> Void
-    let onResumeFromStart: () -> Void
+// MARK: - Hold-menu action lists
+//
+// The menu CONTENT, shared by every surface. Cards present it through
+// `HoldableCard`, which detects the held Select itself; `.contextMenu` is no
+// longer used for these because it fails silently on tvOS 26 (see HoldMenu).
 
-    func body(content: Content) -> some View {
-        content.contextMenu {
-            Button { onDetails() } label: { Label("Go to Details", systemImage: "info.circle") }
-            Button { onPlayManually() } label: { Label("Play Manually", systemImage: "list.and.film") }
-            Button { onResumeFromStart() } label: { Label("Start from Beginning", systemImage: "gobackward") }
-            // NO `role: .destructive` — tvOS will not present a context menu
-            // that contains one, so this single item silently killed the whole
-            // Continue Watching menu while the role-free poster menu worked.
-            // The wording and the ✗ glyph carry the meaning instead.
-            Button {
-                // Remove the whole show (all episodes), like Netflix/Hulu.
-                progressStore.removeShow(metaID: progress.metaID, notifyTrakt: true)
-            } label: {
-                Label("Remove from Continue Watching", systemImage: "xmark")
-            }
+/// Poster menu: Details / Library / Watched.
+@MainActor
+func posterHoldActions(item: MetaItem,
+                       library: LibraryStore,
+                       watched: WatchedStore,
+                       onDetails: @escaping () -> Void) -> [HoldAction] {
+    [
+        HoldAction(title: "Go to Details", systemImage: "info.circle", action: onDetails),
+        HoldAction(title: library.contains(item) ? "Remove from Library" : "Add to Library",
+                   systemImage: library.contains(item) ? "bookmark.slash" : "bookmark") {
+            library.toggle(item)
+        },
+        HoldAction(title: watched.isWatched(item) ? "Mark as Unwatched" : "Mark as Watched",
+                   systemImage: watched.isWatched(item) ? "eye.slash" : "checkmark.circle") {
+            watched.toggleMovie(item)
         }
-    }
+    ]
 }
 
-extension View {
-    /// Continue-Watching hold-Select menu, shared across every theme.
-    func continueHoldMenu(_ progress: WatchProgress,
-                          onDetails: @escaping () -> Void,
-                          onPlayManually: @escaping () -> Void,
-                          onResumeFromStart: @escaping () -> Void) -> some View {
-        modifier(ContinueHoldMenu(progress: progress, onDetails: onDetails,
-                                  onPlayManually: onPlayManually,
-                                  onResumeFromStart: onResumeFromStart))
-    }
+/// Continue Watching menu: Details / Play Manually / Restart / Remove.
+@MainActor
+func continueHoldActions(progress: WatchProgress,
+                         progressStore: ProgressStore,
+                         onDetails: @escaping () -> Void,
+                         onPlayManually: @escaping () -> Void,
+                         onResumeFromStart: @escaping () -> Void) -> [HoldAction] {
+    [
+        HoldAction(title: "Go to Details", systemImage: "info.circle", action: onDetails),
+        HoldAction(title: "Play Manually", systemImage: "list.and.film", action: onPlayManually),
+        HoldAction(title: "Start from Beginning", systemImage: "gobackward", action: onResumeFromStart),
+        HoldAction(title: "Remove from Continue Watching",
+                   systemImage: "xmark", isDestructive: true) {
+            // Removes the whole show (all episodes), like Netflix/Hulu.
+            progressStore.removeShow(metaID: progress.metaID, notifyTrakt: true)
+        }
+    ]
 }

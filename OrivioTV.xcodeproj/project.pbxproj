@@ -21,6 +21,7 @@
 		15BB3A05A87E7A5D23708EAE /* OrivioTVApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7AB4D5107485E37B25A95B6D /* OrivioTVApp.swift */; };
 		171123B0BBF6003C1D0FA4F6 /* TraktService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B872284504BE4D777519FDCD /* TraktService.swift */; };
 		1865D13EE2276BA6529A8BD6 /* TraktSyncManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9BBE97BCD49F9A7D427F1055 /* TraktSyncManager.swift */; };
+		19462491A85DF148733ECFA5 /* HoldMenu.swift in Sources */ = {isa = PBXBuildFile; fileRef = 89DAD5A315E4A70EFC883DAF /* HoldMenu.swift */; };
 		1A62D4292E890705C6BC22DE /* FusionTokens.swift in Sources */ = {isa = PBXBuildFile; fileRef = 441964E7109F694AD904E109 /* FusionTokens.swift */; };
 		1F25E44B5F8F200B508D150E /* DebridService.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5D1FDFE406380313A6DE116 /* DebridService.swift */; };
 		1FFFA5BA9B53FF1A983248CE /* PlayerScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 674ACD2067B15FCDE8CEA330 /* PlayerScreen.swift */; };
@@ -199,6 +200,7 @@
 		838B25B0F5859C2655E3E34E /* CollectionView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CollectionView.swift; sourceTree = "<group>"; };
 		858C0A4692A535F58D9F6170 /* PlaybackDecision.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackDecision.swift; sourceTree = "<group>"; };
 		89C12FEB6FE6C3DEAC015459 /* PluginRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PluginRuntime.swift; sourceTree = "<group>"; };
+		89DAD5A315E4A70EFC883DAF /* HoldMenu.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HoldMenu.swift; sourceTree = "<group>"; };
 		8A9D51722BFE9BE21746795F /* DiagnosticsService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticsService.swift; sourceTree = "<group>"; };
 		8EA3C25F1387DD8419906339 /* FusionPlayerControlsOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FusionPlayerControlsOverlay.swift; sourceTree = "<group>"; };
 		92ED5374FAF9F1C754CA6922 /* PosterHoldMenu.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PosterHoldMenu.swift; sourceTree = "<group>"; };
@@ -348,6 +350,7 @@
 				F2B8D36AAB09C6EB95FABD60 /* DiscoverView.swift */,
 				AB66131D818E6E4824BC7BAC /* FusionHeroBar.swift */,
 				3F163B74531D7869D14E6E88 /* GlassSidebar.swift */,
+				89DAD5A315E4A70EFC883DAF /* HoldMenu.swift */,
 				EB2DF78C140BFE8F2FFA09A3 /* HomeView.swift */,
 				0B1171B30A9B7C0990BFE3CF /* LibraryView.swift */,
 				6B7AF90208E8326B2293F3E4 /* LiveTVView.swift */,
@@ -673,6 +676,7 @@
 				46EE7C8E36D17F83A22607C0 /* FusionPlayerControlsOverlay.swift in Sources */,
 				1A62D4292E890705C6BC22DE /* FusionTokens.swift in Sources */,
 				9C21BB9AF284ECF2C59E8CE9 /* GlassSidebar.swift in Sources */,
+				19462491A85DF148733ECFA5 /* HoldMenu.swift in Sources */,
 				E0BE3820BDB022ACC16AD04D /* HomeCatalogSettingsStore.swift in Sources */,
 				D987A89C54B10CF806337C0D /* HomeView.swift in Sources */,
 				6B400962DD5E6385BD53E357 /* LibraryStore.swift in Sources */,

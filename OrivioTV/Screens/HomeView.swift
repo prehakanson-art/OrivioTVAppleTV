@@ -1369,6 +1369,8 @@ private struct HomePosterCell: View, Equatable {
     let hero: HeroFocus
     let onSelect: (MetaItem) -> Void
     let onPlayManually: (MetaItem, MetaVideo?) -> Void
+    @EnvironmentObject private var library: LibraryStore
+    @EnvironmentObject private var watched: WatchedStore
     @State private var focused = false
 
     static func == (lhs: Self, rhs: Self) -> Bool {
@@ -1380,29 +1382,32 @@ private struct HomePosterCell: View, Equatable {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Button {
-                onSelect(item)
-            } label: {
-                Group {
-                    if useLandscape {
-                        LandscapeCard(
-                            imageURL: item.background ?? item.poster,
-                            title: item.name,
-                            subtitle: nil,
-                            width: 340,
-                            showsCaption: false
-                        )
-                    } else {
-                        PosterCard(item: item)
+            HoldableCard(
+                actions: posterHoldActions(item: item, library: library, watched: watched) {
+                    onSelect(item)
+                },
+                primary: { onSelect(item) },
+                label: {
+                    Group {
+                        if useLandscape {
+                            LandscapeCard(
+                                imageURL: item.background ?? item.poster,
+                                title: item.name,
+                                subtitle: nil,
+                                width: 340,
+                                showsCaption: false
+                            )
+                        } else {
+                            PosterCard(item: item)
+                        }
                     }
-                }
-                .onFocusChange { isFocused in
-                    focused = isFocused
-                    if isFocused && heroFollowsFocus { hero.focus(item) }
-                }
-            }
-            .mediaCardButtonStyle()
-            .posterHoldMenu(item) { onSelect(item) }
+                    .onFocusChange { isFocused in
+                        focused = isFocused
+                        if isFocused && heroFollowsFocus { hero.focus(item) }
+                    }
+                },
+                menuTitle: item.name
+            )
             .onPlayPauseCommand { onPlayManually(item, nil) }
 
             ATVCardCaption(
@@ -1529,6 +1534,7 @@ private struct ContinueWatchingCell: View, Equatable {
     let onDetails: () -> Void
     let onPlayManuallyMenu: () -> Void
     let onResumeFromStartMenu: () -> Void
+    @EnvironmentObject private var progressStore: ProgressStore
     @State private var focused = false
 
     static func == (lhs: Self, rhs: Self) -> Bool {
@@ -1541,9 +1547,16 @@ private struct ContinueWatchingCell: View, Equatable {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Button {
-                onResume(progress)
-            } label: {
+            HoldableCard(
+                actions: continueHoldActions(
+                    progress: progress,
+                    progressStore: progressStore,
+                    onDetails: onDetails,
+                    onPlayManually: onPlayManuallyMenu,
+                    onResumeFromStart: onResumeFromStartMenu
+                ),
+                primary: { onResume(progress) },
+                label: {
                         LandscapeCard(
                             imageURL: imageURL,
                             title: progress.name,
@@ -1563,11 +1576,9 @@ private struct ContinueWatchingCell: View, Equatable {
                     focused = isFocused
                     if isFocused, drivesHero { hero.focus(heroItemFor(progress)) }
                 }
-            }
-            .mediaCardButtonStyle()
-            .continueHoldMenu(progress, onDetails: onDetails,
-                              onPlayManually: onPlayManuallyMenu,
-                              onResumeFromStart: onResumeFromStartMenu)
+                },
+                menuTitle: progress.name
+            )
             // ⏯ resumes instantly from a focused CW card too.
             .onPlayPauseCommand { onResume(progress) }
 

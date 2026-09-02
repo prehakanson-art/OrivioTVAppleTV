@@ -533,16 +533,14 @@ struct DetailView: View {
             HStack(spacing: OrivioSpacing.md) {
                 if viewModel.meta.isSeries {
                     if let target = seriesPlayTarget {
-                        PlayActionButton(title: seriesPlayTitle(target)) {
-                            onPlay(viewModel.meta, target)
-                        }
-                        .focused($actionFocus, equals: .play)
-                        // Auto Link Selector on: hold Play to pick a source
-                        // manually instead of auto-playing the best match.
-                        .playManuallyMenu(
-                            action: { onPlayManually(viewModel.meta, target) },
-                            infuse: { onPlayInInfuse(viewModel.meta, target) }
+                        PlayActionButton(
+                            title: seriesPlayTitle(target),
+                            action: { onPlay(viewModel.meta, target) },
+                            holdActions: playHoldActions(video: target),
+                            holdTitle: viewModel.meta.name
                         )
+                        .focused($actionFocus, equals: .play)
+
                         // Start Over sits right next to Resume: replay the
                         // in-progress episode from 0:00.
                         if episodeInProgress(target) {
@@ -554,14 +552,14 @@ struct DetailView: View {
                         }
                     }
                 } else {
-                    PlayActionButton(title: playButtonTitle) {
-                        onPlay(viewModel.meta, nil)
-                    }
-                    .focused($actionFocus, equals: .play)
-                    .playManuallyMenu(
-                        action: { onPlayManually(viewModel.meta, nil) },
-                        infuse: { onPlayInInfuse(viewModel.meta, nil) }
+                    PlayActionButton(
+                        title: playButtonTitle,
+                        action: { onPlay(viewModel.meta, nil) },
+                        holdActions: playHoldActions(video: nil),
+                        holdTitle: viewModel.meta.name
                     )
+                    .focused($actionFocus, equals: .play)
+
                     // Movie with saved progress → offer a fresh start.
                     if playButtonTitle == "Resume" {
                         CircleIconButton(systemName: "gobackward", active: false) {
@@ -632,6 +630,27 @@ struct DetailView: View {
                     actionFocus = .play
                 }
             }
+    }
+
+    /// Hold-Select actions on the Play button. Always non-empty, so holding
+    /// Play does something predictable whatever the Auto Link Selector setting
+    /// is: with it on, this is the only route to the source list; with it off
+    /// it simply matches what Play already does.
+    private func playHoldActions(video: MetaVideo?) -> [HoldAction] {
+        var actions: [HoldAction] = [
+            HoldAction(title: "Play Manually", systemImage: "list.and.film") {
+                onPlayManually(viewModel.meta, video)
+            }
+        ]
+        // Only offered when Infuse is actually installed — an entry that opens
+        // nothing is worse than no entry.
+        if ExternalPlayers.isInfuseInstalled {
+            actions.append(HoldAction(title: "Play in Infuse",
+                                      systemImage: "arrow.up.forward.app.fill") {
+                onPlayInInfuse(viewModel.meta, video)
+            })
+        }
+        return actions
     }
 
     private var primaryMetaSegments: [String] {
@@ -771,10 +790,18 @@ struct DetailView: View {
                     LazyHStack(alignment: .top, spacing: OrivioSpacing.lg) {
                         ForEach(viewModel.meta.episodesIncludingLinkedSpecials(season: season)) { episode in
                             let extra = episode.episode.flatMap { viewModel.episodeExtras[season]?[$0] }
-                            Button {
-                                onPlay(viewModel.meta, episode)
-                            } label: {
-                                LandscapeCard(
+                            HoldableCard(
+                                actions: [
+                                    HoldAction(
+                                        title: isWatched(episode, season: season)
+                                            ? "Mark as Unwatched" : "Mark as Watched",
+                                        systemImage: isWatched(episode, season: season)
+                                            ? "eye.slash" : "checkmark.circle"
+                                    ) { toggleWatched(episode, season: season) }
+                                ],
+                                primary: { onPlay(viewModel.meta, episode) },
+                                label: {
+                                    LandscapeCard(
                                     imageURL: episode.thumbnail ?? extra?.still ?? viewModel.meta.background,
                                     title: episodeTitle(episode),
                                     subtitle: episodeSubtitle(episode, extra: extra),
@@ -790,20 +817,10 @@ struct DetailView: View {
                                     detailLine: episodeCastLine(viewModel.episodeCasts[episode.id]),
                                     blurImage: shouldBlurEpisode(episode, season: season)
                                 )
-                            }
-                            .buttonStyle(PlainCardButtonStyle())
-                            // Hold Select on an episode to flip its watched
-                            // state without opening it.
-                            .contextMenu {
-                                Button {
-                                    toggleWatched(episode, season: season)
-                                } label: {
-                                    Label(isWatched(episode, season: season)
-                                          ? "Mark as Unwatched" : "Mark as Watched",
-                                          systemImage: isWatched(episode, season: season)
-                                          ? "eye.slash" : "checkmark.circle")
-                                }
-                            }
+                                },
+                                menuTitle: episodeTitle(episode),
+                                usesPlatter: false
+                            )
                             .task { await viewModel.loadCast(for: episode) }
                         }
                     }
@@ -897,13 +914,15 @@ struct DetailView: View {
                 ScrollView(.horizontal) {
                     LazyHStack(spacing: OrivioSpacing.lg) {
                         ForEach(viewModel.collectionParts) { item in
-                            Button {
-                                onSelectItem(item)
-                            } label: {
-                                PosterCard(item: item)
-                            }
-                            .mediaCardButtonStyle()
-                            .posterHoldMenu(item) { onSelectItem(item) }
+                            HoldableCard(
+                                actions: posterHoldActions(item: item, library: library,
+                                                           watched: watched) {
+                                    onSelectItem(item)
+                                },
+                                primary: { onSelectItem(item) },
+                                label: { PosterCard(item: item) },
+                                menuTitle: item.name
+                            )
                         }
                     }
                     .padding(.horizontal, OrivioSpacing.huge)
@@ -925,13 +944,15 @@ struct DetailView: View {
                 ScrollView(.horizontal) {
                     LazyHStack(spacing: OrivioSpacing.lg) {
                         ForEach(viewModel.moreLikeThis) { item in
-                            Button {
-                                onSelectItem(item)
-                            } label: {
-                                PosterCard(item: item)
-                            }
-                            .mediaCardButtonStyle()
-                            .posterHoldMenu(item) { onSelectItem(item) }
+                            HoldableCard(
+                                actions: posterHoldActions(item: item, library: library,
+                                                           watched: watched) {
+                                    onSelectItem(item)
+                                },
+                                primary: { onSelectItem(item) },
+                                label: { PosterCard(item: item) },
+                                menuTitle: item.name
+                            )
                         }
                     }
                     .padding(.horizontal, OrivioSpacing.huge)
@@ -1165,15 +1186,44 @@ struct PlayActionButton: View {
 
     let title: String
     let action: () -> Void
+    /// Hold-Select actions, detected the same way the cards do it (see
+    /// HoldMenu): `.contextMenu` fails silently on tvOS 26, and this button's
+    /// menu was additionally gated behind Auto Link Selector, so holding Play
+    /// frequently did nothing at all.
+    var holdActions: [HoldAction] = []
+    var holdTitle: String = ""
+
+    @State private var showMenu = false
+    /// The hold already acted; swallow the release so Play doesn't also fire.
+    @State private var handledByHold = false
 
     var body: some View {
-        Button(action: action) {
+        Button {
+            if handledByHold {
+                handledByHold = false
+                return
+            }
+            action()
+        } label: {
             HStack(spacing: 12) {
                 Image(systemName: "play.fill").font(.system(size: 24, weight: .bold))
                 Text(title).font(FusionType.button(theme.font))
             }
         }
         .buttonStyle(DetailPillButtonStyle())
+        .background(HoldPressDetector(onHold: triggerHold))
+        .simultaneousGesture(
+            LongPressGesture(minimumDuration: 0.5).onEnded { _ in triggerHold() }
+        )
+        .fullScreenCover(isPresented: $showMenu) {
+            HoldMenuSheet(title: holdTitle, actions: holdActions) { showMenu = false }
+        }
+    }
+
+    private func triggerHold() {
+        guard !holdActions.isEmpty, !showMenu else { return }
+        handledByHold = true
+        showMenu = true
     }
 }
 
