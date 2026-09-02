@@ -97,7 +97,11 @@ struct ContinueHoldMenu: ViewModifier {
             Button { onDetails() } label: { Label("Go to Details", systemImage: "info.circle") }
             Button { onPlayManually() } label: { Label("Play Manually", systemImage: "list.and.film") }
             Button { onResumeFromStart() } label: { Label("Start from Beginning", systemImage: "gobackward") }
-            Button(role: .destructive) {
+            // NO `role: .destructive` — tvOS will not present a context menu
+            // that contains one, so this single item silently killed the whole
+            // Continue Watching menu while the role-free poster menu worked.
+            // The wording and the ✗ glyph carry the meaning instead.
+            Button {
                 // Remove the whole show (all episodes), like Netflix/Hulu.
                 progressStore.removeShow(metaID: progress.metaID, notifyTrakt: true)
             } label: {

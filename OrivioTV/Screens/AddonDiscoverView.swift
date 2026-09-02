@@ -152,7 +152,9 @@ struct AddonDiscoverView: View {
                 // Hold Select on an installed add-on to remove it right here.
                 .contextMenu {
                     if installed {
-                        Button(role: .destructive) { uninstall(item.url) } label: {
+                        // No destructive role — see PosterHoldMenu: tvOS
+                        // won't present a menu containing one.
+                        Button { uninstall(item.url) } label: {
                             Label("Remove Add-on", systemImage: "trash")
                         }
                     }

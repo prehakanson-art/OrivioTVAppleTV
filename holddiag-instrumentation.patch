@@ -1,0 +1,320 @@
+diff --git a/OrivioTV/Components/Components.swift b/OrivioTV/Components/Components.swift
+index 0e53d65..e0b2d97 100644
+--- a/OrivioTV/Components/Components.swift
++++ b/OrivioTV/Components/Components.swift
+@@ -944,6 +944,7 @@ struct GridPosterCell: View {
+     @State private var focused = false
+ 
+     var body: some View {
++        let _ = HoldDiag.log("BODY GridPosterCell \(item.name)")
+         VStack(alignment: .leading, spacing: 0) {
+             button
+ 
+diff --git a/OrivioTV/OrivioTVApp.swift b/OrivioTV/OrivioTVApp.swift
+index 785ff8c..bbb5be2 100644
+--- a/OrivioTV/OrivioTVApp.swift
++++ b/OrivioTV/OrivioTVApp.swift
+@@ -163,6 +163,7 @@ struct RootView: View {
+             .task { await debrid.refreshRealDebridIfNeeded() }
+             .onAppear {
+                 NSLog("[OrivioPlayer] RootView content onAppear")
++                HoldDiag.install()
+                 startPlayerDemoIfRequested()
+                 startDetailDemoIfRequested()
+                 ScrubThumbnailer.runSelfTestIfRequested()
+diff --git a/OrivioTV/Screens/DetailView.swift b/OrivioTV/Screens/DetailView.swift
+index f235616..3a3c6cf 100644
+--- a/OrivioTV/Screens/DetailView.swift
++++ b/OrivioTV/Screens/DetailView.swift
+@@ -243,6 +243,7 @@ struct DetailView: View {
+     private var autoLinkOn: Bool { profiles.activeAutoLink.enabled }
+ 
+     var body: some View {
++        let _ = HoldDiag.log("BODY DetailView \(viewModel.meta.name)")
+         ZStack {
+             ATVBackground()
+             backdrop
+diff --git a/OrivioTV/Screens/DiscoverView.swift b/OrivioTV/Screens/DiscoverView.swift
+index 8c6d7e9..53eb4e1 100644
+--- a/OrivioTV/Screens/DiscoverView.swift
++++ b/OrivioTV/Screens/DiscoverView.swift
+@@ -68,6 +68,7 @@ struct DiscoverView: View {
+     }
+ 
+     var body: some View {
++        let _ = HoldDiag.log("BODY DiscoverView")
+         ZStack {
+             ATVBackground()
+             ScrollViewReader { proxy in
+diff --git a/OrivioTV/Screens/HoldMenu.swift b/OrivioTV/Screens/HoldMenu.swift
+index 269bb4d..0140812 100644
+--- a/OrivioTV/Screens/HoldMenu.swift
++++ b/OrivioTV/Screens/HoldMenu.swift
+@@ -207,3 +207,179 @@ private struct HoldMenuRowStyle: ButtonStyle {
+         }
+     }
+ }
++
++// MARK: - TEMPORARY hold-Select diagnostics (DEBUG only — remove when done)
++//
++// Logs, to Documents/holdDiag.log on the device:
++//   • every Select press reaching the window (down / up / cancelled, with the
++//     hold duration and the UIKit view hierarchy above the focused view),
++//   • every focus change (so a presented context menu shows up as focus
++//     moving onto a menu item, or doesn't),
++//   • every SwiftUI body evaluation of the card / row / screen views, so a
++//     re-render landing inside the hold window is visible with a timestamp.
++#if DEBUG
++import UIKit.UIGestureRecognizerSubclass
++
++@MainActor
++enum HoldDiag {
++    static let fileURL: URL = FileManager.default
++        .urls(for: .documentDirectory, in: .userDomainMask)[0]
++        .appendingPathComponent("holdDiag.log")
++    private static let start = Date()
++    private static var installed = false
++    private static var focusObserver: NSObjectProtocol?
++    private static var pressLogger: HoldDiagPressLogger?
++
++    static func log(_ message: String) {
++        let t = String(format: "%9.3f", Date().timeIntervalSince(start))
++        let line = "\(t)  \(message)\n"
++        NSLog("[HoldDiag] %@", message)
++        guard let data = line.data(using: .utf8) else { return }
++        if let handle = try? FileHandle(forWritingTo: fileURL) {
++            handle.seekToEndOfFile()
++            handle.write(data)
++            try? handle.close()
++        } else {
++            try? data.write(to: fileURL)
++        }
++    }
++
++    /// Call once from the root view; retries until a key window exists.
++    static func install() {
++        guard !installed else { return }
++        installed = true
++        try? FileManager.default.removeItem(at: fileURL)
++        log("=== HoldDiag session start; \(UIDevice.current.systemName) \(UIDevice.current.systemVersion) ===")
++        Task { @MainActor in
++            for _ in 0..<40 {
++                if let window = keyWindow() {
++                    attach(to: window)
++                    return
++                }
++                try? await Task.sleep(nanoseconds: 250_000_000)
++            }
++            log("!! no key window found; press logging NOT installed")
++        }
++    }
++
++    private static func keyWindow() -> UIWindow? {
++        UIApplication.shared.connectedScenes
++            .compactMap { $0 as? UIWindowScene }
++            .flatMap(\.windows)
++            .first { $0.isKeyWindow } ??
++        UIApplication.shared.connectedScenes
++            .compactMap { $0 as? UIWindowScene }
++            .flatMap(\.windows).first
++    }
++
++    private static func attach(to window: UIWindow) {
++        let logger = HoldDiagPressLogger()
++        window.addGestureRecognizer(logger)
++        pressLogger = logger
++        focusObserver = NotificationCenter.default.addObserver(
++            forName: UIFocusSystem.didUpdateNotification, object: nil, queue: .main
++        ) { note in
++            let ctx = note.userInfo?[UIFocusSystem.focusUpdateContextUserInfoKey] as? UIFocusUpdateContext
++            let next = ctx?.nextFocusedItem
++            let prev = ctx?.previouslyFocusedItem
++            let msg = "FOCUS -> \(describe(next))   (from \(describe(prev)))"
++            MainActor.assumeIsolated { log(msg) }
++        }
++        log("press logger + focus observer installed on \(type(of: window))")
++    }
++
++    static func describe(_ item: UIFocusItem?) -> String {
++        guard let item else { return "nil" }
++        guard let view = item as? UIView else { return String(describing: type(of: item)) }
++        var names: [String] = []
++        var v: UIView? = view
++        var depth = 0
++        while let cur = v, depth < 7 {
++            var name = String(describing: type(of: cur))
++            if let id = cur.accessibilityIdentifier, !id.isEmpty { name += "#\(id)" }
++            if let label = cur.accessibilityLabel, !label.isEmpty { name += "(\(label.prefix(24)))" }
++            names.append(name)
++            v = cur.superview
++            depth += 1
++        }
++        return names.joined(separator: " < ")
++    }
++
++    static func focusedItem() -> UIFocusItem? {
++        guard let window = keyWindow() else { return nil }
++        return UIFocusSystem.focusSystem(for: window)?.focusedItem
++    }
++}
++
++/// Never recognises; only observes press timing on the window so nothing
++/// about the app's own press handling changes.
++final class HoldDiagPressLogger: UIGestureRecognizer, UIGestureRecognizerDelegate {
++    private var downAt: [Int: Date] = [:]
++
++    init() {
++        super.init(target: nil, action: nil)
++        cancelsTouchesInView = false
++        delaysTouchesBegan = false
++        delaysTouchesEnded = false
++        allowedTouchTypes = []
++        allowedPressTypes = [NSNumber(value: UIPress.PressType.select.rawValue),
++                             NSNumber(value: UIPress.PressType.playPause.rawValue),
++                             NSNumber(value: UIPress.PressType.menu.rawValue)]
++        delegate = self
++    }
++
++    private func name(_ p: UIPress) -> String {
++        switch p.type {
++        case .select: return "select"
++        case .playPause: return "playPause"
++        case .menu: return "menu"
++        default: return "other(\(p.type.rawValue))"
++        }
++    }
++
++    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent) {
++        for p in presses {
++            downAt[p.type.rawValue] = Date()
++            let focused = MainActor.assumeIsolated { HoldDiag.describe(HoldDiag.focusedItem()) }
++            let responder = p.responder.map { String(describing: type(of: $0)) } ?? "nil"
++            MainActor.assumeIsolated {
++                HoldDiag.log("PRESS DOWN \(name(p)); responder=\(responder); focused=\(focused)")
++            }
++        }
++    }
++
++    override func pressesChanged(_ presses: Set<UIPress>, with event: UIPressesEvent) {}
++
++    override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent) {
++        for p in presses {
++            let held = downAt[p.type.rawValue].map { Date().timeIntervalSince($0) } ?? -1
++            MainActor.assumeIsolated {
++                HoldDiag.log("PRESS UP   \(name(p)); held=\(String(format: "%.3f", held))s")
++            }
++        }
++        state = .failed
++    }
++
++    override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent) {
++        for p in presses {
++            let held = downAt[p.type.rawValue].map { Date().timeIntervalSince($0) } ?? -1
++            MainActor.assumeIsolated {
++                HoldDiag.log("PRESS CANCELLED \(name(p)); held=\(String(format: "%.3f", held))s")
++            }
++        }
++        state = .failed
++    }
++
++    override func reset() {
++        super.reset()
++        downAt.removeAll()
++    }
++
++    func gestureRecognizer(_ g: UIGestureRecognizer,
++                           shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool { true }
++    func gestureRecognizer(_ g: UIGestureRecognizer,
++                           shouldBeRequiredToFailBy other: UIGestureRecognizer) -> Bool { false }
++    func gestureRecognizer(_ g: UIGestureRecognizer,
++                           shouldRequireFailureOf other: UIGestureRecognizer) -> Bool { false }
++}
++#endif
+diff --git a/OrivioTV/Screens/HomeView.swift b/OrivioTV/Screens/HomeView.swift
+index fe33153..78e92c8 100644
+--- a/OrivioTV/Screens/HomeView.swift
++++ b/OrivioTV/Screens/HomeView.swift
+@@ -909,6 +909,7 @@ struct HomeView: View {
+ 
+     @ViewBuilder
+     private var rowsList: some View {
++        let _ = HoldDiag.log("BODY HomeView.rowsList layout=\(layout)")
+         let continueItems = mergedContinueItems()
+         if !continueItems.isEmpty {
+             continueRow(continueItems)
+@@ -1276,6 +1277,7 @@ private struct HomePosterRow: View {
+     @FocusState private var focusedID: String?
+ 
+     var body: some View {
++        let _ = HoldDiag.log("BODY HomePosterRow \(row.title)")
+         VStack(alignment: .leading, spacing: OrivioSpacing.md) {
+             header
+             ScrollViewReader { proxy in
+@@ -1379,6 +1381,7 @@ private struct HomePosterCell: View, Equatable {
+     }
+ 
+     var body: some View {
++        let _ = HoldDiag.log("BODY HomePosterCell \(item.name)")
+         VStack(alignment: .leading, spacing: 0) {
+             Button {
+                 onSelect(item)
+@@ -1444,6 +1447,7 @@ private struct ContinueWatchingRow: View {
+     @FocusState private var focusedCWCard: String?
+ 
+     var body: some View {
++        let _ = HoldDiag.log("BODY ContinueWatchingRow")
+         // Focus model mirrors HomePosterRow (plain @FocusState, no .focusScope /
+         // .focusSection).
+         VStack(alignment: .leading, spacing: OrivioSpacing.md) {
+@@ -1540,6 +1544,7 @@ private struct ContinueWatchingCell: View, Equatable {
+     }
+ 
+     var body: some View {
++        let _ = HoldDiag.log("BODY ContinueWatchingCell \(progress.name)")
+         VStack(alignment: .leading, spacing: 0) {
+             Button {
+                 onResume(progress)
+diff --git a/OrivioTV/Screens/LibraryView.swift b/OrivioTV/Screens/LibraryView.swift
+index 9d09e18..0e2b319 100644
+--- a/OrivioTV/Screens/LibraryView.swift
++++ b/OrivioTV/Screens/LibraryView.swift
+@@ -71,6 +71,7 @@ struct LibraryView: View {
+     }
+ 
+     var body: some View {
++        let _ = HoldDiag.log("BODY LibraryView")
+         ZStack {
+             ATVBackground()
+             ScrollViewReader { proxy in
+diff --git a/OrivioTV/Screens/PosterHoldMenu.swift b/OrivioTV/Screens/PosterHoldMenu.swift
+index ea306f0..15f8714 100644
+--- a/OrivioTV/Screens/PosterHoldMenu.swift
++++ b/OrivioTV/Screens/PosterHoldMenu.swift
+@@ -21,6 +21,7 @@ struct PosterHoldMenu: ViewModifier {
+     let onDetails: () -> Void
+ 
+     func body(content: Content) -> some View {
++        let _ = HoldDiag.log("BODY PosterHoldMenu modifier \(item.name)")
+         content.contextMenu {
+             Button { onDetails() } label: { Label("Go to Details", systemImage: "info.circle") }
+             Button { library.toggle(item) } label: {
+@@ -95,6 +96,7 @@ struct ContinueHoldMenu: ViewModifier {
+     let onResumeFromStart: () -> Void
+ 
+     func body(content: Content) -> some View {
++        let _ = HoldDiag.log("BODY ContinueHoldMenu modifier \(progress.name)")
+         content.contextMenu {
+             Button { onDetails() } label: { Label("Go to Details", systemImage: "info.circle") }
+             Button { onPlayManually() } label: { Label("Play Manually", systemImage: "list.and.film") }
+diff --git a/OrivioTV/Screens/SearchView.swift b/OrivioTV/Screens/SearchView.swift
+index 94bd92f..6e2c30d 100644
+--- a/OrivioTV/Screens/SearchView.swift
++++ b/OrivioTV/Screens/SearchView.swift
+@@ -83,6 +83,7 @@ struct SearchView: View {
+     private var columns: [GridItem] { [GridItem(.adaptive(minimum: posterLayout.posterSize.posterWidth, maximum: posterLayout.posterSize.posterWidth), spacing: OrivioSpacing.lg, alignment: .top)] }
+ 
+     var body: some View {
++        let _ = HoldDiag.log("BODY SearchView")
+         ZStack {
+             ATVBackground()
+             VStack(alignment: .leading, spacing: OrivioSpacing.lg) {

@@ -141,24 +141,25 @@ private extension View {
     /// Adds a hold-Select "Play Manually" menu to the Play button when Auto
     /// Link Selector is on; a no-op otherwise (Play already opens the list).
     @ViewBuilder
-    func playManuallyMenu(enabled: Bool,
-                          action: @escaping () -> Void,
+    func playManuallyMenu(action: @escaping () -> Void,
                           infuse: (() -> Void)? = nil) -> some View {
-        if enabled {
-            contextMenu {
-                Button(action: action) {
-                    Label("Play Manually", systemImage: "list.and.film")
-                }
-                // Only offered when Infuse is actually installed — a menu entry
-                // that opens nothing is worse than no entry.
-                if let infuse, ExternalPlayers.isInfuseInstalled {
-                    Button(action: infuse) {
-                        Label("Play in Infuse", systemImage: "arrow.up.forward.app.fill")
-                    }
+        // The menu is ALWAYS attached. It used to be gated on Auto Link
+        // Selector, so with that setting off holding Play did nothing
+        // whatsoever — indistinguishable from a broken control. "Play
+        // Manually" is meaningful either way: with Auto Link on it is the only
+        // route to the source list, and with it off it simply matches what
+        // Play already does.
+        contextMenu {
+            Button(action: action) {
+                Label("Play Manually", systemImage: "list.and.film")
+            }
+            // Only offered when Infuse is actually installed — a menu entry
+            // that opens nothing is worse than no entry.
+            if let infuse, ExternalPlayers.isInfuseInstalled {
+                Button(action: infuse) {
+                    Label("Play in Infuse", systemImage: "arrow.up.forward.app.fill")
                 }
             }
-        } else {
-            self
         }
     }
 }
@@ -539,7 +540,6 @@ struct DetailView: View {
                         // Auto Link Selector on: hold Play to pick a source
                         // manually instead of auto-playing the best match.
                         .playManuallyMenu(
-                            enabled: autoLinkOn,
                             action: { onPlayManually(viewModel.meta, target) },
                             infuse: { onPlayInInfuse(viewModel.meta, target) }
                         )
@@ -559,7 +559,6 @@ struct DetailView: View {
                     }
                     .focused($actionFocus, equals: .play)
                     .playManuallyMenu(
-                        enabled: autoLinkOn,
                         action: { onPlayManually(viewModel.meta, nil) },
                         infuse: { onPlayInInfuse(viewModel.meta, nil) }
                     )
@@ -793,6 +792,18 @@ struct DetailView: View {
                                 )
                             }
                             .buttonStyle(PlainCardButtonStyle())
+                            // Hold Select on an episode to flip its watched
+                            // state without opening it.
+                            .contextMenu {
+                                Button {
+                                    toggleWatched(episode, season: season)
+                                } label: {
+                                    Label(isWatched(episode, season: season)
+                                          ? "Mark as Unwatched" : "Mark as Watched",
+                                          systemImage: isWatched(episode, season: season)
+                                          ? "eye.slash" : "checkmark.circle")
+                                }
+                            }
                             .task { await viewModel.loadCast(for: episode) }
                         }
                     }
@@ -808,6 +819,23 @@ struct DetailView: View {
         .focusSection()
         .onChange(of: viewModel.selectedSeason) { _, newSeason in
             if let newSeason { Task { await viewModel.loadSeason(newSeason) } }
+        }
+    }
+
+    private func isWatched(_ episode: MetaVideo, season: Int) -> Bool {
+        watched.isWatched(contentID: viewModel.meta.id,
+                          season: episode.season ?? season,
+                          episode: episode.episode)
+    }
+
+    /// Flip one episode's watched state from the hold menu.
+    private func toggleWatched(_ episode: MetaVideo, season: Int) {
+        if isWatched(episode, season: season) {
+            watched.remove(contentID: viewModel.meta.id,
+                           season: episode.season ?? season,
+                           episode: episode.episode)
+        } else {
+            watched.mark(meta: viewModel.meta, video: episode)
         }
     }
 
@@ -875,6 +903,7 @@ struct DetailView: View {
                                 PosterCard(item: item)
                             }
                             .mediaCardButtonStyle()
+                            .posterHoldMenu(item) { onSelectItem(item) }
                         }
                     }
                     .padding(.horizontal, OrivioSpacing.huge)
@@ -902,6 +931,7 @@ struct DetailView: View {
                                 PosterCard(item: item)
                             }
                             .mediaCardButtonStyle()
+                            .posterHoldMenu(item) { onSelectItem(item) }
                         }
                     }
                     .padding(.horizontal, OrivioSpacing.huge)
