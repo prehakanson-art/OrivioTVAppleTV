@@ -550,7 +550,6 @@ struct DetailView: View {
                                 onPlayFromBeginning(viewModel.meta, target)
                             }
                             .focused($actionFocus, equals: .startOver)
-                .focusable(actionFocus != nil)
                         }
                     }
                 } else {
@@ -568,7 +567,6 @@ struct DetailView: View {
                             onPlayFromBeginning(viewModel.meta, nil)
                         }
                         .focused($actionFocus, equals: .startOver)
-                .focusable(actionFocus != nil)
                     }
                 }
                 CircleIconButton(
@@ -581,7 +579,6 @@ struct DetailView: View {
                                             icon: wasSaved ? "bookmark.slash" : "checkmark")
                 }
                 .focused($actionFocus, equals: .library)
-                .focusable(actionFocus != nil)
                 if !viewModel.meta.isSeries {
                     // Eye = seen. Filled + accent when watched, outline when not.
                     CircleIconButton(
@@ -594,7 +591,6 @@ struct DetailView: View {
                                                 icon: "eye.fill")
                     }
                     .focused($actionFocus, equals: .watched)
-                .focusable(actionFocus != nil)
                 }
                 // Rate (Trakt) — star fills when you've rated; opens a 1–10 picker.
                 CircleIconButton(
@@ -602,13 +598,11 @@ struct DetailView: View {
                     active: ratings.rating(for: viewModel.meta.id) != nil
                 ) { showRatingPicker = true }
                 .focused($actionFocus, equals: .rate)
-                .focusable(actionFocus != nil)
                 if layout.detailPageTrailerButtonEnabled, let trailer = viewModel.trailers.first {
                     CircleIconButton(systemName: "play.rectangle.fill", active: false) {
                         activeTrailer = trailer
                     }
                     .focused($actionFocus, equals: .trailer)
-                .focusable(actionFocus != nil)
                 }
                 Spacer(minLength: 0)
             }
@@ -622,6 +616,14 @@ struct DetailView: View {
             // from OUTSIDE a focus section is silently ignored on tvOS 26,
             // which broke the teaser's direct Down-to-Play jump. Reachability
             // from below is covered by the entry redirect instead.
+            //
+            // The circle buttons are ALWAYS focusable. They used to carry
+            // `.focusable(actionFocus != nil)` so that entering the row could
+            // only land on Play — but that makes the focusable SET depend on
+            // focus itself: pressing Down on the synopsis set actionFocus,
+            // which re-rendered the row and flipped the circles to focusable
+            // mid-move, so the focus engine invalidated and bounced focus back
+            // up to the synopsis. Never gate focusability on focus state.
             // The enter-lands-on-Play redirect: focus arriving on any control
             // while the row previously held NOTHING gets moved to Play. Moves
             // WITHIN the row (old != nil) are left alone.
