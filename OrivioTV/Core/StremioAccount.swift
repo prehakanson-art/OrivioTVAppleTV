@@ -140,6 +140,39 @@ enum StremioAccountService {
         }
     }
 
+    /// Sign in with a Stremio email and password, the alternative to the QR
+    /// link flow. Returns the same `authKey` every other call here takes, so
+    /// the two paths are interchangeable from the caller's side.
+    ///
+    /// `type: "Login"` rides along in the body because the official clients
+    /// send it; the server ignores it on the newer endpoints but older
+    /// deployments dispatch on it.
+    static func login(email: String, password: String) async throws -> (authKey: String, user: StremioUser?) {
+        struct U: Decodable { let email: String?; let avatar: String? }
+        struct Result: Decodable { let authKey: String?; let user: U? }
+        struct Resp: Decodable { let result: Result? }
+
+        let email = email.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !email.isEmpty, !password.isEmpty else {
+            throw StremioAccountError.server("Enter your Stremio email and password.")
+        }
+        let (data, response) = try await post("/api/login",
+                                              ["type": "Login", "email": email, "password": password])
+        // The API reports bad credentials in the BODY with a 200, so check the
+        // error envelope before the status code or a wrong password surfaces
+        // as "couldn't reach Stremio".
+        try throwIfAPIError(data)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw StremioAccountError.server("Stremio returned a server error.")
+        }
+        let decoded = try JSONDecoder().decode(Resp.self, from: data)
+        guard let key = decoded.result?.authKey, !key.isEmpty else {
+            throw StremioAccountError.server("Stremio didn't return a session for that account.")
+        }
+        let u = decoded.result?.user
+        return (key, StremioUser(email: u?.email ?? email, avatar: u?.avatar))
+    }
+
     /// The signed-in user (email/avatar) for display.
     static func getUser(authKey: String) async -> StremioUser? {
         struct U: Decodable { let email: String?; let avatar: String? }

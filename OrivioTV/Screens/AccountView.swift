@@ -15,7 +15,9 @@ struct AccountView: View {
 
     private enum AccountFocus: Hashable {
         case orivioSignIn
+        case orivioEmailSignIn
         case stremioSignIn
+        case stremioEmailSignIn
         case cancelOrivioSignIn
         case mergeSync
         case pullUpdates
@@ -78,6 +80,18 @@ struct AccountView: View {
     }
 
     @FocusState private var focusedControl: AccountFocus?
+    // Email/password sign-in, the alternative to each service's QR flow. The
+    // credentials live only for the length of the sheet — nothing is persisted
+    // here; each manager keeps its own token once the exchange succeeds.
+    @State private var showOrivioEmailSignIn = false
+    @State private var orivioEmailField = ""
+    @State private var orivioPasswordField = ""
+    @State private var orivioEmailBusy = false
+    @State private var showStremioEmailSignIn = false
+    @State private var stremioEmailField = ""
+    @State private var stremioPasswordField = ""
+    @State private var stremioEmailBusy = false
+    @State private var stremioEmailError: String?
     @State private var confirmClearHistory = false
     @State private var selectedSection: AccountSection = .orivio
 
@@ -99,6 +113,32 @@ struct AccountView: View {
                 }
                 .environmentObject(theme)
                 .onExitCommand { cancelStremioConnect() }
+            }
+            .fullScreenCover(isPresented: $showOrivioEmailSignIn) {
+                EmailSignInView(
+                    service: "Orivio",
+                    email: $orivioEmailField,
+                    password: $orivioPasswordField,
+                    status: account.errorMessage,
+                    isError: account.errorMessage != nil,
+                    busy: orivioEmailBusy,
+                    onSubmit: submitOrivioEmailSignIn,
+                    onCancel: cancelOrivioEmailSignIn
+                )
+                .environmentObject(theme)
+            }
+            .fullScreenCover(isPresented: $showStremioEmailSignIn) {
+                EmailSignInView(
+                    service: "Stremio",
+                    email: $stremioEmailField,
+                    password: $stremioPasswordField,
+                    status: stremioEmailError,
+                    isError: stremioEmailError != nil,
+                    busy: stremioEmailBusy,
+                    onSubmit: submitStremioEmailSignIn,
+                    onCancel: cancelStremioEmailSignIn
+                )
+                .environmentObject(theme)
             }
             .fullScreenCover(isPresented: $showBackupExport) {
                 AccountBackupExportView(text: backupText, onDone: { showBackupExport = false })
@@ -258,10 +298,10 @@ struct AccountView: View {
         switch selectedSection {
         case .orivio:
             return orivioEmail == nil
-                ? "Sign in with QR to sync this Apple TV with your Orivio account."
+                ? "Sign in by QR or with your email and password to sync this Apple TV with your Orivio account."
                 : "Signed in as \(orivioEmail ?? "Orivio account")."
         case .stremio:
-            return "Connect Stremio Link and keep Stremio data merged into this app."
+            return "Connect by Stremio Link or email and password, and keep Stremio data merged into this app."
         case .sync:
             return "Run account sync actions and inspect the latest sync state without leaving this page."
         case .backups:
@@ -288,10 +328,15 @@ struct AccountView: View {
                     }
                     .focused($focusedControl, equals: .signOut)
                 } else {
-                    AccountPrimaryButton(title: "Sign In", systemImage: "qrcode") {
+                    AccountPrimaryButton(title: "Sign In with QR", systemImage: "qrcode") {
                         account.startQRLogin()
                     }
                     .focused($focusedControl, equals: .orivioSignIn)
+
+                    AccountPrimaryButton(title: "Sign In with Email", systemImage: "envelope", filled: false) {
+                        beginOrivioEmailSignIn()
+                    }
+                    .focused($focusedControl, equals: .orivioEmailSignIn)
 
                     if let error = account.errorMessage {
                         errorLabel(error)
@@ -516,10 +561,15 @@ struct AccountView: View {
                         }
                         .focused($focusedControl, equals: .stremioDisconnect)
                     } else {
-                        AccountPrimaryButton(title: "Connect Stremio", systemImage: "qrcode", filled: false) {
+                        AccountPrimaryButton(title: "Connect with QR", systemImage: "qrcode", filled: false) {
                             startStremioLogin()
                         }
                         .focused($focusedControl, equals: .stremioSignIn)
+
+                        AccountPrimaryButton(title: "Sign In with Email", systemImage: "envelope", filled: false) {
+                            beginStremioEmailSignIn()
+                        }
+                        .focused($focusedControl, equals: .stremioEmailSignIn)
                     }
                 }
 
@@ -776,6 +826,79 @@ struct AccountView: View {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
             if !Task.isCancelled && showStremioConnect { await loadStremioCode() }
+        }
+    }
+
+    // MARK: - Email sign-in
+
+    private func beginOrivioEmailSignIn() {
+        orivioPasswordField = ""
+        orivioEmailBusy = false
+        account.errorMessage = nil
+        showOrivioEmailSignIn = true
+    }
+
+    private func cancelOrivioEmailSignIn() {
+        guard !orivioEmailBusy else { return }
+        showOrivioEmailSignIn = false
+        orivioPasswordField = ""
+        account.errorMessage = nil
+        focusedControl = .orivioEmailSignIn
+    }
+
+    private func submitOrivioEmailSignIn() {
+        guard !orivioEmailBusy else { return }
+        orivioEmailBusy = true
+        Task {
+            await account.signIn(email: orivioEmailField, password: orivioPasswordField)
+            orivioEmailBusy = false
+            // The manager reports failures through `errorMessage`; on success
+            // it flips authState, which swaps this whole pane for the signed-in
+            // shell. Only close the sheet when it actually worked, so a wrong
+            // password leaves the form up with the reason on it.
+            if account.authState.isSignedIn {
+                showOrivioEmailSignIn = false
+                orivioPasswordField = ""
+            }
+        }
+    }
+
+    private func beginStremioEmailSignIn() {
+        stremioPasswordField = ""
+        stremioEmailError = nil
+        stremioEmailBusy = false
+        showStremioEmailSignIn = true
+    }
+
+    private func cancelStremioEmailSignIn() {
+        guard !stremioEmailBusy else { return }
+        showStremioEmailSignIn = false
+        stremioPasswordField = ""
+        stremioEmailError = nil
+        focusedControl = .stremioEmailSignIn
+    }
+
+    private func submitStremioEmailSignIn() {
+        guard !stremioEmailBusy else { return }
+        stremioEmailBusy = true
+        stremioEmailError = nil
+        Task {
+            do {
+                let result = try await StremioAccountService.login(email: stremioEmailField,
+                                                                   password: stremioPasswordField)
+                stremio.signIn(authKey: result.authKey, user: result.user)
+                stremioPasswordField = ""
+                stremioEmailBusy = false
+                showStremioEmailSignIn = false
+                // Same landing as the QR flow: pull the account straight away
+                // so the panel shows real numbers instead of an empty shell.
+                syncStremioNow()
+                focusedControl = .stremioSync
+            } catch {
+                stremioEmailBusy = false
+                stremioEmailError = (error as? LocalizedError)?.errorDescription
+                    ?? "Couldn't sign in to Stremio."
+            }
         }
     }
 
@@ -1213,7 +1336,9 @@ private struct AccountBackupImportView: View {
 }
 
 /// Focusable pill button matching the app's focus visuals.
-private struct AccountPrimaryButton: View {
+/// Internal, not private: `EmailSignInView` is a separate file and uses the
+/// same pill so the sign-in page matches the panels it is opened from.
+struct AccountPrimaryButton: View {
     @EnvironmentObject private var theme: ThemeManager
     let title: String
     let systemImage: String
@@ -1228,7 +1353,7 @@ private struct AccountPrimaryButton: View {
     }
 }
 
-private struct AccountButtonLabel: View {
+struct AccountButtonLabel: View {
     @EnvironmentObject private var theme: ThemeManager
     @Environment(\.isFocused) private var isFocused
 

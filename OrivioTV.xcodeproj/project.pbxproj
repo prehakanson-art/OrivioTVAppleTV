@@ -113,6 +113,7 @@
 		AD70F6C9931E5401C714885E /* AddonPhoneAddView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E28A3B8B2BEAAE5B89B4B452 /* AddonPhoneAddView.swift */; };
 		B41A90FFA692D997DA4A16B1 /* CollectionSourcePickerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D8AAB5DE5A3C8C166957C0C /* CollectionSourcePickerView.swift */; };
 		B69BFAF902737DCAB1312EEC /* PictureInPicture.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE159BBC1CE7195160E54884 /* PictureInPicture.swift */; };
+		B74F031353BC40A07C31C1B9 /* EmailSignInView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE32CA36732B1207C3323294 /* EmailSignInView.swift */; };
 		BE8530C761041E0641F13AA9 /* LiveTVSettingsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9845B0EA1C787B090833EDC4 /* LiveTVSettingsStore.swift */; };
 		C18473C7DB9B8A17E5350B08 /* AccountView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1091EB872A06CA1C9AE5E569 /* AccountView.swift */; };
 		C3959A5E1BD2034B579C953B /* PlusJakartaSans-Medium.ttf in Resources */ = {isa = PBXBuildFile; fileRef = 5D0FC225A0A64F7C0BEBA873 /* PlusJakartaSans-Medium.ttf */; };
@@ -269,6 +270,7 @@
 		C91A77D22EDD01B5AFD02A20 /* AnimatedGIFView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnimatedGIFView.swift; sourceTree = "<group>"; };
 		CDFF486C5610F250EE9DB085 /* OrivioAccountManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrivioAccountManager.swift; sourceTree = "<group>"; };
 		CE159BBC1CE7195160E54884 /* PictureInPicture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PictureInPicture.swift; sourceTree = "<group>"; };
+		CE32CA36732B1207C3323294 /* EmailSignInView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EmailSignInView.swift; sourceTree = "<group>"; };
 		CFA2037D6C200F8E219BD175 /* KSPlayer */ = {isa = PBXFileReference; lastKnownFileType = folder; name = KSPlayer; path = Vendor/KSPlayer; sourceTree = SOURCE_ROOT; };
 		D0AA88FC3B5F32468D43D084 /* StremioSyncManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StremioSyncManager.swift; sourceTree = "<group>"; };
 		D4321AB0FDE1C03667ED1CA0 /* TMDBService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TMDBService.swift; sourceTree = "<group>"; };
@@ -403,6 +405,7 @@
 				C036F9B662E506AB37E1DC31 /* CommunityCollectionsView.swift */,
 				7735E4954774B5ADF097B9B4 /* DetailView.swift */,
 				F2B8D36AAB09C6EB95FABD60 /* DiscoverView.swift */,
+				CE32CA36732B1207C3323294 /* EmailSignInView.swift */,
 				AB66131D818E6E4824BC7BAC /* FusionHeroBar.swift */,
 				3F163B74531D7869D14E6E88 /* GlassSidebar.swift */,
 				EB2DF78C140BFE8F2FFA09A3 /* HomeView.swift */,
@@ -757,6 +760,7 @@
 				AC3D606BB8156028236C51C2 /* DiagnosticsService.swift in Sources */,
 				2718E07A8BBFDCC39539D7B6 /* DiscoverView.swift in Sources */,
 				E71A9C6C7E45666E27367D3C /* DoviConverter.swift in Sources */,
+				B74F031353BC40A07C31C1B9 /* EmailSignInView.swift in Sources */,
 				14B3A982CC6B10FCA4BBEA7C /* ExternalPlayers.swift in Sources */,
 				CDB09260469BE21C29C6E1E5 /* FPSOverlay.swift in Sources */,
 				80E93081B334D3626B05D32F /* FusionHeroBar.swift in Sources */,
