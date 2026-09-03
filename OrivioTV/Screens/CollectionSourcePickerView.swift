@@ -27,7 +27,7 @@ struct CollectionSourcePickerView: View {
             VStack(alignment: .leading, spacing: OrivioSpacing.lg) {
                 HStack {
                     Text("Add TMDB / Trakt Source")
-                        .font(.system(size: 36, weight: .bold))
+                        .font(FusionType.pageTitle(theme.font))
                         .foregroundStyle(theme.palette.textPrimary)
                     Spacer()
                     Button("Done", action: onDone)

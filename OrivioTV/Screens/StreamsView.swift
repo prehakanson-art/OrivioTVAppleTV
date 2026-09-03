@@ -1066,7 +1066,7 @@ struct StreamsView: View {
     private var titleBlock: some View {
         VStack(alignment: .leading, spacing: OrivioSpacing.xs) {
             Text(viewModel.meta.name)
-                .font(.system(size: 44, weight: .bold))
+                .font(FusionType.pageTitle(theme.font))
                 .foregroundStyle(theme.palette.textPrimary)
                 .lineLimit(1)
             if let video = viewModel.video {

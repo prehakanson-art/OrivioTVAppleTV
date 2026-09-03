@@ -289,7 +289,7 @@ struct TraktConnectPage: View {
         VStack(spacing: OrivioSpacing.xl) {
             VStack(spacing: OrivioSpacing.sm) {
                 Text("Connect Trakt")
-                    .font(.system(size: 48, weight: .heavy))
+                    .font(FusionType.pageTitle(theme.font))
                     .foregroundStyle(theme.palette.textPrimary)
                 Text("Scan the code with your phone, or go to \(code.verificationURL) and enter the code below.")
                     .font(.system(size: 24))

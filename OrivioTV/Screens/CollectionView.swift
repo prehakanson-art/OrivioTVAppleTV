@@ -692,7 +692,7 @@ struct CollectionView: View {
             // Pinned header — drawn last so it's in FRONT of the posters.
             VStack(alignment: .leading, spacing: OrivioSpacing.lg) {
                 Text(collection.title)
-                    .font(.system(size: 48, weight: .heavy))
+                    .font(FusionType.pageTitle(theme.font))
                     .foregroundStyle(theme.palette.textPrimary)
                     .padding(.horizontal, OrivioSpacing.huge)
                 // Tabs/sort only appear once content has loaded — no half-built

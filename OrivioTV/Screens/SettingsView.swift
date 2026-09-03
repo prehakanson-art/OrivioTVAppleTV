@@ -1731,10 +1731,10 @@ private struct AddonExportView: View {
             ATVBackground()
             VStack(spacing: OrivioSpacing.xl) {
                 Text("Add-on Setup")
-                    .font(.system(size: 44, weight: .bold))
+                    .font(FusionType.pageTitle(theme.font))
                     .foregroundStyle(theme.palette.textPrimary)
                 Text("Scan with your phone — one manifest URL per line. Paste them into any Orivio install to restore your add-ons.")
-                    .font(.system(size: 23))
+                    .font(FusionType.bodyText(theme.font))
                     .foregroundStyle(theme.palette.textSecondary)
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: 900)

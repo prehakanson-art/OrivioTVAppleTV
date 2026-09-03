@@ -499,19 +499,31 @@ struct DetailView: View {
             // Push the logo down so it sits lower on the backdrop (APK layout).
             Spacer().frame(height: 260)
 
-            if let logo = viewModel.meta.logo {
-                RemoteImage(url: logo, contentMode: .fit, alignment: .bottomLeading)
-                    .frame(width: 520, height: 180)
-                    // Grounds a white logo on both a light frost and dark art.
-                    .shadow(color: .black.opacity(0.5), radius: 16, y: 6)
-            } else {
-                Text(viewModel.meta.name)
-                    .font(FusionType.heroTitle(theme.font))
-                    .foregroundStyle(theme.palette.textPrimary)
-                    .lineLimit(2)
-                    .frame(maxWidth: 900, alignment: .leading)
-                    .shadow(color: .black.opacity(0.4), radius: 10, y: 4)
+            // Both title treatments occupy the SAME 180pt slot, bottom-aligned.
+            // They did not before: a logo got a fixed 180pt box while the text
+            // fallback was sized by its own content, so a one-line title sat
+            // about a hundred points higher than a logo and dragged the meta
+            // lines, description and buttons up with it. Moving between two
+            // titles — one with artwork, one without — visibly re-laid out the
+            // whole header. Bottom alignment is what keeps a short wide logo
+            // and a two-line title sharing a baseline.
+            Group {
+                if let logo = viewModel.meta.logo {
+                    RemoteImage(url: logo, contentMode: .fit, alignment: .bottomLeading)
+                        // Grounds a white logo on both a light frost and dark art.
+                        .shadow(color: .black.opacity(0.5), radius: 16, y: 6)
+                        .frame(width: 520)
+                } else {
+                    Text(viewModel.meta.name)
+                        .font(FusionType.heroTitle(theme.font))
+                        .foregroundStyle(theme.palette.textPrimary)
+                        .lineLimit(2)
+                        .frame(maxWidth: 900, alignment: .leading)
+                        .shadow(color: .black.opacity(0.4), radius: 10, y: 4)
+                }
             }
+            .frame(height: 180, alignment: .bottomLeading)
+            .frame(maxWidth: .infinity, alignment: .leading)
 
             // Meta line 1: Genres • Full release date • IMDb.
             MetaLine(segments: primaryMetaSegments, imdbRating: viewModel.meta.imdbRating)

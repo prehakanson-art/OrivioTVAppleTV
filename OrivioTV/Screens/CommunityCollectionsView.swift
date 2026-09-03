@@ -436,10 +436,10 @@ struct CommunityCollectionsView: View {
                     HStack {
                         VStack(alignment: .leading, spacing: 4) {
                             Text("Community Collections")
-                                .font(.system(size: 40, weight: .bold))
+                                .font(FusionType.pageTitle(theme.font))
                                 .foregroundStyle(theme.palette.textPrimary)
                             Text("Curated, high-quality categories — install just the ones you want, grouped into one Home row per section.")
-                                .font(.system(size: 20))
+                                .font(FusionType.metadata(theme.font))
                                 .foregroundStyle(theme.palette.textSecondary)
                         }
                         Spacer()

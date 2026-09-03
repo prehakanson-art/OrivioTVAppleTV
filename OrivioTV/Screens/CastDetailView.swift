@@ -53,7 +53,7 @@ struct CastDetailView: View {
                 ScrollView(.vertical) {
                     VStack(alignment: .leading, spacing: OrivioSpacing.xl) {
                         Text(viewModel.personName)
-                            .font(.system(size: 52, weight: .heavy))
+                            .font(FusionType.pageTitle(theme.font))
                             .foregroundStyle(theme.palette.textPrimary)
                             .padding(.leading, OrivioSpacing.huge)
                             .padding(.top, OrivioSpacing.xxl)
