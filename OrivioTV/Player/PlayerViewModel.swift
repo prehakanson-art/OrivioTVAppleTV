@@ -5404,31 +5404,42 @@ final class PlayerViewModel: ObservableObject {
         return max(ScrubThumbnailer.secondsPerFrame * 3, spacing * 1.5)
     }
 
+    /// Nearest entry in a TIME-SORTED thumbnail array, by binary search.
+    ///
+    /// Both arrays are built in time order, and this is called from a view body
+    /// at the scrub publish rate (~30Hz) over up to 240 coarse frames plus the
+    /// fine window — thousands of comparisons per second on the main actor while
+    /// the decoder is running. The order was always there to exploit.
+    private static func nearest(
+        in thumbs: [ScrubThumbnail], to time: Double
+    ) -> (thumb: ScrubThumbnail, distance: Double)? {
+        guard !thumbs.isEmpty else { return nil }
+        var low = 0, high = thumbs.count - 1
+        while low < high {
+            let mid = (low + high) / 2
+            if thumbs[mid].time < time { low = mid + 1 } else { high = mid }
+        }
+        var best = thumbs[low]
+        var bestDistance = abs(best.time - time)
+        if low > 0 {
+            let previous = thumbs[low - 1]
+            let distance = abs(previous.time - time)
+            if distance < bestDistance { best = previous; bestDistance = distance }
+        }
+        return (best, bestDistance)
+    }
+
     func thumbnail(at time: Double) -> UIImage? {
         // Prefer a fine frame when one is genuinely near — within a single
         // fine step. Past that the coarse set is the better answer than a
         // stale close-up from the edge of the window.
-        if !fineThumbnails.isEmpty {
-            var best: ScrubThumbnail?
-            var bestDistance = Double.infinity
-            for thumb in fineThumbnails {
-                let distance = abs(thumb.time - time)
-                if distance < bestDistance { bestDistance = distance; best = thumb }
-            }
-            if let best, bestDistance <= ScrubThumbnailer.fineSecondsPerFrame {
-                return best.image
-            }
+        if let hit = Self.nearest(in: fineThumbnails, to: time),
+           hit.distance <= ScrubThumbnailer.fineSecondsPerFrame {
+            return hit.thumb.image
         }
-        guard !scrubThumbnails.isEmpty else { return nil }
-        var best: UIImage?
-        var bestDistance = Double.infinity
-        for thumb in scrubThumbnails {
-            let distance = abs(thumb.time - time)
-            if distance < bestDistance {
-                bestDistance = distance
-                best = thumb.image
-            }
-        }
+        guard let coarse = Self.nearest(in: scrubThumbnails, to: time) else { return nil }
+        let best: UIImage? = coarse.thumb.image
+        let bestDistance = coarse.distance
         // Reject a frame that is nowhere near this scene — but judge "near" by
         // the coverage that actually EXISTS, not by the spacing the pass is
         // aiming for. A flat 90s cut-off meant that early on, when the pass had

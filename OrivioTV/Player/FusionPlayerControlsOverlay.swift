@@ -80,7 +80,13 @@ struct FusionPlayerControlsOverlay: View {
 
     var body: some View {
         ZStack {
-            scrim
+            // (The bottom scrim is drawn ONCE by PlayerScreen — see
+            // `bottomScrim` there. Both this view and FusionInertOverlay used to
+            // draw an identical copy, and they cross-fade through each other on
+            // every scrub entry and exit: two 1920x640 gradients at ~50% each
+            // composite to about 0.75 of the intended density, so the bottom of
+            // the picture visibly lightened and re-darkened. It was also real
+            // fill rate, twice over, on top of live video.)
 
             if viewModel.optionsPopupVisible {
                 FusionOptionsPopup(viewModel: viewModel, focus: $focusedControl)
@@ -237,15 +243,8 @@ struct FusionInertOverlay: View {
 
     var body: some View {
         ZStack {
-            VStack(spacing: 0) {
-                Spacer()
-                LinearGradient(
-                    colors: [.clear, .black.opacity(0.40), .black.opacity(0.88)],
-                    startPoint: .top, endPoint: .bottom
-                )
-                .frame(height: 640)
-            }
-            .ignoresSafeArea()
+            // (Scrim owned by PlayerScreen — see the note in the controls
+            // overlay above.)
 
             FusionBottomBlock(
                 viewModel: viewModel,

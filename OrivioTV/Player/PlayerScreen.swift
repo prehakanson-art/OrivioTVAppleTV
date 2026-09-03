@@ -274,19 +274,30 @@ struct PlayerScreen: View {
             // "Skip Intro" pill while inside an intro-like chapter.
             skipIntroPill
         }
-        .animation(.easeOut(duration: 0.18), value: viewModel.overlay)
-        .animation(.easeOut(duration: 0.2), value: viewModel.isResyncing)
+        // Appear and dismiss are NOT the same move. One symmetric `easeOut`
+        // drove every overlay in this stack, while the token file has said all
+        // along that chrome should arrive on a decelerating curve and leave on a
+        // slower, softer one — `controlsDismiss` (0.26) had never reached the
+        // screen. Dismissal is where a ten-foot UI most needs to be gentle: the
+        // viewer is looking at the picture underneath, not at the thing leaving.
+        .animation(viewModel.overlay == .none ? FusionMotion.controlsDismiss
+                                              : FusionMotion.controlsAppear,
+                   value: viewModel.overlay)
+        .animation(FusionMotion.controlsAppear, value: viewModel.isResyncing)
         // Held over the last frame while the display-mode handshake settles.
         // Opaque and above everything, so the renegotiation happens over a
         // static black screen — never over a video surface being torn down.
         .overlay {
             if exitCoverVisible { Color.black.ignoresSafeArea() }
         }
-        .animation(.easeOut(duration: 0.16), value: viewModel.isScrubbing)
-        .animation(.easeOut(duration: 0.16), value: viewModel.peekVisible)
-        .animation(.easeOut(duration: 0.2), value: viewModel.showBufferSpinner)
-        .animation(.easeOut(duration: 0.16), value: viewModel.pendingSeekDelta != 0)
-        .animation(.easeInOut(duration: 0.3), value: viewModel.hasStartedPlayback)
+        // These four were 0.16/0.16/0.2/0.16 — a 40ms spread nobody can see,
+        // multiplying transactions over the same stack for no gain. One token.
+        .animation(FusionMotion.controlsAppear, value: viewModel.isScrubbing)
+        .animation(FusionMotion.controlsAppear, value: viewModel.peekVisible)
+        .animation(FusionMotion.controlsAppear, value: viewModel.showBufferSpinner)
+        .animation(FusionMotion.controlsAppear, value: viewModel.pendingSeekDelta != 0)
+        // The first frame appearing is a page-scale moment, not a control one.
+        .animation(FusionMotion.pageEnter, value: viewModel.hasStartedPlayback)
         .onPlayPauseCommand {
             if viewModel.isScrubbing {
                 viewModel.commitScrub()
@@ -568,6 +579,35 @@ struct PlayerScreen: View {
         }
     }
 
+    private var bottomBlockVisible: Bool {
+        if viewModel.overlay == .controls { return true }
+        if viewModel.isScrubbing { return true }
+        if viewModel.peekVisible, viewModel.overlay == .none { return true }
+        if viewModel.pendingSeekDelta != 0, viewModel.overlay != .controls { return true }
+        return false
+    }
+
+    /// The one bottom scrim. It follows "is any bottom block on screen" rather
+    /// than living inside each block, so entering or leaving a scrub swaps only
+    /// the content underneath it and the darkening itself stays put.
+    @ViewBuilder
+    private var bottomScrim: some View {
+        if bottomBlockVisible {
+            VStack(spacing: 0) {
+                Spacer()
+                LinearGradient(
+                    colors: [.clear, .black.opacity(0.40), .black.opacity(0.88)],
+                    startPoint: .top, endPoint: .bottom
+                )
+                .frame(height: 640)
+            }
+            .ignoresSafeArea()
+            .allowsHitTesting(false)
+            .transition(.opacity)
+        }
+    }
+
+    @ViewBuilder
     private var bufferingIndicator: some View {
         VStack(spacing: OrivioSpacing.lg) {
             ProgressView()
@@ -839,12 +879,17 @@ struct UpNextOverlay: View {
                     // Countdown timer bar (only while a countdown is active;
                     // an "unlimited" timeout shows no bar, just the buttons).
                     if viewModel.upNextCountdown != nil {
+                        // `scaleEffect`, not `frame(width:)`. Animating a frame
+                        // is a LAYOUT animation: it re-ran layout every frame
+                        // for a full second, once per tick, for the whole
+                        // countdown, while video decoded behind it. A transform
+                        // composites for free — and the parent frame is a known
+                        // 360pt, so the GeometryReader that measured it was
+                        // buying a measurement pass for nothing.
                         ZStack(alignment: .leading) {
                             Capsule().fill(.white.opacity(0.18))
-                            GeometryReader { geo in
-                                Capsule().fill(theme.palette.secondary)
-                                    .frame(width: geo.size.width * progress)
-                            }
+                            Capsule().fill(theme.palette.secondary)
+                                .scaleEffect(x: max(0, min(progress, 1)), anchor: .leading)
                         }
                         .frame(width: 360, height: 6)
                         .animation(.linear(duration: 1), value: progress)
