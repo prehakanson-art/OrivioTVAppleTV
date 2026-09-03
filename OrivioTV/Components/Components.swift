@@ -34,7 +34,18 @@ final class ImageCache: @unchecked Sendable {
     }()
 
     private let memory = NSCache<NSString, UIImage>()
-    private let ioQueue = DispatchQueue(label: "orivio.imagecache.io", qos: .utility)
+    /// CONCURRENT and user-initiated. As a serial `.utility` queue this made
+    /// the best-cached path the slowest one: every newly visible poster queued
+    /// behind every other one, single file, at background priority, while the
+    /// network path hopped to `.userInitiated` and overtook it. A screenful of
+    /// already-cached art cost hundreds of milliseconds of placeholders over
+    /// bytes sitting on local disk.
+    ///
+    /// Reads and writes are independent (distinct files, and a failed read just
+    /// re-downloads), so the only ordering that ever mattered is that a clear or
+    /// a trim not run alongside them — those use `.barrier`.
+    private let ioQueue = DispatchQueue(label: "orivio.imagecache.io",
+                                        qos: .userInitiated, attributes: .concurrent)
     private let fm = FileManager.default
     private let diskURL: URL
     private let diskBudget = 512 * 1024 * 1024   // ~512 MB of encoded images
@@ -47,7 +58,7 @@ final class ImageCache: @unchecked Sendable {
         let caches = fm.urls(for: .cachesDirectory, in: .userDomainMask)[0]
         diskURL = caches.appendingPathComponent("orivio-images", isDirectory: true)
         try? fm.createDirectory(at: diskURL, withIntermediateDirectories: true)
-        ioQueue.async { [weak self] in self?.trimDisk() }
+        ioQueue.async(flags: .barrier) { [weak self] in self?.trimDisk() }
         // Under real memory pressure, decoded pixels are the cheapest thing to
         // give back (they re-decode from disk on demand) — dropping them here
         // is what keeps tvOS from jetsamming the whole app instead.
@@ -118,8 +129,13 @@ final class ImageCache: @unchecked Sendable {
                     return
                 }
                 self.insertMemory(prepared, for: memoryKey ?? key)
-                try? self.fm.setAttributes([.modificationDate: Date()], ofItemAtPath: fileURL.path)
                 continuation.resume(returning: prepared)
+                // LRU bookkeeping only — never make the caller wait on a
+                // filesystem attribute write.
+                self.ioQueue.async { [weak self] in
+                    try? self?.fm.setAttributes([.modificationDate: Date()],
+                                                ofItemAtPath: fileURL.path)
+                }
             }
         }
     }
@@ -162,7 +178,10 @@ final class ImageCache: @unchecked Sendable {
         // asked to empty. Hopped to the main actor because that is where
         // `prefetch(urls:)` writes this property from.
         Task { @MainActor [weak self] in self?.prefetchTask?.cancel() }
-        ioQueue.sync {
+        // `.barrier` now that the queue is concurrent: this is the one operation
+        // that must not run alongside a read or a write, since it deletes the
+        // directory both of them are using.
+        ioQueue.sync(flags: .barrier) {
             try? fm.removeItem(at: diskURL)
             try? fm.createDirectory(at: diskURL, withIntermediateDirectories: true)
         }
@@ -230,14 +249,32 @@ final class ImageCache: @unchecked Sendable {
         let limit = PerformanceProfile.isLowPower ? 36 : (PerformanceProfile.isMidPower ? 60 : 96)
         let candidates = Array(unique.prefix(limit))
         prefetchTask?.cancel()
+        // Bounded, not one at a time. Serially this warmed up to 96 posters at
+        // roughly 60ms each — about six seconds on a session configured for
+        // twelve connections per host — so the prefetch usually lost its race
+        // against the user and the scroll hit the network anyway. Kept modest so
+        // it cannot starve the posters currently on screen.
+        let window = PerformanceProfile.isLowPower ? 4 : (PerformanceProfile.isMidPower ? 6 : 8)
         prefetchTask = Task.detached(priority: .utility) { [weak self] in
-            for urlString in candidates {
-                guard !Task.isCancelled else { return }
-                guard let self, let url = URL(string: urlString) else { continue }
-                let fileURL = self.fileURL(for: urlString)
-                if self.fm.fileExists(atPath: fileURL.path) { continue }
-                guard let (data, _) = try? await ImageCache.downloadSession.data(from: url) else { continue }
-                self.ioQueue.async { self.writeCacheFile(data, to: fileURL) }
+            guard let self else { return }
+            await withTaskGroup(of: Void.self) { group in
+                var next = 0
+                func startNext() {
+                    guard next < candidates.count, !Task.isCancelled else { return }
+                    let urlString = candidates[next]
+                    next += 1
+                    group.addTask { [weak self] in
+                        guard !Task.isCancelled, let self,
+                              let url = URL(string: urlString) else { return }
+                        let fileURL = self.fileURL(for: urlString)
+                        if self.fm.fileExists(atPath: fileURL.path) { return }
+                        guard let (data, _) = try? await ImageCache.downloadSession.data(from: url)
+                        else { return }
+                        self.ioQueue.async { self.writeCacheFile(data, to: fileURL) }
+                    }
+                }
+                for _ in 0 ..< min(window, candidates.count) { startNext() }
+                while await group.next() != nil { startNext() }
             }
         }
     }
@@ -607,7 +644,12 @@ struct PosterCard: View {
     /// The native CardButtonStyle platter supplies focus (raise + trackpad
     /// wiggle), so the card's own ring / scale / shadow / caption are
     /// suppressed — posters read as clean "icons".
-    private var atv: Bool { true }
+    // NOTE: a `private var atv: Bool { true }` used to sit here, left over from
+    // the multi-theme era. Because it was a constant, `&& !atv` made two shipped
+    // settings unreachable: the focused-poster drop shadow (Settings →
+    // Performance → "Card shadows", whose copy promises shadows under posters)
+    // and the poster caption (Settings → Layout → "Poster labels"). Both are
+    // wired to their real settings below.
 
     /// Focus ring fallback. Classic always rings its focused card. Fusion
     /// normally lets the accent GLOW mark focus — but the glow rides the Card
@@ -617,7 +659,7 @@ struct PosterCard: View {
     /// vector stroke — no offscreen pass, nothing recomposited per frame.
     private var showsFocusRing: Bool {
         guard isFocused else { return false }
-        if !atv { return true }
+        // (The retired always-true theme flag used to short-circuit here.)
         // The glow this used to defer to no longer exists (it was always
         // `.clear` and has been removed), and the black drop shadow below is
         // disabled on this style too — so "shadows are on" can no longer stand
@@ -653,7 +695,7 @@ struct PosterCard: View {
             .overlay {
                 // Fusion: unfocused cards rest slightly darker so the focused
                 // one pops (flat overlay — no live filters).
-                if atv && !isFocused {
+                if !isFocused {
                     RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                         .fill(Color.black.opacity(0.11))
                 }
@@ -671,23 +713,19 @@ struct PosterCard: View {
             // card; with the old always-on ambient shadow every visible poster
             // paid one, which is a large share of the scroll cost on the
             // A8/A10X boxes. One shadow (the focused pop) keeps the depth cue.
-            .shadow(color: .black.opacity(perf.settings.cardShadows && isFocused && !atv ? 0.65 : 0),
-                    radius: perf.settings.cardShadows && isFocused && !atv ? 22 : 0, y: 10)
+            .shadow(color: .black.opacity(perf.settings.cardShadows && isFocused ? 0.65 : 0),
+                    radius: perf.settings.cardShadows && isFocused ? 22 : 0, y: 10)
 
-            if layout.showPosterLabels && !atv {
-                MarqueeText(
-                    text: item.name,
-                    font: .system(size: 22, weight: .medium),
-                    color: isFocused ? theme.palette.textPrimary : theme.palette.textSecondary,
-                    active: isFocused
-                )
-                .frame(width: cardWidth, alignment: .leading)
-            }
+            // No caption here. Every screen that wants one wraps this card in
+            // `GridPosterCell`, which draws `ATVCardCaption` as a SIBLING below
+            // the button — keeping the poster a clean tile instead of letting
+            // the native platter bridge artwork and text together. That is where
+            // Settings → Layout → "Poster labels" is honoured.
         }
-        // `atv` opts out: the Apple TV theme uses the native tvOS card platter
-        // (lift + trackpad tilt) instead of a scale. Every other theme gets the
-        // shared card lift, so a poster grows identically in all of them.
-        .focusLift(atv ? 1.0 : OrivioFocus.card, isFocused)
+        // 1.0, i.e. no scale of our own: the native tvOS card platter supplies
+        // the lift and the trackpad tilt. (This used to branch on a theme flag
+        // that has been a constant `true` since the other themes were retired.)
+        .focusLift(1.0, isFocused)
     }
 }
 
@@ -923,7 +961,15 @@ private struct SpoilerBlur: ViewModifier {
 extension View {
     @ViewBuilder
     func liquidGlass<S: Shape>(in shape: S) -> some View {
-        if #available(tvOS 26.0, *) {
+        // `atvGlass` has had a solid fallback for the slower boxes for a while;
+        // this one — which is what the rail, the filter pills, the search bar,
+        // the detail icon circles and EVERY unselected season chip actually call
+        // — had none. A fifteen-season show meant fourteen live glass capsules
+        // in one scroller, and the rail was a full-height live blur that
+        // re-composited through its own expand/collapse animation.
+        if PerformanceProfile.isLowPower || PerformanceProfile.isMidPower {
+            self.background(FusionMaterials.dialog, in: shape)
+        } else if #available(tvOS 26.0, *) {
             self.glassEffect(.regular, in: shape)
         } else {
             self.background(.ultraThinMaterial, in: shape)
@@ -985,6 +1031,7 @@ struct ATVCardCaption: View {
 /// ⏯ straight to the source picker, and the caption easing down while focused
 /// so the grown platter never crowds it. Used by the Home grid and Search.
 struct GridPosterCell: View {
+    @EnvironmentObject private var layout: HomeCatalogSettingsStore
     let item: MetaItem
     let captionWidth: CGFloat
     let onSelect: (MetaItem) -> Void
@@ -997,12 +1044,18 @@ struct GridPosterCell: View {
         VStack(alignment: .leading, spacing: 0) {
             button
 
-            ATVCardCaption(
-                title: item.name,
-                subtitle: item.year,
-                width: captionWidth,
-                lowered: focused
-            )
+            // Settings → Layout → "Poster labels". The switch used to be wired
+            // to a branch inside `PosterCard` that a constant made unreachable,
+            // so it did nothing at all; this is the caption it was always meant
+            // to control.
+            if layout.showPosterLabels {
+                ATVCardCaption(
+                    title: item.name,
+                    subtitle: item.year,
+                    width: captionWidth,
+                    lowered: focused
+                )
+            }
         }
     }
 

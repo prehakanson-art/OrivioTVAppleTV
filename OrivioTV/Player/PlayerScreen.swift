@@ -747,10 +747,15 @@ struct PlayerLoadingOverlay: View {
         .onAppear {
             withAnimation(.easeOut(duration: 0.6).delay(0.15)) { revealed = true }
             // The logo pulse re-composites the (large) title image every frame
-            // for the entire load — exactly while the A8 is busiest opening and
-            // demuxing the stream, which visibly slows the open itself. Static
-            // logo there; the spinner still shows life.
-            if !PerformanceProfile.isLowPower {
+            // for the entire load — exactly while the chip is busiest opening
+            // and demuxing the stream, which visibly slows the open itself.
+            // That argument was written for the A8 but applies just as well to
+            // the A10X opening a 4K remux, and that box is `isMidPower`, so the
+            // mitigation was never reaching it. Also gated on Reduce Motion: a
+            // two-second breathing scale, running for the whole load, is exactly
+            // what that setting exists to suppress. The spinner still shows life.
+            if !PerformanceProfile.isLowPower, !PerformanceProfile.isMidPower,
+               !PerformanceSettingsStore.shared.reduceMotion {
                 withAnimation(.easeInOut(duration: 2).repeatForever(autoreverses: true)) { pulse = true }
             }
         }

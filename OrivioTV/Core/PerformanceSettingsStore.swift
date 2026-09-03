@@ -188,6 +188,11 @@ final class PerformanceSettingsStore: ObservableObject {
         s.heroBackdrop = v; s.heroCrossfade = v; s.cardShadows = v
         s.focusZoom = v; s.cardParallax = v; s.artworkFadeIn = v
         s.sidebarAnimation = v; s.buttonAnimations = v
+        // The label claims this turns off EVERY effect below it, and this one
+        // sits in the same pane — the heaviest per-focus effect in the app (up
+        // to tens of megabytes of decoded frames) and it was the one thing the
+        // switch could not reach.
+        if on { s.collectionGifQuality = .off }
         settings = s
     }
 

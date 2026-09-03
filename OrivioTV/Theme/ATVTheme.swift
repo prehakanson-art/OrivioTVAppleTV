@@ -12,10 +12,13 @@ extension View {
     /// on anything older — "liquid glass if the TV accepts it".
     @ViewBuilder
     func atvGlass<S: Shape>(in shape: S) -> some View {
-        if PerformanceProfile.isLowPower {
+        if PerformanceProfile.isLowPower || PerformanceProfile.isMidPower {
             // A live glass/blur pass is one of the costliest composites on the
-            // A8 Apple TV HD. On that box, back the layer with a solid graphite
-            // tone — identical shape and layout, no per-frame blur.
+            // A8 Apple TV HD — and on the A10X 4K gen 1, which is `isMidPower`,
+            // not `isLowPower`. Checking only the low tier meant every one of
+            // these mitigations missed the box this app targets first. Back the
+            // layer with a solid graphite tone instead: identical shape and
+            // layout, no per-frame blur.
             self.background(FusionMaterials.dialog, in: shape)
         } else if #available(tvOS 26.0, *) {
             // BACKGROUND glass, never wrapping: a `glassEffect` wrapped around
@@ -35,7 +38,10 @@ extension View {
     /// the missing blur doesn't read as a change.
     @ViewBuilder
     func playerChrome<S: Shape>(in shape: S, solid: Color = Color(hex: 0x121418).opacity(0.86)) -> some View {
-        if PerformanceProfile.isLowPower {
+        // Mid tier included: this blurs a MOVING frame on every displayed frame,
+        // while the same chip is decoding it. The worst composite in the app,
+        // and it was landing on the 4K gen 1 because that box is `isMidPower`.
+        if PerformanceProfile.isLowPower || PerformanceProfile.isMidPower {
             self.background(solid, in: shape)
         } else {
             self.background(.ultraThinMaterial, in: shape)
