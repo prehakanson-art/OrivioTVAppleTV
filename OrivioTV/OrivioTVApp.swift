@@ -258,8 +258,15 @@ struct RootView: View {
                     profiles.onSwitchLocal = { [weak trakt, weak ratings] id in
                         trakt?.setProfile(id)
                         ratings?.setProfile(id)
+                        // Every store just re-pointed at another profile's
+                        // data; reconcile the new picture everywhere rather
+                        // than waiting for a tick.
+                        SyncCoordinator.shared.requestFullSync("profile switched")
                     }
-                    profiles.onProfileDeleted = { [weak trakt] id in trakt?.forgetProfile(id) }
+                    profiles.onProfileDeleted = { [weak trakt] id in
+                        trakt?.forgetProfile(id)
+                        SyncCoordinator.shared.requestFullSync("profile deleted")
+                    }
                     traktSync = TraktSyncManager(
                         trakt: trakt, watched: watched, progress: progressStore,
                         library: library, ratings: ratings, addonManager: addonManager
@@ -284,6 +291,26 @@ struct RootView: View {
                         await orivioSync?.pushThisDevice()
                     }
                     stremioSync = stremioManager
+
+                    // Anything sync-relevant that happens locally now kicks a
+                    // full sync of every destination, debounced (see
+                    // SyncCoordinator). Registered by name, so this is safe to
+                    // reach twice.
+                    let coordinator = SyncCoordinator.shared
+                    coordinator.observe(watched: watched, library: library,
+                                        ratings: ratings, progress: progressStore)
+                    coordinator.addDestination("Orivio") { [weak orivioSync] in
+                        Task { await orivioSync?.syncNow() }
+                    }
+                    coordinator.addDestination("Trakt") { [weak traktSyncRef = traktSync] in
+                        traktSyncRef?.syncNow(force: true)
+                    }
+                    coordinator.addDestination("SIMKL") { [weak simklSyncRef = simklSync] in
+                        simklSyncRef?.syncNow(force: true)
+                    }
+                    coordinator.addDestination("Stremio") { [weak stremioManager] in
+                        stremioManager?.syncNow(reason: "Local change")
+                    }
                     // Fix up any already-installed Community Collections after
                     // launch has yielded. Keep network-backed logo migration
                     // out of app-open startup; that runs when the collection

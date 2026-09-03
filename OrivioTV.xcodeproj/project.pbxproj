@@ -93,6 +93,7 @@
 		861FE4C3277BD4A0016E5325 /* OrivioSyncModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 39B30E006EDC24452F5B2080 /* OrivioSyncModels.swift */; };
 		863516B242BE074238412A8B /* AddonDiscoverView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02830E2CD2474508165BC44F /* AddonDiscoverView.swift */; };
 		8B6068EC5B4E24C42D9D120E /* OrivioSyncDiagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 49ED8ECA821B841DB1B0D0B5 /* OrivioSyncDiagnostics.swift */; };
+		8C4912B13F8AE3628D164A69 /* SyncCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = AF0B8F923F6EDC743AB76179 /* SyncCoordinator.swift */; };
 		907533AF9BAF45F3FD373B50 /* RemoteInput.swift in Sources */ = {isa = PBXBuildFile; fileRef = A8DCE70635C3C65E8553BFE1 /* RemoteInput.swift */; };
 		91DB34DE5C2B64B6624FCBF7 /* CatalogSeeAllView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 78D74FCDE486BE869E0193FA /* CatalogSeeAllView.swift */; };
 		94AD2EF7580362A8DB4ED126 /* ProgressStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = DB7D8398AE932BEFD48DD535 /* ProgressStore.swift */; };
@@ -220,6 +221,7 @@
 		A1B5541ACD04013E9000101D /* OrivioAuthModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrivioAuthModels.swift; sourceTree = "<group>"; };
 		A8DCE70635C3C65E8553BFE1 /* RemoteInput.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteInput.swift; sourceTree = "<group>"; };
 		AB66131D818E6E4824BC7BAC /* FusionHeroBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FusionHeroBar.swift; sourceTree = "<group>"; };
+		AF0B8F923F6EDC743AB76179 /* SyncCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncCoordinator.swift; sourceTree = "<group>"; };
 		B509A5BB4E7B7EC1D80A28FB /* TorrServerService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TorrServerService.swift; sourceTree = "<group>"; };
 		B535C3DB8581583E6F5290EF /* FPSOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FPSOverlay.swift; sourceTree = "<group>"; };
 		B872284504BE4D777519FDCD /* TraktService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TraktService.swift; sourceTree = "<group>"; };
@@ -412,6 +414,7 @@
 				71F10A0E3EDFA7EA1AF9E620 /* StremioAccount.swift */,
 				1DC63CE64F31D8669EB31F3D /* StremioAPI.swift */,
 				D0AA88FC3B5F32468D43D084 /* StremioSyncManager.swift */,
+				AF0B8F923F6EDC743AB76179 /* SyncCoordinator.swift */,
 				D4321AB0FDE1C03667ED1CA0 /* TMDBService.swift */,
 				1CCD83FDFCB862907EFAD688 /* TopShelfExporter.swift */,
 				2537327216A64303D3DBF603 /* TorrentSettingsStore.swift */,
@@ -748,6 +751,7 @@
 				6FE058967DDA5D9684B9877B /* StremioAPI.swift in Sources */,
 				210817F418796C4E9618A83D /* StremioAccount.swift in Sources */,
 				A4D19C50A8EC7FE1CC500821 /* StremioSyncManager.swift in Sources */,
+				8C4912B13F8AE3628D164A69 /* SyncCoordinator.swift in Sources */,
 				07C17A358790D05595353E29 /* TMDBBrowseView.swift in Sources */,
 				27CE46D9A7C1FD8B5464BB84 /* TMDBService.swift in Sources */,
 				553EDFBD011EFC07E09B7CDE /* TopShelfExporter.swift in Sources */,

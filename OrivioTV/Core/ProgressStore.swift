@@ -166,10 +166,12 @@ final class ProgressStore: ObservableObject {
     /// resurrect on the next pull.
     var onRemove: (([String]) -> Void)?
     /// Fired when the USER removes a title from Continue Watching (with its
-    /// metaID), so Trakt sync can delete the matching playback rows there too.
-    /// Not fired for internal migrations (recanonicalize) — the title is still
-    /// being watched, its key just changed.
-    var onTraktRemove: ((String) -> Void)?
+    /// metaID), so Trakt sync can delete the matching playback rows there too
+    /// and the coordinator can kick a full sync. A LIST for the same reason as
+    /// the WatchedStore hooks: more than one thing needs to hear it. Not fired
+    /// for internal migrations (recanonicalize) — the title is still being
+    /// watched, its key just changed.
+    var onTrackerProgressRemove: [(String) -> Void] = []
     /// Fired with the metaID when a title leaves Continue Watching, so the
     /// Stremio sync can clear it THERE too. Stremio's continue watching is
     /// derived from each library item's playback state, and the push only
@@ -992,7 +994,7 @@ final class ProgressStore: ObservableObject {
         let removedKeys = items.values.filter { $0.metaID == metaID }.map(\.id)
         guard !removedKeys.isEmpty else {
             if !suppressChange {
-                if notifyTrakt { onTraktRemove?(metaID) }
+                if notifyTrakt { for hook in onTrackerProgressRemove { hook(metaID) } }
                 onStremioClearProgress?(metaID)
             }
             return
@@ -1006,7 +1008,7 @@ final class ProgressStore: ObservableObject {
         save()
         if !suppressChange {
             onRemove?(removedKeys)
-            if notifyTrakt { onTraktRemove?(metaID) }
+            if notifyTrakt { for hook in onTrackerProgressRemove { hook(metaID) } }
             onStremioClearProgress?(metaID)
             onLocalUpdate?()
         }

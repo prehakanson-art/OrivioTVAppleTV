@@ -36,7 +36,7 @@ final class TraktSyncManager: ObservableObject {
         library.onTrackerRemove.append { [weak self] item in self?.pushWatchlistRemove(item) }
         ratings.onTrackerRate.append { [weak self] id, type, r in self?.pushRating(id, type, r) }
         ratings.onTrackerUnrate.append { [weak self] id, type in self?.pushUnrate(id, type) }
-        progress.onTraktRemove = { [weak self] metaID in self?.pushPlaybackRemove(metaID) }
+        progress.onTrackerProgressRemove.append { [weak self] metaID in self?.pushPlaybackRemove(metaID) }
         // Toggling a Trakt sync setting on kicks a full sync.
         trakt.onTraktSettingChange = { [weak self] in self?.syncNow(force: true) }
         trakt.onClearContinueWatching = { [weak self] in
