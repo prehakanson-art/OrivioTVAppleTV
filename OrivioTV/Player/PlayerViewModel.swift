@@ -594,9 +594,31 @@ final class PlayerViewModel: ObservableObject {
     var activeVideoView: UIView? {
         isExiting ? nil : (dvDirectEngine?.videoView ?? vlcEngine?.videoView ?? playerLayer?.player.view)
     }
-    /// Picture in Picture, when the loaded engine can feed it (see the file
-    /// header in PictureInPicture.swift — in practice the AVPlayer path only).
+    /// Picture in Picture, when the loaded engine can feed it.
     let pictureInPicture = PictureInPictureController()
+
+    /// The PiP source for whatever engine is live, or nil when it can't feed
+    /// one. Only this type knows which engine loaded, so the resolution lives
+    /// here rather than in the controller.
+    var pictureInPictureSource: PictureInPictureController.Source? {
+        guard !isExiting else { return nil }
+        if let dv = dvDirectEngine {
+            return .sampleBuffer(dv.videoView.displayLayer, dv.pictureInPictureDelegate)
+        }
+        // FFmpeg: MetalPlayView draws into an AVSampleBufferDisplayLayer while
+        // `isUseDisplayLayer()` holds (display == .plane, this app's default),
+        // and KSPlayer already conforms KSMEPlayer to the playback delegate.
+        if let me = playerLayer?.player as? KSMEPlayer,
+           let metal = me.view as? MetalPlayView {
+            return .sampleBuffer(metal.displayLayer, me)
+        }
+        // KSAVPlayer: a plain AVPlayerLayer handover.
+        if let layer = playerLayer?.player.view?.layer as? AVPlayerLayer {
+            return .playerLayer(layer)
+        }
+        // VLC renders into its own drawable — nothing AVKit can adopt.
+        return nil
+    }
     /// True between PiP starting and the session ending or being restored.
     /// `PlayerScreen.onDisappear` reads it to skip `teardown()`: the video is
     /// still playing, just in the corner, so nothing teardown cancels should

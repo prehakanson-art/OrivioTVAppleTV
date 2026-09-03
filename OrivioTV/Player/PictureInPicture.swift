@@ -1,27 +1,28 @@
 import AVKit
+import KSPlayer
 import UIKit
 
 /// Picture in Picture for the player.
 ///
-/// tvOS has had `AVPictureInPictureController` since 14, but only for content
-/// AVKit is itself rendering. Of this app's four engines that is exactly one:
+/// AVKit will only drive PiP from a layer it can take over: an `AVPlayerLayer`,
+/// or an `AVSampleBufferDisplayLayer` paired with a playback delegate. Three of
+/// this app's four engines qualify:
 ///
-/// * **KSAVPlayer** — an `AVPlayer` behind an `AVPlayerLayer`. PiP works, and
-///   this is `KSOptions.firstPlayerType` for real mp4/HLS.
-/// * **KSMEPlayer** — the FFmpeg engine, drawing through Metal. There is no
-///   layer to hand AVKit. Auto picks this for mkv and extensionless debrid
-///   links, which is most of what this app actually plays, so PiP is
-///   genuinely unavailable much of the time.
-/// * **VLC** — renders into its own drawable. Same story.
-/// * **DVSampleEngine** — feeds an `AVSampleBufferDisplayLayer`, which *can*
-///   drive PiP via a sample-buffer content source. That is not a layer
-///   handover though: it needs a full
-///   `AVPictureInPictureSampleBufferPlaybackDelegate` supplying transport,
-///   seeking and a live time range. Not wired up.
+/// * **KSAVPlayer** — an `AVPlayer` behind an `AVPlayerLayer`. The mp4/HLS path.
+/// * **KSMEPlayer** (FFmpeg) — draws into an `AVSampleBufferDisplayLayer`
+///   whenever `KSOptions.isUseDisplayLayer()` holds, which is `display ==
+///   .plane` — the default this app never changes. KSPlayer already conforms
+///   KSMEPlayer to `AVPictureInPictureSampleBufferPlaybackDelegate`, so the
+///   transport comes for free. This is the engine Auto picks for mkv and
+///   extensionless debrid links, i.e. most of what actually gets played.
+/// * **DVSampleEngine** — feeds its own `AVSampleBufferDisplayLayer`; the
+///   delegate is implemented alongside the engine.
+/// * **VLC** — renders into its own drawable with no CALayer AVKit can adopt.
+///   This one genuinely cannot, and is the only exclusion.
 ///
-/// So availability is decided per SESSION rather than once, and the control is
-/// hidden when the engine that actually loaded can't do it — better than
-/// offering a button that silently fails.
+/// Availability is still decided per SESSION rather than assumed: the control
+/// is hidden unless the engine that actually loaded produced a usable source
+/// and AVKit reports PiP possible for it.
 @MainActor
 final class PictureInPictureController: NSObject, ObservableObject {
     /// Can PiP start right now? False until the attached layer has content,
@@ -42,27 +43,50 @@ final class PictureInPictureController: NSObject, ObservableObject {
 
     private var controller: AVPictureInPictureController?
     private var possibleObservation: NSKeyValueObservation?
-    private weak var attachedLayer: AVPlayerLayer?
+    private weak var attachedLayer: CALayer?
+
+    /// Where the picture comes from. Built by `PlayerViewModel` from whichever
+    /// engine is live, because only it knows which one that is.
+    enum Source {
+        case playerLayer(AVPlayerLayer)
+        case sampleBuffer(AVSampleBufferDisplayLayer, AVPictureInPictureSampleBufferPlaybackDelegate)
+
+        /// Identity used to decide whether the attached source actually
+        /// changed. Comparing the LAYER (not the enum, which can't be
+        /// Equatable with a delegate in it) is what makes `attach` idempotent.
+        var layer: CALayer {
+            switch self {
+            case .playerLayer(let l): return l
+            case .sampleBuffer(let l, _): return l
+            }
+        }
+    }
 
     /// Point at whatever the engine renders into.
     ///
     /// Idempotent on purpose: `PlayerVideoView.updateUIView` calls this on
-    /// every SwiftUI update, so rebuilding the controller each time would
-    /// churn AVKit state (and drop an active PiP session) many times a second.
-    func attach(to view: UIView?) {
+    /// every SwiftUI update, so rebuilding the controller each time would churn
+    /// AVKit state (and drop an active PiP session) many times a second.
+    func attach(_ source: Source?) {
         guard AVPictureInPictureController.isPictureInPictureSupported(),
-              let layer = view?.layer as? AVPlayerLayer else {
-            // Every non-AVPlayer engine lands here. Don't tear down an ACTIVE
+              let source else {
+            // VLC, or a device/simulator without PiP. Don't tear down an ACTIVE
             // session: during the handoff the render view is going away by
-            // design, and resetting here would kill the PiP window we just
-            // opened.
+            // design, and resetting here would kill the window just opened.
             if !isActive { reset() }
             return
         }
-        guard layer !== attachedLayer else { return }
+        guard source.layer !== attachedLayer else { return }
         reset()
-        attachedLayer = layer
-        let pip = AVPictureInPictureController(playerLayer: layer)
+        attachedLayer = source.layer
+        let pip: AVPictureInPictureController?
+        switch source {
+        case .playerLayer(let layer):
+            pip = AVPictureInPictureController(playerLayer: layer)
+        case .sampleBuffer(let layer, let delegate):
+            pip = AVPictureInPictureController(contentSource: .init(
+                sampleBufferDisplayLayer: layer, playbackDelegate: delegate))
+        }
         pip?.delegate = self
         controller = pip
         possibleObservation = pip?.observe(\.isPictureInPicturePossible,

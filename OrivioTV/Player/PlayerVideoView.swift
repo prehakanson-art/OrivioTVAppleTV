@@ -30,7 +30,7 @@ struct PlayerVideoView: UIViewRepresentable {
         // Point PiP at whatever the engine ended up rendering into. Done here
         // rather than at load time because the render view only exists once
         // the engine has actually started, and it CHANGES on an engine swap.
-        viewModel.pictureInPicture.attach(to: viewModel.activeVideoView)
+        viewModel.pictureInPicture.attach(viewModel.pictureInPictureSource)
         // The active engine's render view (KSPlayer's player view or VLC's
         // drawable) — bumped via videoRefreshID when the engine changes.
         guard let videoView = viewModel.activeVideoView else {

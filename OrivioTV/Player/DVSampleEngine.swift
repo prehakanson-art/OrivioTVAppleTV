@@ -1,4 +1,5 @@
 import AVFoundation
+import AVKit
 import CoreMedia
 import Foundation
 import KSPlayer
@@ -42,6 +43,10 @@ final class DVSampleEngine {
 
     /// Hosts the AVSampleBufferDisplayLayer; hand this to PlayerVideoView.
     let videoView = DVSampleLayerView()
+
+    /// Transport target for the PiP window. Owned here because AVKit does not
+    /// keep the playback delegate alive; the adapter holds the engine weakly.
+    lazy var pictureInPictureDelegate = DVPictureInPictureDelegate(engine: self)
 
     /// Fired on main ~2×/s with the current position (absolute source secs).
     var onTime: ((Double) -> Void)?
@@ -2341,4 +2346,63 @@ final class DVSampleLayerView: UIView {
         backgroundColor = .black
     }
     required init?(coder: NSCoder) { fatalError("unavailable") }
+}
+
+// MARK: - Picture in Picture
+
+/// Lets AVKit drive the DV engine from the PiP window.
+///
+/// A separate NSObject rather than a conformance on the engine itself:
+/// `AVPictureInPictureSampleBufferPlaybackDelegate` inherits NSObjectProtocol,
+/// and making `DVSampleEngine` an NSObject subclass to satisfy that would
+/// change how the most delicate object in the player is constructed for a
+/// purely structural reason. The engine already owns the two things a
+/// sample-buffer PiP source needs — an AVSampleBufferDisplayLayer and a render
+/// synchronizer — so all that was missing is somewhere to send transport
+/// commands. KSPlayer supplies the equivalent for its own FFmpeg engine.
+///
+/// Holds the engine WEAKLY: the engine owns this adapter, so a strong link
+/// back would be a cycle that outlives every playback session.
+final class DVPictureInPictureDelegate: NSObject, AVPictureInPictureSampleBufferPlaybackDelegate {
+    private weak var engine: DVSampleEngine?
+
+    init(engine: DVSampleEngine) {
+        self.engine = engine
+        super.init()
+    }
+
+    func pictureInPictureController(_: AVPictureInPictureController, setPlaying playing: Bool) {
+        playing ? engine?.play() : engine?.pause()
+    }
+
+    func pictureInPictureControllerIsPlaybackPaused(_: AVPictureInPictureController) -> Bool {
+        !(engine?.isPlaying ?? false)
+    }
+
+    func pictureInPictureControllerTimeRangeForPlayback(_: AVPictureInPictureController) -> CMTimeRange {
+        // A zero-length range makes AVKit present the window as live rather
+        // than drawing a scrubber that can't move — the honest presentation
+        // until a duration is actually known.
+        guard let duration = engine?.duration, duration > 0 else {
+            return CMTimeRange(start: .zero, duration: .zero)
+        }
+        return CMTimeRange(start: .zero,
+                           duration: CMTime(seconds: duration, preferredTimescale: 600))
+    }
+
+    func pictureInPictureController(_: AVPictureInPictureController,
+                                    didTransitionToRenderSize _: CMVideoDimensions) {}
+
+    func pictureInPictureController(_: AVPictureInPictureController,
+                                    skipByInterval interval: CMTime) async {
+        guard let engine else { return }
+        let target = engine.position + CMTimeGetSeconds(interval)
+        let duration = engine.duration
+        engine.seek(to: max(0, duration > 0 ? min(target, duration) : target))
+    }
+
+    /// The audio must keep playing while the window is up — that is the point.
+    func pictureInPictureControllerShouldProhibitBackgroundAudioPlayback(
+        _: AVPictureInPictureController
+    ) -> Bool { false }
 }
