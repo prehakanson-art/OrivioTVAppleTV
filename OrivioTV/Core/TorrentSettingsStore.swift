@@ -11,6 +11,25 @@ struct TorrentSettings: Codable, Equatable {
     var serverURL: String = ""
     var hideTorrentStats: Bool = true
 
+    init() {}
+
+    private enum CodingKeys: String, CodingKey {
+        case p2pEnabled, serverURL, hideTorrentStats
+    }
+
+    /// Lenient decode, matching `PlayerSettings` / `PerformanceSettingsStore
+    /// .Settings`. With synthesized `Codable` over three non-optional fields,
+    /// adding ONE field would have failed the whole decode on every existing
+    /// install and `init` would have fallen back to `.default` — silently
+    /// wiping the TorrServer address the user typed in by hand, with P2P
+    /// switched back off and no hint as to why.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        p2pEnabled = (try? c.decode(Bool.self, forKey: .p2pEnabled)) ?? false
+        serverURL = (try? c.decode(String.self, forKey: .serverURL)) ?? ""
+        hideTorrentStats = (try? c.decode(Bool.self, forKey: .hideTorrentStats)) ?? true
+    }
+
     var isConfigured: Bool {
         p2pEnabled && !serverURL.trimmingCharacters(in: .whitespaces).isEmpty
     }

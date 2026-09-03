@@ -458,7 +458,8 @@ enum TMDBService {
     }
 
     /// A TMDB entity flattened to the fields we need before IMDB resolution.
-    private struct TMDBRawItem {
+    /// `Sendable` so `mapToMetaItems` can hand items to `boundedConcurrentMap`.
+    private struct TMDBRawItem: Sendable {
         let tmdbID: Int
         let isMovie: Bool
         let name: String
@@ -485,21 +486,44 @@ enum TMDBService {
         10767: "Talk", 10768: "War & Politics", 37: "Western",
     ]
 
+    /// Concurrency window for the `/external_ids` resolves in `mapToMetaItems`.
+    /// Higher than the addon sweep limits on purpose: these are tiny JSON
+    /// responses (and, after the first pass over a folder, mostly cache hits),
+    /// so the peak-memory argument behind `AddonSweepLimits` barely applies.
+    private static var imdbResolveWindow: Int { PerformanceProfile.isLowPower ? 6 : 12 }
+
     private static func mapToMetaItems(_ raw: [TMDBRawItem]) async -> [MetaItem] {
-        // Resolve IMDB ids concurrently (capped) so the whole folder loads fast.
-        var resolved: [(Int, String?)] = []
-        await withTaskGroup(of: (Int, String?).self) { group in
-            for (index, item) in raw.prefix(40).enumerated() {
-                group.addTask {
-                    (index, await imdbID(tmdbID: item.tmdbID, isMovie: item.isMovie))
-                }
-            }
-            for await pair in group { resolved.append(pair) }
+        // Resolve EVERY item's IMDb id, not just `raw.prefix(40)`. The task
+        // group resolved 40 but the mapping ran over the whole array, so item
+        // 41 onward silently kept a `tmdb:` id — and a `tmdb:` id is a
+        // different animal everywhere downstream (Trakt id mapping, addon
+        // selection, Cinemeta meta lookups all key on `tt…`), so the tail of a
+        // big company/network/genre folder behaved unlike its head.
+        //
+        // Bounded rather than unbounded: `boundedConcurrentMap` keeps at most
+        // `imdbResolveWindow` requests in flight and returns results in input
+        // order, so a 500-item folder resolves fully without firing 500
+        // simultaneous URLSession requests at a 2 GB Apple TV. "" = unresolved
+        // (a plain `String` avoids the double-optional the generic result would
+        // otherwise carry).
+        let resolvedIDs = await boundedConcurrentMap(raw, limit: imdbResolveWindow) { item in
+            await imdbID(tmdbID: item.tmdbID, isMovie: item.isMovie) ?? ""
         }
-        let imdbByIndex = Dictionary(resolved, uniquingKeysWith: { a, _ in a })
-        return raw.enumerated().map { index, item in
-            let id = imdbByIndex[index].flatMap { $0 } ?? "tmdb:\(item.tmdbID)"
-            return MetaItem(
+        // Deduplicate on the FINAL id. Dedup upstream is by TMDB id, but the id
+        // is then REWRITTEN to the resolved `tt…`, and two TMDB records can map
+        // to one IMDb title (duplicate entries; a movie + tv pair in
+        // `browseCompany`, which concatenates both discover calls). Two
+        // MetaItems with the same id inside a SwiftUI `ForEach` take the tvOS
+        // focus engine down, and several callers feed this straight into one —
+        // so it has to happen here, where every caller is covered.
+        var seenIDs = Set<String>()
+        var mapped: [MetaItem] = []
+        mapped.reserveCapacity(raw.count)
+        for (index, item) in raw.enumerated() {
+            let resolved = index < resolvedIDs.count ? resolvedIDs[index] : ""
+            let id = resolved.isEmpty ? "tmdb:\(item.tmdbID)" : resolved
+            guard seenIDs.insert(id).inserted else { continue }
+            mapped.append(MetaItem(
                 id: id,
                 type: item.isMovie ? "movie" : "series",
                 name: item.name,
@@ -510,8 +534,9 @@ enum TMDBService {
                 releaseInfo: item.releaseInfo,
                 imdbRating: item.rating.map { String(format: "%.1f", $0) },
                 genres: item.genres
-            )
+            ))
         }
+        return mapped
     }
 
     // MARK: - Endpoint helpers

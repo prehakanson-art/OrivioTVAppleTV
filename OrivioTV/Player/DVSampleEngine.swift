@@ -452,6 +452,46 @@ final class DVSampleEngine {
         }
     }
 
+    /// Demux thread only. Park at EOF until a seek moves the playhead (returns
+    /// true) or `stop()` cancels the session (returns false).
+    ///
+    /// Timed waits rather than an open-ended one: `seek()` and `stop()` both
+    /// broadcast, but a wake-up that lands between the generation check and the
+    /// wait would otherwise strand a finished title forever — a quarter-second
+    /// poll costs nothing on a thread that is doing no work at all, and is the
+    /// same belt-and-braces `enqueueBounded` already uses.
+    private func waitForSeekAfterEOF(currentGeneration: Int) -> Bool {
+        queueLock.lock()
+        defer { queueLock.unlock() }
+        while !cancelled, seekGeneration == currentGeneration {
+            queueLock.wait(until: Date().addingTimeInterval(0.25))
+        }
+        return !cancelled
+    }
+
+    /// Demux thread only. Undo the end-of-stream state so the seek we just woke
+    /// for actually plays: clear EOF for the feed blocks, forget that the end
+    /// was reported, and re-arm the renderers `signalEndOnce` stopped.
+    ///
+    /// The end-state reset runs on `feedQueue` because that is where
+    /// `didSignalEnd` and `signalEndOnce` live — dispatching it there serialises
+    /// it against an in-flight feed block, which could otherwise observe the
+    /// cleared flag, re-signal the end and immediately stop the media requests
+    /// we had just re-installed.
+    private func rearmAfterEOF() {
+        queueLock.lock()
+        demuxEOF = false
+        queueLock.broadcast()
+        queueLock.unlock()
+        feedQueue.async { [weak self] in
+            guard let self, !self.cancelled else { return }
+            self.didSignalEnd = false
+            // Nothing the renderers held survives the seek's flush.
+            self.lastRenderedEnd = 0
+            self.installFeeders()
+        }
+    }
+
     @Atomic private var cancelled = false
     /// Total stream bytes demuxed (packet payloads) — probe reads the delta
     /// to report live ingest throughput.
@@ -520,7 +560,17 @@ final class DVSampleEngine {
             guard let self else { return }
             let failReason = self.run()
             if let failReason {
-                DispatchQueue.main.async { completion(false, failReason) }
+                DispatchQueue.main.async { [weak self] in
+                    // Release the stored copy BEFORE reporting: the caller's
+                    // closure captures this engine strongly (its
+                    // `dvDirectEngine === engine` identity check needs it), and
+                    // `startCompletion` was only ever cleared on the SUCCESS
+                    // path — so every declined DV attempt left engine → closure
+                    // → engine alive with its synchronizer, both renderers and
+                    // the display view, for the life of the process.
+                    self?.startCompletion = nil
+                    completion(false, failReason)
+                }
             }
         }
         thread.name = "DVSampleEngine"
@@ -633,7 +683,11 @@ final class DVSampleEngine {
         queueLock.lock()
         videoQueue.removeAll()
         audioQueue.removeAll()
-        queueLock.signal()
+        // BROADCAST, not signal: the demux thread may be parked at EOF
+        // (`waitForSeekAfterEOF`) rather than waiting for queue room, and a
+        // seek that failed to wake it would leave the rewind unserved — the
+        // stuck-at-the-end symptom this whole path exists to cure.
+        queueLock.broadcast()
         queueLock.unlock()
         vtFlush()
         displayLayer.flush()
@@ -677,6 +731,12 @@ final class DVSampleEngine {
         onBuffering = nil
         onEnded = nil
         onError = nil
+        // Same cycle, same fix, one more owner: a start that is ABANDONED —
+        // stopped while the open was still in flight — never reaches either
+        // path that clears this, and the start closure captures the engine
+        // strongly. Clearing the other four callbacks but not this one left the
+        // engine (and its renderers and display view) alive anyway.
+        startCompletion = nil
     }
 
     deinit {
@@ -1105,6 +1165,14 @@ final class DVSampleEngine {
                 if target >= 0 {
                     let ts = Int64(target * Double(AV_TIME_BASE))
                     av_seek_frame(ictx, -1, ts, 1)
+                    // Clear the AVIO end-of-file latch with the seek. Now that
+                    // the loop PARKS at EOF instead of exiting, this branch can
+                    // run on a context that already reported the end, and a
+                    // still-latched `eof_reached` makes the very next
+                    // av_read_frame return EOF again — the rewind would appear
+                    // to take and then re-end the title on the spot. A no-op on
+                    // the ordinary mid-stream seek, where the latch is clear.
+                    ictx?.pointee.pb?.pointee.eof_reached = 0
                     // Seeks land on the KEYFRAME BEFORE the target, so left
                     // alone every skip jumped back a few seconds. Trim: the
                     // lead-in video is decoded but flagged do-not-display,
@@ -1156,8 +1224,30 @@ final class DVSampleEngine {
                     }
                     break
                 }
+                // GENUINE END OF STREAM — and NOT the end of this thread.
+                //
+                // This used to `break`, which made the end of a film terminal:
+                // nothing was left to serve a seek, `demuxEOF`/`didSignalEnd`
+                // were never cleared and the feeders were never re-armed. So a
+                // rewind inside the last ten seconds could not recover — the
+                // queues drained, the feed block saw EOF with empty queues and
+                // reported the end (progress saved as complete, Up Next armed),
+                // or, if the end had already been reported, the picture froze on
+                // the last frame with the clock still running. Replay from the
+                // post-play overlay died the same way.
+                //
+                // Instead: mark EOF, then PARK on the queue condition until a
+                // seek arrives (or `stop()` cancels us). A seek wakes us, the
+                // end state is cleared, the renderers are re-armed and the loop
+                // top repositions to `pendingSeekTo` — the same code path every
+                // ordinary seek takes. One thread, always exactly one: parking
+                // rather than exiting is what keeps `start()` from ever needing
+                // to spawn a second demuxer.
                 queueLock.lock(); demuxEOF = true; queueLock.broadcast(); queueLock.unlock()
-                break
+                guard waitForSeekAfterEOF(currentGeneration: myGeneration) else { break }
+                rearmAfterEOF()
+                eagainRetries = 0   // the post-seek reads are a fresh budget
+                continue   // the loop top does the reposition + decoder flush
             }
             eagainRetries = 0
             defer { av_packet_unref(packet) }
@@ -1878,7 +1968,23 @@ final class DVSampleEngine {
 
     // MARK: Feeders
 
+    /// (Re)install the media-request blocks. ALWAYS stops first.
+    ///
+    /// `requestMediaDataWhenReady(on:using:)` is documented as an error to call
+    /// a second time without an intervening `stopRequestingMediaData()`, and
+    /// the display-layer recovery path did exactly that (flush + seek +
+    /// installFeeders on a layer that already had a live block). The observable
+    /// damage was two feed blocks per renderer: the single
+    /// `stopRequestingMediaData()` in `signalEndOnce` then stopped only one of
+    /// them, so the survivor kept pulling against an empty queue and the
+    /// end-of-movie feed spin came back — the very spin `signalEndOnce` exists
+    /// to end. Stopping unconditionally here makes every call site (start,
+    /// layer recovery, and the post-EOF re-arm) correctly paired by
+    /// construction; stopping a renderer that has no block installed is a
+    /// no-op.
     private func installFeeders() {
+        displayLayer.stopRequestingMediaData()
+        audioRenderer.stopRequestingMediaData()
         displayLayer.requestMediaDataWhenReady(on: feedQueue) { [weak self] in
             self?.feed(video: true)
         }

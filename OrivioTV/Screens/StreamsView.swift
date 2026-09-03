@@ -112,6 +112,19 @@ final class StreamsViewModel: ObservableObject {
         groups.flatMap(\.entries)
     }
 
+    /// Whether the list has at least one PLAYABLE row.
+    ///
+    /// `groups` being non-empty is not the same thing: once the sweep finishes,
+    /// `rebuildGroups` appends a name-only group for every addon that returned
+    /// nothing, so a single stream addon that times out leaves one group of
+    /// pure `Text`. The panel used to take that as "we have results", skip the
+    /// empty state with its Try Again button, and render a page with NOTHING
+    /// focusable — and a Menu press on a focus-less page falls through to tvOS
+    /// and suspends the app (see the FocusAnchor note in HomeView).
+    var hasPlayableEntries: Bool {
+        groups.contains { !$0.entries.isEmpty }
+    }
+
     /// Filter the visible list to a single addon (nil = All). Re-curates from
     /// the raw pool so the chosen addon shows its full per-tier selection.
     func selectAddon(_ name: String?) {
@@ -794,19 +807,7 @@ struct StreamsView: View {
                             .multilineTextAlignment(.center)
                             .padding(.horizontal, OrivioSpacing.huge)
                     }
-                    Button {
-                        Task {
-                            await viewModel.reload(
-                                addonManager: addonManager,
-                                debridEnabled: debrid.hasAnyConfigured || torrent.settings.isConfigured,
-                                perTier: playerSettings.settings.sourcesPerSizeTier,
-                                filtersEnabled: playerSettings.settings.sourceFiltersEnabled
-                            )
-                        }
-                    } label: {
-                        RetryLabel()
-                    }
-                    .buttonStyle(PlainCardButtonStyle())
+                    retryButton
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -819,6 +820,24 @@ struct StreamsView: View {
             }
             .padding(OrivioSpacing.md)
         }
+    }
+
+    /// The retry affordance, shared by the empty state and by the diagnostic
+    /// list (see `streamList`) — the page's guaranteed focusable control.
+    private var retryButton: some View {
+        Button {
+            Task {
+                await viewModel.reload(
+                    addonManager: addonManager,
+                    debridEnabled: debrid.hasAnyConfigured || torrent.settings.isConfigured,
+                    perTier: playerSettings.settings.sourcesPerSizeTier,
+                    filtersEnabled: playerSettings.settings.sourceFiltersEnabled
+                )
+            }
+        } label: {
+            RetryLabel()
+        }
+        .buttonStyle(PlainCardButtonStyle())
     }
 
     /// Stremio-style addon filter: "All" plus one chip per addon that returned
@@ -889,7 +908,12 @@ struct StreamsView: View {
                 stream: entry.stream,
                 providers: await debrid.resolversRefreshingIfNeeded(),
                 season: viewModel.video?.season,
-                episode: viewModel.video?.episode
+                episode: viewModel.video?.episode,
+                // The addon told us WHICH file of the pack this row is. Without
+                // it every row of a season pack resolved to the same (largest)
+                // episode — the rows the fileIdx-aware dedupe now surfaces were
+                // all playing the same file.
+                fileIdx: entry.stream.fileIdx
             )
             let provider = resolvedBy ?? provider
             resolving = false
@@ -933,7 +957,11 @@ struct StreamsView: View {
         Task {
             let result = await TorrServerService.resolve(
                 magnet: magnet, settings: torrent.settings,
-                season: viewModel.video?.season, episode: viewModel.video?.episode
+                season: viewModel.video?.season, episode: viewModel.video?.episode,
+                // TorrServer's file id IS the torrent-relative index, so unlike
+                // most debrid providers it can honour the addon's pick directly
+                // instead of guessing by filename or size.
+                fileIdx: entry.stream.fileIdx
             )
             resolving = false
             // Back popped the page during the P2P resolve — don't present the
@@ -1048,6 +1076,17 @@ struct StreamsView: View {
                             .padding(.leading, 8)
                     }
                 }
+                // Every group is name-only (each queried addon replied with
+                // nothing / timed out), so nothing above this is focusable.
+                // With one stream addon installed the addon filter bar is
+                // hidden too and the page had NO focusable view at all — a
+                // Menu press then fell through to tvOS and suspended the app.
+                // Keep the retry affordance on screen instead.
+                if !viewModel.hasPlayableEntries {
+                    retryButton
+                        .frame(maxWidth: .infinity)
+                        .padding(.top, OrivioSpacing.md)
+                }
             }
             .padding(.vertical, OrivioSpacing.lg)
         }
@@ -1055,8 +1094,14 @@ struct StreamsView: View {
             // Only grab focus on the FIRST results arriving — otherwise changing
             // the addon filter (which rebuilds groups) would yank focus off the
             // chip you just picked and down into the list.
+            //
+            // `groups.first` can be an addon that returned NOTHING (a name-only
+            // group), so ask for the first group that actually has rows —
+            // otherwise the initial focus grab silently no-ops and the list
+            // opens with focus nowhere.
             guard !didInitialFocus, focusedEntry == nil,
-                  let first = viewModel.groups.first?.entries.first else { return }
+                  let first = viewModel.groups.first(where: { !$0.entries.isEmpty })?.entries.first
+            else { return }
             focusedEntry = first.id
             didInitialFocus = true
         }

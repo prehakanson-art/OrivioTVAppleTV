@@ -401,8 +401,22 @@ final class ProgressStore: ObservableObject {
             (!remoteIDs.contains(id) && local.updatedAt < cutoff
              && !awaitingServerAck.contains(id)) ? id : nil
         }
+        let staleRemovalTime = Date()
         for id in staleIDs {
             items.removeValue(forKey: id)
+            // Same reason as remove()/removeShow()/collapseDuplicateEpisodes():
+            // the reconciled-away key can be the one CURRENTLY PLAYING, whose
+            // live position lives only in `transientOverrides` (playback
+            // publishes to `items` at start and exit only, while the periodic
+            // save runs every ten seconds — so the `items` row ages past the
+            // deletion grace mid-film and qualifies here). Left behind, the
+            // override is folded straight back onto disk by `save()` and
+            // re-pushed by `serviceBackedForSync()`: the card the user is
+            // watching vanished from Continue Watching mid-playback and came
+            // back on the next launch. Tombstone it as every other removal
+            // path does so nothing resurrects it inside the grace window.
+            transientOverrides.removeValue(forKey: id)
+            tombstones[id] = staleRemovalTime
             changed = true
         }
 
@@ -439,6 +453,15 @@ final class ProgressStore: ObservableObject {
             return Self.serviceSyncSources.contains(source)
         }
         guard next.count != items.count else { return }
+        // Retire the periodic in-playback rows of the keys being dropped, like
+        // every other removal path — otherwise `save()` folds a purged row
+        // straight back onto disk from `transientOverrides`. No tombstone here:
+        // unlike the reconcile-deletes, this is a local filter that runs either
+        // side of a Stremio merge, and tombstoning would block that merge from
+        // (re)adding the same key for the whole grace window.
+        for id in items.keys where next[id] == nil {
+            transientOverrides.removeValue(forKey: id)
+        }
         items = next
         awaitingServerAck.formIntersection(Set(items.keys))
         externallyMerged.formIntersection(Set(items.keys))
@@ -456,13 +479,36 @@ final class ProgressStore: ObservableObject {
         let sanitizedRemote = remote.compactMap(Self.sanitized)
         let remoteIDs = Set(sanitizedRemote.map(\.id))
         awaitingServerAck.subtract(remoteIDs)
+        pruneTombstones()
 
         var next: [String: WatchProgress] = [:]
         for entry in sanitizedRemote {
-            if let local = items[entry.id] {
-                next[entry.id] = coalesced(remote: entry, local: local)
-            } else {
+            // Respect tombstones exactly as `mergeRemote` does. This path used
+            // to ignore them entirely, so a row whose server delete was still
+            // retrying came straight back on the next pull and the card the
+            // user had just removed reappeared on screen. A remote row NEWER
+            // than our removal means it was re-watched elsewhere afterwards —
+            // honour that and drop the tombstone.
+            if let tomb = tombstones[entry.id] {
+                if entry.updatedAt > tomb {
+                    tombstones.removeValue(forKey: entry.id)
+                } else {
+                    continue
+                }
+            }
+            guard let local = items[entry.id] else {
                 next[entry.id] = entry
+                continue
+            }
+            // Newest side wins, same comparison `mergeRemote` uses. This path
+            // was remote-always-wins: it adopted the server's position AND its
+            // timestamp unconditionally, so with any clock skew (or a snapshot
+            // captured before our push landed) an OLDER remote row overwrote a
+            // newer local resume point and playback jumped backwards.
+            if local.updatedAt >= entry.updatedAt {
+                next[entry.id] = local
+            } else {
+                next[entry.id] = coalesced(remote: entry, local: local)
             }
         }
         for id in awaitingServerAck {
@@ -480,6 +526,16 @@ final class ProgressStore: ObservableObject {
         }
 
         guard next != items else { return }
+        // Rows this snapshot drops need the same cleanup every other removal
+        // path performs. Without it the dropped key's periodic in-playback row
+        // stayed in `transientOverrides` and `save()` folded it right back onto
+        // disk — the title the user was watching disappeared from Continue
+        // Watching mid-playback and returned after a relaunch.
+        let droppedTime = Date()
+        for id in items.keys where next[id] == nil {
+            transientOverrides.removeValue(forKey: id)
+            tombstones[id] = droppedTime
+        }
         items = next
         save()
     }
@@ -836,11 +892,22 @@ final class ProgressStore: ObservableObject {
     }
 
     @discardableResult
-    func clearAllProgress(notify: Bool = true) -> [String] {
+    func clearAllProgress(notify: Bool = true, tombstone: Bool = true) -> [String] {
         let removedKeys = Array(items.keys)
+        // The Next Up dismissals are this profile's state too, and on an account
+        // switch they would keep suppressing shows for a user who never removed
+        // them. Cleared even when there are no rows to remove.
+        if !tombstone, !dismissedNextUpShows.isEmpty {
+            dismissedNextUpShows = []
+            UserDefaults.standard.removeObject(forKey: dismissedNextUpKey)
+        }
         guard !removedKeys.isEmpty else { return [] }
         let now = Date()
-        for key in removedKeys { tombstones[key] = now }
+        // On an account switch tombstoning would suppress the INCOMING
+        // account's rows locally for the whole 180s grace.
+        if tombstone {
+            for key in removedKeys { tombstones[key] = now }
+        }
         items.removeAll()
         externallyMerged.removeAll()
         awaitingServerAck.removeAll()
@@ -939,12 +1006,20 @@ final class ProgressStore: ObservableObject {
     private(set) var continueFractions: [String: Double] = [:]
 
     private func rebuildContinueFractions() {
-        var latest: [String: (Date, Double)] = [:]
+        // Ties broken by (updatedAt, id), matching `continueWatching` exactly.
+        // With `existing.0 >= item.updatedAt` the winner among equal timestamps
+        // was whichever row the (unordered) dictionary happened to yield first,
+        // while the Continue Watching card picked the highest id — so for
+        // batch-imported rows sharing a timestamp (a Trakt history import
+        // stamps hundreds within the same moment) a poster's progress bar
+        // showed a DIFFERENT episode's fraction than the card for that show.
+        var latest: [String: (updatedAt: Date, id: String, fraction: Double)] = [:]
         for item in items.values where item.fraction < 0.95 {
-            if let existing = latest[item.metaID], existing.0 >= item.updatedAt { continue }
-            latest[item.metaID] = (item.updatedAt, item.fraction)
+            if let existing = latest[item.metaID],
+               (existing.updatedAt, existing.id) >= (item.updatedAt, item.id) { continue }
+            latest[item.metaID] = (item.updatedAt, item.id, item.fraction)
         }
-        continueFractions = latest.mapValues { $0.1 }
+        continueFractions = latest.mapValues { $0.fraction }
     }
 
     private func load() {

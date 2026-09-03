@@ -204,6 +204,28 @@ final class LibraryStore: ObservableObject {
 
     // MARK: - Sync bridge
 
+    /// Wipe this profile's rows outright.
+    ///
+    /// For an ACCOUNT SWITCH, where the resident data belongs to the user who
+    /// just signed out. `tombstone: false` there: tombstones exist to stop a
+    /// pull resurrecting something the user deleted, but on a switch they would
+    /// instead suppress the INCOMING account's rows for the whole grace period.
+    @discardableResult
+    func clearAll(notify: Bool = true, tombstone: Bool = true) -> [SavedLibraryItem] {
+        let removed = Array(items.values)
+        guard !removed.isEmpty else { return [] }
+        if tombstone {
+            let now = Date()
+            for item in removed { tombstones[item.key] = now }
+        }
+        items.removeAll()
+        save()
+        // Deliberately NOT firing onTraktRemove: this clears local state, it is
+        // not the user removing titles from their watchlist.
+        if notify && !suppressChange { onLocalChange?() }
+        return removed
+    }
+
     func allForSync() -> [SavedLibraryItem] { Array(items.values) }
 
     /// Merge a FULL remote snapshot. Two-way, mirroring Progress/Watched: rows

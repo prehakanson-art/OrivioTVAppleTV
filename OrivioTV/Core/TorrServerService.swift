@@ -19,8 +19,17 @@ enum TorrServerService {
 
     /// Add a magnet to TorrServer, pick the right video file, and return a
     /// directly-playable `/stream` URL.
+    ///
+    /// `fileIdx` is the addon-supplied index of the wanted file inside the
+    /// TORRENT's own file list (Stremio's `Stream.fileIdx`, 0-based, counting
+    /// every file including samples and subtitles). It was ignored here — the
+    /// same defect the debrid path had — so a season pack fell through to the
+    /// filename heuristic and, when that missed, played the LARGEST file:
+    /// reliably the wrong episode. Defaulted to nil so the existing call site
+    /// keeps compiling until it passes the value through.
     static func resolve(
-        magnet: String, settings: TorrentSettings, season: Int?, episode: Int?
+        magnet: String, settings: TorrentSettings, season: Int?, episode: Int?,
+        fileIdx: Int? = nil
     ) async -> P2PResult {
         guard settings.isConfigured else { return .notConfigured }
         let base = settings.normalizedServerURL
@@ -35,7 +44,7 @@ enum TorrServerService {
                 if !files.isEmpty { break }
                 try? await Task.sleep(nanoseconds: 500_000_000)
             }
-            guard let file = selectFile(files, season: season, episode: episode) else {
+            guard let file = selectFile(files, season: season, episode: episode, fileIdx: fileIdx) else {
                 return .failed("No video file found in the torrent")
             }
             let url = streamURL(base: base, magnet: magnet, index: file.id)
@@ -77,7 +86,14 @@ enum TorrServerService {
     }
 
     private static func post(base: String, body: [String: Any]) async throws -> Data {
-        var request = URLRequest(url: URL(string: "\(base)/torrents")!)
+        // NOT force-unwrapped: `base` is a free-text server address the user
+        // types into settings (`ping()` merely fails the Test button, it never
+        // stops them saving a bad one), so a stray space or a pasted quote made
+        // `URL(string:)` return nil and playing a P2P source TRAPPED. Throwing
+        // instead lands in `resolve`'s catch, which shows "Can't reach
+        // TorrServer at …" — the right message for an unusable address.
+        guard let url = URL(string: "\(base)/torrents") else { throw URLError(.badURL) }
+        var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -95,8 +111,32 @@ enum TorrServerService {
     private struct TorrFile { let id: Int; let path: String; let length: Int64 }
     private static let videoExtensions = ["mkv", "mp4", "avi", "mov", "m4v", "ts", "webm"]
 
-    private static func selectFile(_ files: [TorrFile], season: Int?, episode: Int?) -> TorrFile? {
-        let videos = files.filter { videoExtensions.contains(($0.path as NSString).pathExtension.lowercased()) }
+    private static func isVideo(_ file: TorrFile) -> Bool {
+        videoExtensions.contains((file.path as NSString).pathExtension.lowercased())
+    }
+
+    /// Pick the wanted file. Order of preference matches the debrid sibling
+    /// (`DebridService.selectFile`):
+    /// 1. The addon's `fileIdx`, mapped onto TorrServer's own ids. Unlike most
+    ///    debrid providers, this list can be indexed safely: `file_stats` is
+    ///    the torrent's COMPLETE file list (nothing filtered — this method does
+    ///    the video filtering itself) and `TorrFile.id` is that list's position,
+    ///    which is exactly what `fileIdx` counts. The pick must still be a
+    ///    video file, so a stale/bogus index falls through instead of handing
+    ///    the player an .nfo.
+    /// 2. For series, a filename matching SxxExx / Sxx.Exx / SxE.
+    /// 3. The largest video file.
+    private static func selectFile(_ files: [TorrFile], season: Int?, episode: Int?,
+                                   fileIdx: Int? = nil) -> TorrFile? {
+        // TorrServer numbers files from 1 (and `fileStats` falls back to `i + 1`
+        // for the same reason), while `fileIdx` counts from 0 — so the offset is
+        // the list's own lowest id rather than a hardcoded 1. That also keeps
+        // this correct if a build ever numbers from 0.
+        if let fileIdx, fileIdx >= 0, let base = files.map(\.id).min(),
+           let pick = files.first(where: { $0.id - base == fileIdx }), isVideo(pick) {
+            return pick
+        }
+        let videos = files.filter(isVideo)
         guard !videos.isEmpty else { return files.max { $0.length < $1.length } }
         if let season, let episode {
             let patterns = [

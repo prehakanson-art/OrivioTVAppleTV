@@ -83,6 +83,36 @@ struct UserProfile: Codable, Identifiable, Hashable {
         self.autoLink = autoLink
     }
 
+    private enum CodingKeys: String, CodingKey {
+        case id, name, avatarColorHex, usesPrimaryAddons, usesPrimaryPlugins
+        case avatarID, avatarURL, pinEnabled, pinHash, autoLink
+    }
+
+    /// Tolerant decode, for the same reason `AutoLinkPreferences` has one — but
+    /// the stakes here are higher. Synthesized `Codable` over non-optional
+    /// fields fails the WHOLE array if one key is missing, and `load()` then
+    /// left `profiles` empty, `init` synthesised "Profile 1" and `saveList()`
+    /// wrote it straight over the stored blob: one added field would have
+    /// silently destroyed every profile on every device. A missing key now
+    /// falls back to its default instead. `id` is the one field with no
+    /// sensible default (it scopes all of a profile's storage), so its absence
+    /// still throws — and `load()` keeps the blob untouched when it does.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(Int.self, forKey: .id)
+        name = (try? c.decode(String.self, forKey: .name)) ?? "Profile \(id)"
+        // Literal rather than `ProfileStore.avatarColors[0]`: this initializer
+        // is nonisolated and that store is @MainActor.
+        avatarColorHex = (try? c.decode(String.self, forKey: .avatarColorHex)) ?? "#1E88E5"
+        usesPrimaryAddons = (try? c.decode(Bool.self, forKey: .usesPrimaryAddons)) ?? false
+        usesPrimaryPlugins = (try? c.decode(Bool.self, forKey: .usesPrimaryPlugins)) ?? false
+        avatarID = try? c.decodeIfPresent(String.self, forKey: .avatarID)
+        avatarURL = try? c.decodeIfPresent(String.self, forKey: .avatarURL)
+        pinEnabled = (try? c.decode(Bool.self, forKey: .pinEnabled)) ?? false
+        pinHash = try? c.decodeIfPresent(String.self, forKey: .pinHash)
+        autoLink = try? c.decodeIfPresent(AutoLinkPreferences.self, forKey: .autoLink)
+    }
+
     /// First letter shown on the avatar circle.
     var initial: String { String(name.first ?? "?").uppercased() }
 
@@ -150,7 +180,11 @@ final class ProfileStore: ObservableObject {
         load()
         if profiles.isEmpty {
             profiles = [UserProfile(id: 1, name: "Profile 1", avatarColorHex: Self.avatarColors[0])]
-            saveList()
+            // Persist the synthesised default ONLY when there was nothing
+            // readable to lose. If a stored blob exists but failed to decode,
+            // writing this over it destroys every profile the user had (see
+            // `listBlobUnreadable`) — run on the default in memory instead.
+            if !listBlobUnreadable { saveList() }
         }
         activeProfileID = UserDefaults.standard.object(forKey: Self.activeKey) as? Int ?? 1
         if !profiles.contains(where: { $0.id == activeProfileID }) {
@@ -395,14 +429,30 @@ final class ProfileStore: ObservableObject {
         if !suppressChange { onLocalChange?() }
     }
 
+    /// Set when a stored profile blob EXISTS but could not be decoded. `load()`
+    /// used to just return, leaving `profiles` empty, whereupon `init`
+    /// synthesised "Profile 1" and `saveList()` wrote it straight over the
+    /// undecodable bytes — turning a recoverable decode bug into PERMANENT loss
+    /// of every profile (and, since a profile id scopes its progress/library
+    /// storage, of everything reachable through them). The synthesised default
+    /// is now kept in memory only, so a later build can still read the bytes.
+    /// A deliberate mutation afterwards (the user adding/renaming a profile, or
+    /// a server list arriving) is real new state and does overwrite.
+    private(set) var listBlobUnreadable = false
+
     private func load() {
-        guard let data = UserDefaults.standard.data(forKey: Self.listKey),
-              let decoded = try? JSONDecoder().decode([UserProfile].self, from: data) else { return }
+        guard let data = UserDefaults.standard.data(forKey: Self.listKey) else { return }
+        guard let decoded = try? JSONDecoder().decode([UserProfile].self, from: data) else {
+            listBlobUnreadable = true
+            return
+        }
+        listBlobUnreadable = false
         profiles = decoded
     }
 
     private func saveList() {
         guard let data = try? JSONEncoder().encode(profiles) else { return }
         UserDefaults.standard.set(data, forKey: Self.listKey)
+        listBlobUnreadable = false
     }
 }

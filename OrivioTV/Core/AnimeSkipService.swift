@@ -23,7 +23,9 @@ enum AnimeSkipService {
     // detail Tasks, and a plain Swift Dictionary is not thread-safe (concurrent
     // mutation → EXC_BAD_ACCESS). Same pattern as TMDBService.
     private static let cacheLock = NSLock()
-    private static var malCache: [String: [Int]] = [:]   // imdbId → per-season MAL ids
+    // Per-season MAL ids, POSITIONAL: index 0 is season 1, and a season ARM has
+    // no MyAnimeList mapping for keeps a nil slot (see `malIDs`).
+    private static var malCache: [String: [Int?]] = [:]   // imdbId → per-season MAL ids
     private static var intervalCache: [String: [AnimeSkipInterval]] = [:]
 
     private static func cachedIntervals(_ key: String) -> [AnimeSkipInterval]? {
@@ -34,11 +36,11 @@ enum AnimeSkipService {
         cacheLock.lock(); defer { cacheLock.unlock() }
         intervalCache[key] = value
     }
-    private static func cachedMALIDs(_ key: String) -> [Int]? {
+    private static func cachedMALIDs(_ key: String) -> [Int?]? {
         cacheLock.lock(); defer { cacheLock.unlock() }
         return malCache[key]
     }
-    private static func storeMALIDs(_ value: [Int], for key: String) {
+    private static func storeMALIDs(_ value: [Int?], for key: String) {
         cacheLock.lock(); defer { cacheLock.unlock() }
         malCache[key] = value
     }
@@ -51,13 +53,24 @@ enum AnimeSkipService {
         if let hit = cachedIntervals(key) { return hit }
 
         let malIDs = await malIDs(imdbID: imdbID)
-        guard !malIDs.isEmpty else { storeIntervals([], for: key); return [] }
-        // ARM returns one entry per season; fall back to the first mapping.
-        // Season 0 is normal for anime specials/OVAs in Cinemeta and Kitsu
-        // metadata, so the LOW end needs guarding as much as the high one —
-        // `malIDs[-1]` traps.
+        guard malIDs.contains(where: { $0 != nil }) else { storeIntervals([], for: key); return [] }
+        // ARM returns one entry per season, in season order, and the slot for a
+        // season it has no mapping for is nil. Season 0 is normal for anime
+        // specials/OVAs in Cinemeta and Kitsu metadata, so the LOW end needs
+        // guarding as much as the high one — `malIDs[-1]` traps.
         let seasonIndex = season - 1
-        let malID: Int? = malIDs.indices.contains(seasonIndex) ? malIDs[seasonIndex] : malIDs.first
+        let malID: Int?
+        if malIDs.indices.contains(seasonIndex) {
+            // In range but nil = ARM knows this season and has no MAL id for
+            // it. Falling back to another season's id here is exactly the
+            // wrong-season skip times this mapping was fixed to avoid, so
+            // report no intervals instead.
+            malID = malIDs[seasonIndex]
+        } else {
+            // Out of range = ARM returned fewer entries than the metadata has
+            // seasons; the long-standing fallback is the first real mapping.
+            malID = malIDs.compactMap { $0 }.first
+        }
         guard let malID else { storeIntervals([], for: key); return [] }
 
         let result = await fetchAniSkip(malID: malID, episode: episode, episodeLength: episodeLength)
@@ -67,7 +80,7 @@ enum AnimeSkipService {
 
     // MARK: ARM — IMDb → per-season MAL ids
 
-    private static func malIDs(imdbID: String) async -> [Int] {
+    private static func malIDs(imdbID: String) async -> [Int?] {
         if let hit = cachedMALIDs(imdbID) { return hit }
         var comps = URLComponents(string: "https://arm.haglund.dev/api/v2/imdb")!
         comps.queryItems = [
@@ -82,7 +95,11 @@ enum AnimeSkipService {
             return []
         }
         // Preserve per-season order; a nil season entry stays nil in the slot.
-        let ids = entries.map { $0.myanimelist }.compactMap { $0 }
+        // `.compactMap { $0 }` used to REMOVE the nils, shifting every later
+        // season down a slot — so for any show whose earlier season has no
+        // MyAnimeList mapping, `intervals` skipped using the NEXT season's
+        // op/ed times and the player jumped to the wrong place.
+        let ids = entries.map { $0.myanimelist }
         storeMALIDs(ids, for: imdbID)
         return ids
     }

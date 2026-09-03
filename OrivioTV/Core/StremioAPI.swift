@@ -134,7 +134,7 @@ enum StremioAPI {
     ) async throws -> [MetaItem] {
         let type = encodePathComponent(catalog.type)
         let id = encodePathComponent(catalog.id)
-        var url = "\(addon.baseURL)/catalog/\(type)/\(id)"
+        var path = "/catalog/\(type)/\(id)"
         // Stremio catalog "extra" args are one path segment; multiple props
         // are joined with `&` (e.g. `/genre=Action&skip=100.json`).
         var extras: [String] = []
@@ -144,8 +144,13 @@ enum StremioAPI {
             if let genre, !genre.isEmpty { extras.append("genre=\(encodePathComponent(genre))") }
             if let skip, skip > 0 { extras.append("skip=\(skip)") }
         }
-        if !extras.isEmpty { url += "/" + extras.joined(separator: "&") }
-        url += ".json"
+        if !extras.isEmpty { path += "/" + extras.joined(separator: "&") }
+        path += ".json"
+        // Built through the addon rather than by concatenating `baseURL`: a
+        // configured addon keeps its token in the manifest URL's query, and
+        // that query has to be re-appended AFTER `.json` or the request goes
+        // out unauthenticated and silently returns nothing.
+        let url = addon.resourceURL(path)
         // Don't cache search results (query-specific, one-shot); catalogs are
         // cached briefly so revisiting Home is instant.
         let ttl: TimeInterval = (search?.isEmpty == false) ? 0 : 120
@@ -156,7 +161,9 @@ enum StremioAPI {
     }
 
     static func meta(addon: InstalledAddon, type: String, id: String) async throws -> MetaItem {
-        let url = "\(addon.baseURL)/meta/\(encodePathComponent(type))/\(encodePathComponent(id)).json"
+        // Via `resourceURL` so a configured addon's manifest query (its
+        // token) rides along after `.json` instead of being dropped.
+        let url = addon.resourceURL("/meta/\(encodePathComponent(type))/\(encodePathComponent(id)).json")
         if let cached = await metaDiskCache.value(for: url, ttl: metaDiskTTL) { return cached }
         let response: MetaResponse = try await get(url, ttl: 600)
         guard let meta = response.meta else { throw StremioAPIError.emptyBody }
@@ -165,7 +172,9 @@ enum StremioAPI {
     }
 
     static func streams(addon: InstalledAddon, type: String, id: String) async throws -> [Stream] {
-        let url = "\(addon.baseURL)/stream/\(encodePathComponent(type))/\(encodePathComponent(id)).json"
+        // Via `resourceURL` so a configured addon's manifest query (its
+        // token) rides along after `.json` instead of being dropped.
+        let url = addon.resourceURL("/stream/\(encodePathComponent(type))/\(encodePathComponent(id)).json")
         // Stream searches get a LONGER deadline than the session's 20s
         // default. Live torrent scrapers (Comet with cachedOnly=false,
         // Torrentio under load) legitimately compute for 15-20s before
@@ -191,7 +200,9 @@ enum StremioAPI {
 
     /// Stremio subtitle addons (e.g. OpenSubtitles): `/subtitles/{type}/{id}.json`.
     static func subtitles(addon: InstalledAddon, type: String, id: String) async throws -> [AddonSubtitle] {
-        let url = "\(addon.baseURL)/subtitles/\(encodePathComponent(type))/\(encodePathComponent(id)).json"
+        // Via `resourceURL` so a configured addon's manifest query (its
+        // token) rides along after `.json` instead of being dropped.
+        let url = addon.resourceURL("/subtitles/\(encodePathComponent(type))/\(encodePathComponent(id)).json")
         let response: SubtitlesResponse = try await get(url, ttl: 600)
         return response.subtitles ?? []
     }

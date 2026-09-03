@@ -187,6 +187,10 @@ final class OrivioAccountManager: ObservableObject {
         guard let state = qrLogin, !exchangeInFlight else { return }
         exchangeInFlight = true
         defer { exchangeInFlight = false }
+        // Same generation guard as performRefresh: this is the other path that
+        // writes tokens after an `await`, so a sign-out landing mid-exchange
+        // must not be undone by the response arriving afterwards.
+        let generation = authGeneration
         do {
             // Parse tokens leniently: the exchange edge function may return them
             // flat or nested (session/data), so don't rely on a strict shape.
@@ -195,9 +199,14 @@ final class OrivioAccountManager: ObservableObject {
                 body: ["code": state.code, "device_nonce": state.nonce]
             )
             let (access, refresh) = try Self.parseTokens(from: data)
+            guard generation == authGeneration else {
+                NSLog("[OrivioAuth] discarding a QR exchange that completed after sign-out")
+                return
+            }
             storeTokens(access: access, refresh: refresh)
             qrLogin = nil
         } catch {
+            guard generation == authGeneration else { return }
             errorMessage = friendlyError(error)
         }
     }
@@ -206,11 +215,30 @@ final class OrivioAccountManager: ObservableObject {
 
     func signOut() {
         cancelPolling()
+        // Retire every token-writing operation that is already in flight.
+        //
+        // Sign-out used to clear the session and publish `.signedOut` while
+        // leaving `refreshTask` running. A refresh already past its `await`
+        // then called `storeTokens`, which saved a NEW session and flipped the
+        // state back to signed-in — with the sync bookkeeping already reset,
+        // so the account came back half-retired. Cancelling alone is not
+        // enough (the task may be past every cancellation point), so the
+        // generation is what actually makes the completion a no-op: any
+        // token-writing continuation started before this bump is ignored.
+        authGeneration &+= 1
+        refreshTask?.cancel()
+        refreshTask = nil
         session = nil
         OrivioSession.clear()
         qrLogin = nil
         authState = .signedOut
     }
+
+    /// Bumped by every sign-out. An async operation that will end by writing
+    /// tokens captures this first and refuses to write if it no longer matches
+    /// — the user signed out while it was in flight, and resurrecting their
+    /// session is never the right answer.
+    private var authGeneration = 0
 
     /// The in-flight refresh, if any. Supabase ROTATES the refresh token on
     /// every use, and every sync call that meets a 401 calls this — so a token
@@ -225,24 +253,40 @@ final class OrivioAccountManager: ObservableObject {
     func refreshSession() async -> Bool {
         if let existing = refreshTask { return await existing.value }
         guard session?.refreshToken != nil else { return false }
+        let generation = authGeneration
         let task = Task { [weak self] () -> Bool in
-            await self?.performRefresh() ?? false
+            await self?.performRefresh(generation: generation) ?? false
         }
         refreshTask = task
         let result = await task.value
-        refreshTask = nil
+        // Only the generation that owns this task may clear the slot. A
+        // sign-out has already cancelled and nilled it, and a sign-in after
+        // that may have started its own refresh — clearing unconditionally
+        // would drop THAT task's handle and let a second concurrent refresh
+        // burn the rotated token, which is the failure this serialization
+        // exists to prevent.
+        if generation == authGeneration { refreshTask = nil }
         return result
     }
 
-    private func performRefresh() async -> Bool {
+    private func performRefresh(generation: Int) async -> Bool {
         guard let refreshToken = session?.refreshToken else { return false }
         do {
             let data = try await post(endpoint: Endpoint.refresh, body: ["refresh_token": refreshToken])
             let (access, refresh) = try Self.parseTokens(from: data)
+            // The user signed out while this was in flight. Storing the new
+            // tokens here is what used to UNDO the sign-out: it wrote a fresh
+            // session to disk and republished `.signedIn`.
+            guard generation == authGeneration else {
+                NSLog("[OrivioAuth] discarding a refresh that completed after sign-out")
+                return false
+            }
             storeTokens(access: access, refresh: refresh)
             return true
         } catch {
             // A hard failure here means the refresh token is no longer valid.
+            // Nothing to sign out of if the user already did it themselves.
+            guard generation == authGeneration else { return false }
             if case OrivioAuthError.http(let code, _) = error, [400, 401, 403].contains(code) {
                 signOut()
             }

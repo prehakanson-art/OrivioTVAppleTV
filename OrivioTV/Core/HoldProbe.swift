@@ -35,10 +35,15 @@ final class HoldProbe: ObservableObject {
     /// Safe to call from anywhere, including inside a ViewBuilder: the append
     /// is deferred so it never mutates state during a view update.
     nonisolated static func log(_ text: String) {
-        // Also to the console, so the probe can be watched over a device log
-        // stream and not only on the HUD.
-        NSLog("[HoldProbe] %@", text)
         Task { @MainActor in
+            // Respect the setting. The console line used to be emitted
+            // unconditionally, so every call site that forgot to guard kept
+            // spamming the device log (and building its message string) with
+            // the probe switched off.
+            guard PerformanceSettingsStore.shared.settings.showHoldProbe else { return }
+            // Also to the console, so the probe can be watched over a device
+            // log stream and not only on the HUD.
+            NSLog("[HoldProbe] %@", text)
             let probe = HoldProbe.shared
             probe.events.append(Event(at: Date(), text: text))
             if probe.events.count > 12 { probe.events.removeFirst(probe.events.count - 12) }
@@ -120,11 +125,22 @@ extension View {
 enum HoldInteractionTrace {
     private static var token: NSObjectProtocol?
 
+    /// Is the probe still switched on? Read from the notification / gesture
+    /// callbacks, which are nonisolated but always run on the main thread
+    /// (`queue: .main`, and UIKit gesture actions).
+    ///
+    /// Belt and braces alongside `uninstall()`: even between the toggle going
+    /// off and the uninstall landing, nothing should log.
+    nonisolated static func isEnabled() -> Bool {
+        MainActor.assumeIsolated { PerformanceSettingsStore.shared.settings.showHoldProbe }
+    }
+
     static func install() {
         guard token == nil else { return }
         token = NotificationCenter.default.addObserver(
             forName: UIFocusSystem.didUpdateNotification, object: nil, queue: .main
         ) { note in
+            guard isEnabled() else { return }
             guard let ctx = note.userInfo?[UIFocusSystem.focusUpdateContextUserInfoKey]
                     as? UIFocusUpdateContext,
                   let view = ctx.nextFocusedItem as? UIView else { return }
@@ -143,6 +159,23 @@ enum HoldInteractionTrace {
                   found, chain.joined(separator: " < "))
         }
         installWindowPressWatch()
+    }
+
+    /// Remove BOTH probes. `install()` had no counterpart, so switching "Hold
+    /// menu probe" back off left a focus observer that walks ten superviews and
+    /// NSLogs on EVERY focus move — plus a window-wide long-press recogniser —
+    /// running for the rest of the session, on a device where focus moves are
+    /// the hot path. Idempotent, like `install()`.
+    static func uninstall() {
+        if let token {
+            NotificationCenter.default.removeObserver(token)
+            Self.token = nil
+        }
+        if let watch = pressWatch {
+            watch.view?.removeGestureRecognizer(watch)
+            pressWatch = nil
+        }
+        NSLog("[HoldTrace] uninstalled")
     }
 
     /// Observes Select presses at the WINDOW, so the card's own gesture is
@@ -176,6 +209,7 @@ enum HoldInteractionTrace {
     /// installed the interaction" from "installed but refusing to present" —
     /// the one thing the source cannot tell us.
     static func dumpMenuInteractions() {
+        guard isEnabled() else { return }
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
         guard let window = scenes.flatMap(\.windows).first(where: { $0.isKeyWindow })
                 ?? scenes.flatMap(\.windows).first else { return }
@@ -201,6 +235,9 @@ enum HoldInteractionTrace {
 
     final class SimultaneousDelegate: NSObject, UIGestureRecognizerDelegate {
         @objc func handle(_ g: UILongPressGestureRecognizer) {
+            // The recogniser is removed by `uninstall()`, but stay quiet even
+            // if a press is already in flight when the setting goes off.
+            guard HoldInteractionTrace.isEnabled() else { return }
             switch g.state {
             case .began:
                 NSLog("[Press] HOLD BEGAN")

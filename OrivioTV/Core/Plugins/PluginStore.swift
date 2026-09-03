@@ -11,6 +11,13 @@ final class PluginStore: ObservableObject {
     @Published private(set) var scrapers: [ScraperInfo] = []
     @Published var isBusy = false
     @Published var lastError: String?
+    /// Informational, NOT a failure — e.g. "2 scraper(s) couldn't be downloaded,
+    /// they'll be retried automatically". This used to be written into
+    /// `lastError` on the SUCCESS path, and since `applyRemote` calls
+    /// `addRepository` during background account sync, a transient CDN hiccup
+    /// surfaced in the UI as a red error AND clobbered any real prior error the
+    /// user still needed to see.
+    @Published var lastNotice: String?
 
     /// Fired on a user-driven change so account sync can push (repo list only —
     /// JS bodies are re-downloaded, not synced).
@@ -42,7 +49,7 @@ final class PluginStore: ObservableObject {
     func addRepository(_ rawURL: String) async {
         let manifestURL = Self.canonicalManifestURL(rawURL)
         guard let url = URL(string: manifestURL) else { lastError = "Invalid URL"; return }
-        isBusy = true; lastError = nil
+        isBusy = true; lastError = nil; lastNotice = nil
         defer { isBusy = false }
         do {
             let (data, _) = try await session.data(from: url)
@@ -80,7 +87,9 @@ final class PluginStore: ObservableObject {
             scrapers.append(contentsOf: newScrapers)
             save(); notifyLocalChange()
             if deferredBodies > 0 {
-                lastError = "\(deferredBodies) scraper(s) couldn't be downloaded — they'll be retried automatically."
+                // A notice, not an error: the repo installed fine and the
+                // missing bodies self-heal on the next run (see jsBody).
+                lastNotice = "\(deferredBodies) scraper(s) couldn't be downloaded — they'll be retried automatically."
             }
         } catch {
             lastError = "Couldn't add repository: \(error.localizedDescription)"
@@ -118,8 +127,13 @@ final class PluginStore: ObservableObject {
         // a long plugin list expensive rather than just slow.
         let batches = await boundedConcurrentMap(scrapers, limit: AddonSweepLimits.plugins) { [runtime, session] scraper in
             guard let js = await Self.jsBody(for: scraper, session: session) else { return [StreamEntry]() }
+            // `scraperID:` is what lets the runtime remember which scrapers
+            // already wedged this session and stop re-running them (see
+            // PluginRuntime.run) — one leaked thread per bad scraper instead of
+            // one per search.
             let results = await runtime.run(
-                scraperJS: js, tmdbID: tmdbID, mediaType: mediaType, season: season, episode: episode
+                scraperID: scraper.id, scraperName: scraper.name, scraperJS: js,
+                tmdbID: tmdbID, mediaType: mediaType, season: season, episode: episode
             )
             return results.map { Self.entry(from: $0, scraperName: scraper.name) }
         }
@@ -206,9 +220,26 @@ final class PluginStore: ObservableObject {
         return s.hasSuffix(".json") ? s : (s.hasSuffix("/") ? s + "manifest.json" : s + "/manifest.json")
     }
 
+    /// Resolves a scraper's `filename` against its repository manifest URL.
+    ///
+    /// Strips only a TRAILING JSON filename component, and only at the end.
+    /// Two bugs lived in the old one-liner:
+    ///   * it stripped "/manifest.json" specifically, but `canonicalManifestURL`
+    ///     accepts ANY URL already ending in `.json` — so a repo at
+    ///     `https://h/repo.json` resolved its bodies to
+    ///     `https://h/repo.json/scraper.js`, a guaranteed 404. Bodies are now
+    ///     fetched lazily, so that showed up as a silent retry-and-fail on every
+    ///     single stream search rather than one visible install failure.
+    ///   * `replacingOccurrences` rewrote ANY occurrence, so a host or path that
+    ///     happened to contain "/manifest.json" (a proxy/CDN prefix) was mangled
+    ///     mid-URL.
     private static func resolve(filename: String, against manifestURL: String) -> String {
         if filename.hasPrefix("http://") || filename.hasPrefix("https://") { return filename }
-        let base = manifestURL.replacingOccurrences(of: "/manifest.json", with: "")
+        var base = manifestURL
+        if let slash = base.lastIndex(of: "/") {
+            let last = base[base.index(after: slash)...]
+            if last.hasSuffix(".json") { base = String(base[base.startIndex..<slash]) }
+        }
         return "\(base)/\(filename.hasPrefix("/") ? String(filename.dropFirst()) : filename)"
     }
 

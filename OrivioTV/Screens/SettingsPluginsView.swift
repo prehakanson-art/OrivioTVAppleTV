@@ -37,6 +37,15 @@ struct PluginsSettingsDetail: View {
                         .font(.system(size: 18))
                         .foregroundStyle(OrivioPrimitives.error)
                 }
+                // Informational, NOT an error: some scraper bodies failed to
+                // download and will be retried on the next stream search. This
+                // used to ride in `lastError`, so a transient CDN hiccup during
+                // a background account sync surfaced as a red failure.
+                if let notice = plugins.lastNotice {
+                    Text(notice)
+                        .font(.system(size: 18))
+                        .foregroundStyle(theme.palette.textSecondary)
+                }
                 Text("Scrapers run in a sandboxed JS engine. Ones that only call JSON APIs work today; scrapers that parse HTML (cheerio) need that bundled and aren't supported yet. CloudStream (.cs3) extensions are Android-only and can't run on tvOS.")
                     .font(.system(size: 17))
                     .foregroundStyle(theme.palette.textTertiary)

@@ -202,9 +202,12 @@ struct AddonDiscoverView: View {
         loading = false
     }
 
+    /// The third copy of this derivation — and the one that kept the query, so
+    /// for a configured addon (`…/manifest.json?token=…`) it disagreed with
+    /// `InstalledAddon.baseURL` and both "Installed" and Uninstall silently
+    /// failed to match. There is now one source of truth.
     private static func base(_ url: String) -> String {
-        let n = AddonManager.normalizeManifestURL(url)
-        return n.hasSuffix("/manifest.json") ? String(n.dropLast("/manifest.json".count)) : n
+        InstalledAddon.baseURL(forManifestURL: AddonManager.normalizeManifestURL(url))
     }
 
     private func isInstalled(_ url: String) -> Bool {

@@ -131,6 +131,28 @@ struct RootView: View {
     /// Deferred (not popped at play time) so StreamsView isn't torn down while
     /// its resolve Task is still running.
     @State private var pendingAutoPlayPop = false
+    /// A deep-link add-on install waiting for the viewer to say yes.
+    ///
+    /// A `stremio://` / `https://…/manifest.json` / `orivio://<host>` link used
+    /// to install SILENTLY (a bare `Task { try? await install(…) }` — no prompt,
+    /// no toast, error swallowed). Anything on the network that can make tvOS
+    /// open a URL — another app, a QR code, an AirPlay handoff — could add a
+    /// stream provider that then feeds this app arbitrary stream URLs. Now the
+    /// manifest is fetched first (read-only), the add-on is NAMED in a
+    /// confirmation, and nothing is written until the viewer presses Install.
+    @State private var pendingAddonInstall: PendingAddonInstall?
+    /// True while the manifest behind a deep link is being fetched for the
+    /// prompt — keeps a second link from queueing a second dialog.
+    @State private var addonInstallInFlight = false
+
+    struct PendingAddonInstall: Identifiable {
+        let id = UUID()
+        let manifestURL: String
+        let name: String
+        /// Already installed: the prompt says "Update" instead of "Install".
+        let isUpdate: Bool
+    }
+
     @State private var sync: OrivioSyncManager?
     @State private var traktSync: TraktSyncManager?
     @State private var stremioSync: StremioSyncManager?
@@ -169,7 +191,13 @@ struct RootView: View {
             // bring up the HUD with nothing to report until the next relaunch.
             // `install()` is idempotent, so a second call is free.
             .onChange(of: perf.settings.showHoldProbe) { _, on in
+                // Off matters as much as on: the trace installs a focus-change
+                // observer that walks ten superviews and logs on EVERY focus
+                // move, plus a window-wide long-press recogniser. Left behind,
+                // they cost that on the A8/A10X boxes for the rest of the
+                // session after the user switched the probe back off.
                 if on { HoldInteractionTrace.install() }
+                else { HoldInteractionTrace.uninstall() }
             }
             // Refresh a QR-linked Real-Debrid token at launch (its device-flow
             // access token is short-lived).
@@ -518,13 +546,37 @@ struct RootView: View {
                 addonManager: addonManager,
                 progressStore: progressStore,
                 playerSettings: playerSettings.settings,
-                allowUnairedNextUp: homeCatalogSettings.showUnairedNextUp
+                allowUnairedNextUp: homeCatalogSettings.showUnairedNextUp,
+                // Auto-advance / in-player episode pick: the cover and its
+                // PlaybackRequest never change, so `onChange(of: playback?.id)`
+                // below can't see it. Without this only episode one of a binge
+                // was ever scrobbled.
+                onNowPlayingChanged: { meta, video in
+                    scrobbleNowPlayingChanged(meta, video)
+                }
             ) {
                 // Just dismiss the cover; the auto-play pop runs in onDismiss.
                 playback = nil
             }
         }
         .onChange(of: playback?.id) { _, _ in scrobbleForPlaybackChange() }
+        // Deep-link add-on install confirmation. A tvOS alert is fully
+        // focusable and remote-navigable, and Cancel carries the `.cancel`
+        // role so a Menu press is a REFUSAL — the safe default for a prompt
+        // the viewer may not have asked for.
+        .alert(
+            pendingAddonInstall?.isUpdate == true ? "Update add-on?" : "Install add-on?",
+            isPresented: Binding(
+                get: { pendingAddonInstall != nil },
+                set: { if !$0 { pendingAddonInstall = nil } }
+            ),
+            presenting: pendingAddonInstall
+        ) { pending in
+            Button(pending.isUpdate ? "Update" : "Install") { confirmAddonInstall(pending) }
+            Button("Cancel", role: .cancel) { pendingAddonInstall = nil }
+        } message: { pending in
+            Text("\(pending.name)\n\(pending.manifestURL)\n\nThis add-on will be able to supply catalogs, metadata and stream links to Orivio.")
+        }
         // Feed the resolved system scheme to the theme so `.system` appearance
         // under the Apple TV theme can pick the matching palette.
         .onAppear { theme.systemIsDark = colorScheme == .dark }
@@ -896,45 +948,85 @@ struct RootView: View {
         }
         if let request = playback {
             // Playback started.
-            scrobblingItem = (request.meta, request.video)
-            let startKey = ProgressStore.key(metaID: request.meta.id, video: request.video)
-            // A re-watch starts fresh: last session's "finished" must not make
-            // this one report 100% if the viewer bails out after five minutes.
-            finishedThisSession.keys.remove(startKey)
-            let fraction = request.resumePosition.flatMap { pos -> Double? in
-                let key = ProgressStore.key(metaID: request.meta.id, video: request.video)
-                guard let duration = progressStore.progress(for: key)?.durationSeconds, duration > 0 else { return nil }
-                return pos / duration * 100
-            } ?? 0
-            Task {
-                await TraktService.scrobble(
-                    action: .start, imdbID: request.meta.id, type: request.meta.type,
-                    season: request.video?.season, episode: request.video?.episode,
-                    progress: fraction, accessToken: token
-                )
-            }
+            startScrobble(meta: request.meta, video: request.video,
+                          resumePosition: request.resumePosition, token: token)
         } else if let item = scrobblingItem {
             // Playback ended — report final progress.
             scrobblingItem = nil
-            let key = ProgressStore.key(metaID: item.meta.id, video: item.video)
-            // A live row wins; otherwise a row that vanished because it FINISHED
-            // reports complete, and one that never existed reports 0.
-            let fraction: Double
-            if let live = progressStore.progress(for: key)?.fraction {
-                fraction = live * 100
-            } else if finishedThisSession.keys.contains(key) {
-                fraction = 100
-            } else {
-                fraction = 0
-            }
-            finishedThisSession.keys.remove(key)
-            Task {
-                await TraktService.scrobble(
-                    action: .stop, imdbID: item.meta.id, type: item.meta.type,
-                    season: item.video?.season, episode: item.video?.episode,
-                    progress: fraction, accessToken: token
-                )
-            }
+            stopScrobble(item, token: token)
+        }
+    }
+
+    /// The playing item changed WITHIN one player session — auto-advance to the
+    /// next episode, or a pick from the in-player episode list.
+    ///
+    /// The player advances inside the SAME `fullScreenCover` and never replaces
+    /// the `PlaybackRequest`, so `onChange(of: playback?.id)` never fires: every
+    /// episode after the first got no `start`, and the eventual `stop` was
+    /// addressed to episode ONE — a whole binge landed on Trakt as one episode
+    /// watched and the rest untouched. Treat it as end-of-previous +
+    /// start-of-next, reusing the same bookkeeping as the cover-level lifecycle.
+    private func scrobbleNowPlayingChanged(_ meta: MetaItem, _ video: MetaVideo?) {
+        guard trakt.isSignedIn, trakt.scrobbleEnabled, let token = trakt.accessToken else {
+            scrobblingItem = nil
+            return
+        }
+        // Same item (a reload / source switch re-announcing the current
+        // episode): re-sending start/stop would double-count it.
+        if let current = scrobblingItem,
+           current.meta.id == meta.id,
+           current.video?.id == video?.id {
+            return
+        }
+        if let previous = scrobblingItem {
+            scrobblingItem = nil
+            stopScrobble(previous, token: token)
+        }
+        // No resume position: an auto-advanced episode starts at zero, and a
+        // pick from the episode list has already had its own resume applied by
+        // the player itself.
+        startScrobble(meta: meta, video: video, resumePosition: nil, token: token)
+    }
+
+    private func startScrobble(meta: MetaItem, video: MetaVideo?,
+                               resumePosition: Double?, token: String) {
+        scrobblingItem = (meta, video)
+        let startKey = ProgressStore.key(metaID: meta.id, video: video)
+        // A re-watch starts fresh: last session's "finished" must not make
+        // this one report 100% if the viewer bails out after five minutes.
+        finishedThisSession.keys.remove(startKey)
+        let fraction = resumePosition.flatMap { pos -> Double? in
+            guard let duration = progressStore.progress(for: startKey)?.durationSeconds, duration > 0 else { return nil }
+            return pos / duration * 100
+        } ?? 0
+        Task {
+            await TraktService.scrobble(
+                action: .start, imdbID: meta.id, type: meta.type,
+                season: video?.season, episode: video?.episode,
+                progress: fraction, accessToken: token
+            )
+        }
+    }
+
+    private func stopScrobble(_ item: (meta: MetaItem, video: MetaVideo?), token: String) {
+        let key = ProgressStore.key(metaID: item.meta.id, video: item.video)
+        // A live row wins; otherwise a row that vanished because it FINISHED
+        // reports complete, and one that never existed reports 0.
+        let fraction: Double
+        if let live = progressStore.progress(for: key)?.fraction {
+            fraction = live * 100
+        } else if finishedThisSession.keys.contains(key) {
+            fraction = 100
+        } else {
+            fraction = 0
+        }
+        finishedThisSession.keys.remove(key)
+        Task {
+            await TraktService.scrobble(
+                action: .stop, imdbID: item.meta.id, type: item.meta.type,
+                season: item.video?.season, episode: item.video?.episode,
+                progress: fraction, accessToken: token
+            )
         }
     }
 
@@ -1246,7 +1338,7 @@ struct RootView: View {
             selectedTab = 0
             homePath.append(Route.detail(meta))
         case .addonInstall(let manifestURL):
-            Task { try? await addonManager.install(manifestURL: manifestURL) }
+            requestAddonInstall(manifestURL)
         case .externalPlaybackFinished(let streamURL, let position):
             finishExternalPlayback(streamURL: streamURL, position: position)
         case .externalPlaybackFailed(let message):
@@ -1258,6 +1350,46 @@ struct RootView: View {
             }
             ExternalPlaybackSession.clear()
             NSLog("[OrivioPlayer] external player error: %@", message ?? "(none)")
+        }
+    }
+
+    /// Step 1 of a deep-link add-on install: read the manifest so the prompt
+    /// can NAME the add-on, then ask. Nothing is installed here — fetching a
+    /// manifest is a plain read, and the viewer still has to say yes.
+    private func requestAddonInstall(_ manifestURL: String) {
+        guard !addonInstallInFlight, pendingAddonInstall == nil else { return }
+        addonInstallInFlight = true
+        Task { @MainActor in
+            defer { addonInstallInFlight = false }
+            let normalized = AddonManager.normalizeManifestURL(manifestURL)
+            guard let manifest = try? await StremioAPI.manifest(url: normalized) else {
+                // Previously this failure was swallowed entirely — the link
+                // just did nothing and the viewer had no idea why.
+                ToastCenter.shared.show("Couldn't read that add-on's manifest", icon: "exclamationmark.triangle")
+                return
+            }
+            pendingAddonInstall = PendingAddonInstall(
+                manifestURL: normalized,
+                name: manifest.name.isEmpty ? normalized : manifest.name,
+                isUpdate: addonManager.addons.contains { $0.manifestURL == normalized }
+            )
+        }
+    }
+
+    /// Step 2: the viewer pressed Install/Update. Success and failure are both
+    /// reported — the old silent `try?` left either outcome invisible.
+    private func confirmAddonInstall(_ pending: PendingAddonInstall) {
+        pendingAddonInstall = nil
+        Task { @MainActor in
+            do {
+                try await addonManager.install(manifestURL: pending.manifestURL)
+                ToastCenter.shared.show(
+                    pending.isUpdate ? "Updated \(pending.name)" : "Installed \(pending.name)",
+                    icon: "checkmark.circle"
+                )
+            } catch {
+                ToastCenter.shared.show("Couldn't install \(pending.name)", icon: "exclamationmark.triangle")
+            }
         }
     }
 

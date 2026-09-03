@@ -138,11 +138,15 @@ final class WatchedStore: ObservableObject {
     }
 
     @discardableResult
-    func clearAll(notify: Bool = true) -> [WatchedItem] {
+    func clearAll(notify: Bool = true, tombstone: Bool = true) -> [WatchedItem] {
         let removedItems = Array(items.values)
         guard !removedItems.isEmpty else { return [] }
+        // See ProgressStore.clearAllProgress: on an account switch tombstoning
+        // would suppress the INCOMING account's rows for the grace period.
         let now = Date()
-        for item in removedItems { tombstones[item.key] = now }
+        if tombstone {
+            for item in removedItems { tombstones[item.key] = now }
+        }
         items.removeAll()
         save()
         if notify && !suppressChange {

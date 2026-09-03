@@ -17,12 +17,21 @@ struct PlayerScreen: View {
 
     let dismiss: () -> Void
 
+    /// The playing item changed WITHIN this session — auto-advance, or a pick
+    /// from the in-player episode list. The host needs this because the player
+    /// advances episodes inside the SAME full-screen cover without replacing
+    /// the `PlaybackRequest`, so nothing the host observes changes: Trakt only
+    /// ever scrobbled the FIRST episode of a binge, and the closing `stop` was
+    /// addressed to that episode too.
+    let onNowPlayingChanged: ((MetaItem, MetaVideo?) -> Void)?
+
     init(
         request: PlaybackRequest,
         addonManager: AddonManager,
         progressStore: ProgressStore,
         playerSettings: PlayerSettings = .default,
         allowUnairedNextUp: Bool = true,
+        onNowPlayingChanged: ((MetaItem, MetaVideo?) -> Void)? = nil,
         dismiss: @escaping () -> Void
     ) {
         _viewModel = StateObject(wrappedValue: PlayerViewModel(
@@ -33,6 +42,7 @@ struct PlayerScreen: View {
             allowUnairedNextUp: allowUnairedNextUp
         ))
         self.dismiss = dismiss
+        self.onNowPlayingChanged = onNowPlayingChanged
     }
 
     var body: some View {
@@ -341,6 +351,14 @@ struct PlayerScreen: View {
                 guard let viewModel else { return }
                 watched.mark(meta: viewModel.meta, video: episode)
             }
+            // Tell the host each time the playing item changes inside this
+            // session, so the Trakt scrobble stops the finished episode and
+            // starts the new one (see `onNowPlayingChanged` above). The view
+            // model invokes it on the main actor once the new episode's
+            // metadata is in place.
+            if let onNowPlayingChanged {
+                viewModel.onNowPlayingChanged = onNowPlayingChanged
+            }
             // Hand the view model a debrid resolver so torrent sources can be
             // switched to (and failed over to) mid-playback. Tries every
             // configured provider, preferred first, like the Sources page.
@@ -354,7 +372,11 @@ struct PlayerScreen: View {
                         stream: stream,
                         providers: await debrid.resolversRefreshingIfNeeded(),
                         season: viewModel?.currentVideo?.season,
-                        episode: viewModel?.currentVideo?.episode
+                        episode: viewModel?.currentVideo?.episode,
+                        // Mid-playback source switch / failover: honour the
+                        // addon's file index too, so switching to a season-pack
+                        // source doesn't jump to a different episode.
+                        fileIdx: stream.fileIdx
                     )
                     guard case .success(let url, let filename) = result else { return nil }
                     return Stream(

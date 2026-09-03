@@ -108,6 +108,17 @@ enum DeepLinkService {
         return v
     }
 
+    /// Deliberately loose — any dotted host counts, because addon links come
+    /// from every corner of the Stremio ecosystem and a stricter test would
+    /// reject legitimate ones.
+    ///
+    /// That breadth is the reason `.addonInstall` is NOT self-authorizing: this
+    /// is reachable from any `stremio://<dotted-host>`, any
+    /// `https://…manifest.json`, and the `orivio://` catch-all, i.e. from any
+    /// app or QR code that can make tvOS open a URL. The install itself is
+    /// gated on an explicit confirmation naming the add-on (see
+    /// `requestAddonInstall` in OrivioTVApp) — parsing a link must never be
+    /// taken as consent to install one.
     private static func looksLikeAddonHost(_ host: String) -> Bool {
         host.contains(".")
     }

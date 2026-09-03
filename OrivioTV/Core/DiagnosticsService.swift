@@ -61,13 +61,20 @@ enum DiagnosticsService {
 
     /// Bytes the "Clear cache" button would actually free — so the number the
     /// user reads matches what pressing it does.
+    ///
+    /// Includes the image cache, which lives in a SIBLING directory
+    /// (`Caches/orivio-images`, budgeted at 512 MB) rather than under the cache
+    /// root: it was neither counted nor cleared, so the About row could report
+    /// a few MB while half a gigabyte of artwork sat on disk — and its own
+    /// subtitle told the user images were included.
     static func cacheSize() -> Int64 {
         let contents = (try? FileManager.default.contentsOfDirectory(
             at: cacheRoot, includingPropertiesForKeys: nil
         )) ?? []
-        return contents
+        let rootBytes = contents
             .filter { !protectedEntries.contains($0.lastPathComponent) }
             .reduce(0) { $0 + size(of: $1) }
+        return rootBytes + size(of: ImageCache.diskDirectory)
     }
 
     static func cacheSizeLabel() -> String {
@@ -75,7 +82,16 @@ enum DiagnosticsService {
     }
 
     /// Clear the app's caches: everything under the cache root EXCEPT the
-    /// entries above, plus the shared URL cache.
+    /// protected entries above, the image cache in its sibling directory, and
+    /// the shared URL cache.
+    ///
+    /// The per-cache directories under the root are deleted, not just emptied —
+    /// each `DiskCache` created its directory once at init, so afterwards every
+    /// `store()` failed silently and the app ran uncached until relaunch.
+    /// `DiskCache.store` now recreates its directory on a failed write, and
+    /// `ImageCache.clearDisk()` recreates its own, so both come back to life
+    /// immediately. Recreating only `cacheRoot` here (as before) is enough for
+    /// the root itself.
     static func clearCaches() {
         let fm = FileManager.default
         let contents = (try? fm.contentsOfDirectory(at: cacheRoot, includingPropertiesForKeys: nil)) ?? []
@@ -83,6 +99,7 @@ enum DiagnosticsService {
             try? fm.removeItem(at: url)
         }
         try? fm.createDirectory(at: cacheRoot, withIntermediateDirectories: true)
+        ImageCache.shared.clearDisk()
         URLCache.shared.removeAllCachedResponses()
     }
 }

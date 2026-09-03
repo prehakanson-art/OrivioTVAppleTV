@@ -26,10 +26,16 @@ enum StremioLinkResult {
 
 enum StremioAccountError: LocalizedError {
     case server(String)
+    /// A request URL that wouldn't build. Every Stremio endpoint interpolates
+    /// something — a login code, an API path — and a value carrying a character
+    /// URL can't parse used to hit a force-unwrap and take the whole app down
+    /// with it. A failed request is the correct outcome; a crash never is.
+    case badURL(String)
 
     var errorDescription: String? {
         switch self {
         case .server(let message): return message
+        case .badURL(let path): return "Couldn't build a Stremio request URL for \(path)."
         }
     }
 }
@@ -98,7 +104,8 @@ enum StremioAccountService {
     /// Start a QR/link login — returns the code + link to display.
     static func createLink() async throws -> StremioLinkCode {
         struct Resp: Decodable { let code: String; let link: String }
-        let url = URL(string: "\(linkBase)/api/create?type=Create")!
+        let path = "\(linkBase)/api/create?type=Create"
+        guard let url = URL(string: path) else { throw StremioAccountError.badURL(path) }
         let (data, _) = try await session.data(from: url)
         let r = try JSONDecoder().decode(Resp.self, from: data)
         return StremioLinkCode(code: r.code, link: r.link)
@@ -224,7 +231,13 @@ enum StremioAccountService {
     }
 
     private static func post(_ path: String, _ body: [String: Any]) async throws -> (Data, URLResponse) {
-        var req = URLRequest(url: URL(string: apiBase + path)!)
+        // `apiBase` is a literal but `path` is interpolated by every caller, so
+        // this was a force-unwrap on a value the callers control: an illegal
+        // character trapped the process instead of failing the one request.
+        guard let url = URL(string: apiBase + path) else {
+            throw StremioAccountError.badURL(path)
+        }
+        var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -428,7 +441,12 @@ enum StremioSync {
             guard let st = li.state else { continue }
             withState += 1
             pulledStates[li.id] = st.wireForm
-            let (pos, dur) = playbackSeconds(offset: st.timeOffset, duration: st.duration)
+            let (pos, dur) = playbackSeconds(
+                offset: st.timeOffset,
+                duration: st.duration,
+                timeWatched: st.timeWatched,
+                overallTimeWatched: st.overallTimeWatched
+            )
             let (season, episode) = parseVideoID(st.video_id)
             let lastWatched = StremioDate.parse(st.lastWatched) ?? Date()
             if pos > 0 { withPosition += 1 }
@@ -658,10 +676,29 @@ enum StremioSync {
             rows[item.id] = row
         }
 
+        // Stremio's datastore keeps ONE playback state per LIBRARY ITEM — the
+        // show, not the episode — so a series with two in-progress episodes has
+        // to nominate one. This loop used to assign `row["state"]` for every
+        // entry as it walked `serviceBackedForSync()`, whose order is
+        // `Dictionary.Values`: unspecified, and seed-randomised per launch. The
+        // last writer won, so the episode Stremio resumed flipped between syncs
+        // and regularly REGRESSED to an older one. Nominate deterministically:
+        // the most recently updated episode per show, ties broken on the
+        // progress key so the choice never depends on hash order.
+        var newestByMeta: [String: WatchProgress] = [:]
         for wp in progress {
             guard wp.durationSeconds.isFinite,
                   wp.positionSeconds.isFinite,
                   wp.durationSeconds > 0 else { continue }
+            if let incumbent = newestByMeta[wp.metaID] {
+                let wins = wp.updatedAt > incumbent.updatedAt
+                    || (wp.updatedAt == incumbent.updatedAt && wp.id > incumbent.id)
+                guard wins else { continue }
+            }
+            newestByMeta[wp.metaID] = wp
+        }
+
+        for wp in newestByMeta.values.sorted(by: { $0.metaID < $1.metaID }) {
             let id = wp.metaID
             var row = rows[id] ?? [
                 "_id": id,
@@ -722,7 +759,10 @@ enum StremioSync {
             rows[id] = row
         }
 
-        return Array(rows.values)
+        // Ordered by id for the same reason the nomination above is: a payload
+        // that shuffles on every launch is impossible to diff against the last
+        // one when a resume point comes back wrong.
+        return rows.keys.sorted().compactMap { rows[$0] }
     }
 
     private static func stremioState(progress: WatchProgress?, watched: WatchedItem?) -> [String: Any] {
@@ -841,10 +881,21 @@ enum StremioSync {
         return (s, e)
     }
 
+    /// Above this, a value cannot be a number of SECONDS of playback: nothing
+    /// with a resume point runs for a day.
+    private static let millisecondEvidenceThreshold: Double = 86_400
+
     /// Stremio datastore values have been seen as both seconds and milliseconds
     /// depending on client/version. Normalize by duration: anything larger than
     /// a day is certainly milliseconds for a movie/episode runtime.
-    private static func playbackSeconds(offset: Double?, duration: Double?) -> (Double, Double) {
+    ///
+    /// `timeWatched` / `overallTimeWatched` come from the SAME record and are
+    /// written in the same unit as `timeOffset`, so they get a vote when the
+    /// offset alone can't settle it.
+    private static func playbackSeconds(offset: Double?,
+                                        duration: Double?,
+                                        timeWatched: Double?,
+                                        overallTimeWatched: Double?) -> (Double, Double) {
         let rawOffset = offset ?? 0
         let rawDuration = duration ?? 0
         // Duration is the reliable signal, but it is very often ABSENT (see the
@@ -852,13 +903,22 @@ enum StremioSync {
         // millisecond offset through as seconds: a 50-minute resume point became
         // 3,000,000 "seconds", `enrichContinueWatching` computed a fraction far
         // past 1.0 and dropped the row as finished — silently discarding most
-        // duration-less resume points on import. With no duration, fall back to
-        // the offset's own magnitude: no movie or episode runs for a day.
+        // duration-less resume points on import.
         let scale: Double
         if rawDuration > 0 {
-            scale = rawDuration > 86_400 ? 1000.0 : 1.0
+            scale = rawDuration > millisecondEvidenceThreshold ? 1000.0 : 1.0
         } else {
-            scale = rawOffset > 86_400 ? 1000.0 : 1.0
+            // The offset's own magnitude is not enough either. An offset that IS
+            // in milliseconds but below the threshold — the first ~86 seconds of
+            // playback — passed straight through as seconds and became up to 24
+            // hours, so `enrichContinueWatching` dropped it as finished: every
+            // title the user had only just started disappeared on import.
+            // Cross-check the companion fields Stremio sends in the same record.
+            // Any ONE of them above the threshold proves the record is in
+            // milliseconds, however small the offset happens to be. With nothing
+            // else present this falls back to the offset test on its own.
+            let evidence = max(rawOffset, max(timeWatched ?? 0, overallTimeWatched ?? 0))
+            scale = evidence > millisecondEvidenceThreshold ? 1000.0 : 1.0
         }
         return (rawOffset / scale, rawDuration / scale)
     }

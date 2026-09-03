@@ -84,8 +84,20 @@ actor DiskCache<Value: Codable & Sendable> {
         let entry = Entry(value: value, time: Date())
         memory[key] = entry
         capMemory()
-        if let data = try? JSONEncoder().encode(entry) {
-            try? data.write(to: fileURL(key), options: .atomic)
+        guard let data = try? JSONEncoder().encode(entry) else { return }
+        let url = fileURL(key)
+        do {
+            try data.write(to: url, options: .atomic)
+        } catch {
+            // The directory is created ONCE, in init. Anything that removes it
+            // afterwards — Settings → "Clear cache" deletes every child of the
+            // cache root and recreates only the root, and tvOS may reclaim
+            // Caches/ under pressure — left every store() failing silently for
+            // the rest of the session: catalogs, meta and stream results all
+            // stopped being cached, with no symptom but a permanently slow app
+            // until relaunch. Recreate and retry once.
+            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try? data.write(to: url, options: .atomic)
         }
     }
 

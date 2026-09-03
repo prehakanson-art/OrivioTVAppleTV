@@ -286,17 +286,23 @@ enum DebridService {
     /// resolved so callers can label the source correctly. This is what makes
     /// a multi-debrid setup (e.g. TorBox + RD) actually use all of them
     /// instead of only the preferred one.
+    ///
+    /// `fileIdx` is the addon-supplied index of the wanted file inside the
+    /// TORRENT's file list (Stremio's `Stream.fileIdx`). It defaults to the
+    /// stream's own value so no call site can silently drop it; pass it
+    /// explicitly only to override.
     static func resolveAcross(
         stream: Stream,
         providers: [(provider: DebridProvider, apiKey: String)],
         season: Int?,
-        episode: Int?
+        episode: Int?,
+        fileIdx: Int? = nil
     ) async -> (result: DebridResult, provider: DebridProvider?) {
         var lastResult: DebridResult = .missingKey
         for (provider, apiKey) in providers {
             let result = await resolve(
                 stream: stream, provider: provider, apiKey: apiKey,
-                season: season, episode: episode
+                season: season, episode: episode, fileIdx: fileIdx
             )
             if case .success = result { return (result, provider) }
             lastResult = result
@@ -305,27 +311,38 @@ enum DebridService {
     }
 
     /// Resolve a torrent stream to a direct URL using the given provider+key.
+    ///
+    /// See `resolveAcross` for `fileIdx`. Season packs used to resolve to
+    /// whichever file `selectFile`'s SxxExx/size heuristic liked — so every
+    /// episode row of a pack played the SAME (usually biggest) episode, and a
+    /// pack named `S01.E01` / `Ep01` / absolutely-numbered matched nothing at
+    /// all. The addon already told us which file it meant; honour that where
+    /// the provider's file list can be mapped back to the torrent's.
     static func resolve(
         stream: Stream,
         provider: DebridProvider,
         apiKey: String,
         season: Int?,
-        episode: Int?
+        episode: Int?,
+        fileIdx: Int? = nil
     ) async -> DebridResult {
         guard !apiKey.isEmpty else { return .missingKey }
         guard let magnet = stream.magnetURI, let infoHash = stream.infoHash else {
             return .failed("Not a torrent stream")
         }
+        // The stream's own index is the default so a caller that forgets to
+        // forward it still gets the right episode.
+        let wantedIndex = fileIdx ?? stream.fileIdx
         do {
             switch provider {
             case .realDebrid:
-                return try await resolveRealDebrid(magnet: magnet, apiKey: apiKey, season: season, episode: episode)
+                return try await resolveRealDebrid(magnet: magnet, apiKey: apiKey, season: season, episode: episode, fileIdx: wantedIndex)
             case .premiumize:
-                return try await resolvePremiumize(magnet: magnet, apiKey: apiKey, season: season, episode: episode)
+                return try await resolvePremiumize(magnet: magnet, apiKey: apiKey, season: season, episode: episode, fileIdx: wantedIndex)
             case .torbox:
-                return try await resolveTorbox(magnet: magnet, apiKey: apiKey, season: season, episode: episode)
+                return try await resolveTorbox(magnet: magnet, apiKey: apiKey, season: season, episode: episode, fileIdx: wantedIndex)
             case .allDebrid:
-                return try await resolveAllDebrid(magnet: magnet, infoHash: infoHash, apiKey: apiKey, season: season, episode: episode)
+                return try await resolveAllDebrid(magnet: magnet, infoHash: infoHash, apiKey: apiKey, season: season, episode: episode, fileIdx: wantedIndex)
             }
         } catch {
             return .failed(error.localizedDescription)
@@ -568,15 +585,19 @@ enum DebridService {
         let request: URLRequest
         switch provider {
         case .realDebrid:
-            request = bearerRequest("https://api.real-debrid.com/rest/1.0/user", key: apiKey)
+            guard let r = try? bearerRequest("https://api.real-debrid.com/rest/1.0/user", key: apiKey) else { return false }
+            request = r
         case .premiumize:
-            request = bearerRequest("https://www.premiumize.me/api/account/info", key: apiKey)
+            guard let r = try? bearerRequest("https://www.premiumize.me/api/account/info", key: apiKey) else { return false }
+            request = r
         case .torbox:
-            request = bearerRequest("https://api.torbox.app/v1/api/user/me", key: apiKey)
+            guard let r = try? bearerRequest("https://api.torbox.app/v1/api/user/me", key: apiKey) else { return false }
+            request = r
         case .allDebrid:
-            var comps = URLComponents(string: "https://api.alldebrid.com/v4/user")!
+            guard var comps = URLComponents(string: "https://api.alldebrid.com/v4/user") else { return false }
             comps.queryItems = [.init(name: "agent", value: "nuvio"), .init(name: "apikey", value: apiKey)]
-            request = URLRequest(url: comps.url!)
+            guard let url = comps.url else { return false }
+            request = URLRequest(url: url)
         }
         guard let (_, response) = try? await session.data(for: request),
               let http = response as? HTTPURLResponse else { return false }
@@ -585,19 +606,45 @@ enum DebridService {
 
     // MARK: File selection
 
-    /// Pick the best video file: for series match SxxExx, else the largest.
+    private static func isVideoPath(_ path: String) -> Bool {
+        videoExtensions.contains((path as NSString).pathExtension.lowercased())
+    }
+
+    /// Pick the wanted file.
+    ///
+    /// Order of preference:
+    /// 1. The addon's `fileIdx` — but ONLY when the caller can map a provider
+    ///    entry back to its position in the torrent's own file list, which is
+    ///    what `fileIdx` indexes. `torrentIndex` is that mapping, and a
+    ///    provider that filters or re-orders its file list must not supply one:
+    ///    a blind `files[fileIdx]` there picks the WRONG episode, which is
+    ///    worse than the heuristic below. The pick is also required to be a
+    ///    video file, so a bogus/stale index falls through instead of handing
+    ///    the player an .nfo.
+    /// 2. For series, a filename matching SxxExx / SxE.
+    /// 3. The largest video file.
     private static func selectFile<F>(
         _ files: [F], season: Int?, episode: Int?,
-        path: (F) -> String, size: (F) -> Int64
+        path: (F) -> String, size: (F) -> Int64,
+        fileIdx: Int? = nil,
+        torrentIndex: ((F) -> Int)? = nil
     ) -> F? {
-        let videos = files.filter { f in
-            let ext = (path(f) as NSString).pathExtension.lowercased()
-            return videoExtensions.contains(ext)
+        // Matched against the FULL list (not the video-only pool): `fileIdx`
+        // counts every file in the torrent, samples and subtitles included.
+        if let fileIdx, fileIdx >= 0, let torrentIndex,
+           let pick = files.first(where: { torrentIndex($0) == fileIdx }),
+           isVideoPath(path(pick)) {
+            return pick
         }
+        let videos = files.filter { isVideoPath(path($0)) }
         let pool = videos.isEmpty ? files : videos
         if let season, let episode {
+            // `s01.e01` was missing here while the P2P sibling
+            // (TorrServerService.selectFile) already matched it — a pack named
+            // that way fell all the way through to "largest file".
             let patterns = [
                 String(format: "s%02de%02d", season, episode),
+                String(format: "s%02d.e%02d", season, episode),
                 String(format: "%dx%02d", season, episode)
             ]
             if let match = pool.first(where: { f in
@@ -610,7 +657,7 @@ enum DebridService {
 
     // MARK: Real-Debrid
 
-    private static func resolveRealDebrid(magnet: String, apiKey: String, season: Int?, episode: Int?) async throws -> DebridResult {
+    private static func resolveRealDebrid(magnet: String, apiKey: String, season: Int?, episode: Int?, fileIdx: Int?) async throws -> DebridResult {
         struct AddResult: Decodable { let id: String }
         struct TorrentInfo: Decodable {
             let status: String
@@ -641,7 +688,15 @@ enum DebridService {
             try? await Task.sleep(nanoseconds: 700_000_000)
             info1 = try await bearerGET("https://api.real-debrid.com/rest/1.0/torrents/info/\(torrentID)", key: apiKey)
         }
-        guard let file = selectFile(info1.files ?? [], season: season, episode: episode, path: \.path, size: \.bytes) else {
+        // RD is the ONE provider whose list can be indexed by `fileIdx`:
+        // `torrents/info` is read here BEFORE `selectFiles`, so it is the
+        // torrent's complete file list (nothing filtered out), and RD's `id`
+        // is that list's 1-based position — i.e. `id - 1 == fileIdx`. Matching
+        // on `id` rather than array position also survives any re-ordering of
+        // the JSON array.
+        guard let file = selectFile(info1.files ?? [], season: season, episode: episode,
+                                    path: \.path, size: \.bytes,
+                                    fileIdx: fileIdx, torrentIndex: { $0.id - 1 }) else {
             return .notCached
         }
         try? await formIgnore("https://api.real-debrid.com/rest/1.0/torrents/selectFiles/\(torrentID)", key: apiKey, fields: ["files": String(file.id)])
@@ -665,7 +720,7 @@ enum DebridService {
 
     // MARK: Premiumize
 
-    private static func resolvePremiumize(magnet: String, apiKey: String, season: Int?, episode: Int?) async throws -> DebridResult {
+    private static func resolvePremiumize(magnet: String, apiKey: String, season: Int?, episode: Int?, fileIdx: Int?) async throws -> DebridResult {
         struct DirectDL: Decodable {
             let status: String?
             let content: [Content]?
@@ -674,8 +729,14 @@ enum DebridService {
         let result: DirectDL = try await form("https://www.premiumize.me/api/transfer/directdl", key: apiKey, fields: ["src": magnet])
         if result.status?.lowercased() == "error" { return .notCached }
         let contents = result.content ?? []
+        // No `torrentIndex` for Premiumize: `transfer/directdl` returns the
+        // files it can SERVE, flattened out of their directories and with
+        // unservable entries dropped — it is not the torrent's list and carries
+        // no index back to it. `fileIdx` is accepted and deliberately unused
+        // here; indexing this array would pick the wrong episode.
         guard let file = selectFile(contents, season: season, episode: episode,
-                                    path: { $0.path ?? "" }, size: { $0.size ?? 0 }),
+                                    path: { $0.path ?? "" }, size: { $0.size ?? 0 },
+                                    fileIdx: fileIdx, torrentIndex: nil),
               let link = file.link, !link.isEmpty else {
             return .notCached
         }
@@ -684,7 +745,7 @@ enum DebridService {
 
     // MARK: TorBox
 
-    private static func resolveTorbox(magnet: String, apiKey: String, season: Int?, episode: Int?) async throws -> DebridResult {
+    private static func resolveTorbox(magnet: String, apiKey: String, season: Int?, episode: Int?, fileIdx: Int?) async throws -> DebridResult {
         struct Envelope<T: Decodable>: Decodable { let success: Bool?; let data: T? }
         struct CreateData: Decodable { let torrent_id: Int?; let id: Int? }
         struct TorrentData: Decodable { let files: [TorrentFile]? }
@@ -703,7 +764,7 @@ enum DebridService {
                 .init(name: "format", value: "object"),
                 .init(name: "list_files", value: "false")
             ]
-            if let check: Envelope<[String: Cached]> = try? await decode(bearerRequest(probe.url!.absoluteString, key: apiKey)),
+            if let check: Envelope<[String: Cached]> = try? await decode(try bearerRequest(probe.url!.absoluteString, key: apiKey)),
                check.success == true, (check.data ?? [:]).isEmpty {
                 return .notCached
             }
@@ -721,12 +782,19 @@ enum DebridService {
         for attempt in 0..<4 {
             var comps = URLComponents(string: "https://api.torbox.app/v1/api/torrents/mylist")!
             comps.queryItems = [.init(name: "id", value: String(torrentID)), .init(name: "bypass_cache", value: "true")]
-            let list: Envelope<TorrentData> = try await decode(bearerRequest(comps.url!.absoluteString, key: apiKey))
+            let list: Envelope<TorrentData> = try await decode(try bearerRequest(comps.url!.absoluteString, key: apiKey))
             files = list.data?.files ?? []
             if !files.isEmpty { break }
             if attempt < 3 { try? await Task.sleep(nanoseconds: 700_000_000) }
         }
-        guard let file = selectFile(files, season: season, episode: episode, path: \.name, size: { $0.size ?? 0 }) else {
+        // No `torrentIndex` for TorBox: `mylist` reports TorBox's OWN file
+        // records — its `id` is a per-account file id used by `requestdl`, not
+        // a position in the torrent, and TorBox prunes junk/sample entries from
+        // the list. Neither the ids nor the array positions can be trusted to
+        // line up with `fileIdx`, so the name/size heuristic stays.
+        guard let file = selectFile(files, season: season, episode: episode,
+                                    path: \.name, size: { $0.size ?? 0 },
+                                    fileIdx: fileIdx, torrentIndex: nil) else {
             return .notCached
         }
         var linkComps = URLComponents(string: "https://api.torbox.app/v1/api/torrents/requestdl")!
@@ -735,14 +803,14 @@ enum DebridService {
             .init(name: "torrent_id", value: String(torrentID)),
             .init(name: "file_id", value: String(file.id))
         ]
-        let link: LinkData = try await decode(bearerRequest(linkComps.url!.absoluteString, key: apiKey))
+        let link: LinkData = try await decode(try bearerRequest(linkComps.url!.absoluteString, key: apiKey))
         guard let url = link.data, !url.isEmpty else { return .notCached }
         return .success(url: url, filename: file.name)
     }
 
     // MARK: AllDebrid (public v4 API)
 
-    private static func resolveAllDebrid(magnet: String, infoHash: String, apiKey: String, season: Int?, episode: Int?) async throws -> DebridResult {
+    private static func resolveAllDebrid(magnet: String, infoHash: String, apiKey: String, season: Int?, episode: Int?, fileIdx: Int?) async throws -> DebridResult {
         // Upload magnet → get id, then poll status for ready links, then unlock.
         struct UploadResponse: Decodable { let data: UploadData? }
         struct UploadData: Decodable { let magnets: [UploadMagnet]? }
@@ -761,8 +829,14 @@ enum DebridService {
               let links = status.data?.magnets?.links, !links.isEmpty else {
             return .notCached
         }
+        // No `torrentIndex` for AllDebrid: `magnet/status` returns the LINKS it
+        // produced, one per file it actually unlocked, with no torrent-relative
+        // index on them — and v4 flattens/omits entries it couldn't serve. Its
+        // order is AllDebrid's, not the torrent's, so `fileIdx` can't address
+        // it and is deliberately unused here.
         let chosen = selectFile(links, season: season, episode: episode,
-                                path: { $0.filename ?? "" }, size: { $0.size ?? 0 })
+                                path: { $0.filename ?? "" }, size: { $0.size ?? 0 },
+                                fileIdx: fileIdx, torrentIndex: nil)
         guard let protectedLink = chosen?.link else { return .notCached }
         let unlock: UnlockResponse = try await adGET("link/unlock", apiKey: apiKey, query: ["link": protectedLink])
         guard let url = unlock.data?.link, !url.isEmpty else { return .notCached }
@@ -771,8 +845,13 @@ enum DebridService {
 
     // MARK: - HTTP helpers
 
-    private static func bearerRequest(_ url: String, key: String) -> URLRequest {
-        var request = URLRequest(url: URL(string: url)!)
+    /// Throws rather than trapping. Every caller today passes a literal or the
+    /// `absoluteString` of an already-built URL, so this is unreachable — but a
+    /// force-unwrap in a shared HTTP helper is one interpolated id away from
+    /// being a crash, which is exactly how the TMDB and Trakt ones bit.
+    private static func bearerRequest(_ url: String, key: String) throws -> URLRequest {
+        guard let parsed = URL(string: url) else { throw URLError(.badURL) }
+        var request = URLRequest(url: parsed)
         request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         return request
@@ -784,11 +863,11 @@ enum DebridService {
     }
 
     private static func bearerGET<T: Decodable>(_ url: String, key: String) async throws -> T {
-        try await decode(bearerRequest(url, key: key))
+        try await decode(try bearerRequest(url, key: key))
     }
 
     private static func form<T: Decodable>(_ url: String, key: String, fields: [String: String]) async throws -> T {
-        var request = bearerRequest(url, key: key)
+        var request = try bearerRequest(url, key: key)
         request.httpMethod = "POST"
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
         let body = fields.map { "\($0.key)=\($0.value.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? $0.value)" }
@@ -799,7 +878,7 @@ enum DebridService {
 
     /// POST a form body and ignore the response (used for RD selectFiles).
     private static func formIgnore(_ url: String, key: String, fields: [String: String]) async throws {
-        var request = bearerRequest(url, key: key)
+        var request = try bearerRequest(url, key: key)
         request.httpMethod = "POST"
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
         let body = fields.map { "\($0.key)=\($0.value.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? $0.value)" }
@@ -810,14 +889,14 @@ enum DebridService {
 
     @discardableResult
     private static func delete(_ url: String, key: String) async throws -> Data {
-        var request = bearerRequest(url, key: key)
+        var request = try bearerRequest(url, key: key)
         request.httpMethod = "DELETE"
         let (data, _) = try await session.data(for: request)
         return data
     }
 
     private static func multipart<T: Decodable>(_ url: String, key: String, parts: [String: String]) async throws -> T {
-        var request = bearerRequest(url, key: key)
+        var request = try bearerRequest(url, key: key)
         request.httpMethod = "POST"
         let boundary = "Boundary-\(UUID().uuidString)"
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")

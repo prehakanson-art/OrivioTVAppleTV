@@ -83,8 +83,14 @@ final class AddonManager: ObservableObject {
         defer { suppressChange = false }
         let normalizedStates = remoteAddons.map { state in
             let manifestURL = Self.normalizeManifestURL(state.manifestURL)
-            let baseURL = manifestURL.hasSuffix("/manifest.json")
-                ? String(manifestURL.dropLast("/manifest.json".count)) : manifestURL
+            // Derived by the SAME rule as `InstalledAddon.baseURL`. This used to
+            // strip only a trailing "/manifest.json" and keep the query, so for
+            // a configured addon (…/manifest.json?token=…) the two disagreed and
+            // the identity match below never fired: every sync re-fetched and
+            // re-appended the addon (shuffling it to the end of the priority
+            // order), a reconciling pull removed then re-added it, and an
+            // enable/disable made on another device never reached it.
+            let baseURL = InstalledAddon.baseURL(forManifestURL: manifestURL)
             return (manifestURL: manifestURL, baseURL: baseURL, enabled: state.enabled)
         }
         let existing = Set(addons.map { $0.baseURL })

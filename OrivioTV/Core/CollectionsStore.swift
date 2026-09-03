@@ -443,6 +443,27 @@ final class CollectionsStore: ObservableObject {
 
     /// Remove from the account entirely (all profiles). To hide it on just this
     /// profile use `setVisible(false:id:)`.
+    /// Drop the whole shared library — for an ACCOUNT SWITCH, where these
+    /// collections belong to the user who just signed out.
+    ///
+    /// Deliberately not `remove(id:)` per collection: that records a removal
+    /// tombstone for each one, which would then suppress the incoming account's
+    /// collections of the same id, and writes the library file N times.
+    func clearAll() {
+        guard !library.isEmpty || !removedAt.isEmpty else { return }
+        suppressChange = true
+        defer { suppressChange = false }
+        library = []
+        hiddenIDs = []
+        hiddenFolderIDs = []
+        globalHiddenIDs = []
+        globalHiddenFolderIDs = []
+        removedAt = [:]
+        saveRemoved()
+        save()
+        recomputeVisible()
+    }
+
     func remove(id: String) {
         library.removeAll { $0.id == id }
         hiddenIDs.remove(id)

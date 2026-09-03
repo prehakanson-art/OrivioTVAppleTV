@@ -200,19 +200,55 @@ struct InstalledAddon: Codable, Identifiable, Hashable {
         enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
     }
 
-    var baseURL: String {
-        var base = manifestURL
-        // Drop any query/fragment first. A configured addon's manifest can carry
-        // one, and without this the suffix test below failed, `baseURL` came
-        // back EQUAL to the manifest URL, and every resource request was built
-        // as "…/manifest.json?token=…/catalog/…".
+    /// THE single source of truth for splitting a manifest URL into the base
+    /// path every resource request hangs off, and the query/fragment that has
+    /// to be carried along with it.
+    ///
+    /// Two derivations of this used to exist — `baseURL` here (which dropped
+    /// the query) and an inline one in `AddonManager.applyRemote` (which kept
+    /// it) — and for a configured addon whose manifest carries a token
+    /// (`…/manifest.json?token=…`) they disagreed. Account sync then never
+    /// recognised that addon as already installed: every pull re-fetched and
+    /// re-appended it (shuffling it to the end of the priority order), a
+    /// reconciling pull removed and re-added it, and an enable/disable made on
+    /// another device never landed on it.
+    static func split(manifestURL raw: String) -> (base: String, query: String) {
+        var base = raw
+        var query = ""
+        // Query/fragment comes off FIRST. Without this the suffix test below
+        // failed, `base` came back EQUAL to the manifest URL, and every
+        // resource request was built as "…/manifest.json?token=…/catalog/…".
         if let mark = base.firstIndex(where: { $0 == "?" || $0 == "#" }) {
+            query = String(base[mark...])
             base = String(base[base.startIndex..<mark])
         }
         if base.hasSuffix("/manifest.json") {
             base = String(base.dropLast("/manifest.json".count))
         }
-        return base
+        return (base, query)
+    }
+
+    /// The base path of a manifest URL, without its query. Callers that only
+    /// have the raw string (account sync, the Discover list) use this so they
+    /// match `InstalledAddon.baseURL` exactly.
+    static func baseURL(forManifestURL raw: String) -> String {
+        split(manifestURL: raw).base
+    }
+
+    var baseURL: String { Self.split(manifestURL: manifestURL).base }
+
+    /// Builds a resource URL for this addon: base path + `path` + the manifest
+    /// URL's own query re-appended AFTER the `.json` suffix.
+    ///
+    /// `baseURL` alone is not enough for a configured addon: the token lives in
+    /// the manifest URL's query, and plain string concatenation dropped it, so
+    /// every catalog/meta/stream/subtitle request went out unauthenticated and
+    /// silently came back with nothing. For the overwhelmingly common case of a
+    /// manifest URL with no query this returns exactly what concatenation did.
+    /// `path` is the full resource path including its leading `/` and `.json`.
+    func resourceURL(_ path: String) -> String {
+        let parts = Self.split(manifestURL: manifestURL)
+        return parts.base + path + parts.query
     }
 
     /// Whether this addon claims to resolve the given content id. Prefixes can

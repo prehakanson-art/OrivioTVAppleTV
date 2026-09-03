@@ -296,8 +296,26 @@ enum TraktService {
         return URLSession(configuration: config)
     }()
 
-    private static func request(_ path: String, method: String = "GET", bearer: String? = nil) -> URLRequest {
-        var request = URLRequest(url: URL(string: base + path)!)
+    /// Returns nil for a path that can't form a URL — it used to force-unwrap.
+    /// Paths are interpolated from user-supplied text (a pasted trakt.tv list
+    /// URL via `parseListIDPath`, whose regex branches happily return an id
+    /// containing a space or a quote), so `URL(string:)` returned nil and
+    /// adding a collection source TRAPPED. Illegal characters are
+    /// percent-escaped first, so a merely-unescaped path still resolves and
+    /// only genuine nonsense fails — as nil, which every caller already has a
+    /// graceful path for.
+    private static func request(_ path: String, method: String = "GET", bearer: String? = nil) -> URLRequest? {
+        let url = URL(string: base + path)
+            // path ∪ query so the escape pass can't mangle "?…&…=" on a path
+            // that carries a query string.
+            ?? path.addingPercentEncoding(
+                withAllowedCharacters: CharacterSet.urlPathAllowed.union(.urlQueryAllowed)
+            ).flatMap { URL(string: base + $0) }
+        guard let url else {
+            NSLog("[OrivioTrakt] unusable request path %@", path)
+            return nil
+        }
+        var request = URLRequest(url: url)
         request.httpMethod = method
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("2", forHTTPHeaderField: "trakt-api-version")
@@ -314,7 +332,7 @@ enum TraktService {
             let device_code: String; let user_code: String
             let verification_url: String; let expires_in: Int; let interval: Int
         }
-        var req = request("/oauth/device/code", method: "POST")
+        guard var req = request("/oauth/device/code", method: "POST") else { throw URLError(.badURL) }
         req.httpBody = try JSONSerialization.data(withJSONObject: ["client_id": TraktStore.clientID])
         let (data, _) = try await session.data(for: req)
         let r = try JSONDecoder().decode(Response.self, from: data)
@@ -330,7 +348,9 @@ enum TraktService {
         let secret = clientSecret.trimmingCharacters(in: .whitespaces)
         guard !secret.isEmpty else { return .needsSecret }
         struct TokenResponse: Decodable { let access_token: String; let refresh_token: String }
-        var req = request("/oauth/device/token", method: "POST")
+        guard var req = request("/oauth/device/token", method: "POST") else {
+            return .failed("Bad request URL")
+        }
         let body = ["code": deviceCode, "client_id": TraktStore.clientID, "client_secret": secret]
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
         guard let (data, response) = try? await session.data(for: req),
@@ -356,7 +376,7 @@ enum TraktService {
     /// Fetch the signed-in user's username for display.
     static func fetchUsername(accessToken: String) async -> String? {
         struct Settings: Decodable { struct User: Decodable { let username: String? }; let user: User? }
-        let req = request("/users/settings", bearer: accessToken)
+        guard let req = request("/users/settings", bearer: accessToken) else { return nil }
         guard let (data, _) = try? await session.data(for: req),
               let settings = try? JSONDecoder().decode(Settings.self, from: data) else { return nil }
         return settings.user?.username
@@ -382,7 +402,7 @@ enum TraktService {
             struct User: Decodable { let username: String? }
             let id: Int; let comment: String; let spoiler: Bool?; let likes: Int?; let user: User?
         }
-        let req = request("/\(kind)/\(imdbID)/comments/likes?limit=\(limit)")
+        guard let req = request("/\(kind)/\(imdbID)/comments/likes?limit=\(limit)") else { return [] }
         guard let (data, response) = try? await session.data(for: req),
               let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
               let dtos = try? JSONDecoder().decode([CommentDTO].self, from: data) else { return [] }
@@ -417,7 +437,9 @@ enum TraktService {
         } else {
             body["movie"] = ["ids": ["imdb": imdbID]]
         }
-        var req = request("/scrobble/\(action.rawValue)", method: "POST", bearer: accessToken)
+        guard var req = request("/scrobble/\(action.rawValue)", method: "POST", bearer: accessToken) else {
+            return false
+        }
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
         guard let (_, response) = try? await session.data(for: req),
               let http = response as? HTTPURLResponse else { return false }
@@ -430,7 +452,7 @@ enum TraktService {
     /// tokens last ~3 months; this keeps the link alive without re-login.
     static func refreshToken(_ refresh: String) async -> (access: String, refresh: String)? {
         struct TokenResponse: Decodable { let access_token: String; let refresh_token: String }
-        var req = request("/oauth/token", method: "POST")
+        guard var req = request("/oauth/token", method: "POST") else { return nil }
         let body: [String: Any] = [
             "refresh_token": refresh,
             "client_id": TraktStore.clientID,
@@ -548,7 +570,9 @@ enum TraktService {
     /// Delete one row from Trakt's playback list (their Continue Watching).
     @discardableResult
     static func removePlayback(playbackID: Int, accessToken: String) async -> Bool {
-        let req = request("/sync/playback/\(playbackID)", method: "DELETE", bearer: accessToken)
+        guard let req = request("/sync/playback/\(playbackID)", method: "DELETE", bearer: accessToken) else {
+            return false
+        }
         guard let (_, response) = try? await session.data(for: req),
               let http = response as? HTTPURLResponse else { return false }
         return (200..<300).contains(http.statusCode)
@@ -595,7 +619,7 @@ enum TraktService {
         if !movies.isEmpty { body["movies"] = movies }
         if !shows.isEmpty { body["shows"] = shows }
         guard !body.isEmpty else { return false }
-        var req = request(path, method: "POST", bearer: token)
+        guard var req = request(path, method: "POST", bearer: token) else { return false }
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
         guard let (_, response) = try? await session.data(for: req),
               let http = response as? HTTPURLResponse else {
@@ -614,7 +638,7 @@ enum TraktService {
     }
 
     private static func get(_ path: String, _ token: String) async -> (Data, Int)? {
-        let req = request(path, bearer: token)
+        guard let req = request(path, bearer: token) else { return nil }
         guard let (data, response) = try? await session.data(for: req),
               let http = response as? HTTPURLResponse else {
             NSLog("[OrivioTrakt] GET %@ — network error", path)
@@ -704,7 +728,7 @@ enum TraktService {
         if !movies.isEmpty { body["movies"] = movies }
         if !shows.isEmpty { body["shows"] = shows }
         guard !body.isEmpty else { return false }
-        var req = request(path, method: "POST", bearer: token)
+        guard var req = request(path, method: "POST", bearer: token) else { return false }
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
         guard let (_, response) = try? await session.data(for: req),
               let http = response as? HTTPURLResponse else {
@@ -749,7 +773,7 @@ enum TraktService {
             struct IDs: Decodable { let trakt: Int64? }
             let name: String?; let description: String?; let ids: IDs?
         }
-        let req = request("/lists/\(idPath)?extended=full")
+        guard let req = request("/lists/\(idPath)?extended=full") else { return nil }
         guard let (data, response) = try? await session.data(for: req),
               let http = response as? HTTPURLResponse, http.statusCode == 200,
               let body = try? JSONDecoder().decode(Response.self, from: data),
@@ -775,7 +799,9 @@ enum TraktService {
             let type: String?; let movie: Media?; let show: Media?
         }
         let path = "/lists/\(traktListId)/items/\(type)"
-        let req = request(path + "?extended=full&limit=200&sort_by=\(sortBy)&sort_how=\(sortHow)")
+        guard let req = request(path + "?extended=full&limit=200&sort_by=\(sortBy)&sort_how=\(sortHow)") else {
+            return []
+        }
         guard let (data, response) = try? await session.data(for: req),
               let http = response as? HTTPURLResponse else { return [] }
         if http.statusCode != 200 { NSLog("[OrivioTrakt] GET %@ → HTTP %d", path, http.statusCode) }

@@ -13,21 +13,48 @@ import JavaScriptCore
 // through that queue hop. `@unchecked` because the compiler can't see that
 // confinement, only the code review can.
 final class PluginRuntime: @unchecked Sendable {
-    // A serial queue owns each JSContext (JSCore isn't thread-safe) and fetch
-    // completions hop back onto it before touching JS values — but the queue is
-    // created PER RUN, not shared. One shared queue meant every scraper ran
-    // strictly one at a time (PluginStore's bounded concurrency did nothing),
-    // and a scraper doing long synchronous work blocked every other scraper
-    // behind it. tvOS does not expose JavaScriptCore's execution time limit, so
-    // a runaway script cannot be interrupted; isolating it to its own queue is
-    // what keeps it from taking the rest of the plugins down with it.
-    private let session: URLSession = {
+    private let fetchDelegate: BoundedFetchDelegate
+    /// Session wired to `fetchDelegate` so response bodies are inspected as they
+    /// arrive instead of after URLSession has already buffered the whole thing.
+    /// Built in `init` rather than lazily: concurrent runs each install their own
+    /// `fetch` binding, and a `lazy var` touched from several of those queues at
+    /// once is a data race. Never invalidated (URLSession retains its delegate
+    /// until you do), which is fine — one PluginRuntime lives for the life of
+    /// the app.
+    private let session: URLSession
+
+    init() {
+        let delegate = BoundedFetchDelegate(maxBytes: Self.maxFetchBytes)
         let c = URLSessionConfiguration.default
         c.timeoutIntervalForRequest = 20
-        return URLSession(configuration: c)
-    }()
+        fetchDelegate = delegate
+        session = URLSession(configuration: c, delegate: delegate, delegateQueue: nil)
+    }
+
+    /// Scrapers whose run hit the safety timeout this session.
+    ///
+    /// A wedged scraper — one in a synchronous infinite loop — permanently owns
+    /// the libdispatch thread backing its per-run queue AND the JSContext held
+    /// by its pending callbacks; tvOS does not expose JavaScriptCore's execution
+    /// time limit, so there is no way to interrupt it. What we CAN do is stop
+    /// re-running it: without this, every stream search started another copy and
+    /// leaked another thread + JSContext until the app was jetsam'd.
+    private let timedOutLock = NSLock()
+    private var timedOutScraperIDs = Set<String>()
+
+    /// Scoped accessors. Taking the lock inline in an `async` function is an
+    /// error under the Swift 6 language mode — the compiler cannot see that the
+    /// critical section never spans a suspension point, and a lock held across
+    /// one would deadlock the cooperative pool.
+    private func hasTimedOut(_ scraperID: String) -> Bool {
+        timedOutLock.lock(); defer { timedOutLock.unlock() }
+        return timedOutScraperIDs.contains(scraperID)
+    }
+
 
     func run(
+        scraperID: String,
+        scraperName: String,
         scraperJS: String,
         tmdbID: String,
         mediaType: String,
@@ -35,11 +62,24 @@ final class PluginRuntime: @unchecked Sendable {
         episode: Int?,
         timeout: TimeInterval = 25
     ) async -> [ScraperResult] {
+        if hasTimedOut(scraperID) {
+            NSLog("[Plugin] skipping '%@' — it timed out earlier this session and its run can't be interrupted; it stays skipped until the app restarts.", scraperName)
+            return []
+        }
+        // A serial queue owns each JSContext (JSCore isn't thread-safe) and fetch
+        // completions hop back onto it before touching JS values — but the queue is
+        // created PER RUN, not shared. One shared queue meant every scraper ran
+        // strictly one at a time (PluginStore's bounded concurrency did nothing),
+        // and a scraper doing long synchronous work blocked every other scraper
+        // behind it. tvOS does not expose JavaScriptCore's execution time limit, so
+        // a runaway script cannot be interrupted; isolating it to its own queue is
+        // what keeps it from taking the rest of the plugins down with it.
         let queue = DispatchQueue(label: "tv.nuvio.plugin.runtime.\(UUID().uuidString)")
         return await withCheckedContinuation { continuation in
             queue.async { [weak self] in
                 self?.execute(
                     queue: queue,
+                    scraperID: scraperID, scraperName: scraperName,
                     scraperJS: scraperJS, tmdbID: tmdbID, mediaType: mediaType,
                     season: season, episode: episode, timeout: timeout, continuation: continuation
                 )
@@ -47,10 +87,17 @@ final class PluginRuntime: @unchecked Sendable {
         }
     }
 
+    private func markTimedOut(_ scraperID: String) {
+        timedOutLock.lock()
+        timedOutScraperIDs.insert(scraperID)
+        timedOutLock.unlock()
+    }
+
     // MARK: - Execution (runs on `queue`)
 
     private func execute(
         queue: DispatchQueue,
+        scraperID: String, scraperName: String,
         scraperJS: String, tmdbID: String, mediaType: String,
         season: Int?, episode: Int?, timeout: TimeInterval,
         continuation: CheckedContinuation<[ScraperResult], Never>
@@ -61,15 +108,19 @@ final class PluginRuntime: @unchecked Sendable {
         // timeout below can resume the continuation even when that queue is
         // wedged by a synchronous script. Hopping onto the queue to resume was
         // the reason a runaway scraper left its `run()` awaiting forever.
+        // Returns true only for the caller that actually resumed, so the timeout
+        // can tell "I fired first" (the scraper is wedged) from "I lost the
+        // race" (the scraper finished normally, just close to the deadline).
         let finishLock = NSLock()
         var finished = false
-        let finish: ([ScraperResult]) -> Void = { results in
+        let finish: ([ScraperResult]) -> Bool = { results in
             finishLock.lock()
             let already = finished
             finished = true
             finishLock.unlock()
-            guard !already else { return }
+            guard !already else { return false }
             continuation.resume(returning: results)
+            return true
         }
 
         context.exceptionHandler = { _, value in
@@ -87,7 +138,7 @@ final class PluginRuntime: @unchecked Sendable {
         let getArgs: @convention(block) () -> String = { argsJSON }
         context.setObject(getArgs, forKeyedSubscript: "__get_call_args" as NSString)
         let capture: @convention(block) (String) -> Void = { json in
-            finish(Self.parseResults(json))
+            _ = finish(Self.parseResults(json))
         }
         context.setObject(capture, forKeyedSubscript: "__capture_result" as NSString)
 
@@ -104,8 +155,15 @@ final class PluginRuntime: @unchecked Sendable {
         // scraper doing long synchronous work held the queue and its own timeout
         // could never run — so its `run()` continuation never resumed and every
         // plugin queued behind it was stuck until relaunch.
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout + 1) {
-            finish([])
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout + 1) { [weak self] in
+            guard finish([]) else { return }
+            // We resumed instead of the script, so this run never came back:
+            // `queue`'s thread and this JSContext are gone for good. Remember the
+            // scraper so the rest of the session skips it — otherwise every
+            // subsequent search leaks another thread and another JSContext.
+            self?.markTimedOut(scraperID)
+            NSLog("[Plugin] '%@' timed out after %.0fs — its thread and JSContext can't be reclaimed (tvOS exposes no JS execution time limit), so it will be skipped for the rest of this session.",
+                  scraperName, timeout + 1)
         }
     }
 
@@ -151,7 +209,12 @@ final class PluginRuntime: @unchecked Sendable {
             }
             if !body.isEmpty, method.uppercased() != "GET" { request.httpBody = body.data(using: .utf8) }
 
-            self.session.dataTask(with: request) { data, response, error in
+            // Delegate-driven rather than a completion-handler task: the size cap
+            // has to be enforced BEFORE the body is in memory (see
+            // BoundedFetchDelegate). Register before `resume()` so no callback
+            // can arrive with nothing to deliver it to.
+            let task = self.session.dataTask(with: request)
+            self.fetchDelegate.register(task) { data, response, error in
                 queue.async {
                     if let error {
                         reject.call(withArguments: [error.localizedDescription]); return
@@ -162,6 +225,10 @@ final class PluginRuntime: @unchecked Sendable {
                     guard let http = response as? HTTPURLResponse else {
                         reject.call(withArguments: ["Non-HTTP response"]); return
                     }
+                    // Backstop only — the delegate already rejects on an
+                    // oversized Content-Length before the body downloads and
+                    // cancels mid-flight once the accumulated bytes cross the
+                    // cap. Kept in case a future caller bypasses the delegate.
                     if let data, data.count > Self.maxFetchBytes {
                         reject.call(withArguments: ["Response too large"]); return
                     }
@@ -180,7 +247,8 @@ final class PluginRuntime: @unchecked Sendable {
                     ]
                     resolve.call(withArguments: [payload])
                 }
-            }.resume()
+            }
+            task.resume()
         }
         context.setObject(fetch, forKeyedSubscript: "__nativeFetch" as NSString)
     }
@@ -274,6 +342,96 @@ final class PluginRuntime: @unchecked Sendable {
         return raw.compactMap { element in
             guard let elemData = try? JSONSerialization.data(withJSONObject: element) else { return nil }
             return try? JSONDecoder().decode(ScraperResult.self, from: elemData)
+        }
+    }
+}
+
+/// Streams a plugin `fetch` response and refuses one that is too big BEFORE it
+/// is in memory.
+///
+/// `PluginRuntime.maxFetchBytes` used to be checked only in the `dataTask`
+/// completion handler — by which point URLSession had already buffered the
+/// entire body, so a multi-gigabyte response exhausted memory and jetsam'd the
+/// app long before the check could ever fire. The cap has to live where the
+/// bytes arrive, which means a delegate:
+///   * a declared `Content-Length` over the cap cancels the task with no body
+///     downloaded at all (the pre-check);
+///   * a chunked response that declares no length is cancelled the moment the
+///     accumulated bytes cross the cap.
+/// `@unchecked Sendable` because the per-task state is hand-guarded by `lock`;
+/// URLSession calls these delegate methods on its own operation queue.
+private final class BoundedFetchDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    enum FetchError: LocalizedError {
+        case responseTooLarge
+        var errorDescription: String? { "Response too large" }
+    }
+
+    private let maxBytes: Int
+    private let lock = NSLock()
+    private var handlers: [Int: (Data?, URLResponse?, Error?) -> Void] = [:]
+    private var buffers: [Int: Data] = [:]
+    private var oversized: Set<Int> = []
+
+    init(maxBytes: Int) {
+        self.maxBytes = maxBytes
+        super.init()
+    }
+
+    /// Must be called BEFORE `task.resume()`.
+    func register(_ task: URLSessionTask, completion: @escaping (Data?, URLResponse?, Error?) -> Void) {
+        lock.lock()
+        handlers[task.taskIdentifier] = completion
+        lock.unlock()
+    }
+
+    func urlSession(
+        _ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        // The pre-check: `expectedContentLength` is the server's declared
+        // Content-Length (-1 when it declares none), and this fires before a
+        // single body byte is accepted.
+        if response.expectedContentLength > Int64(maxBytes) {
+            lock.lock()
+            oversized.insert(dataTask.taskIdentifier)
+            lock.unlock()
+            completionHandler(.cancel)
+            return
+        }
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        let id = dataTask.taskIdentifier
+        lock.lock()
+        var buffer = buffers[id] ?? Data()
+        buffer.append(data)
+        let tooBig = buffer.count > maxBytes
+        if tooBig {
+            // Drop what we already hold rather than carrying it to completion.
+            buffers[id] = nil
+            oversized.insert(id)
+        } else {
+            buffers[id] = buffer
+        }
+        lock.unlock()
+        if tooBig { dataTask.cancel() }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        let id = task.taskIdentifier
+        lock.lock()
+        let handler = handlers.removeValue(forKey: id)
+        let data = buffers.removeValue(forKey: id)
+        let tooBig = oversized.remove(id) != nil
+        lock.unlock()
+        guard let handler else { return }
+        // A cap breach cancels the task, so `error` here is a plain
+        // "cancelled" — report the real reason instead.
+        if tooBig {
+            handler(nil, task.response, FetchError.responseTooLarge)
+        } else {
+            handler(data, task.response, error)
         }
     }
 }
