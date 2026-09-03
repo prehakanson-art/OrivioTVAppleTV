@@ -187,6 +187,32 @@ final class ImageCache: @unchecked Sendable {
         }
     }
 
+    /// One download per URL, however many callers want it.
+    ///
+    /// The same poster routinely appears in two rows, and the prefetch may
+    /// already be fetching it — each of those was a separate round trip. Uses an
+    /// unstructured task deliberately, so one caller cancelling (a cell
+    /// scrolling away) does not cancel the fetch the others are waiting on.
+    private actor DownloadCoalescer {
+        private var inFlight: [String: Task<Data, Error>] = [:]
+
+        func data(for url: URL) async throws -> Data {
+            let key = url.absoluteString
+            if let existing = inFlight[key] { return try await existing.value }
+            let task = Task { try await ImageCache.downloadSession.data(from: url).0 }
+            inFlight[key] = task
+            let result = await task.result
+            inFlight[key] = nil
+            return try result.get()
+        }
+    }
+
+    private let downloads = DownloadCoalescer()
+
+    func download(_ url: URL) async throws -> Data {
+        try await downloads.data(for: url)
+    }
+
     /// Write one cached image body, recreating the cache directory if it has
     /// gone missing. Without the retry, anything that deletes the directory
     /// (Settings → "Clear cache", or tvOS reclaiming Caches/ under pressure)
@@ -268,8 +294,10 @@ final class ImageCache: @unchecked Sendable {
                               let url = URL(string: urlString) else { return }
                         let fileURL = self.fileURL(for: urlString)
                         if self.fm.fileExists(atPath: fileURL.path) { return }
-                        guard let (data, _) = try? await ImageCache.downloadSession.data(from: url)
-                        else { return }
+                        // Same coalescer as the on-screen path, so a prefetch
+                        // and a visible cell never download the same poster
+                        // twice.
+                        guard let data = try? await self.download(url) else { return }
                         self.ioQueue.async { self.writeCacheFile(data, to: fileURL) }
                     }
                 }
@@ -439,7 +467,10 @@ struct RemoteImage: View {
             return
         }
         // Keep the current image visible while the replacement downloads.
-        guard let (data, _) = try? await ImageCache.downloadSession.data(from: parsed),
+        // Coalesced: the same poster can appear in two rows at once, or race the
+        // prefetch already fetching it, and each of those used to be its own
+        // download.
+        guard let data = try? await ImageCache.shared.download(parsed),
               !Task.isCancelled else { return }
         // Decode off the render path (UIKit otherwise decodes lazily on first
         // draw — a scroll hitch per newly visible poster), downsampled to this

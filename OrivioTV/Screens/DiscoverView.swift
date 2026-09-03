@@ -12,14 +12,21 @@ final class DiscoverViewModel: ObservableObject {
     /// the last cell and fires an unstructured Task that nothing cancels, so a
     /// page request routinely outlives the selection that started it.
     private var generation = 0
+    /// Set by `reset`, cleared when the replacement's first page lands.
+    private var replacingSelection = false
 
     func reset(addon: InstalledAddon, catalog: ManifestCatalog, genre: String?) async {
         generation += 1
         current = (addon, catalog)
         self.genre = genre
-        items = []
+        // Deliberately NOT clearing `items` here. Doing so replaced the grid the
+        // viewer was reading with a spinner for a whole network round trip and
+        // destroyed the focused cell with it — focus then landed wherever the
+        // engine could find it. The outgoing results stay until the first page
+        // of the new selection actually arrives (see `loadMore`).
         seen = []
         reachedEnd = false
+        replacingSelection = true
         // Deliberately NOT waiting on the in-flight page: `loadMore` is gated on
         // `isLoading`, so leaving it set meant the new selection never fetched
         // anything. The grid was then empty, and the only thing that retriggers
@@ -43,6 +50,13 @@ final class DiscoverViewModel: ObservableObject {
         // `isLoading` alone too — it now belongs to the newer request.
         guard token == generation else { return }
         isLoading = false
+        // First page of a NEW selection: this is the moment to replace what is
+        // on screen, so the swap happens once, with content, instead of via an
+        // empty grid.
+        if items.isEmpty || replacingSelection {
+            replacingSelection = false
+            items = []
+        }
         let fresh = page.filter { seen.insert($0.id + $0.type).inserted }
         if fresh.isEmpty { reachedEnd = true } else { items.append(contentsOf: fresh) }
     }

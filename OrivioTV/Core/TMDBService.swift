@@ -210,14 +210,43 @@ enum TMDBService {
 
     // MARK: - ID mapping
 
+    /// TMDB id -> IMDb id is a PERMANENT mapping, so it is worth keeping across
+    /// launches. In memory only, every relaunch re-resolved every id from
+    /// scratch — and this sits in front of first paint on a collection page.
+    private static let imdbDiskCache = DiskCache<String>(name: "tmdb-imdb-ids")
+    private static let imdbDiskTTL: TimeInterval = 90 * 24 * 60 * 60
+    /// Two folders containing the same title fired two simultaneous lookups,
+    /// because the in-memory cache is only written once a response lands.
+    private actor IMDbCoalescer {
+        private var inFlight: [String: Task<String?, Never>] = [:]
+
+        func resolve(_ key: String, _ work: @Sendable @escaping () async -> String?) async -> String? {
+            if let existing = inFlight[key] { return await existing.value }
+            let task = Task { await work() }
+            inFlight[key] = task
+            let value = await task.value
+            inFlight[key] = nil
+            return value
+        }
+    }
+    private static let imdbCoalescer = IMDbCoalescer()
+
     /// Map a TMDB id to an IMDB tt id via /external_ids. Cached; nil on failure.
     static func imdbID(tmdbID: Int, isMovie: Bool) async -> String? {
         let cacheKey = "\(isMovie ? "m" : "t"):\(tmdbID)"
         if let hit = cachedIMDB(cacheKey) { return hit.isEmpty ? nil : hit }
+        if let stored = await imdbDiskCache.value(for: cacheKey, ttl: imdbDiskTTL) {
+            storeIMDB(stored, for: cacheKey)
+            return stored.isEmpty ? nil : stored
+        }
         let path = isMovie ? "/movie/\(tmdbID)/external_ids" : "/tv/\(tmdbID)/external_ids"
         struct ExternalIDs: Decodable { let imdb_id: String? }
-        let imdb = (try? await get(path) as ExternalIDs)?.imdb_id
+        // Coalesced on the cache key so concurrent callers share one round trip.
+        let imdb = await imdbCoalescer.resolve(cacheKey) {
+            (try? await get(path) as ExternalIDs)?.imdb_id
+        }
         storeIMDB(imdb ?? "", for: cacheKey)
+        await imdbDiskCache.store(imdb ?? "", for: cacheKey)
         return imdb?.isEmpty == false ? imdb : nil
     }
 

@@ -348,6 +348,10 @@ final class StreamsViewModel: ObservableObject {
         addonNames = []
         selectedAddon = nil
         finishedAddons = 0
+        // NOTE: the view resets its one-shot focus latch around this call —
+        // `reload` regenerates every entry id, so the previously focused row no
+        // longer exists, and the retry button that held focus disappears the
+        // moment results arrive.
         await load(addonManager: addonManager, debridEnabled: debridEnabled, perTier: perTier, filtersEnabled: filtersEnabled, forceRefresh: true)
     }
 
@@ -868,6 +872,14 @@ struct StreamsView: View {
     private var retryButton: some View {
         Button {
             Task {
+                // Re-arm the one-shot focus grab: every entry id is about to be
+                // regenerated, so nothing that currently holds focus will still
+                // exist, and the retry button that has it disappears as soon as
+                // results land. Without this the page ends up with nothing
+                // focused — the state this file's own comments identify as
+                // letting a Menu press fall through and suspend the app.
+                didInitialFocus = false
+                focusedEntry = nil
                 await viewModel.reload(
                     addonManager: addonManager,
                     debridEnabled: debrid.hasAnyConfigured || torrent.settings.isConfigured,
