@@ -953,10 +953,8 @@ private struct AccountNavRow: View {
         .focusable(true, interactions: .activate)
         .focusEffectDisabled()
         .onTapGesture(perform: action)
-        // 0.14 against everyone else's 0.15 — a 10ms difference nobody can
-        // perceive, which is how you can tell it was typed, not chosen.
         .animation(perf.motion(FusionFocus.liftAnimation), value: isFocused)
-        .animation(.easeInOut(duration: 0.14), value: selected)
+        .animation(perf.motion(FusionMotion.focusMove), value: selected)
     }
 }
 

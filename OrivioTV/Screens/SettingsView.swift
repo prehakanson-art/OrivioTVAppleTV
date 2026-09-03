@@ -261,7 +261,7 @@ private struct SettingsRailButton: View {
                 )
         )
         .animation(perf.motion(FusionFocus.liftAnimation), value: isFocused)
-        .animation(.easeInOut(duration: 0.15), value: selected)
+        .animation(perf.motion(FusionMotion.focusMove), value: selected)
     }
 }
 

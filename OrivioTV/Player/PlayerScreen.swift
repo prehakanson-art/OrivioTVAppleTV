@@ -329,7 +329,7 @@ struct PlayerScreen: View {
                 DispatchQueue.main.async { catcherFocused = true }
             }
         }
-        .animation(.easeOut(duration: 0.18), value: viewModel.skipIntroActive)
+        .animation(FusionMotion.controlsAppear, value: viewModel.skipIntroActive)
         // View model → focus engine.
         .onChange(of: viewModel.skipIntroFocused) { _, focused in
             if focused {
@@ -1048,7 +1048,7 @@ struct InfoPullDownPanel: View {
                     fileInfoTab
                 }
             }
-            .animation(.easeOut(duration: 0.18), value: viewModel.infoTab)
+            .animation(FusionMotion.controlsAppear, value: viewModel.infoTab)
         }
         .task(id: viewModel.infoTab) {
             guard viewModel.infoTab == 1 else { return }

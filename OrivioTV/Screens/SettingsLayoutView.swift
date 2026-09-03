@@ -397,6 +397,7 @@ private struct LayoutPreviewCard: View {
 }
 
 private struct LayoutRowView: View {
+    @ObservedObject private var perf = PerformanceSettingsStore.shared
     @EnvironmentObject private var theme: ThemeManager
 
     let row: LayoutRowInfo
@@ -457,7 +458,7 @@ private struct LayoutRowView: View {
             RoundedRectangle(cornerRadius: OrivioRadius.md, style: .continuous)
                 .strokeBorder(focused ? theme.palette.focusRing : .clear, lineWidth: 3)
         )
-        .animation(.easeInOut(duration: 0.15), value: focused)
+        .animation(perf.motion(FusionMotion.focusEntry), value: focused)
     }
 
     private func controlButton(icon: String, action: @escaping () -> Void) -> some View {

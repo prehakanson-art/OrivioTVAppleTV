@@ -1778,8 +1778,8 @@ struct RetryLabel: View {
         .background(Capsule().fill(isFocused ? theme.palette.secondary : Color.primary.opacity(0.1)))
         .overlay(Capsule().strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 3))
         .focusLift(OrivioFocus.card, isFocused)
-        .animation(PerformanceSettingsStore.shared.buttonAnimationsEffective
-                   ? .easeInOut(duration: 0.15) : nil, value: isFocused)
+        .animation(PerformanceSettingsStore.shared.buttonMotion(FusionMotion.focusEntry),
+                   value: isFocused)
     }
 }
 
@@ -1809,8 +1809,8 @@ struct SeeAllLabel: View {
                 .strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 3)
         )
         .focusLift(OrivioFocus.card, isFocused)
-        .animation(PerformanceSettingsStore.shared.buttonAnimationsEffective
-                   ? .spring(response: 0.3, dampingFraction: 0.8) : nil, value: isFocused)
+        .animation(PerformanceSettingsStore.shared.buttonMotion(FusionMotion.focusEntry),
+                   value: isFocused)
     }
 }
 

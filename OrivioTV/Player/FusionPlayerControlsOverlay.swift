@@ -131,7 +131,7 @@ struct FusionPlayerControlsOverlay: View {
             // never to nothing (which would leave the remote dead).
             if !visible { focusedControl = .options }
         }
-        .animation(.easeOut(duration: 0.18), value: viewModel.optionsPopupVisible)
+        .animation(FusionMotion.controlsAppear, value: viewModel.optionsPopupVisible)
     }
 
     // A single soft bottom scrim, like the system player — no top gradient, so

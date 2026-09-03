@@ -223,7 +223,7 @@ private struct LibraryChip: View {
                 lineWidth: 3))
             .shadow(color: isFocused ? .black.opacity(0.35) : .clear, radius: isFocused ? 16 : 0, y: 6)
             .focusLift(OrivioFocus.card, isFocused)
-            .animation(PerformanceSettingsStore.shared.buttonAnimationsEffective
-                       ? .spring(response: 0.3, dampingFraction: 0.8) : nil, value: isFocused)
+            .animation(PerformanceSettingsStore.shared.buttonMotion(FusionMotion.focusEntry),
+                       value: isFocused)
     }
 }
