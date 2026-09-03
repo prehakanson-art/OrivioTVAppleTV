@@ -193,10 +193,16 @@ struct DetailView: View {
     }
     /// Entering the action row from ANY direction lands on the Play button:
     /// when focus arrives on any other control while the row didn't previously
-    /// hold focus, it's immediately redirected to Play. (The declarative
-    /// routes — `.defaultFocus` / `.focusScope` — both BROKE directional entry
-    /// into the row's focusSection on tvOS 26; this manual redirect doesn't.)
+    /// hold focus, it's immediately redirected to Play. (`.focusScope`, and
+    /// `.defaultFocus` applied to the ROW, both BROKE directional entry into
+    /// the row's focusSection on tvOS 26; this manual redirect doesn't. The
+    /// `.defaultFocus` on the scroll view in `body` is a different thing —
+    /// it only decides the page's OPENING focus, not directional moves.)
     @FocusState private var actionFocus: ActionControl?
+    /// How Play was pressed while a series' episode list was still loading —
+    /// replayed against the real episode the moment it resolves.
+    private enum PendingPlay { case auto, manual, infuse }
+    @State private var pendingSeriesPlay: PendingPlay?
     @State private var showRatingPicker = false
     /// Trailer playing silently in the backdrop after the idle delay.
     @State private var backdropPlayer: AVPlayer?
@@ -270,6 +276,12 @@ struct DetailView: View {
                 .padding(.bottom, OrivioSpacing.huge)
             }
             .scrollClipDisabled()
+            // Play owns the page from the first frame. Without this the focus
+            // engine picks the topmost focusable — the synopsis teaser — and
+            // the action row's entry redirect then hops focus down to Play in
+            // a later frame, which reads as the page snatching focus away from
+            // whatever you were looking at.
+            .defaultFocus($actionFocus, .play)
             .opacity(trailerFullscreen ? 0 : 1)
             // Hidden is NOT unfocusable: without this, focus could stay on the
             // invisible synopsis during full-screen — whose move-handler then
@@ -335,6 +347,17 @@ struct DetailView: View {
                           actionFocus.map { String(describing: $0) } ?? "nil")
                     try? await Task.sleep(for: .seconds(2))
                 }
+            }
+        }
+        // Play pressed before the episode list arrived: run it now, against
+        // the episode the loaded data actually points at.
+        .onChange(of: seriesPlayTarget?.id) { _, _ in
+            guard let pending = pendingSeriesPlay, let target = seriesPlayTarget else { return }
+            pendingSeriesPlay = nil
+            switch pending {
+            case .auto: onPlay(viewModel.meta, target)
+            case .manual: onPlayManually(viewModel.meta, target)
+            case .infuse: onPlayInInfuse(viewModel.meta, target)
             }
         }
         .task { await viewModel.load(addonManager: addonManager, mdbSettings: mdblist.settings, tmdb: tmdbSettings.settings, parentalGuideEnabled: playerSettings.settings.parentalGuideEnabled) }
@@ -584,26 +607,44 @@ struct DetailView: View {
     private var actionRow: some View {
             HStack(spacing: OrivioSpacing.md) {
                 if viewModel.meta.isSeries {
-                    if let target = seriesPlayTarget {
-                        PlayActionButton(title: seriesPlayTitle(target)) {
+                    // The Play button is present from the FIRST frame, even
+                    // before the episode list has loaded and `seriesPlayTarget`
+                    // can say which episode it starts. It used to be wrapped in
+                    // `if let target = seriesPlayTarget`, so a series page
+                    // opened with no Play button at all: focus settled on the
+                    // synopsis or a circle icon, then Play appeared a moment
+                    // later and the entry redirect yanked focus across the row
+                    // — the visible jump. Pressing it early is not lost either:
+                    // `pendingSeriesPlay` fires it as soon as the target lands.
+                    let target = seriesPlayTarget
+                    PlayActionButton(title: target.map(seriesPlayTitle) ?? "Play") {
+                        if let target {
                             onPlay(viewModel.meta, target)
+                        } else {
+                            pendingSeriesPlay = .auto
                         }
-                        .focused($actionFocus, equals: .play)
-                        // Auto Link Selector on: hold Play to pick a source
-                        // manually instead of auto-playing the best match.
-                        .playManuallyMenu(
-                            enabled: autoLinkOn,
-                            action: { onPlayManually(viewModel.meta, target) },
-                            infuse: { onPlayInInfuse(viewModel.meta, target) }
-                        )
-                        // Start Over sits right next to Resume: replay the
-                        // in-progress episode from 0:00.
-                        if episodeInProgress(target) {
-                            CircleIconButton(systemName: "gobackward", active: false) {
-                                onPlayFromBeginning(viewModel.meta, target)
-                            }
-                            .focused($actionFocus, equals: .startOver)
+                    }
+                    .focused($actionFocus, equals: .play)
+                    // Auto Link Selector on: hold Play to pick a source
+                    // manually instead of auto-playing the best match.
+                    .playManuallyMenu(
+                        enabled: autoLinkOn,
+                        action: {
+                            if let target { onPlayManually(viewModel.meta, target) }
+                            else { pendingSeriesPlay = .manual }
+                        },
+                        infuse: {
+                            if let target { onPlayInInfuse(viewModel.meta, target) }
+                            else { pendingSeriesPlay = .infuse }
                         }
+                    )
+                    // Start Over sits right next to Resume: replay the
+                    // in-progress episode from 0:00.
+                    if let target, episodeInProgress(target) {
+                        CircleIconButton(systemName: "gobackward", active: false) {
+                            onPlayFromBeginning(viewModel.meta, target)
+                        }
+                        .focused($actionFocus, equals: .startOver)
                     }
                 } else {
                     PlayActionButton(title: playButtonTitle) {
