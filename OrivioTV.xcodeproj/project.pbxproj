@@ -22,6 +22,7 @@
 		171123B0BBF6003C1D0FA4F6 /* TraktService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B872284504BE4D777519FDCD /* TraktService.swift */; };
 		1865D13EE2276BA6529A8BD6 /* TraktSyncManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9BBE97BCD49F9A7D427F1055 /* TraktSyncManager.swift */; };
 		1A62D4292E890705C6BC22DE /* FusionTokens.swift in Sources */ = {isa = PBXBuildFile; fileRef = 441964E7109F694AD904E109 /* FusionTokens.swift */; };
+		1D846EC0580C64ECC402D963 /* AddonImportServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = E28E10356B1135B4BFF354D5 /* AddonImportServer.swift */; };
 		1F25E44B5F8F200B508D150E /* DebridService.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5D1FDFE406380313A6DE116 /* DebridService.swift */; };
 		1FFFA5BA9B53FF1A983248CE /* PlayerScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 674ACD2067B15FCDE8CEA330 /* PlayerScreen.swift */; };
 		210817F418796C4E9618A83D /* StremioAccount.swift in Sources */ = {isa = PBXBuildFile; fileRef = 71F10A0E3EDFA7EA1AF9E620 /* StremioAccount.swift */; };
@@ -276,6 +277,7 @@
 		DEFF051B946AA2A704F5AE4B /* OrivioConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrivioConfig.swift; sourceTree = "<group>"; };
 		E13A33496D93F8B432057F04 /* ATVSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ATVSettingsView.swift; sourceTree = "<group>"; };
 		E26267002F066B9550A6AA41 /* StreamProbe.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamProbe.swift; sourceTree = "<group>"; };
+		E28E10356B1135B4BFF354D5 /* AddonImportServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AddonImportServer.swift; sourceTree = "<group>"; };
 		E2AF54A21166EC2FE7E70FA8 /* PlayerViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerViewModel.swift; sourceTree = "<group>"; };
 		E57FA38C482F71DE9C65359D /* SettingsTraktView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsTraktView.swift; sourceTree = "<group>"; };
 		E5D1FDFE406380313A6DE116 /* DebridService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebridService.swift; sourceTree = "<group>"; };
@@ -422,6 +424,7 @@
 			isa = PBXGroup;
 			children = (
 				678B47C88E4E971B7FB4BC95 /* AddonCatalogService.swift */,
+				E28E10356B1135B4BFF354D5 /* AddonImportServer.swift */,
 				DE28C1498503E382A4AE7BCC /* AddonManager.swift */,
 				82894A00BA4CBE0ECBAFD169 /* AnimeSkipService.swift */,
 				3D2D0D7E27B31C1E68A3ED79 /* AppGroupResolver.swift */,
@@ -723,6 +726,7 @@
 				C18473C7DB9B8A17E5350B08 /* AccountView.swift in Sources */,
 				501DADCE8CD3AA40EC990BE6 /* AddonCatalogService.swift in Sources */,
 				863516B242BE074238412A8B /* AddonDiscoverView.swift in Sources */,
+				1D846EC0580C64ECC402D963 /* AddonImportServer.swift in Sources */,
 				148670B15320178A243421F4 /* AddonManager.swift in Sources */,
 				321709B26C90C869D0ECE1FE /* AnimatedGIFView.swift in Sources */,
 				04409CF4F100848004803ED6 /* AnimeSkipService.swift in Sources */,

@@ -195,10 +195,7 @@ final class AddonManager: ObservableObject {
 
     init() {
         load()
-        if addons.isEmpty {
-            addons = [Self.bundledCinemeta()]
-            save()
-        }
+        ensureDefaults()
         // Manifests barely ever change — skip the launch refresh when the last
         // one is under an hour old (faster cold start, less addon traffic).
         // The manual "Refresh Add-ons" button always forces it.
@@ -259,6 +256,9 @@ final class AddonManager: ObservableObject {
     }
 
     func remove(_ addon: InstalledAddon) {
+        // Record it FIRST: a default removed on purpose must not come back on
+        // the next launch, or the Remove button looks broken.
+        noteDefaultRemoved(addon)
         addons.removeAll { $0.id == addon.id }
         save()
         notifyLocalChange()
@@ -501,6 +501,68 @@ final class AddonManager: ObservableObject {
     private func save() {
         guard let data = try? JSONEncoder().encode(addons) else { return }
         UserDefaults.standard.set(data, forKey: Self.storageKey)
+    }
+
+    /// Add-ons every install gets, with or without an account.
+    ///
+    /// Someone who chose "Use without an account" still has to be able to
+    /// browse something, so these are guaranteed rather than merely seeded:
+    /// `ensureDefaults()` puts back any that are missing. Removing one by hand
+    /// is still respected — see `forgottenDefaultsKey`.
+    static let defaultManifestURLs = [cinemetaURL, openSubtitlesURL]
+
+    static let openSubtitlesURL = "https://opensubtitles-v3.strem.io/manifest.json"
+
+    /// Defaults the viewer deliberately removed. Without this, `ensureDefaults`
+    /// would reinstate them on the next launch and the Remove button would look
+    /// broken.
+    private static let forgottenDefaultsKey = "orivio.addons.forgottenDefaults.v1"
+
+    private var forgottenDefaults: Set<String> {
+        get { Set(UserDefaults.standard.stringArray(forKey: Self.forgottenDefaultsKey) ?? []) }
+        set { UserDefaults.standard.set(Array(newValue), forKey: Self.forgottenDefaultsKey) }
+    }
+
+    /// Put back any default the viewer hasn't explicitly removed.
+    ///
+    /// The bundled manifests are stand-ins so there is content before the first
+    /// network round-trip; `refreshManifests()` replaces them with the live
+    /// ones moments later.
+    func ensureDefaults() {
+        var changed = false
+        let forgotten = forgottenDefaults
+        for url in Self.defaultManifestURLs where !forgotten.contains(url) {
+            guard !addons.contains(where: { $0.manifestURL == url }) else { continue }
+            addons.append(Self.bundledDefault(for: url))
+            changed = true
+        }
+        if changed { save() }
+    }
+
+    /// Remember that a default was removed on purpose.
+    func noteDefaultRemoved(_ addon: InstalledAddon) {
+        guard Self.defaultManifestURLs.contains(addon.manifestURL) else { return }
+        forgottenDefaults.insert(addon.manifestURL)
+    }
+
+    private static func bundledDefault(for url: String) -> InstalledAddon {
+        url == openSubtitlesURL ? bundledOpenSubtitles() : bundledCinemeta()
+    }
+
+    /// Placeholder for the subtitles default, replaced by the live manifest.
+    static func bundledOpenSubtitles() -> InstalledAddon {
+        let manifest = AddonManifest(
+            id: "org.stremio.opensubtitlesv3",
+            name: "OpenSubtitles v3",
+            version: "1.0.0",
+            description: "Subtitles from OpenSubtitles",
+            logo: nil,
+            types: ["movie", "series"],
+            idPrefixes: ["tt"],
+            catalogs: [],
+            resources: [.simple("subtitles")]
+        )
+        return InstalledAddon(manifestURL: openSubtitlesURL, manifest: manifest)
     }
 
     /// Seed manifest so the home screen has content before the first network

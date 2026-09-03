@@ -160,6 +160,8 @@ struct RootView: View {
     @State private var sync: OrivioSyncManager?
     @State private var traktSync: TraktSyncManager?
     @State private var simklSync: SimklSyncManager?
+    /// Held only by -addonServerProbe; nil in normal runs.
+    @State private var devAddonServer: AddonImportServer?
     @State private var stremioSync: StremioSyncManager?
     @State private var showProfileGate = false
     /// True when the gate was opened from the rail / Settings (Back closes
@@ -347,6 +349,32 @@ struct RootView: View {
                     if args.contains("-discoverDemo") {
                         selectedTab = 1
                         searchPath.append(Route.discover)
+                    }
+                    // Dev: run the add-on import server standalone and log
+                    // its address, so the HTTP path can be exercised without
+                    // driving the settings UI.
+                    if args.contains("-addonServerProbe") {
+                        let server = AddonImportServer()
+                        server.onInstall = { [weak addonManager] url in
+                            guard let addonManager else { return .failure(URLError(.cancelled)) }
+                            do {
+                                try await addonManager.install(manifestURL: url)
+                                let name = addonManager.addons.first { $0.manifestURL == url }?.manifest.name
+                                return .success(name ?? url)
+                            } catch { return .failure(error) }
+                        }
+                        server.start()
+                        devAddonServer = server
+                        Task { @MainActor in
+                            for _ in 0..<20 {
+                                if let a = server.address {
+                                    NSLog("[OrivioAddonServer] listening at %@", a); return
+                                }
+                                try? await Task.sleep(nanoseconds: 250_000_000)
+                            }
+                            NSLog("[OrivioAddonServer] never became ready: %@",
+                                  server.lastError ?? "unknown")
+                        }
                     }
                     // Dev: can this device do Picture in Picture at all?
                     if args.contains("-pipProbe") {
