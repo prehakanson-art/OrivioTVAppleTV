@@ -402,6 +402,7 @@ struct DetailView: View {
                 if showBackdropTrailer, let player = backdropPlayer {
                     BackdropVideoView(player: player)
                         .frame(width: geo.size.width, height: geo.size.height)
+                        .allowsHitTesting(false)
                         .transition(.opacity)
                 }
                 HeroGradient(background: theme.stageBlend, fullBleed: true)
@@ -565,12 +566,7 @@ struct DetailView: View {
                         // NOT clearing fullscreenCooldown here: focus falls
                         // back onto the teaser as part of exiting full-screen.
                         interactionCount += 1
-                    },
-                    // Down goes STRAIGHT to Play. Left to the engine, the
-                    // nearest control below the teaser's center is one of the
-                    // circle icons, and the entry redirect then hops focus to
-                    // Play a frame later — a visible double-jump.
-                    onMoveDown: { actionFocus = .play }
+                    }
                 )
             }
 
@@ -733,7 +729,14 @@ struct DetailView: View {
                     fullscreenCooldown = false
                 }
                 if old == nil, let new, new != .play {
-                    actionFocus = .play
+                    // DEFERRED, not immediate: setting @FocusState while the
+                    // engine's own move is still in flight made it revert —
+                    // Down from the synopsis went circle -> Play -> back to the
+                    // synopsis, so the press appeared to do nothing at all.
+                    Task { @MainActor in
+                        guard actionFocus != nil, actionFocus != .play else { return }
+                        actionFocus = .play
+                    }
                 }
             }
     }
@@ -915,12 +918,20 @@ struct DetailView: View {
                     .padding(.vertical, OrivioSpacing.lg)
                 }
                 .scrollClipDisabled()
+                // The EPISODE ROW is the focus section, not the whole block.
+                // With the section around the block, Down from Play entered it
+                // and the engine picked the section's nearest item — "Mark
+                // Season Watched", parked at the far right — so leaving Play
+                // threw focus 1400pt across the screen. Sectioning only the row
+                // leaves the header button to the ordinary directional rules,
+                // which never pick it for a Down out of Play: it isn't below
+                // Play, the episodes are.
+                .focusSection()
             } else if viewModel.isLoading {
                 OrivioLoadingView(label: "Loading episodes")
                     .frame(height: 260)
             }
         }
-        .focusSection()
         .onChange(of: viewModel.selectedSeason) { _, newSeason in
             if let newSeason { Task { await viewModel.loadSeason(newSeason) } }
         }
@@ -1388,7 +1399,6 @@ private struct DescriptionTeaser: View {
     let text: String
     let title: String
     var onFocusChanged: (Bool) -> Void = { _ in }
-    var onMoveDown: () -> Void = {}
     @State private var showFull = false
 
     var body: some View {
@@ -1396,12 +1406,12 @@ private struct DescriptionTeaser: View {
             TeaserLabel(text: text, onFocusChanged: onFocusChanged)
         }
         .buttonStyle(PlainCardButtonStyle())
-        // Safe to consume every direction here: the teaser is top-most and
-        // horizontally alone, so only Down has anywhere real to go — and it
-        // must land on Play without the engine's nearest-neighbor detour.
-        .onMoveCommand { direction in
-            if direction == .down { onMoveDown() }
-        }
+        // No .onMoveCommand redirect here. It set `actionFocus = .play` while
+        // the engine's own Down was still in flight, and the engine won: focus
+        // went to a circle icon anyway, then the action row's entry redirect
+        // moved it to Play, then the whole update reverted to the teaser — so
+        // pressing Down on the synopsis LOOKED like it did nothing. The row's
+        // redirect (deferred by one turn) is the single owner of that move now.
         .fullScreenCover(isPresented: $showFull) {
             DescriptionOverlay(title: title, text: text) { showFull = false }
                 .environmentObject(theme)

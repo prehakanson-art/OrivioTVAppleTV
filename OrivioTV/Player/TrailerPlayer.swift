@@ -112,6 +112,12 @@ struct BackdropVideoView: UIViewRepresentable {
         let view = PlayerLayerUIView()
         view.playerLayer.player = player
         view.playerLayer.videoGravity = .resizeAspectFill
+        // Decoration only. Inserting an interactive UIView into the hierarchy
+        // makes the focus engine re-resolve, and on the detail page that threw
+        // focus off Play and onto the synopsis the moment the backdrop trailer
+        // started — the page appeared to grab the highlight on its own a
+        // second after it opened. Same rule as the hero artwork.
+        view.isUserInteractionEnabled = false
         return view
     }
 
