@@ -125,13 +125,17 @@ struct ProfileGateView: View {
                             .buttonStyle(PlainCardButtonStyle())
                             .focused($focusedProfile, equals: profile.id)
                         }
-                        // Deliberately absent from the cold-launch gate (the one
-                        // with no cancel, shown because a profile is PIN-locked):
-                        // `addProfile` immediately activates the new profile and
-                        // dismisses, so the tile walked straight past the lock —
-                        // press Add and you are inside with an unlocked profile.
-                        // Adding a profile lives in Settings → Account.
-                        if profiles.canAddProfile, onCancel != nil {
+                        // Hidden ONLY when it would actually defeat a lock: on
+                        // the non-cancellable launch gate with a PIN-enabled
+                        // profile present. `addProfile` activates the new profile
+                        // and dismisses immediately, so there the tile walked
+                        // straight past the PIN.
+                        //
+                        // Everywhere else it stays. With no PIN anywhere there is
+                        // nothing to bypass, and this gate is the only place a
+                        // profile can be added at launch — hiding it outright
+                        // took that away from everyone.
+                        if profiles.canAddProfile, !addWouldBypassALock {
                             Button { addProfile() } label: {
                                 GateTile(title: "Add") { DashedCircle(systemName: "plus") }
                             }
@@ -159,6 +163,13 @@ struct ProfileGateView: View {
             profiles.setActive(profile.id)
             onSelected()
         }
+    }
+
+    /// True when this is the launch gate (no cancel) AND some profile is
+    /// PIN-locked — the only combination in which adding a profile from here
+    /// lets someone walk past a lock.
+    private var addWouldBypassALock: Bool {
+        onCancel == nil && profiles.profiles.contains { $0.pinEnabled }
     }
 
     private func addProfile() {
