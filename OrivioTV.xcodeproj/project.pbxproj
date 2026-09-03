@@ -78,6 +78,7 @@
 		6D396334A11C8F1EB78247E2 /* ScrubThumbnailer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 388B1E00D3FF9FF3C623E607 /* ScrubThumbnailer.swift */; };
 		6FE058967DDA5D9684B9877B /* StremioAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1DC63CE64F31D8669EB31F3D /* StremioAPI.swift */; };
 		744F21A337C17E861B20E766 /* ParentalGuideService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 336649B70E24C035EE57A905 /* ParentalGuideService.swift */; };
+		78C5C453DFDA6EE3060F25DF /* TopShelfProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3B4A29D8AF76C72EC59202C8 /* TopShelfProvider.swift */; };
 		78F1D8125F795A3F68715A28 /* LiveTVView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6B7AF90208E8326B2293F3E4 /* LiveTVView.swift */; };
 		796445AED9B3FAF5913D4751 /* CollectionResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA14A45A7C313EF88FF27D02 /* CollectionResolver.swift */; };
 		7A1B0F4C23ABDF48927A4333 /* OrivioDropdown.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC1EFC66403633B0A8EAE4C5 /* OrivioDropdown.swift */; };
@@ -100,6 +101,7 @@
 		9633BEE3BB5BF879EB4E57C3 /* SettingsStremioView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0915B91E4F1CD9254E8E8F5 /* SettingsStremioView.swift */; };
 		9B8B8930E0999793339484D4 /* ATVSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E13A33496D93F8B432057F04 /* ATVSettingsView.swift */; };
 		9C21BB9AF284ECF2C59E8CE9 /* GlassSidebar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3F163B74531D7869D14E6E88 /* GlassSidebar.swift */; };
+		9C31A05CA14B8EFB40C905D6 /* OrivioTopShelf.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 62C6585486AAE42CCD95C040 /* OrivioTopShelf.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		9EAD035973DA3DEE0920A62D /* ATVTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = EC13FABB5BF494BFD80C2495 /* ATVTheme.swift */; };
 		A1802024AA5A825C008BBBF1 /* CollectionView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 838B25B0F5859C2655E3E34E /* CollectionView.swift */; };
 		A4D19C50A8EC7FE1CC500821 /* StremioSyncManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0AA88FC3B5F32468D43D084 /* StremioSyncManager.swift */; };
@@ -120,6 +122,7 @@
 		D987A89C54B10CF806337C0D /* HomeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = EB2DF78C140BFE8F2FFA09A3 /* HomeView.swift */; };
 		D9D8061C2B6CB5DC0404604A /* PlusJakartaSans-Bold.ttf in Resources */ = {isa = PBXBuildFile; fileRef = 22997706F55334744C6F3FEE /* PlusJakartaSans-Bold.ttf */; };
 		DC0E9E70DB221F0950F6894A /* SidePanels.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3EC9F39C2F564E698758FA8 /* SidePanels.swift */; };
+		DC1320A5E78A0A5B4DFF2D35 /* AppGroupResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3D2D0D7E27B31C1E68A3ED79 /* AppGroupResolver.swift */; };
 		DD0A25B28D3A846DACFC4C94 /* ProfilesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9E056E9745C95EAC5F152F2E /* ProfilesView.swift */; };
 		E0BE3820BDB022ACC16AD04D /* HomeCatalogSettingsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 65E0E4F5D1EDBE641A28EA18 /* HomeCatalogSettingsStore.swift */; };
 		E1B642631F0BED2D4C0E7DD4 /* SimklSyncManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 34E7D17DD079A7F255B25845 /* SimklSyncManager.swift */; };
@@ -137,7 +140,28 @@
 			remoteGlobalIDString = F3B80386B2196FBD0BA475AC;
 			remoteInfo = OrivioTV;
 		};
+		326A7AA1793179DA89A473CD /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 0634B0C525077AFC709BAFE0 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 8CFB23740ABA933CC89C5B66;
+			remoteInfo = OrivioTopShelf;
+		};
 /* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		E99154B6F70430F1502404F1 /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				9C31A05CA14B8EFB40C905D6 /* OrivioTopShelf.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
 		004482370EFE6A0DB2244C10 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -168,6 +192,7 @@
 		388B1E00D3FF9FF3C623E607 /* ScrubThumbnailer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScrubThumbnailer.swift; sourceTree = "<group>"; };
 		397C4520601062A6C4875571 /* TMDBBrowseView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TMDBBrowseView.swift; sourceTree = "<group>"; };
 		39B30E006EDC24452F5B2080 /* OrivioSyncModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrivioSyncModels.swift; sourceTree = "<group>"; };
+		3B4A29D8AF76C72EC59202C8 /* TopShelfProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TopShelfProvider.swift; sourceTree = "<group>"; };
 		3CDC06B1C4E03B40E71C6410 /* PlaybackMemory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackMemory.swift; sourceTree = "<group>"; };
 		3D2D0D7E27B31C1E68A3ED79 /* AppGroupResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppGroupResolver.swift; sourceTree = "<group>"; };
 		3F163B74531D7869D14E6E88 /* GlassSidebar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlassSidebar.swift; sourceTree = "<group>"; };
@@ -186,6 +211,7 @@
 		5CBA50043F25BC04985DBBC6 /* PerformanceProfile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PerformanceProfile.swift; sourceTree = "<group>"; };
 		5D0FC225A0A64F7C0BEBA873 /* PlusJakartaSans-Medium.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; path = "PlusJakartaSans-Medium.ttf"; sourceTree = "<group>"; };
 		5D116BB391F1350665E457F7 /* RequestCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RequestCache.swift; sourceTree = "<group>"; };
+		62C6585486AAE42CCD95C040 /* OrivioTopShelf.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = OrivioTopShelf.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		65E0E4F5D1EDBE641A28EA18 /* HomeCatalogSettingsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeCatalogSettingsStore.swift; sourceTree = "<group>"; };
 		669630524318B915E627A870 /* StreamBadges.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamBadges.swift; sourceTree = "<group>"; };
 		674ACD2067B15FCDE8CEA330 /* PlayerScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerScreen.swift; sourceTree = "<group>"; };
@@ -206,6 +232,7 @@
 		89C12FEB6FE6C3DEAC015459 /* PluginRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PluginRuntime.swift; sourceTree = "<group>"; };
 		8A9D51722BFE9BE21746795F /* DiagnosticsService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticsService.swift; sourceTree = "<group>"; };
 		8EA3C25F1387DD8419906339 /* FusionPlayerControlsOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FusionPlayerControlsOverlay.swift; sourceTree = "<group>"; };
+		91FE650F568A5528683212A1 /* OrivioTopShelf.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = OrivioTopShelf.entitlements; sourceTree = "<group>"; };
 		92ED5374FAF9F1C754CA6922 /* PosterHoldMenu.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PosterHoldMenu.swift; sourceTree = "<group>"; };
 		93B46E5779B70861AE91ADB9 /* SettingsPluginsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsPluginsView.swift; sourceTree = "<group>"; };
 		979CBF8CDEFEA7486B3DAED0 /* DeepLinkService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeepLinkService.swift; sourceTree = "<group>"; };
@@ -239,6 +266,7 @@
 		CFA2037D6C200F8E219BD175 /* KSPlayer */ = {isa = PBXFileReference; lastKnownFileType = folder; name = KSPlayer; path = Vendor/KSPlayer; sourceTree = SOURCE_ROOT; };
 		D0AA88FC3B5F32468D43D084 /* StremioSyncManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StremioSyncManager.swift; sourceTree = "<group>"; };
 		D4321AB0FDE1C03667ED1CA0 /* TMDBService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TMDBService.swift; sourceTree = "<group>"; };
+		D8C110D38C8864DAB4AABD5F /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		DA14A45A7C313EF88FF27D02 /* CollectionResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CollectionResolver.swift; sourceTree = "<group>"; };
 		DB7D8398AE932BEFD48DD535 /* ProgressStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProgressStore.swift; sourceTree = "<group>"; };
 		DCFAD1C14A8127420EB6E60B /* OrivioLocalBackupService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrivioLocalBackupService.swift; sourceTree = "<group>"; };
@@ -285,6 +313,16 @@
 			name = Frameworks;
 			sourceTree = "<group>";
 		};
+		12C95E549472D0A0DB6B5AD9 /* OrivioTopShelf */ = {
+			isa = PBXGroup;
+			children = (
+				D8C110D38C8864DAB4AABD5F /* Info.plist */,
+				91FE650F568A5528683212A1 /* OrivioTopShelf.entitlements */,
+				3B4A29D8AF76C72EC59202C8 /* TopShelfProvider.swift */,
+			);
+			path = OrivioTopShelf;
+			sourceTree = "<group>";
+		};
 		1F74F161323AA5203D27B0FF /* Components */ = {
 			isa = PBXGroup;
 			children = (
@@ -299,6 +337,7 @@
 		2A5DF0DB0B55F03ACA9A367B /* Products */ = {
 			isa = PBXGroup;
 			children = (
+				62C6585486AAE42CCD95C040 /* OrivioTopShelf.appex */,
 				350FC2130915C0A942D1A624 /* OrivioTV.app */,
 				C865821313538C54068A9A1A /* OrivioTVUITests.xctest */,
 			);
@@ -308,6 +347,7 @@
 		3DD7846F499F4D9D01E462E0 = {
 			isa = PBXGroup;
 			children = (
+				12C95E549472D0A0DB6B5AD9 /* OrivioTopShelf */,
 				4629AC0F63B353CC9E7E323E /* OrivioTV */,
 				D9054172B23F69E8EF0BFD95 /* OrivioTVUITests */,
 				559F7E03B26CCEC8523C2453 /* Packages */,
@@ -536,6 +576,23 @@
 			productReference = C865821313538C54068A9A1A /* OrivioTVUITests.xctest */;
 			productType = "com.apple.product-type.bundle.ui-testing";
 		};
+		8CFB23740ABA933CC89C5B66 /* OrivioTopShelf */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 75AC80821A44C989D9EEC6E0 /* Build configuration list for PBXNativeTarget "OrivioTopShelf" */;
+			buildPhases = (
+				587A004F52053842C5DB332F /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = OrivioTopShelf;
+			packageProductDependencies = (
+			);
+			productName = OrivioTopShelf;
+			productReference = 62C6585486AAE42CCD95C040 /* OrivioTopShelf.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 		F3B80386B2196FBD0BA475AC /* OrivioTV */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = DE018FD5C614F9ED9EF8F7E0 /* Build configuration list for PBXNativeTarget "OrivioTV" */;
@@ -543,11 +600,13 @@
 				1EE99B4D3BCE8D03835D1A37 /* Sources */,
 				356F53D4489F78AAAD439D45 /* Resources */,
 				4954A52A605F1D7AA6189308 /* Frameworks */,
+				E99154B6F70430F1502404F1 /* Embed Foundation Extensions */,
 				BD7B145B1D7996533641D190 /* Sanitize embedded framework bundle IDs */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				BF0F47AB0CE6C8268F95B551 /* PBXTargetDependency */,
 			);
 			name = OrivioTV;
 			packageProductDependencies = (
@@ -570,6 +629,10 @@
 				TargetAttributes = {
 					256146040EDF5C68CCC7DD0F = {
 						TestTargetID = F3B80386B2196FBD0BA475AC;
+					};
+					8CFB23740ABA933CC89C5B66 = {
+						DevelopmentTeam = CYCSPZ5MTR;
+						ProvisioningStyle = Automatic;
 					};
 					F3B80386B2196FBD0BA475AC = {
 						DevelopmentTeam = CYCSPZ5MTR;
@@ -598,6 +661,7 @@
 			targets = (
 				F3B80386B2196FBD0BA475AC /* OrivioTV */,
 				256146040EDF5C68CCC7DD0F /* OrivioTVUITests */,
+				8CFB23740ABA933CC89C5B66 /* OrivioTopShelf */,
 			);
 		};
 /* End PBXProject section */
@@ -765,6 +829,15 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		587A004F52053842C5DB332F /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				DC1320A5E78A0A5B4DFF2D35 /* AppGroupResolver.swift in Sources */,
+				78C5C453DFDA6EE3060F25DF /* TopShelfProvider.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -772,6 +845,11 @@
 			isa = PBXTargetDependency;
 			target = F3B80386B2196FBD0BA475AC /* OrivioTV */;
 			targetProxy = 04012D136A38FDFBDFBFAB5A /* PBXContainerItemProxy */;
+		};
+		BF0F47AB0CE6C8268F95B551 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 8CFB23740ABA933CC89C5B66 /* OrivioTopShelf */;
+			targetProxy = 326A7AA1793179DA89A473CD /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -793,6 +871,27 @@
 				TEST_TARGET_NAME = OrivioTV;
 			};
 			name = Release;
+		};
+		AD7249B7B9DCBDBB0DB823F4 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = OrivioTopShelf/OrivioTopShelf.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = CYCSPZ5MTR;
+				INFOPLIST_FILE = OrivioTopShelf/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 0.7.15;
+				PRODUCT_BUNDLE_IDENTIFIER = com.orivio.tv.appletv.dev.topshelf;
+				SDKROOT = appletvos;
+				SWIFT_VERSION = 5.9;
+				TARGETED_DEVICE_FAMILY = 3;
+			};
+			name = Debug;
 		};
 		B1BED78D9979D7FA84D6BA29 /* Debug */ = {
 			isa = XCBuildConfiguration;
@@ -931,11 +1030,33 @@
 			};
 			name = Debug;
 		};
+		D8FD4DEC9400D731663D4677 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = OrivioTopShelf/OrivioTopShelf.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = CYCSPZ5MTR;
+				INFOPLIST_FILE = OrivioTopShelf/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 0.7.15;
+				PRODUCT_BUNDLE_IDENTIFIER = com.orivio.tv.appletv.topshelf;
+				SDKROOT = appletvos;
+				SWIFT_VERSION = 5.9;
+				TARGETED_DEVICE_FAMILY = 3;
+			};
+			name = Release;
+		};
 		E259B962977D2740076199E0 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = "App Icon & Top Shelf Image";
 				ASSETCATALOG_COMPILER_LAUNCHIMAGE_NAME = LaunchImage;
+				CODE_SIGN_ENTITLEMENTS = Config/OrivioTV.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = CYCSPZ5MTR;
@@ -962,6 +1083,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = "App Icon & Top Shelf Image";
 				ASSETCATALOG_COMPILER_LAUNCHIMAGE_NAME = LaunchImage;
+				CODE_SIGN_ENTITLEMENTS = Config/OrivioTV.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = CYCSPZ5MTR;
@@ -1000,6 +1122,15 @@
 			buildConfigurations = (
 				CDE94EA658BC4961070BE174 /* Debug */,
 				C518B4388995A8970A90B6BE /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		75AC80821A44C989D9EEC6E0 /* Build configuration list for PBXNativeTarget "OrivioTopShelf" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				AD7249B7B9DCBDBB0DB823F4 /* Debug */,
+				D8FD4DEC9400D731663D4677 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;

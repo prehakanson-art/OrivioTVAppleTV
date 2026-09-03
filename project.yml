@@ -39,15 +39,15 @@ targets:
       - framework: Vendor/libdovi.xcframework
         embed: false
       # ─── Top Shelf (Continue Watching on the tvOS home screen) ───
-      # OFF. Confirmed: this device is signed with a free/Personal Team
-      # Apple ID, and App Groups capability is UNAVAILABLE to Personal
-      # Team accounts — full stop, not fixable by changing entitlements,
-      # bundle ids, or how the project is signed. Top Shelf needs an app
-      # group to hand data to its extension, so it can only ever work with
-      # a paid Apple Developer Program membership ($99/yr). Do not
-      # re-enable this without one — see the other two TOP SHELF spots
-      # below, which must be re-enabled together.
-      # - target: OrivioTopShelf
+      # ON. Needs an App Group, which needs a team that can provision one.
+      # Team CYCSPZ5MTR has group.com.innerapns.pubtest.CYCSPZ5MTR (the id
+      # ends in the team id, so it was issued to this team) — which is why
+      # this is switched back on. AppGroupResolver reads the group from the
+      # LIVE entitlement at runtime, so a re-signing tool that swaps in its
+      # own group still works; if a signer strips the entitlement entirely,
+      # the container is nil and the shelf stays empty without affecting
+      # the app. Three spots, all marked TOP SHELF, move together.
+      - target: OrivioTopShelf
     info:
       path: Config/Info.plist
       properties:
@@ -115,10 +115,9 @@ targets:
         ENABLE_USER_SCRIPT_SANDBOXING: false
         ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
         # ─── TOP SHELF (2 of 3) ─── App group entitlement, shared with the
-        # extension. OFF — Personal Team accounts can't provision App
-        # Groups. Only uncomment with a paid Developer Program membership,
-        # together with the other two TOP SHELF spots.
-        # CODE_SIGN_ENTITLEMENTS: Config/OrivioTV.entitlements
+        # extension. Both sides must name the SAME group or the container
+        # they each resolve is a different directory and the shelf is empty.
+        CODE_SIGN_ENTITLEMENTS: Config/OrivioTV.entitlements
       configs:
         # DEVELOPMENT identity — used when you Run onto a real Apple TV from
         # Xcode. Building to a device REGISTERS the bundle id against your
@@ -164,36 +163,49 @@ targets:
                 ;;
             esac
           done
-  # ─── TOP SHELF (3 of 3) ─── The extension target itself. OFF — see the
-  # note on the dependency above (Personal Team accounts can't provision
-  # App Groups). Renders Continue Watching on the tvOS home screen when
-  # working (Android's "Watch Next" equivalent); reads a JSON snapshot
-  # from the shared app group written by TopShelfExporter. Uncomment this
-  # whole block together with the other two TOP SHELF spots ONLY once
-  # signed in with a paid Apple Developer Program membership.
-  # OrivioTopShelf:
-  #   type: app-extension
-  #   platform: tvOS
-  #   sources:
-  #     - OrivioTopShelf
-  #     - path: OrivioTV/Core/AppGroupResolver.swift
-  #       buildPhase: sources
-  #   info:
-  #     path: OrivioTopShelf/Info.plist
-  #     properties:
-  #       CFBundleDisplayName: OrivioTV
-  #       CFBundleShortVersionString: "0.7.15"
-  #       NSExtension:
-  #         NSExtensionPointIdentifier: com.apple.tv-top-shelf
-  #         NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).TopShelfProvider
-  #   settings:
-  #     base:
-  #       PRODUCT_BUNDLE_IDENTIFIER: com.orivio.tv.appletv.topshelf
-  #       SWIFT_VERSION: "5.9"
-  #       TARGETED_DEVICE_FAMILY: "3"
-  #       MARKETING_VERSION: "0.7.15"
-  #       CURRENT_PROJECT_VERSION: "1"
-  #       CODE_SIGN_ENTITLEMENTS: OrivioTopShelf/OrivioTopShelf.entitlements
+  # ─── TOP SHELF (3 of 3) ─── The extension target itself. Renders
+  # Continue Watching on the tvOS home screen (Android's "Watch Next"
+  # equivalent); reads a JSON snapshot from the shared app group written
+  # by TopShelfExporter. Moves together with the other two TOP SHELF spots.
+  OrivioTopShelf:
+    type: app-extension
+    platform: tvOS
+    sources:
+      - OrivioTopShelf
+      - path: OrivioTV/Core/AppGroupResolver.swift
+        buildPhase: sources
+    info:
+      path: OrivioTopShelf/Info.plist
+      properties:
+        CFBundleDisplayName: OrivioTV
+        # From the build setting, not a literal: the app's own version keys
+        # were hardcoded here once and went stale silently.
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.tv-top-shelf
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).TopShelfProvider
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.orivio.tv.appletv.topshelf
+        DEVELOPMENT_TEAM: CYCSPZ5MTR
+        CODE_SIGN_STYLE: Automatic
+        SWIFT_VERSION: "5.9"
+        TARGETED_DEVICE_FAMILY: "3"
+        MARKETING_VERSION: "0.7.15"
+        CURRENT_PROJECT_VERSION: "1"
+        CODE_SIGN_ENTITLEMENTS: OrivioTopShelf/OrivioTopShelf.entitlements
+      # Nested under `settings`, matching the app target above — as a direct
+      # child of the target xcodegen ignores it silently and both configs keep
+      # the base id.
+      configs:
+        # An app extension's bundle id MUST be prefixed by its host app's, and
+        # the app's Debug id is the .dev one (see the note on that override).
+        # Left at the release id, a Debug build fails validation with
+        # "embedded binary's bundle identifier is not prefixed with the parent
+        # app's".
+        Debug:
+          PRODUCT_BUNDLE_IDENTIFIER: com.orivio.tv.appletv.dev.topshelf
   # UI-test target: drives the tvOS remote (XCUIRemote) to verify focus/menu
   # behavior, which osascript keystroke automation can't do. Simulator only.
   OrivioTVUITests:
