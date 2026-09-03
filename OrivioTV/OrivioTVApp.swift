@@ -164,6 +164,9 @@ struct RootView: View {
     @State private var devAddonServer: AddonImportServer?
     @State private var stremioSync: StremioSyncManager?
     @State private var showProfileGate = false
+    /// First launch, nobody signed in — the welcome screen sits in front of
+    /// everything, including the profile gate.
+    @State private var showWelcome = false
     /// True when the gate was opened from the rail / Settings (Back closes
     /// it); false for the cold-launch gate, where Back stays a no-op.
     @State private var profileGateCancellable = false
@@ -338,6 +341,8 @@ struct RootView: View {
                     let args = ProcessInfo.processInfo.arguments
                     let demoArgs = ["-detailDemo", "-detailDemoSeries", "-homeDemo", "-settingsDemo", "-liveTVDemo", "-searchDemo", "-libraryDemo", "-discoverDemo", "-traktQRDemo", "-simklQRDemo", "-accountDemo", "-settingsTabDemo"]
                     let demoMode = demoArgs.contains { args.contains($0) }
+                    showWelcome = OnboardingState.shouldShow(
+                        signedIn: account.authState.isSignedIn) && !demoMode
                     showProfileGate = (profiles.profiles.count >= 2 || profiles.active.pinEnabled) && !demoMode
                     if args.contains("-settingsDemo") { selectedTab = 3 }
                     // Settings TAB (in-place, not the full-screen pane demo) —
@@ -537,6 +542,16 @@ struct RootView: View {
                         }
                     }
                 }
+            }
+            // Presented AFTER the profile gate's modifier so it layers on
+            // top: on a fresh install both would otherwise want the screen,
+            // and "who's watching" makes no sense before "who are you".
+            .fullScreenCover(isPresented: $showWelcome) {
+                WelcomeView(account: account) {
+                    OnboardingState.completed = true
+                    showWelcome = false
+                }
+                .environmentObject(theme)
             }
             .fullScreenCover(isPresented: $showProfileGate) {
                 // The gate now only SELECTS a profile; account + Manage Profiles

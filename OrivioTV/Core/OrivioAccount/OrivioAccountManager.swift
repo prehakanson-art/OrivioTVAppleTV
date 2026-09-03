@@ -228,6 +228,34 @@ final class OrivioAccountManager: ObservableObject {
 
     // MARK: - Sign out / refresh
 
+    /// Sign in with an email address and password.
+    ///
+    /// NOTE: this is a deliberate change of posture. The QR flow exists so the
+    /// password is only ever typed on the official web page and the app never
+    /// handles it (see the note in OrivioConfig). Entering it on the TV means
+    /// the app does see it — it is sent straight to Supabase's token endpoint
+    /// over TLS and never stored, only the returned tokens are — but the QR
+    /// flow remains the safer path and stays the default on the welcome
+    /// screen.
+    func signIn(email: String, password: String) async {
+        let email = email.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !email.isEmpty, !password.isEmpty else {
+            errorMessage = "Enter your email and password."
+            return
+        }
+        errorMessage = nil
+        do {
+            let data = try await post(endpoint: "/auth/v1/token?grant_type=password",
+                                      body: ["email": email, "password": password])
+            let tokens = try Self.parseTokens(from: data)
+            didSignInInteractively = true
+            storeTokens(access: tokens.access, refresh: tokens.refresh)
+            applySignedIn(from: tokens.access)
+        } catch {
+            errorMessage = friendlyError(error)
+        }
+    }
+
     func signOut() {
         cancelPolling()
         // Retire every token-writing operation that is already in flight.
