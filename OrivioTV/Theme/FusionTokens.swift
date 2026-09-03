@@ -75,7 +75,10 @@ enum FusionMotion {
     /// bounce — the previous 0.82-damped spring overshot, so the whole row
     /// visibly wobbled back into place — and runs slightly longer than a focus
     /// move so the growth reads as deliberate rather than snapped.
-    static let rowExpand: Animation = .smooth(duration: 0.45)
+    /// Ambient auto-rotation of the hero. Deliberately slower than
+    /// `heroCrossfade`: nobody asked for this change, so it should drift rather
+    /// than cut.
+    static let heroAutoRotate = enter(0.7)
 
     static let toastVisibleSeconds: Double = 2.6
 }

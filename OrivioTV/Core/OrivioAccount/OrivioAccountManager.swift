@@ -37,6 +37,16 @@ final class OrivioAccountManager: ObservableObject {
         restoreSession()
     }
 
+    /// True when the CURRENT session came from someone actually signing in on
+    /// this device, rather than from a token restored at launch.
+    ///
+    /// Both publish `.signedIn`, and the sync manager has to tell them apart:
+    /// a restore must not drag a heavyweight full sync into app construction,
+    /// but a real sign-in should bring the account's data down at once instead
+    /// of leaving the viewer looking at an empty library until the next
+    /// auto-sync tick.
+    private(set) var didSignInInteractively = false
+
     // MARK: - Session restore
 
     private func restoreSession() {
@@ -45,6 +55,7 @@ final class OrivioAccountManager: ObservableObject {
             return
         }
         session = stored
+        didSignInInteractively = false
         applySignedIn(from: stored.accessToken)
         // Refresh in the background if the access token is stale.
         if let claims = JWT.decode(stored.accessToken),
@@ -203,6 +214,10 @@ final class OrivioAccountManager: ObservableObject {
                 NSLog("[OrivioAuth] discarding a QR exchange that completed after sign-out")
                 return
             }
+            // Someone just signed in on this device — see
+            // `didSignInInteractively`. Set BEFORE `storeTokens`, which is what
+            // publishes `.signedIn` and wakes the sync manager.
+            didSignInInteractively = true
             storeTokens(access: access, refresh: refresh)
             qrLogin = nil
         } catch {
@@ -226,6 +241,7 @@ final class OrivioAccountManager: ObservableObject {
         // generation is what actually makes the completion a no-op: any
         // token-writing continuation started before this bump is ignored.
         authGeneration &+= 1
+        didSignInInteractively = false
         refreshTask?.cancel()
         refreshTask = nil
         session = nil

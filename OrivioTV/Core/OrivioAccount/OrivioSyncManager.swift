@@ -580,10 +580,27 @@ final class OrivioSyncManager: ObservableObject {
             startAutoSync()
             guard !wasSignedIn else { return }
             wasSignedIn = true
-            // Do not run the heavyweight full sync during app construction. The
-            // 30-second auto-sync loop and manual controls still sync the account,
-            // but launch must stay responsive even with a large saved library.
-            OrivioSyncDiagnostics.record(.info, area: "Orivio", "Account sync will run after launch or when requested.")
+            // A session RESTORED at launch stays deferred: a heavyweight full
+            // sync during app construction is what made launch unresponsive on a
+            // large library, and the 30s loop picks it up shortly anyway.
+            //
+            // Someone actually SIGNING IN is the opposite case. They are sitting
+            // in front of the TV having just authenticated, and everything they
+            // own — library, watch progress, add-ons, collections — is on the
+            // account rather than the device. Waiting up to thirty seconds to
+            // see any of it reads as a broken sign-in, so pull it now.
+            guard account.didSignInInteractively else {
+                OrivioSyncDiagnostics.record(
+                    .info, area: "Orivio",
+                    "Restored session; the account syncs on the next tick."
+                )
+                return
+            }
+            OrivioSyncDiagnostics.record(
+                .info, area: "Orivio", "Signed in — syncing this account now."
+            )
+            fullSyncTask?.cancel()
+            fullSyncTask = Task { [weak self] in await self?.syncNow() }
         case .signedOut:
             // Only a REAL sign-out, not the launch-time "no stored session" or a
             // failed session restore — both of those also publish `.signedOut`,

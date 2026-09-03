@@ -214,6 +214,7 @@ struct SettingsCategoryPane: View {
 // MARK: - Rail button (Classic — icon + title + chevron, pill highlight)
 
 private struct SettingsRailButton: View {
+    @ObservedObject private var perf = PerformanceSettingsStore.shared
     @EnvironmentObject private var theme: ThemeManager
     @Environment(\.isFocused) private var isFocused
     let category: SettingsCategory
@@ -259,7 +260,7 @@ private struct SettingsRailButton: View {
                     lineWidth: 3
                 )
         )
-        .animation(.easeInOut(duration: 0.15), value: isFocused)
+        .animation(perf.motion(FusionFocus.liftAnimation), value: isFocused)
         .animation(.easeInOut(duration: 0.15), value: selected)
     }
 }
@@ -379,6 +380,7 @@ struct SettingsGroupCard<Content: View>: View {
 
 /// A tappable settings row with strong focus, matching the Android SettingsActionRow.
 struct SettingsActionRow: View {
+    @ObservedObject private var perf = PerformanceSettingsStore.shared
     @EnvironmentObject private var theme: ThemeManager
     @Environment(\.isFocused) private var isFocused
     let title: String
@@ -420,7 +422,9 @@ struct SettingsActionRow: View {
         .frame(minHeight: 72)
         .frame(maxWidth: .infinity)
         .background(SettingsRowBackground(isFocused: isFocused))
-        .animation(.spring(response: 0.28, dampingFraction: 0.85), value: isFocused)
+        // Was a spring, so one row type bounced while the value row directly
+        // beneath it eased. One focus response for the whole app.
+        .animation(perf.motion(FusionFocus.liftAnimation), value: isFocused)
     }
 }
 
@@ -679,6 +683,7 @@ private struct ToggleCardLabel: View {
 /// A navigation-style row with a trailing value + chevron. Focus = brighter
 /// fill + thick accent ring so the selected row is always unmistakable.
 struct SettingsValueCard: View {
+    @ObservedObject private var perf = PerformanceSettingsStore.shared
     @EnvironmentObject private var theme: ThemeManager
     @Environment(\.isFocused) private var isFocused
     let title: String
@@ -706,7 +711,7 @@ struct SettingsValueCard: View {
         .padding(.vertical, OrivioSpacing.md)
         .frame(minHeight: 72)
         .background(SettingsRowBackground(isFocused: isFocused))
-        .animation(.easeInOut(duration: 0.15), value: isFocused)
+        .animation(perf.motion(FusionFocus.liftAnimation), value: isFocused)
     }
 }
 

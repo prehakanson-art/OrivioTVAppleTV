@@ -51,12 +51,19 @@ final class TraktSyncManager: ObservableObject {
             .removeDuplicates()
             .sink { [weak self] signedIn in
                 guard signedIn else { return }
-                // Deferred, like the Stremio and account syncs already are.
-                // `@Published` delivers its CURRENT value on subscribe, so this
-                // fired during app construction and ran four network phases in
-                // series against the Home catalog sweep — and its watched-store
-                // merge then re-triggered the Next Up refetch on top. Nothing
-                // here needs to happen before the first screen is usable.
+                // Someone who just completed the device-code login is sitting
+                // there waiting for their history: sync immediately.
+                if self?.trakt.didSignInInteractively == true {
+                    self?.syncNow(force: true)
+                    return
+                }
+                // A token restored at launch is deferred, like the Stremio and
+                // account syncs. `@Published` delivers its CURRENT value on
+                // subscribe, so this otherwise fired during app construction and
+                // ran four network phases in series against the Home catalog
+                // sweep — and its watched-store merge re-triggered the Next Up
+                // refetch on top. None of that has to happen before the first
+                // screen is usable.
                 Task { @MainActor [weak self] in
                     try? await Task.sleep(nanoseconds: 5_000_000_000)
                     guard !Task.isCancelled else { return }

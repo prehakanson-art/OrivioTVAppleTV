@@ -129,7 +129,18 @@ final class TraktStore: ObservableObject {
     }
 
     /// Called by the device-code flow when a login completes on this profile.
-    func markSignedInHere() { signedInHere = true }
+    /// True when THIS session's Trakt login was performed here, on this device,
+    /// just now — as opposed to a token loaded from disk at launch or arriving
+    /// from account sync. The sync manager defers the launch case (a heavyweight
+    /// four-phase sync during app construction competed with the Home catalog
+    /// sweep) but must NOT defer this one: the viewer just finished a device-code
+    /// login and is waiting to see their history appear.
+    private(set) var didSignInInteractively = false
+
+    func markSignedInHere() {
+        signedInHere = true
+        didSignInInteractively = true
+    }
 
     /// Splitting accounts hands the existing login to PROFILE 1, not to
     /// whoever happens to be using the app.
@@ -237,6 +248,7 @@ final class TraktStore: ObservableObject {
     }
 
     func signOut() {
+        didSignInInteractively = false
         accessToken = nil
         refreshToken = nil
         username = nil

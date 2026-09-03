@@ -927,7 +927,7 @@ struct LandscapeCard: View {
             }
             .frame(width: width, height: 98, alignment: .topLeading)
             .clipped()
-            .animation(.easeInOut(duration: 0.18), value: isFocused)
+            .animation(perf.motion(FusionFocus.liftAnimation), value: isFocused)
         } else {
             episodeSubtitle(subtitle, lines: 2, color: theme.palette.textTertiary)
         }
@@ -1302,26 +1302,6 @@ extension View {
     func focusLift(_ scale: CGFloat, _ focused: Bool,
                    animation: Animation = FusionFocus.liftAnimation) -> some View {
         modifier(FocusLift(scale: scale, focused: focused, animation: animation))
-    }
-
-    /// The row-reflow animation for themes whose focused card expands into a
-    /// landscape tile (Onyx, Marquee). One bounce-free curve drives both the
-    /// card's growth and the neighbours' shift so the row moves as a single
-    /// motion, and Reduce Motion makes the swap instant.
-    func focusExpand<V: Equatable>(_ value: V,
-                                   animation: Animation = FusionMotion.rowExpand) -> some View {
-        modifier(FocusExpand(value: value, animation: animation))
-    }
-}
-
-/// See `View.focusExpand(_:animation:)`.
-private struct FocusExpand<V: Equatable>: ViewModifier {
-    @ObservedObject private var perf = PerformanceSettingsStore.shared
-    let value: V
-    let animation: Animation
-
-    func body(content: Content) -> some View {
-        content.animation(perf.motion(animation), value: value)
     }
 }
 
@@ -1734,75 +1714,14 @@ struct FusionToastHost: View {
 
 // MARK: - Shared themed card row
 
-/// The horizontal card strip every themed home builds, with the focus, Back and
-/// scroll bookkeeping owned ONCE.
-///
-/// Each theme used to write its own: the same ScrollViewReader + LazyHStack +
-/// per-row `@FocusState` + `.id(item.id)` + Back-to-start, re-typed six times.
-/// That is exactly how the homes drifted apart — Cinema's Back handler was
-/// never wired to anything, Onyx's rows had no Back-to-start at all, and the
-/// Equatable-cell fix had to be applied to every theme separately. A row built
-/// here inherits all of it, so the next theme starts correct.
-///
-/// The theme still owns everything VISUAL: it supplies the header and the card
-/// itself, plus spacing and alignment. `card` receives the row's focus binding
-/// so a card can bind `.focused(binding, equals: id)` for the Back-to-start
-/// jump; a card driving its own `@FocusState` can ignore it.
-struct ThemedCardRow<Element: Identifiable, Header: View, Card: View>: View
-where Element.ID == String {
-    let items: [Element]
-    var spacing: CGFloat = 24
-    var horizontalPadding: CGFloat = 0
-    var verticalPadding: CGFloat = 14
-    var alignment: VerticalAlignment = .top
-    var headerSpacing: CGFloat = 16
-    /// Bubbled when Back is pressed while the FIRST card is already focused —
-    /// the theme decides what "out of this row" means (top of page, sidebar…).
-    var onBackAtStart: () -> Void = {}
-    /// Fired when the focused card within this row changes. The Stremio board
-    /// uses it to snap the focused row to a fixed line under its hero; themes
-    /// that don't care leave it nil.
-    var onFocusedIDChange: ((String?) -> Void)? = nil
-    /// Apply the shared focus-expansion curve to the whole strip, so a card
-    /// that grows on focus reflows its neighbours as one motion (Onyx).
-    var expandsOnFocus: Bool = false
-    @ViewBuilder var header: () -> Header
-    @ViewBuilder var card: (Element, FocusState<String?>.Binding) -> Card
+// NOTE: `ThemedCardRow` lived here — "the horizontal card strip every themed
+// home builds" — along with `View.focusExpand` and the `FocusExpand` modifier it
+// drove. It had ZERO call sites: the 210->560pt focused-card growth belonged to
+// the themes that were retired in the glass redesign, and the four rows that
+// remain (HomePosterRow, ContinueWatchingRow, and the two collection rows) each
+// build their own strip. `FusionMotion.rowExpand`, whose comment recorded a real
+// fix for a spring that visibly wobbled, went with it.
 
-    @FocusState private var focusedID: String?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: headerSpacing) {
-            header()
-            ScrollViewReader { proxy in
-                ScrollView(.horizontal) {
-                    LazyHStack(alignment: alignment, spacing: spacing) {
-                        ForEach(items) { element in
-                            card(element, $focusedID)
-                                .id(element.id)
-                        }
-                    }
-                    .padding(.horizontal, horizontalPadding)
-                    .padding(.vertical, verticalPadding)
-                    .focusExpand(expandsOnFocus ? focusedID : nil)
-                }
-                .scrollClipDisabled()
-                // Back walks to the first card, then out of the row. The card
-                // may have been unloaded by the LazyHStack, so scroll it back
-                // into view before focusing it.
-                .onExitCommand {
-                    guard let first = items.first?.id, focusedID != first else {
-                        onBackAtStart()
-                        return
-                    }
-                    withAnimation(.easeOut(duration: 0.3)) { proxy.scrollTo(first, anchor: .leading) }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { focusedID = first }
-                }
-            }
-        }
-        .onChange(of: focusedID) { _, id in onFocusedIDChange?(id) }
-    }
-}
 
 // MARK: - Shared content-rating lookup
 

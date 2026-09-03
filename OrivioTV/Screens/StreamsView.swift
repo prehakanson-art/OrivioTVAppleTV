@@ -1198,6 +1198,7 @@ struct StreamsView: View {
 }
 
 struct StreamRowView: View {
+    @ObservedObject private var perf = PerformanceSettingsStore.shared
     @EnvironmentObject private var theme: ThemeManager
     @Environment(\.isFocused) private var isFocused
 
@@ -1287,7 +1288,9 @@ struct StreamRowView: View {
         // No focus scale: scaling a row forces offscreen re-composition of
         // the whole card every focus move mid-scroll (stutter on the A10X);
         // the fill + ring change is plenty of focus affordance.
-        .animation(theme.isAppleTVTheme ? FusionMotion.focusEntry : .easeOut(duration: 0.15), value: isFocused)
+        // `isAppleTVTheme` is a retired always-false stub, so the token branch
+        // never executed and every source row settled on the literal instead.
+        .animation(perf.motion(FusionFocus.liftAnimation), value: isFocused)
     }
 }
 

@@ -645,7 +645,7 @@ final class HeroFocus: ObservableObject {
         spotlightIndex = (spotlightIndex + delta + spotlight.count) % spotlight.count
         let next = spotlight[spotlightIndex]
         let fade = PerformanceSettingsStore.shared.heroCrossfadeEffective
-        withAnimation(fade ? .easeInOut(duration: 0.4) : nil) { item = next }
+        withAnimation(fade ? FusionMotion.heroCrossfade : nil) { item = next }
     }
 
     /// Timer tick: advance to the next spotlight title, but only if the user
@@ -653,14 +653,20 @@ final class HeroFocus: ObservableObject {
     /// out from under someone browsing).
     func rotateIfIdle() {
         let now = Date()
-        guard spotlight.count > 1, !heroButtonFocused,
+        // Reduce Motion disables automatic rotation, exactly as FusionHeroBar
+        // already does. Without it the billboard kept swapping every few
+        // seconds — and because `heroCrossfadeEffective` is false under that
+        // setting, it swapped as a HARD CUT, which is strictly worse for the
+        // person the setting exists to protect. Manual stepping still works.
+        guard !PerformanceSettingsStore.shared.reduceMotion,
+              spotlight.count > 1, !heroButtonFocused,
               now.timeIntervalSince(lastInteraction) > 6,
               now.timeIntervalSince(lastRotation) >= dwellSeconds else { return }
         lastRotation = now
         spotlightIndex = (spotlightIndex + 1) % spotlight.count
         let next = spotlight[spotlightIndex]
         let fade = PerformanceSettingsStore.shared.heroCrossfadeEffective
-        withAnimation(fade ? .easeInOut(duration: 0.7) : nil) { item = next }
+        withAnimation(fade ? FusionMotion.heroAutoRotate : nil) { item = next }
     }
     /// The id the debounce is ABOUT to commit. Guarding only against the
     /// COMMITTED item had a race: moving X→Y→X inside the debounce window
@@ -704,7 +710,7 @@ final class HeroFocus: ObservableObject {
             guard !Task.isCancelled else { return }
             let display = enriched[newItem.id] ?? newItem
             let fade = PerformanceSettingsStore.shared.heroCrossfadeEffective
-            withAnimation(fade ? .easeInOut(duration: 0.4) : nil) {
+            withAnimation(fade ? FusionMotion.heroCrossfade : nil) {
                 item = display
                 progress = newProgress
             }
@@ -716,7 +722,7 @@ final class HeroFocus: ObservableObject {
             guard let full = await enrich(display), !Task.isCancelled,
                   self.item?.id == display.id else { return }
             enriched[display.id] = full
-            withAnimation(fade ? .easeInOut(duration: 0.25) : nil) { self.item = full }
+            withAnimation(fade ? FusionMotion.heroCrossfade : nil) { self.item = full }
         }
     }
 }

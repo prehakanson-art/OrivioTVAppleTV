@@ -71,6 +71,10 @@ final class StremioSyncManager: ObservableObject {
         runSync(reason: reason, logSkippedBusy: true)
     }
 
+    /// False until the auth-key publisher has delivered its first value, which
+    /// at launch is whatever was restored from disk.
+    private var sawInitialAuthKey = false
+
     private func handleAuthKey(_ key: String?) {
         guard let key, !key.isEmpty else {
             stopAutoSync()
@@ -78,10 +82,20 @@ final class StremioSyncManager: ObservableObject {
             return
         }
         startAutoSync()
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 5_000_000_000)
-            guard !Task.isCancelled else { return }
-            self?.runSync(reason: "Stremio sign-in", logSkippedBusy: false)
+        // A key that ARRIVES while the app is running is someone signing in —
+        // the publisher's initial value at launch is the restored one, and that
+        // stays deferred so a heavyweight sync does not land in app
+        // construction. Signing in should show the account's library at once,
+        // not up to thirty seconds later.
+        if sawInitialAuthKey {
+            runSync(reason: "Stremio sign-in", logSkippedBusy: false)
+        } else {
+            sawInitialAuthKey = true
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                guard !Task.isCancelled else { return }
+                self?.runSync(reason: "Stremio launch", logSkippedBusy: false)
+            }
         }
     }
 
