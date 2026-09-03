@@ -89,7 +89,8 @@ struct FusionPlayerControlsOverlay: View {
             // fill rate, twice over, on top of live video.)
 
             if viewModel.optionsPopupVisible {
-                FusionOptionsPopup(viewModel: viewModel, focus: $focusedControl)
+                FusionOptionsPopup(viewModel: viewModel, pip: viewModel.pictureInPicture,
+                                   focus: $focusedControl)
                     .padding(.trailing, FusionMetrics.sideInset)
                     .padding(.bottom, FusionMetrics.bottomInset + 176)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
@@ -673,6 +674,10 @@ private struct FusionOption: Identifiable {
 private struct FusionOptionsPopup: View {
     @EnvironmentObject private var theme: ThemeManager
     @ObservedObject var viewModel: PlayerViewModel
+    /// `isPossible` flips only once the layer has content, and it lives on a
+    /// separate object — without observing it here the row would be missing
+    /// until some unrelated redraw happened to rebuild the popup.
+    @ObservedObject var pip: PictureInPictureController
     @FocusState.Binding var focus: FusionPlayerControlsOverlay.Control?
     @Namespace private var namespace
 
@@ -690,6 +695,14 @@ private struct FusionOptionsPopup: View {
             add("captions.bubble", "Subtitles",
                 selectedName(in: viewModel.subtitleOptions, id: viewModel.selectedSubtitleID)) {
                 viewModel.overlay = .subtitles
+            }
+        }
+        // Only when the loaded engine can actually feed AVKit — see the file
+        // header in PictureInPicture.swift. Hidden rather than disabled: a
+        // permanently greyed row on most content is just noise.
+        if viewModel.pictureInPicture.isPossible {
+            add("pip", "Picture in Picture", nil) {
+                viewModel.pictureInPicture.start()
             }
         }
         if !viewModel.audioOptions.isEmpty {

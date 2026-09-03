@@ -109,6 +109,7 @@
 		AC3D606BB8156028236C51C2 /* DiagnosticsService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A9D51722BFE9BE21746795F /* DiagnosticsService.swift */; };
 		AC455BAF271DD72DE6BE2983 /* StreamProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = E26267002F066B9550A6AA41 /* StreamProbe.swift */; };
 		B41A90FFA692D997DA4A16B1 /* CollectionSourcePickerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D8AAB5DE5A3C8C166957C0C /* CollectionSourcePickerView.swift */; };
+		B69BFAF902737DCAB1312EEC /* PictureInPicture.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE159BBC1CE7195160E54884 /* PictureInPicture.swift */; };
 		BE8530C761041E0641F13AA9 /* LiveTVSettingsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9845B0EA1C787B090833EDC4 /* LiveTVSettingsStore.swift */; };
 		C18473C7DB9B8A17E5350B08 /* AccountView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1091EB872A06CA1C9AE5E569 /* AccountView.swift */; };
 		C3959A5E1BD2034B579C953B /* PlusJakartaSans-Medium.ttf in Resources */ = {isa = PBXBuildFile; fileRef = 5D0FC225A0A64F7C0BEBA873 /* PlusJakartaSans-Medium.ttf */; };
@@ -263,6 +264,7 @@
 		C865821313538C54068A9A1A /* OrivioTVUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = OrivioTVUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		C91A77D22EDD01B5AFD02A20 /* AnimatedGIFView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnimatedGIFView.swift; sourceTree = "<group>"; };
 		CDFF486C5610F250EE9DB085 /* OrivioAccountManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrivioAccountManager.swift; sourceTree = "<group>"; };
+		CE159BBC1CE7195160E54884 /* PictureInPicture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PictureInPicture.swift; sourceTree = "<group>"; };
 		CFA2037D6C200F8E219BD175 /* KSPlayer */ = {isa = PBXFileReference; lastKnownFileType = folder; name = KSPlayer; path = Vendor/KSPlayer; sourceTree = SOURCE_ROOT; };
 		D0AA88FC3B5F32468D43D084 /* StremioSyncManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StremioSyncManager.swift; sourceTree = "<group>"; };
 		D4321AB0FDE1C03667ED1CA0 /* TMDBService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TMDBService.swift; sourceTree = "<group>"; };
@@ -486,6 +488,7 @@
 				F07580EF70623B0981FB2BE3 /* DVSampleEngine.swift */,
 				8EA3C25F1387DD8419906339 /* FusionPlayerControlsOverlay.swift */,
 				9908818EAEA1E72362F6BF81 /* PauseOverlayView.swift */,
+				CE159BBC1CE7195160E54884 /* PictureInPicture.swift */,
 				858C0A4692A535F58D9F6170 /* PlaybackDecision.swift */,
 				3CDC06B1C4E03B40E71C6410 /* PlaybackMemory.swift */,
 				1F4E1CEB920FFBB8B6246A74 /* PlayerDiagnosticsHUD.swift */,
@@ -774,6 +777,7 @@
 				857AD729799E95DBF15F1D5C /* PauseOverlayView.swift in Sources */,
 				45571C4D63C8AEB59E298E03 /* PerformanceProfile.swift in Sources */,
 				80CE576BFB82E07ECBEDFBEE /* PerformanceSettingsStore.swift in Sources */,
+				B69BFAF902737DCAB1312EEC /* PictureInPicture.swift in Sources */,
 				E8AE20FDCE91890A04B32626 /* PlaybackDecision.swift in Sources */,
 				40CD01278A170E0F9A840801 /* PlaybackMemory.swift in Sources */,
 				81648390F5978BFD81A971D4 /* PlayerDiagnosticsHUD.swift in Sources */,
@@ -1044,7 +1048,7 @@
 					"@executable_path/../../Frameworks",
 				);
 				MARKETING_VERSION = 0.7.15;
-				PRODUCT_BUNDLE_IDENTIFIER = com.orivio.tv.appletv.topshelf;
+				PRODUCT_BUNDLE_IDENTIFIER = com.orivio.tv.appletv.dev.topshelf;
 				SDKROOT = appletvos;
 				SWIFT_VERSION = 5.9;
 				TARGETED_DEVICE_FAMILY = 3;

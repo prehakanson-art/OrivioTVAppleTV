@@ -64,6 +64,10 @@ targets:
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         UIUserInterfaceStyle: Dark
+        # Picture in Picture keeps rendering while the app is not frontmost, and
+        # AVKit refuses to start PiP at all without the audio background mode.
+        UIBackgroundModes:
+          - audio
         # Plus Jakarta Sans — bundled for the Stremio theme's chrome typography.
         UIAppFonts:
           - PlusJakartaSans-Regular.ttf
@@ -187,7 +191,14 @@ targets:
           NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).TopShelfProvider
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.orivio.tv.appletv.topshelf
+        # MUST stay prefixed by the app's id or the build fails validation
+        # with "embedded binary's bundle identifier is not prefixed with the
+        # parent app's". The app uses the .dev id in BOTH configs (see the
+        # RELEASE identity note on its settings.base), so this is .dev too —
+        # there is deliberately no per-config override here, because having
+        # one is what hid the mismatch: Debug passed and only the Release
+        # archive failed.
+        PRODUCT_BUNDLE_IDENTIFIER: com.orivio.tv.appletv.dev.topshelf
         DEVELOPMENT_TEAM: CYCSPZ5MTR
         CODE_SIGN_STYLE: Automatic
         SWIFT_VERSION: "5.9"
@@ -195,17 +206,6 @@ targets:
         MARKETING_VERSION: "0.7.15"
         CURRENT_PROJECT_VERSION: "1"
         CODE_SIGN_ENTITLEMENTS: OrivioTopShelf/OrivioTopShelf.entitlements
-      # Nested under `settings`, matching the app target above — as a direct
-      # child of the target xcodegen ignores it silently and both configs keep
-      # the base id.
-      configs:
-        # An app extension's bundle id MUST be prefixed by its host app's, and
-        # the app's Debug id is the .dev one (see the note on that override).
-        # Left at the release id, a Debug build fails validation with
-        # "embedded binary's bundle identifier is not prefixed with the parent
-        # app's".
-        Debug:
-          PRODUCT_BUNDLE_IDENTIFIER: com.orivio.tv.appletv.dev.topshelf
   # UI-test target: drives the tvOS remote (XCUIRemote) to verify focus/menu
   # behavior, which osascript keystroke automation can't do. Simulator only.
   OrivioTVUITests:

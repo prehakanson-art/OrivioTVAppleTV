@@ -594,6 +594,15 @@ final class PlayerViewModel: ObservableObject {
     var activeVideoView: UIView? {
         isExiting ? nil : (dvDirectEngine?.videoView ?? vlcEngine?.videoView ?? playerLayer?.player.view)
     }
+    /// Picture in Picture, when the loaded engine can feed it (see the file
+    /// header in PictureInPicture.swift — in practice the AVPlayer path only).
+    let pictureInPicture = PictureInPictureController()
+    /// True between PiP starting and the session ending or being restored.
+    /// `PlayerScreen.onDisappear` reads it to skip `teardown()`: the video is
+    /// still playing, just in the corner, so nothing teardown cancels should
+    /// be cancelled yet.
+    var isHandingOffToPictureInPicture = false
+
     let subtitleModel = SubtitleModel()
     /// Embedded tracks bridged from the direct engine (this session).
     private var dvEmbeddedSubs: [DVEmbeddedSubtitleInfo] = []

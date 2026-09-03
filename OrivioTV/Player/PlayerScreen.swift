@@ -16,6 +16,9 @@ struct PlayerScreen: View {
     @State private var exitCoverVisible = false
 
     let dismiss: () -> Void
+    /// Kept so a Picture in Picture handoff can park this exact session and
+    /// the root view can re-present the same request when it ends.
+    private let request: PlaybackRequest
 
     /// The playing item changed WITHIN this session — auto-advance, or a pick
     /// from the in-player episode list. The host needs this because the player
@@ -34,13 +37,22 @@ struct PlayerScreen: View {
         onNowPlayingChanged: ((MetaItem, MetaVideo?) -> Void)? = nil,
         dismiss: @escaping () -> Void
     ) {
-        _viewModel = StateObject(wrappedValue: PlayerViewModel(
-            request: request,
-            addonManager: addonManager,
-            progressStore: progressStore,
-            settings: playerSettings,
-            allowUnairedNextUp: allowUnairedNextUp
-        ))
+        // Coming back from Picture in Picture re-presents the cover for a
+        // session that never stopped playing, so adopt the parked model rather
+        // than building a second one over a live engine.
+        if let parked = PiPHandoff.shared.parkedViewModel(for: request) {
+            _viewModel = StateObject(wrappedValue: parked)
+            PiPHandoff.shared.releaseAfterRestore()
+        } else {
+            _viewModel = StateObject(wrappedValue: PlayerViewModel(
+                request: request,
+                addonManager: addonManager,
+                progressStore: progressStore,
+                settings: playerSettings,
+                allowUnairedNextUp: allowUnairedNextUp
+            ))
+        }
+        self.request = request
         self.dismiss = dismiss
         self.onNowPlayingChanged = onNowPlayingChanged
     }
@@ -347,6 +359,11 @@ struct PlayerScreen: View {
             if viewModel.skipIntroFocused != focused { viewModel.skipIntroFocused = focused }
         }
         .onDisappear {
+            // During a PiP handoff the session is still playing — in the
+            // system's small window — and PiPHandoff.finish() runs teardown
+            // when it really ends. Tearing down here would stop the engine and
+            // take the PiP window with it.
+            guard !viewModel.isHandingOffToPictureInPicture else { return }
             viewModel.teardown()
         }
         // Belt #3 against Back closing the player: even if a Menu press slips
@@ -356,6 +373,23 @@ struct PlayerScreen: View {
         // exitPlayer() → dismiss().
         .interactiveDismissDisabled()
         .onAppear {
+            // Picture in Picture hands the video to the system's small window;
+            // the full-screen cover has to get out of the way or the viewer is
+            // left staring at a black screen behind it.
+            viewModel.pictureInPicture.onWillStart = { [weak viewModel] in
+                guard let viewModel else { return }
+                viewModel.isHandingOffToPictureInPicture = true
+                PiPHandoff.shared.begin(viewModel: viewModel, request: request)
+                dismiss()
+            }
+            // Closed from the PiP window itself: nobody is coming back, so run
+            // the teardown onDisappear skipped.
+            viewModel.pictureInPicture.onDidStop = {
+                PiPHandoff.shared.finish()
+            }
+            viewModel.pictureInPicture.onRestore = { completion in
+                PiPHandoff.shared.restore(completion)
+            }
             // Let the player mark episodes watched (Episodes / Up Next
             // long-press) via the shared WatchedStore.
             viewModel.markWatched = { [weak viewModel] episode in

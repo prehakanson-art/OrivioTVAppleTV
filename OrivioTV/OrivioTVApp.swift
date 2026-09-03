@@ -1,3 +1,4 @@
+import AVKit
 import SwiftUI
 
 @main
@@ -299,6 +300,9 @@ struct RootView: View {
                     // full sync of every destination, debounced (see
                     // SyncCoordinator). Registered by name, so this is safe to
                     // reach twice.
+                    // Coming back from Picture in Picture: re-present the
+                    // cover for the session PiPHandoff kept alive.
+                    PiPHandoff.shared.present = { request in playback = request }
                     let coordinator = SyncCoordinator.shared
                     coordinator.observe(watched: watched, library: library,
                                         ratings: ratings, progress: progressStore)
@@ -343,6 +347,11 @@ struct RootView: View {
                     if args.contains("-discoverDemo") {
                         selectedTab = 1
                         searchPath.append(Route.discover)
+                    }
+                    // Dev: can this device do Picture in Picture at all?
+                    if args.contains("-pipProbe") {
+                        NSLog("[OrivioPiP] isPictureInPictureSupported=%d",
+                              AVPictureInPictureController.isPictureInPictureSupported() ? 1 : 0)
                     }
                     // Dev: what search will query, in order, and what one real
                     // query returns from each — the ordering is the whole point

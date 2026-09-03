@@ -54,6 +54,10 @@
 		<string>PlusJakartaSans-Medium.ttf</string>
 		<string>PlusJakartaSans-Bold.ttf</string>
 	</array>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+	</array>
 	<key>UIUserInterfaceStyle</key>
 	<string>Dark</string>
 </dict>
