@@ -523,7 +523,6 @@ struct DetailView: View {
                 }
             }
             .frame(height: 180, alignment: .bottomLeading)
-            .frame(maxWidth: .infinity, alignment: .leading)
 
             // Meta line 1: Genres • Full release date • IMDb.
             MetaLine(segments: primaryMetaSegments, imdbRating: viewModel.meta.imdbRating)
