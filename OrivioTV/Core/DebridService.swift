@@ -657,6 +657,18 @@ enum DebridService {
 
     // MARK: Real-Debrid
 
+    /// Poll delays, in nanoseconds. Same total patience as the flat 700ms it
+    /// replaces, but the early beats are short — and a cached torrent almost
+    /// always answers on the first or second one, so the common case returns
+    /// several hundred milliseconds sooner while a slow one waits just as long.
+    private static let pollBackoff: [UInt64] = [
+        250_000_000, 400_000_000, 700_000_000, 1_000_000_000, 1_400_000_000
+    ]
+
+    private static func pollDelay(_ attempt: Int) -> UInt64 {
+        pollBackoff[min(max(attempt, 0), pollBackoff.count - 1)]
+    }
+
     private static func resolveRealDebrid(magnet: String, apiKey: String, season: Int?, episode: Int?, fileIdx: Int?) async throws -> DebridResult {
         struct AddResult: Decodable { let id: String }
         struct TorrentInfo: Decodable {
@@ -684,8 +696,8 @@ enum DebridService {
         while (info1.files ?? []).isEmpty,
               ["magnet_conversion", "queued", "waiting_files_selection"].contains(info1.status.lowercased()),
               waits < 5 {
+            try? await Task.sleep(nanoseconds: Self.pollDelay(waits))
             waits += 1
-            try? await Task.sleep(nanoseconds: 700_000_000)
             info1 = try await bearerGET("https://api.real-debrid.com/rest/1.0/torrents/info/\(torrentID)", key: apiKey)
         }
         // RD is the ONE provider whose list can be indexed by `fileIdx`:
@@ -705,8 +717,8 @@ enum DebridService {
         var info2: TorrentInfo = try await bearerGET("https://api.real-debrid.com/rest/1.0/torrents/info/\(torrentID)", key: apiKey)
         waits = 0
         while info2.status.lowercased() != "downloaded", waits < 2 {
+            try? await Task.sleep(nanoseconds: Self.pollDelay(waits))
             waits += 1
-            try? await Task.sleep(nanoseconds: 700_000_000)
             info2 = try await bearerGET("https://api.real-debrid.com/rest/1.0/torrents/info/\(torrentID)", key: apiKey)
         }
         guard info2.status.lowercased() == "downloaded", let link = info2.links?.first else {

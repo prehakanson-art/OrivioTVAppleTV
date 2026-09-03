@@ -510,16 +510,21 @@ final class StreamsViewModel: ObservableObject {
             ? SourceSelection.byAddon(scoped, perTier: perTier)
             : SourceSelection.byAddonUnfiltered(scoped, cap: PlayerSettings.unfilteredPerAddonCap)
 
-        // Once the sweep is finished, add an empty (rendered as "None") group
-        // for every queried addon that produced no usable link — so each addon
-        // is always represented. Gated on completion so an addon still loading
-        // doesn't flash "None" before its links land.
-        if finishedAddons >= totalAddons {
-            let wanted = selectedAddon.map { [$0] } ?? queriedAddonNames
-            let present = Set(built.map(\.addonName))
-            for name in wanted where !present.contains(name) {
-                built.append(AddonSourceGroup(addonName: name, sections: []))
-            }
+        // EVERY queried addon gets a slot from the first rebuild, not just the
+        // ones that have answered. Appending these only at the end meant the
+        // list changed shape twice underneath the reader: a slow addon that sits
+        // early in the installed order inserted its whole group ABOVE the rows
+        // being scanned, and then at completion a batch of "None" headings was
+        // scattered through the list — both while someone was settling on a
+        // candidate. With the skeleton in place results fill into slots that
+        // already exist and nothing is ever inserted above the reading position.
+        //
+        // An addon that has not replied yet renders as pending rather than
+        // "None"; `finishedAddonNames` is what tells the row which it is.
+        let wanted = selectedAddon.map { [$0] } ?? queriedAddonNames
+        let present = Set(built.map(\.addonName))
+        for name in wanted where !present.contains(name) {
+            built.append(AddonSourceGroup(addonName: name, sections: []))
         }
         // Stable installed-order layout regardless of which addon replied first.
         let order = Dictionary(
@@ -1103,10 +1108,16 @@ struct StreamsView: View {
                                 }
                             }
                         }
-                        // Addon produced no rows: its NAME still shows (block
-                        // above); add text only when it actually failed —
-                        // an addon that answered with nothing stays name-only.
+                        // Every queried addon has a slot from the first frame,
+                        // so an empty one has to say WHICH kind of empty it is:
+                        // still working, failed, or answered with nothing.
                         if group.entries.isEmpty,
+                           !viewModel.finishedAddonNames.contains(group.addonName) {
+                            Text("Searching…")
+                                .font(.system(size: 18, weight: .semibold))
+                                .foregroundStyle(theme.palette.textTertiary)
+                                .padding(.leading, 8)
+                        } else if group.entries.isEmpty,
                            let reason = viewModel.failedAddons[group.addonName] {
                             Text("Not working — \(reason)")
                                 .font(.system(size: 18, weight: .semibold))
