@@ -207,7 +207,15 @@ final class StreamsViewModel: ObservableObject {
     /// can't hold up the whole thing.
     func earlyAutoLinkPick(_ prefs: AutoLinkPreferences) -> StreamEntry? {
         let pool = autoLinkPool(prefs)
-        let patient = Date().timeIntervalSince(sweepStarted) < Self.preferredAddonWait
+        // Patience only means something when there is a specific addon whose
+        // answer we are waiting FOR. With neither a preferred nor a secondary
+        // addon set — the default — the window below made the selector sit on a
+        // perfectly good cached link that arrived at 300ms for the full 6s and
+        // then take it anyway.
+        let hasAddonPreference = !prefs.preferredAddon.trimmingCharacters(in: .whitespaces).isEmpty
+            || !prefs.secondaryAddon.trimmingCharacters(in: .whitespaces).isEmpty
+        let patient = hasAddonPreference
+            && Date().timeIntervalSince(sweepStarted) < Self.preferredAddonWait
 
         /// Whether an addon can still change the answer: it has to be one we
         /// queried at all, and not yet returned.
@@ -231,6 +239,22 @@ final class StreamsViewModel: ObservableObject {
         // once the sweep is done; until then keep collecting.
         guard finishedAddons >= totalAddons || !patient else { return nil }
         return pool.first
+    }
+
+    /// Evaluate the early pick and fire it at most once per sweep.
+    ///
+    /// Called both when an addon answers AND from a deadline timer, because the
+    /// per-batch path can only run when an addon answers — which made
+    /// `preferredAddonWait` really mean "6s OR the next addon to reply,
+    /// whichever is LATER". One slow addon stretched a 6s window to the full
+    /// 45s stream timeout.
+    func evaluateEarlyAutoLink(_ prefs: AutoLinkPreferences) {
+        guard !earlyPickFired, !allEntries.isEmpty else { return }
+        rebuildGroups()
+        guard let pick = earlyAutoLinkPick(prefs) else { return }
+        earlyPickFired = true
+        stage("auto-link picked \(pick.addonName) — \(pick.displayName)")
+        onEarlyAutoLink?(pick)
     }
 
     /// The entries a profile's Auto Link prefs allow, best-first.
@@ -344,7 +368,10 @@ final class StreamsViewModel: ObservableObject {
         // queried, no error anywhere). Retry those now, when the user actually
         // needs them, so e.g. a DMM Cast that installed broken starts working.
         if addonManager.addons.contains(where: { $0.enabled && $0.manifest.isPlaceholder }) {
-            _ = await addonManager.resolvePlaceholders()
+            // Detached: this is a self-heal for add-ons whose manifest failed to
+            // load earlier, and nothing about this play depends on it. Awaiting
+            // it put up to N x 5s in front of the first stream request.
+            Task { [addonManager] in await addonManager.resolvePlaceholders() }
         }
         let addons = addonManager.streamAddons.filter { $0.handles(id: fetchID) }
         var seenNames = Set<String>()
@@ -387,6 +414,18 @@ final class StreamsViewModel: ObservableObject {
         failedAddons = [:]
         finishedAddonNames = []
         sweepStarted = Date()
+        // Reset per sweep, or a refresh after an early pick could never fire one.
+        earlyPickFired = false
+        // The deadline that `preferredAddonWait` was always supposed to be.
+        var autoLinkDeadline: Task<Void, Never>?
+        if let prefs = autoLinkPrefs {
+            autoLinkDeadline = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(Self.preferredAddonWait * 1_000_000_000))
+                guard !Task.isCancelled else { return }
+                self?.evaluateEarlyAutoLink(prefs)
+            }
+        }
+        defer { autoLinkDeadline?.cancel() }
         await withTaskGroup(of: (name: String, entries: [StreamEntry],
                                  failure: (name: String, reason: String)?).self) { group in
             // Bounded window: with a large install this sweep queries dozens of
@@ -435,22 +474,18 @@ final class StreamsViewModel: ObservableObject {
                 }
                 // Auto Link Selector: act the MOMENT the answer is knowable,
                 // rather than at the end of the sweep. See earlyAutoLinkPick.
-                if let prefs = autoLinkPrefs, !earlyPickFired {
-                    rebuildGroups()
-                    if let pick = earlyAutoLinkPick(prefs) {
-                        earlyPickFired = true
-                        stage("auto-link picked \(pick.addonName) — \(pick.displayName)")
-                        onEarlyAutoLink?(pick)
-                    }
-                }
+                if let prefs = autoLinkPrefs { evaluateEarlyAutoLink(prefs) }
             }
             rebuildGroups()
         }
         isLoading = false
 
-        // Persist for instant re-open.
+        // Persist for instant re-open — but ONLY a sweep that actually finished.
+        // This ran even when `onDisappear` cancelled the task, so backing out at
+        // two seconds persisted a one-addon snapshot that the next open then
+        // showed as the complete list for the full cache TTL.
         let snapshot = pool.map { CachedStreamSource(addonName: $0.addonName, stream: $0.stream) }
-        if !snapshot.isEmpty {
+        if !snapshot.isEmpty, !Task.isCancelled, finishedAddons >= totalAddons {
             await Self.sourceCache.store(snapshot, for: fetchID)
         }
     }
@@ -689,13 +724,19 @@ struct StreamsView: View {
                 // were issued for the same title.
                 guard !didAutoAct else { return }
                 didAutoAct = true
-                await loadTask.value
-                // Back was pressed while loading: this view is popped and the
-                // task cancelled. Do NOT auto-act — presenting the player or
-                // popping the (already-gone) source page from a torn-down view
-                // crashes. Just stop.
-                guard !Task.isCancelled, !isGone else { return }
-                onSelect(last, viewModel.allEntries)
+                // Do NOT wait for the sweep. The remembered link is already in
+                // hand — the only thing `loadTask` would add is the alternates
+                // list, and the player fetches those on demand via
+                // `loadSourcesIfNeeded()` when it holds a single entry. Awaiting
+                // it here paced the one feature built to make replay INSTANT at
+                // the speed of the slowest installed add-on: ceil(addons/8) x the
+                // 45s stream timeout in the worst case, 3-20s typically.
+                //
+                // The sweep is deliberately left running: it still fills
+                // `sourceCache`, so the in-player Sources panel and any failover
+                // are warm by the time they are needed.
+                guard !isGone else { return }
+                onSelect(last, [last])
                 // Signals a deferred pop (handled when the player closes); does
                 // NOT tear down this view now, so the in-flight resolve is safe.
                 if autoLinkResolving { onAutoDismiss() }

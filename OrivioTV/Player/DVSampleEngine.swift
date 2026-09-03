@@ -988,6 +988,14 @@ final class DVSampleEngine {
         if startAt > 1 {
             let ts = Int64(startAt * Double(AV_TIME_BASE))
             av_seek_frame(ictx, -1, ts, 1 /* BACKWARD */)
+            // Trim to the target, exactly as every mid-session seek does. The
+            // seek lands on the keyframe BEFORE `startAt`, and without this the
+            // whole lead-in GOP was decoded by VideoToolbox and its audio
+            // enqueued — 1-5s of content, tens of MB on a remux — purely to be
+            // discarded. Those invisible AUs also counted toward the startup
+            // preroll, so the clock could start before a single displayable
+            // frame was queued.
+            trimBefore = startAt - 0.05
         }
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }

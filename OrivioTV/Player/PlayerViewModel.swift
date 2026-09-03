@@ -994,15 +994,28 @@ final class PlayerViewModel: ObservableObject {
                             // that window is the overlap that wedges. Require
                             // three consecutive stable polls post-change, then
                             // a long quiet beat.
+                            // 12 polls (3s), not 24. This loop can only ever
+                            // succeed when `maximumFramesPerSecond` CHANGES —
+                            // and with tvOS Match Content set to Dynamic Range
+                            // but not Frame Rate (a common setup, and this app's
+                            // own default for matchFrameRate), it never does. So
+                            // a range-only switch that completed in under a
+                            // second burned the full six seconds here and then
+                            // the quiet beat below: eight and a half seconds of
+                            // black screen for nothing. A switch that has not
+                            // registered within three seconds never will.
                             var stable = 0
                             var last = before
-                            for _ in 0 ..< 24 {   // up to 6s
+                            for _ in 0 ..< 12 {   // up to 3s
                                 try? await Task.sleep(nanoseconds: 250_000_000)
                                 let now = UIScreen.main.maximumFramesPerSecond
                                 if now != before, now == last { stable += 1 } else { stable = 0 }
                                 last = now
                                 if stable >= 3 { break }
                             }
+                            // NOTE: the 2.5s quiet beat below is deliberate
+                            // margin for HDMI link training on a panel that
+                            // produced a grey-screen wedge. Left alone.
                             try? await Task.sleep(nanoseconds: 2_500_000_000)
                             guard self.dvDirectEngine === engine, !self.isExiting else { return }
                             Self.dvTrail("display settled at \(UIScreen.main.maximumFramesPerSecond)fps — attaching video")
@@ -1613,6 +1626,12 @@ final class PlayerViewModel: ObservableObject {
     /// first file's answers for the rest of the session.
     private var probedURLs: Set<String> = []
     private func runStreamProbe() {
+        // Never during a direct DV session: the engine has the container open
+        // already, so this would be a THIRD concurrent connection to the same
+        // file competing for bandwidth during preroll — and its styled-ASS
+        // reroute would yank a DV session over to VLC and silently lose Dolby
+        // Vision.
+        guard !usingDVDirect else { return }
         guard effectiveEngine == .auto || effectiveEngine == .ffmpeg,
               let url = currentEntry.stream.url,
               !probedURLs.contains(url) else { return }
@@ -5928,7 +5947,14 @@ extension PlayerViewModel: KSPlayerLayerDelegate {
                 // playing outright — play(episode:) paused the layer before the
                 // switch, so without this an unwatched episode set up its stream
                 // but never left pause, spinning on the loading state forever.
-                if resume > 5, duration == 0 || resume < duration - 30 {
+                // `meaningfulResume` is the determination made above: it is
+                // already false when `startPlayTime` opened the container AT the
+                // resume point. This branch used to ignore that and seek anyway
+                // on the raw `resume`, so every source switch and every failover
+                // with a saved position opened at the right byte offset and then
+                // immediately flushed and re-sought to the same place — paying a
+                // range request plus KSPlayer's own seek gate for nothing.
+                if meaningfulResume, duration == 0 || resume < duration - 30 {
                     // (The playlist-offset translation that used to wrap this
                     // target went with the remux tier: a KSPlayer session's
                     // timeline IS the source timeline.)

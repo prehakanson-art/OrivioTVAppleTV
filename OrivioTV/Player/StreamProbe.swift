@@ -12,10 +12,6 @@ struct StreamProbeResult {
     /// Dolby Vision profile from the container's dvcC/dvvC record (nil when
     /// the stream carries none). Read from the header — no packet scan.
     var dvProfile: Int?
-    /// Profile 7 only: true when the enhancement layer is a real residual
-    /// stream (FEL) rather than a minimal shell (MEL). Measured by a short
-    /// packet scan; FEL conversion to 8.1 is approximate, MEL is lossless.
-    var isFEL = false
     /// An HEVC video track exists (the direct engine's requirement).
     var hasHEVC = false
     /// The video is PQ-transfer HDR (HDR10 family) — drives the display-mode
@@ -136,49 +132,13 @@ enum StreamProbe {
         if needsHDR10Plus, videoIndex >= 0, isPQ {
             result.hasHDR10Plus = scanForHDR10Plus(ctx: ctx, videoIndex: videoIndex)
         }
-        // FEL/MEL is decided the same way: a bounded packet scan measuring
-        // the enhancement-layer (type-63) NAL sizes. MEL shells are ~100
-        // bytes; FEL residual frames are kilobytes.
-        if result.dvProfile == 7, videoIndex >= 0 {
-            result.isFEL = scanForFEL(ctx: ctx, videoIndex: videoIndex)
-        }
+        // NOTE: a FEL/MEL packet scan used to run here for Profile 7. It read
+        // up to 48 video packets behind a 4s deadline — tens of megabytes on a
+        // UHD remux, in front of playback — and nothing ever read its result.
+        // The engine measures the enhancement layer live from the stream it is
+        // already demuxing and reports it through `onELVerdict`, so the answer
+        // arrives without a preflight and without the wait.
         return result
-    }
-
-    /// Average type-63 NAL payload over a short packet run; >1000 bytes = FEL.
-    private static func scanForFEL(
-        ctx: UnsafeMutablePointer<AVFormatContext>, videoIndex: Int32
-    ) -> Bool {
-        guard let packet = av_packet_alloc() else { return false }
-        defer { var pp: UnsafeMutablePointer<AVPacket>? = packet; av_packet_free(&pp) }
-        var nalLengthSize = 4
-        if let stream = ctx.pointee.streams[Int(videoIndex)],
-           let extra = stream.pointee.codecpar.pointee.extradata,
-           stream.pointee.codecpar.pointee.extradata_size > 22,
-           extra[0] == 1 {
-            nalLengthSize = Int(extra[21] & 0x03) + 1
-        }
-        var scanned = 0, elCount = 0, elBytes = 0
-        let deadline = Date().addingTimeInterval(4)
-        while scanned < 48, Date() < deadline {
-            guard av_read_frame(ctx, packet) >= 0 else { break }
-            defer { av_packet_unref(packet) }
-            guard packet.pointee.stream_index == videoIndex,
-                  let data = packet.pointee.data, packet.pointee.size > 0 else { continue }
-            scanned += 1
-            let au = UnsafeBufferPointer(start: data, count: Int(packet.pointee.size))
-            var i = 0
-            while i + nalLengthSize <= au.count {
-                var len = 0
-                for k in 0 ..< nalLengthSize { len = (len << 8) | Int(au[i + k]) }
-                let start = i + nalLengthSize
-                guard len > 0, start + len <= au.count else { break }
-                if (au[start] >> 1) & 0x3F == 63 { elCount += 1; elBytes += len }
-                i = start + len
-            }
-        }
-        guard elCount > 0 else { return false }
-        return elBytes / elCount > 1000
     }
 
     /// Read a bounded run of video packets looking for the HDR10+ SEI.

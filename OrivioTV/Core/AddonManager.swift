@@ -153,18 +153,39 @@ final class AddonManager: ObservableObject {
     /// Sources page opens so a transient install-time failure self-heals the
     /// next time the user actually needs the addon. Returns true if any
     /// placeholder resolved into a real manifest.
+    /// Bounded and time-boxed. This used to be a plain serial loop at the 20s
+    /// session timeout, and the source sweep AWAITED it — so two unreachable
+    /// add-ons on a cold cache meant up to forty seconds staring at
+    /// "Searching addons 0/0" before a single stream request went out. It is a
+    /// self-heal, not a precondition for playing anything.
+    private static let placeholderResolveTimeout: TimeInterval = 5
+
+    @discardableResult
     func resolvePlaceholders() async -> Bool {
         let stuck = addons.filter { $0.enabled && $0.manifest.isPlaceholder }
         guard !stuck.isEmpty else { return false }
-        var resolvedAny = false
-        for addon in stuck {
-            guard let manifest = try? await StremioAPI.manifest(url: addon.manifestURL) else { continue }
-            if let index = addons.firstIndex(where: { $0.manifestURL == addon.manifestURL }) {
-                addons[index] = InstalledAddon(
-                    manifestURL: addon.manifestURL, manifest: manifest, enabled: addon.enabled
-                )
-                resolvedAny = true
+        let timeout = Self.placeholderResolveTimeout
+        let resolved = await boundedConcurrentMap(stuck, limit: AddonSweepLimits.manifests) { addon in
+            let manifest: AddonManifest? = await withTaskGroup(of: AddonManifest?.self) { group in
+                group.addTask { try? await StremioAPI.manifest(url: addon.manifestURL) }
+                group.addTask {
+                    try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                    return nil
+                }
+                let first = await group.next() ?? nil
+                group.cancelAll()
+                return first
             }
+            return (url: addon.manifestURL, manifest: manifest, enabled: addon.enabled)
+        }
+        var resolvedAny = false
+        for entry in resolved {
+            guard let manifest = entry.manifest,
+                  let index = addons.firstIndex(where: { $0.manifestURL == entry.url }) else { continue }
+            addons[index] = InstalledAddon(
+                manifestURL: entry.url, manifest: manifest, enabled: entry.enabled
+            )
+            resolvedAny = true
         }
         if resolvedAny { save() }
         return resolvedAny
