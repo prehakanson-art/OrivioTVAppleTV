@@ -660,6 +660,15 @@ struct DetailView: View {
                         .focused($actionFocus, equals: .startOver)
                     }
                 }
+                // The secondary icons are one focus section, so a vertical
+                // move into the row resolves against the section as a unit
+                // instead of picking whichever circle's centre happens to be
+                // nearest. tvOS chooses a Down/Up target by horizontal CENTRE
+                // distance, and from the synopsis (centre ~564) or an episode
+                // card (centre ~344) a bare circle always beat Play at x=64 —
+                // so focus visibly landed on an icon before the row's redirect
+                // pulled it back. That flash is the "jump".
+                HStack(spacing: OrivioSpacing.md) {
                 CircleIconButton(
                     systemName: library.contains(viewModel.meta) ? "checkmark" : "plus",
                     active: library.contains(viewModel.meta)
@@ -695,6 +704,8 @@ struct DetailView: View {
                     }
                     .focused($actionFocus, equals: .trailer)
                 }
+                }
+                .focusSection()
                 Spacer(minLength: 0)
             }
             .padding(.top, OrivioSpacing.xs)
@@ -733,6 +744,8 @@ struct DetailView: View {
                     // engine's own move is still in flight made it revert —
                     // Down from the synopsis went circle -> Play -> back to the
                     // synopsis, so the press appeared to do nothing at all.
+                    // The icon it lands on never PAINTS in the meantime; see
+                    // CircleIconLabel.
                     Task { @MainActor in
                         guard actionFocus != nil, actionFocus != .play else { return }
                         actionFocus = .play
@@ -1246,9 +1259,29 @@ struct CircleIconButton: View {
 
 private struct CircleIconLabel: View {
     @EnvironmentObject private var theme: ThemeManager
-    @Environment(\.isFocused) private var isFocused
+    @Environment(\.isFocused) private var rawFocused
     let systemName: String
     let active: Bool
+
+    /// Real focus, mirrored into state so the debounce below can re-read it.
+    @State private var focusedNow = false
+    /// Focus as DRAWN — real focus that has survived `paintDelay`.
+    @State private var painted = false
+
+    /// A vertical move into the action row lands on one of these icons before
+    /// the row's redirect puts focus on Play: tvOS resolves such a move by
+    /// horizontal centre distance and an icon's centre always beats Play's at
+    /// x=64. The move itself can't be vetoed — SwiftUI reports focus after the
+    /// engine has committed it — so the icon simply doesn't draw the highlight
+    /// until it has held focus for three frames. A correction takes about one,
+    /// so the visit never reaches the screen; a real Left/Right move onto an
+    /// icon is 50ms behind, well inside the focus animation that follows.
+    /// (Driving this off the row's @FocusState instead does NOT work:
+    /// @FocusState updates a beat AFTER the focus system, so the icon has
+    /// already painted by the time the row knows anything moved.)
+    private static let paintDelay = Duration.milliseconds(50)
+
+    private var isFocused: Bool { painted }
 
     var body: some View {
         Image(systemName: systemName)
@@ -1266,6 +1299,18 @@ private struct CircleIconLabel: View {
             .liquidGlassIf(!isFocused && !active, in: Circle())
             .overlay(Circle().strokeBorder(isFocused ? Color.white.opacity(0.95) : .clear, lineWidth: 3))
             .focusLift(OrivioFocus.control, isFocused)
+            .onAppear {
+                focusedNow = rawFocused
+                painted = rawFocused
+            }
+            .onChange(of: rawFocused) { _, focused in
+                focusedNow = focused
+                guard focused else { painted = false; return }
+                Task { @MainActor in
+                    try? await Task.sleep(for: Self.paintDelay)
+                    if focusedNow { painted = true }
+                }
+            }
     }
 }
 
