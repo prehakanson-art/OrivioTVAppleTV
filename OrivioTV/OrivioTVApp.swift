@@ -103,6 +103,7 @@ struct RootView: View {
     @EnvironmentObject private var collections: CollectionsStore
     @EnvironmentObject private var homeCatalogSettings: HomeCatalogSettingsStore
     @EnvironmentObject private var trakt: TraktStore
+    @EnvironmentObject private var simkl: SimklStore
     @EnvironmentObject private var stremioAccount: StremioAccountStore
     @EnvironmentObject private var playerSettings: PlayerSettingsStore
     @EnvironmentObject private var streamBadges: StreamBadgeStore
@@ -157,6 +158,7 @@ struct RootView: View {
 
     @State private var sync: OrivioSyncManager?
     @State private var traktSync: TraktSyncManager?
+    @State private var simklSync: SimklSyncManager?
     @State private var stremioSync: StremioSyncManager?
     @State private var showProfileGate = false
     /// True when the gate was opened from the rail / Settings (Back closes
@@ -262,6 +264,14 @@ struct RootView: View {
                         trakt: trakt, watched: watched, progress: progressStore,
                         library: library, ratings: ratings, addonManager: addonManager
                     )
+                    // Constructed AFTER the Trakt manager, and safely so: the
+                    // store hooks both subscribe to are lists, so this appends
+                    // rather than replacing Trakt's subscriptions. No progress
+                    // store — SIMKL has no playback-position API.
+                    simklSync = SimklSyncManager(
+                        simkl: simkl, watched: watched, library: library,
+                        ratings: ratings, addonManager: addonManager
+                    )
                     let stremioManager = StremioSyncManager(
                         stremio: stremioAccount,
                         addonManager: addonManager,
@@ -308,6 +318,28 @@ struct RootView: View {
                     // after sync has had a chance to interfere. Reading the raw
                     // defaults keys can't answer this — the answer depends on
                     // which scope the store chose.
+                    // Dev: dump the SIMKL request bodies (see debugEnvelope).
+                    if args.contains("-simklEnvelopeReport") {
+                        let now = Date(timeIntervalSince1970: 1_700_000_000)
+                        let history: [SimklService.SyncItem] = [
+                            .init(imdb: "tt0111161", type: "movie", title: "The Shawshank Redemption", watchedAt: now),
+                            .init(imdb: "tt0903747", type: "series", title: "Breaking Bad", season: 1, episode: 1, watchedAt: now),
+                            .init(imdb: "tt0903747", type: "series", season: 1, episode: 2, watchedAt: now),
+                            .init(imdb: "tt0903747", type: "series", season: 2, episode: 1, watchedAt: now),
+                            .init(tmdb: 1396, type: "series", title: "Tmdb Only", season: 1, episode: 1, watchedAt: now),
+                            .init(type: "movie", title: "No IDs — must be dropped"),
+                        ]
+                        let rated: [SimklService.SyncItem] = [
+                            .init(imdb: "tt0111161", type: "movie", title: "Shawshank", rating: 9),
+                        ]
+                        let watchlist: [SimklService.SyncItem] = [
+                            .init(imdb: "tt0468569", type: "movie", title: "The Dark Knight"),
+                        ]
+                        let report = "HISTORY\n" + SimklService.debugEnvelope(history)
+                            + "\n\nRATINGS\n" + SimklService.debugEnvelope(rated, includeRating: true)
+                            + "\n\nWATCHLIST\n" + SimklService.debugEnvelope(watchlist, listTarget: "plantowatch")
+                        UserDefaults.standard.set(report, forKey: "dev.simklEnvelope")
+                    }
                     if args.contains("-traktReport") {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
                             let report = "profile=\(profiles.activeProfileID)"

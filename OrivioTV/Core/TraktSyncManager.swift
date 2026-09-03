@@ -30,12 +30,12 @@ final class TraktSyncManager: ObservableObject {
         self.addonManager = addonManager
 
         // LOCAL → TRAKT: immediate push on each kind of local change.
-        watched.onTraktMark = { [weak self] item in self?.pushMark(item) }
-        watched.onTraktRemove = { [weak self] items in self?.pushRemove(items) }
-        library.onTraktAdd = { [weak self] item in self?.pushWatchlistAdd(item) }
-        library.onTraktRemove = { [weak self] item in self?.pushWatchlistRemove(item) }
-        ratings.onTraktRate = { [weak self] id, type, r in self?.pushRating(id, type, r) }
-        ratings.onTraktUnrate = { [weak self] id, type in self?.pushUnrate(id, type) }
+        watched.onTrackerMark.append { [weak self] item in self?.pushMark(item) }
+        watched.onTrackerRemove.append { [weak self] items in self?.pushRemove(items) }
+        library.onTrackerAdd.append { [weak self] item in self?.pushWatchlistAdd(item) }
+        library.onTrackerRemove.append { [weak self] item in self?.pushWatchlistRemove(item) }
+        ratings.onTrackerRate.append { [weak self] id, type, r in self?.pushRating(id, type, r) }
+        ratings.onTrackerUnrate.append { [weak self] id, type in self?.pushUnrate(id, type) }
         progress.onTraktRemove = { [weak self] metaID in self?.pushPlaybackRemove(metaID) }
         // Toggling a Trakt sync setting on kicks a full sync.
         trakt.onTraktSettingChange = { [weak self] in self?.syncNow(force: true) }

@@ -109,10 +109,11 @@ final class LibraryStore: ObservableObject {
     /// removal lost to a killed app, an offline moment or an expired token was
     /// never represented anywhere, and the next pull re-added the item for good.
     var onRemove: (([SavedLibraryItem]) -> Void)?
-    /// Trakt watchlist hooks (separate owner from account-sync): fired on a
-    /// genuine local add / remove so the Trakt manager can push to the watchlist.
-    var onTraktAdd: ((SavedLibraryItem) -> Void)?
-    var onTraktRemove: ((SavedLibraryItem) -> Void)?
+    /// Tracking-service watchlist hooks, fired on a genuine local add /
+    /// remove. Lists, not single closures — see the note in WatchedStore:
+    /// Trakt and SIMKL both subscribe, and one property could only hold one.
+    var onTrackerAdd: [(SavedLibraryItem) -> Void] = []
+    var onTrackerRemove: [(SavedLibraryItem) -> Void] = []
     private var suppressChange = false
 
     /// Recently-removed keys → removal time. The library push is full-replace
@@ -192,7 +193,7 @@ final class LibraryStore: ObservableObject {
         items[item.key] = item
         save()
         if !suppressChange {
-            if isNew { onTraktAdd?(item) }
+            if isNew { for hook in onTrackerAdd { hook(item) } }
             onLocalChange?()
         }
     }
@@ -204,7 +205,7 @@ final class LibraryStore: ObservableObject {
         save()
         if !suppressChange {
             onRemove?([removed])
-            onTraktRemove?(removed)
+            for hook in onTrackerRemove { hook(removed) }
             onLocalChange?()
         }
     }
@@ -230,7 +231,7 @@ final class LibraryStore: ObservableObject {
         }
         items.removeAll()
         save()
-        // Deliberately NOT firing onTraktRemove: this clears local state, it is
+        // Deliberately NOT firing onTrackerRemove: this clears local state, it is
         // not the user removing titles from their watchlist.
         if notify && !suppressChange { onLocalChange?() }
         return removed

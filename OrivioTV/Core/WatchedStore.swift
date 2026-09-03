@@ -32,11 +32,15 @@ final class WatchedStore: ObservableObject {
     /// upsert-only push would resurrect them on the next pull. Mirrors
     /// ProgressStore.onRemove.
     var onRemove: (([WatchedItem]) -> Void)?
-    /// Trakt-specific hooks (separate owner from the account-sync onRemove):
-    /// fired on a genuine local mark / un-mark so the Trakt manager can add or
-    /// remove the item from Trakt watch history.
-    var onTraktMark: ((WatchedItem) -> Void)?
-    var onTraktRemove: (([WatchedItem]) -> Void)?
+    /// Tracking-service hooks, fired on a genuine local mark / un-mark.
+    ///
+    /// A LIST rather than a single closure: Trakt and SIMKL are independent
+    /// destinations and both want to hear about the same local change. While
+    /// this was one `onTrakt…` property, whichever manager was constructed
+    /// second would silently overwrite the first's subscription. Separate from
+    /// the account-sync `onRemove`, which has its own owner.
+    var onTrackerMark: [(WatchedItem) -> Void] = []
+    var onTrackerRemove: [([WatchedItem]) -> Void] = []
     private var suppressChange = false
 
     /// Recently un-marked keys → removal time. A full-snapshot pull can still
@@ -127,7 +131,7 @@ final class WatchedStore: ObservableObject {
         items[item.key] = item
         save()
         if !suppressChange {
-            if isNew { onTraktMark?(item) }
+            if isNew { for hook in onTrackerMark { hook(item) } }
             onLocalChange?()
         }
     }
@@ -139,7 +143,7 @@ final class WatchedStore: ObservableObject {
         save()
         if !suppressChange {
             onRemove?([removed])
-            onTraktRemove?([removed])
+            for hook in onTrackerRemove { hook([removed]) }
             onLocalChange?()
         }
     }
@@ -162,7 +166,7 @@ final class WatchedStore: ObservableObject {
         save()
         if notify && !suppressChange {
             onRemove?(removedItems)
-            onTraktRemove?(removedItems)
+            for hook in onTrackerRemove { hook(removedItems) }
             onLocalChange?()
         }
         return removedItems

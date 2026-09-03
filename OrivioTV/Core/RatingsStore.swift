@@ -9,9 +9,10 @@ final class RatingsStore: ObservableObject {
     @Published private(set) var ratings: [String: Int] = [:]
     private var types: [String: String] = [:]
 
-    /// Fired on a genuine local rate/unrate so the Trakt manager can push.
-    var onTraktRate: ((_ metaID: String, _ type: String, _ rating: Int) -> Void)?
-    var onTraktUnrate: ((_ metaID: String, _ type: String) -> Void)?
+    /// Fired on a genuine local rate/unrate so every tracking service can
+    /// push. Lists, not single closures — see the note in WatchedStore.
+    var onTrackerRate: [(_ metaID: String, _ type: String, _ rating: Int) -> Void] = []
+    var onTrackerUnrate: [(_ metaID: String, _ type: String) -> Void] = []
     private var suppressChange = false
 
     /// Active profile scope. Profile 1 keeps the original (unsuffixed) key so
@@ -57,12 +58,12 @@ final class RatingsStore: ObservableObject {
             ratings[metaID] = value
             types[metaID] = type
             save()
-            if !suppressChange { onTraktRate?(metaID, type, value) }
+            if !suppressChange { for hook in onTrackerRate { hook(metaID, type, value) } }
         } else {
             ratings.removeValue(forKey: metaID)
             let t = types.removeValue(forKey: metaID) ?? type
             save()
-            if !suppressChange { onTraktUnrate?(metaID, t) }
+            if !suppressChange { for hook in onTrackerUnrate { hook(metaID, t) } }
         }
     }
 

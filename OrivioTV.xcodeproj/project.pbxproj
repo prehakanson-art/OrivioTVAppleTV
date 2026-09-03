@@ -121,6 +121,7 @@
 		DC0E9E70DB221F0950F6894A /* SidePanels.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3EC9F39C2F564E698758FA8 /* SidePanels.swift */; };
 		DD0A25B28D3A846DACFC4C94 /* ProfilesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9E056E9745C95EAC5F152F2E /* ProfilesView.swift */; };
 		E0BE3820BDB022ACC16AD04D /* HomeCatalogSettingsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 65E0E4F5D1EDBE641A28EA18 /* HomeCatalogSettingsStore.swift */; };
+		E1B642631F0BED2D4C0E7DD4 /* SimklSyncManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 34E7D17DD079A7F255B25845 /* SimklSyncManager.swift */; };
 		E71A9C6C7E45666E27367D3C /* DoviConverter.swift in Sources */ = {isa = PBXBuildFile; fileRef = EC88B7827A15F09EC43F4C34 /* DoviConverter.swift */; };
 		E8AE20FDCE91890A04B32626 /* PlaybackDecision.swift in Sources */ = {isa = PBXBuildFile; fileRef = 858C0A4692A535F58D9F6170 /* PlaybackDecision.swift */; };
 		ECC26F9C157AC8420610988D /* RequestCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5D116BB391F1350665E457F7 /* RequestCache.swift */; };
@@ -161,6 +162,7 @@
 		29B880EA0D7076A1D666821E /* PluginStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PluginStore.swift; sourceTree = "<group>"; };
 		336649B70E24C035EE57A905 /* ParentalGuideService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ParentalGuideService.swift; sourceTree = "<group>"; };
 		343918D06B3BE0D50D514515 /* OrivioSyncManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrivioSyncManager.swift; sourceTree = "<group>"; };
+		34E7D17DD079A7F255B25845 /* SimklSyncManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SimklSyncManager.swift; sourceTree = "<group>"; };
 		350FC2130915C0A942D1A624 /* OrivioTV.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = OrivioTV.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		388B1E00D3FF9FF3C623E607 /* ScrubThumbnailer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScrubThumbnailer.swift; sourceTree = "<group>"; };
 		397C4520601062A6C4875571 /* TMDBBrowseView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TMDBBrowseView.swift; sourceTree = "<group>"; };
@@ -404,6 +406,7 @@
 				FFEF8269DCFC5B5CBBD63E95 /* RatingsStore.swift */,
 				5D116BB391F1350665E457F7 /* RequestCache.swift */,
 				9D5D90DE05390256E6F7CD6F /* SimklService.swift */,
+				34E7D17DD079A7F255B25845 /* SimklSyncManager.swift */,
 				0DA8AE05972975B40C348D53 /* SourceSelection.swift */,
 				669630524318B915E627A870 /* StreamBadges.swift */,
 				71F10A0E3EDFA7EA1AF9E620 /* StremioAccount.swift */,
@@ -737,6 +740,7 @@
 				224323A6B3C794CAA2848163 /* SettingsView.swift in Sources */,
 				DC0E9E70DB221F0950F6894A /* SidePanels.swift in Sources */,
 				3A41FBF2EB0B8D86395FEA6A /* SimklService.swift in Sources */,
+				E1B642631F0BED2D4C0E7DD4 /* SimklSyncManager.swift in Sources */,
 				37A27074B3CA714A0E4B1048 /* SourceSelection.swift in Sources */,
 				63062C6AE27B38290E3D9D37 /* StreamBadges.swift in Sources */,
 				AC455BAF271DD72DE6BE2983 /* StreamProbe.swift in Sources */,

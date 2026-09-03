@@ -653,7 +653,10 @@ private struct IntegrationRowBackground: ViewModifier {
         content
             .padding(.horizontal, OrivioSpacing.lg)
             .frame(minHeight: 68)
-            .frame(maxWidth: .infinity)
+            // Leading, not the default centre: every other row in these panes
+            // is left-aligned, so a connected-account row (Trakt's and SIMKL's
+            // both use this) sat centred in the middle of a left-aligned list.
+            .frame(maxWidth: .infinity, alignment: .leading)
             .background(
                 RoundedRectangle(cornerRadius: OrivioRadius.md, style: .continuous)
                     .fill(isFocused ? theme.palette.focusBackground : theme.palette.backgroundCard.opacity(0.5))

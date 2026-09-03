@@ -86,8 +86,18 @@ struct TraktDetail: View {
 
     // MARK: SIMKL
 
-    @ViewBuilder
     private var simklSection: some View {
+        // SettingsGroupCard's content stack is centre-aligned (its rows are all
+        // full-width, so it never showed). The account row and the note are
+        // not, and sat centred while Trakt's identical row above sat leading.
+        VStack(alignment: .leading, spacing: OrivioSpacing.lg) {
+            simklSectionContent
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private var simklSectionContent: some View {
         if simkl.isSignedIn {
             HStack(spacing: OrivioSpacing.lg) {
                 Image(systemName: "checkmark.seal.fill")
@@ -103,6 +113,51 @@ struct TraktDetail: View {
                 }
             }
             .integrationRowBackground(theme)
+
+            SettingsToggleCard(
+                title: "Sync watch history",
+                subtitle: "Two-way sync of watched movies & episodes (the ✓ badges) between this app and SIMKL",
+                isOn: Binding(
+                    get: { simkl.syncWatchHistory },
+                    set: { simkl.syncWatchHistory = $0; simkl.onSyncSettingChange?() }
+                )
+            )
+            SettingsToggleCard(
+                title: "Sync watchlist",
+                subtitle: "Your Library and SIMKL's plan-to-watch list fill each other in. Removals stay local — SIMKL can't drop a title from a list without erasing its watch history too.",
+                isOn: Binding(
+                    get: { simkl.syncWatchlist },
+                    set: { simkl.syncWatchlist = $0; simkl.onSyncSettingChange?() }
+                )
+            )
+            SettingsToggleCard(
+                title: "Sync ratings",
+                subtitle: "Two-way sync of your 1–10 star ratings with SIMKL (rate from any title's page)",
+                isOn: Binding(
+                    get: { simkl.syncRatings },
+                    set: { simkl.syncRatings = $0; simkl.onSyncSettingChange?() }
+                )
+            )
+
+            Button {
+                simkl.onSyncSettingChange?()
+                simkl.setSyncStatus("Syncing with SIMKL…")
+            } label: {
+                SettingsActionRow(
+                    title: "Sync now",
+                    subtitle: simkl.lastSyncStatus ?? "Force a two-way sync with SIMKL",
+                    leadingIcon: "arrow.triangle.2.circlepath"
+                )
+            }
+            .buttonStyle(PlainCardButtonStyle())
+
+            // Said once, here, rather than leaving a viewer to wonder why the
+            // Trakt section above has a Continue Watching switch and this one
+            // does not.
+            Text("SIMKL has no playback-position API, so Continue Watching isn't synced with it. Finishing something still marks it watched.")
+                .font(.system(size: 20))
+                .foregroundStyle(theme.palette.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
 
             Button { simkl.signOut() } label: {
                 DestructivePillLabel(title: "Sign Out of SIMKL")
@@ -168,6 +223,10 @@ struct TraktDetail: View {
             while !Task.isCancelled && Date() < deadline {
                 switch await SimklService.pollToken(userCode: code.userCode) {
                 case .authorized(let access):
+                    // Before storing: the manager watches `accessToken` and
+                    // reads this flag to decide between syncing now and
+                    // deferring behind the first screen.
+                    simkl.markSignedInHere()
                     simkl.store(access: access)
                     let name = await SimklService.fetchUsername(accessToken: access)
                     simkl.setUsername(name)
