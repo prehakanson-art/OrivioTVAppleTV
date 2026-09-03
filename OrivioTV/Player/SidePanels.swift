@@ -23,7 +23,13 @@ struct SidePanel<Content: View>: View {
                 content
                 Spacer(minLength: 40)
             }
-            .padding(.horizontal, OrivioSpacing.xl)
+            // `huge` (64pt), matching `FusionMetrics.sideInset` on the player's
+            // own controls. At `xl` (28pt) the trailing resolution and size
+            // badges and the selected checkmark sat inside the tvOS title-safe
+            // inset — 60pt at the 1920x1080 reference — so any TV that
+            // overscans clipped them. The background still bleeds to the edge;
+            // only the content moves in.
+            .padding(.horizontal, OrivioSpacing.huge)
             .frame(width: 640, alignment: .leading)
             .frame(maxHeight: .infinity)
             .background(theme.palette.panel.opacity(0.98))

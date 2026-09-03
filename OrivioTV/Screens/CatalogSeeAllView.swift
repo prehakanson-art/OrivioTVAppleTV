@@ -35,12 +35,22 @@ final class CatalogSeeAllViewModel: ObservableObject {
 /// a home row. Mirrors Android's `CatalogSeeAllScreen`.
 struct CatalogSeeAllView: View {
     @EnvironmentObject private var theme: ThemeManager
+    @EnvironmentObject private var posterLayout: HomeCatalogSettingsStore
     @StateObject private var viewModel: CatalogSeeAllViewModel
 
     let title: String
     let onSelect: (MetaItem) -> Void
 
-    private let columns = Array(repeating: GridItem(.fixed(220), spacing: OrivioSpacing.lg), count: 6)
+    /// Bound to the poster-size setting, like Home, Search, Library and
+    /// Discover. A hardcoded 220pt column clipped: `PosterCard` draws at the
+    /// user's chosen 180/220/264, so at Large the card was 44pt wider than its
+    /// column and neighbouring cards overlapped, while at Small it left 40pt of
+    /// dead gutter.
+    private var columns: [GridItem] {
+        [GridItem(.adaptive(minimum: posterLayout.posterSize.posterWidth,
+                            maximum: posterLayout.posterSize.posterWidth),
+                  spacing: OrivioSpacing.lg, alignment: .top)]
+    }
 
     init(addon: InstalledAddon, catalog: ManifestCatalog, title: String, onSelect: @escaping (MetaItem) -> Void) {
         _viewModel = StateObject(wrappedValue: CatalogSeeAllViewModel(addon: addon, catalog: catalog))

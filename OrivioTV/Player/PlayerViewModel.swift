@@ -1006,17 +1006,30 @@ final class PlayerViewModel: ObservableObject {
                             // registered within three seconds never will.
                             var stable = 0
                             var last = before
+                            var rateChanged = false
                             for _ in 0 ..< 12 {   // up to 3s
                                 try? await Task.sleep(nanoseconds: 250_000_000)
                                 let now = UIScreen.main.maximumFramesPerSecond
+                                if now != before { rateChanged = true }
                                 if now != before, now == last { stable += 1 } else { stable = 0 }
                                 last = now
                                 if stable >= 3 { break }
                             }
-                            // NOTE: the 2.5s quiet beat below is deliberate
-                            // margin for HDMI link training on a panel that
-                            // produced a grey-screen wedge. Left alone.
-                            try? await Task.sleep(nanoseconds: 2_500_000_000)
+                            // The 2.5s beat is deliberate margin for HDMI link
+                            // training, and it stays exactly as it was whenever
+                            // a REFRESH RATE change actually happened — that is
+                            // the renegotiation that produced the grey-screen
+                            // wedge this margin exists for.
+                            //
+                            // When the rate never moved, no such renegotiation
+                            // took place: either only the dynamic range changed
+                            // (which the panel handles in-band) or the pin was
+                            // already correct. Waiting the full margin there was
+                            // buying safety against something that did not
+                            // occur, and it is the common case, because this
+                            // app's own `matchFrameRate` default is off.
+                            let beat: UInt64 = rateChanged ? 2_500_000_000 : 600_000_000
+                            try? await Task.sleep(nanoseconds: beat)
                             guard self.dvDirectEngine === engine, !self.isExiting else { return }
                             Self.dvTrail("display settled at \(UIScreen.main.maximumFramesPerSecond)fps — attaching video")
                             // Attach the engine's layer view: PlayerVideoView

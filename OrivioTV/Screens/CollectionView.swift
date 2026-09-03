@@ -607,7 +607,13 @@ struct CollectionView: View {
         return items
     }
 
-    private let columns = [GridItem(.adaptive(minimum: 220), spacing: OrivioSpacing.lg)]
+    /// Bound to the poster-size setting — an `.adaptive(minimum: 220)` column
+    /// let a 264pt Large card overflow its own track.
+    private var columns: [GridItem] {
+        [GridItem(.adaptive(minimum: layoutSettings.posterSize.posterWidth,
+                            maximum: layoutSettings.posterSize.posterWidth),
+                  spacing: OrivioSpacing.lg)]
+    }
 
     /// The collection's background picture — explicit backdrop, else the first
     /// folder's cover (so it matches the tile).
