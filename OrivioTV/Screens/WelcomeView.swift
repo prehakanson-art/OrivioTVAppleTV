@@ -19,7 +19,7 @@ struct WelcomeView: View {
     /// account". Someone who SIGNED IN has their add-ons arriving from their
     /// account moments later, so asking them to add some would be both
     /// redundant and confusing.
-    private enum Step { case choose, email, offerAddons, addAddons }
+    private enum Step: Equatable { case choose, email, offerAddons, addAddons }
     @State private var step: Step =
         ProcessInfo.processInfo.arguments.contains("-welcomeOfferDemo") ? .offerAddons : .choose
     /// The offer's primary action holds focus, so a Select arriving as the
@@ -59,8 +59,14 @@ struct WelcomeView: View {
         // Signing in by ANY route finishes onboarding — the QR poll completes
         // on its own timeline, so watching the auth state is what catches it
         // rather than a callback on the button.
+        //
+        // Only while still ON a sign-in step, though. A session restored in
+        // the background flips this too, and without the guard it tore the
+        // screen away from someone who had already chosen "Use without an
+        // account" and was part-way through adding add-ons from their phone.
         .onChange(of: account.authState.isSignedIn) { _, signedIn in
-            if signedIn { onFinished() }
+            guard signedIn, step == .choose || step == .email else { return }
+            onFinished()
         }
         .onAppear { if account.qrLogin == nil { account.startQRLogin() } }
         .onDisappear { account.cancelQRLogin() }

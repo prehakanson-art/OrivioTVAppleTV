@@ -341,8 +341,13 @@ struct RootView: View {
                     let args = ProcessInfo.processInfo.arguments
                     let demoArgs = ["-detailDemo", "-detailDemoSeries", "-homeDemo", "-settingsDemo", "-liveTVDemo", "-searchDemo", "-libraryDemo", "-discoverDemo", "-traktQRDemo", "-simklQRDemo", "-accountDemo", "-settingsTabDemo"]
                     let demoMode = demoArgs.contains { args.contains($0) }
-                    showWelcome = OnboardingState.shouldShow(
-                        signedIn: account.authState.isSignedIn) && !demoMode
+                    // -welcomeDemo forces it regardless of the completed flag
+                    // or an already-restored session, which is the only way to
+                    // look at this screen twice on one install.
+                    let forceWelcome = args.contains("-welcomeDemo")
+                        || args.contains("-welcomeOfferDemo")
+                    showWelcome = (forceWelcome || OnboardingState.shouldShow(
+                        signedIn: account.authState.isSignedIn)) && !demoMode
                     showProfileGate = (profiles.profiles.count >= 2 || profiles.active.pinEnabled) && !demoMode
                     if args.contains("-settingsDemo") { selectedTab = 3 }
                     // Settings TAB (in-place, not the full-screen pane demo) —
@@ -364,8 +369,9 @@ struct RootView: View {
                             guard let addonManager else { return .failure(URLError(.cancelled)) }
                             do {
                                 try await addonManager.install(manifestURL: url)
-                                let name = addonManager.addons.first { $0.manifestURL == url }?.manifest.name
-                                return .success(name ?? url)
+                                let m = addonManager.addons.first { $0.manifestURL == url }?.manifest
+                                return .success(.init(manifestURL: url, name: m?.name ?? url,
+                                                      logo: m?.logo, description: m?.description))
                             } catch { return .failure(error) }
                         }
                         server.start()

@@ -46,11 +46,23 @@ struct AddonPhoneAddView: View {
                 if !server.accepted.isEmpty {
                     // Echo what the phone sent so it is obvious it worked
                     // without walking back to the TV to check the list.
-                    VStack(spacing: 4) {
-                        ForEach(server.accepted.prefix(4), id: \.self) { name in
-                            Text("Added \(name)")
-                                .font(.system(size: 22, weight: .medium))
-                                .foregroundStyle(OrivioPrimitives.success)
+                    VStack(alignment: .leading, spacing: OrivioSpacing.sm) {
+                        ForEach(server.accepted.prefix(3)) { addon in
+                            HStack(spacing: OrivioSpacing.sm) {
+                                // Manifest logos are frequently missing; the
+                                // placeholder keeps the rows aligned instead of
+                                // letting the names jump left.
+                                RemoteImage(url: addon.logo, contentMode: .fit)
+                                    .frame(width: 44, height: 44)
+                                    .background(Color.white.opacity(0.06),
+                                                in: RoundedRectangle(cornerRadius: 8))
+                                Text(addon.name)
+                                    .font(.system(size: 24, weight: .semibold))
+                                    .foregroundStyle(theme.palette.textPrimary)
+                                Image(systemName: "checkmark.circle.fill")
+                                    .font(.system(size: 22))
+                                    .foregroundStyle(OrivioPrimitives.success)
+                            }
                         }
                     }
                 }
@@ -65,10 +77,18 @@ struct AddonPhoneAddView: View {
             server.onInstall = { url in
                 do {
                     try await addonManager.install(manifestURL: url)
-                    // Name it from what actually installed, so the phone
-                    // confirms the real add-on rather than echoing the URL.
-                    let name = addonManager.addons.first { $0.manifestURL == url }?.manifest.name
-                    return .success(name ?? url)
+                    // Report what actually installed — the manifest's own name,
+                    // logo and description — rather than echoing the link back.
+                    // A URL tells you nothing about what you just added.
+                    guard let installed = addonManager.addons.first(where: { $0.manifestURL == url })
+                    else {
+                        return .success(.init(manifestURL: url, name: url,
+                                              logo: nil, description: nil))
+                    }
+                    return .success(.init(manifestURL: url,
+                                          name: installed.manifest.name,
+                                          logo: installed.manifest.logo,
+                                          description: installed.manifest.description))
                 } catch {
                     return .failure(error)
                 }

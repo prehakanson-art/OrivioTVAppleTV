@@ -23,14 +23,25 @@ final class AddonImportServer: ObservableObject {
     /// What the QR encodes, e.g. "http://192.168.1.20:8090". nil until the
     /// listener is actually up.
     @Published private(set) var address: String?
-    /// Manifest URLs accepted so far this session, newest first — the TV
-    /// echoes them back so you can see the phone worked.
-    @Published private(set) var accepted: [String] = []
+    /// What an install actually turned out to be. A manifest URL says nothing
+    /// about what you just added — the point of echoing this back is to show
+    /// the add-on, not the link that fetched it.
+    struct AddedAddon: Identifiable, Equatable {
+        var id: String { manifestURL }
+        let manifestURL: String
+        let name: String
+        let logo: String?
+        let description: String?
+    }
+
+    /// Add-ons accepted so far this session, newest first — echoed to both the
+    /// phone and the TV so you can see the phone worked.
+    @Published private(set) var accepted: [AddedAddon] = []
     @Published private(set) var lastError: String?
 
     /// Installs an accepted URL. Set by the view so this type stays free of
     /// any dependency on AddonManager.
-    var onInstall: ((String) async -> Result<String, Error>)?
+    var onInstall: ((String) async -> Result<AddedAddon, Error>)?
 
     private var listener: NWListener?
     private var connections: [ObjectIdentifier: NWConnection] = [:]
@@ -129,9 +140,12 @@ final class AddonImportServer: ObservableObject {
             for url in urls {
                 guard let onInstall else { break }
                 switch await onInstall(url) {
-                case .success(let name):
-                    accepted.insert(name, at: 0)
-                    results.append("Added \(name)")
+                case .success(let addon):
+                    // Newest first, and never twice: re-adding an installed
+                    // add-on succeeds, and a duplicate row would suggest two.
+                    accepted.removeAll { $0.manifestURL == addon.manifestURL }
+                    accepted.insert(addon, at: 0)
+                    results.append("Added \(addon.name)")
                 case .failure(let error):
                     results.append("Couldn't add: \(error.localizedDescription)")
                 }
@@ -200,9 +214,18 @@ final class AddonImportServer: ObservableObject {
             .replacingOccurrences(of: "\"", with: "&quot;")
     }
 
-    private static func page(accepted: [String], message: String?) -> String {
-        let list = accepted.isEmpty ? "" :
-            "<h2>Added</h2><ul>" + accepted.map { "<li>\(escape($0))</li>" }.joined() + "</ul>"
+    private static func page(accepted: [AddedAddon], message: String?) -> String {
+        // Logos load straight from the add-on's own host — the phone has
+        // internet, and proxying them through the TV would mean this server
+        // fetching arbitrary URLs on request, which it deliberately does not.
+        let rows = accepted.map { addon -> String in
+            let art = addon.logo.map { "<img src=\"\(escape($0))\" alt=\"\" loading=lazy>" }
+                ?? "<span class=ph></span>"
+            let blurb = addon.description.map { "<p>\(escape($0))</p>" } ?? ""
+            return "<li>\(art)<div><strong>\(escape(addon.name))</strong>\(blurb)</div></li>"
+        }
+        let list = accepted.isEmpty ? ""
+            : "<h2>Added</h2><ul class=addons>" + rows.joined() + "</ul>"
         let note = message.map { "<p class=note>\(escape($0))</p>" } ?? ""
         return """
         <!doctype html><html><head><meta charset=utf-8>
@@ -218,7 +241,12 @@ final class AddonImportServer: ObservableObject {
         button{margin-top:12px;width:100%;padding:14px;font-size:17px;font-weight:600;
                border:0;border-radius:12px;background:#7c3aed;color:#fff}
         .note{margin:16px 0 0;color:#c7c7d1}
-        ul{padding-left:20px} li{margin:4px 0}
+        ul.addons{list-style:none;padding:0;margin:8px 0 0}
+        ul.addons li{display:flex;gap:12px;align-items:flex-start;margin:14px 0}
+        ul.addons img,.ph{width:44px;height:44px;border-radius:10px;flex:0 0 44px;
+             object-fit:contain;background:#161923}
+        ul.addons strong{font-size:17px}
+        ul.addons p{margin:2px 0 0;font-size:14px;color:#9a9aa6}
         </style></head><body>
         <h1>Add add-ons</h1>
         <p>Paste one manifest URL, or a whole Add-on Setup export — one URL
