@@ -533,13 +533,19 @@ private struct PlaceholderShimmer: View {
 /// measuring/animating variant exists ONLY on the focused card, so grids pay
 /// zero extra cost — critical after the row-perf work.
 struct MarqueeText: View {
+    @ObservedObject private var perf = PerformanceSettingsStore.shared
     let text: String
     let font: Font
     let color: Color
     let active: Bool
 
     var body: some View {
-        if active {
+        // A title that scrolls indefinitely on the focused card is the textbook
+        // Reduce Motion violation, and it had no gate at all — the loop is
+        // `repeatForever`, so it ran for as long as the card held focus. The
+        // inactive branch below already renders a clean truncated label, so the
+        // focus state change is still visible; only the movement goes.
+        if active, !perf.reduceMotion {
             ActiveMarquee(text: text, font: font, color: color)
         } else {
             Text(text).font(font).foregroundStyle(color).lineLimit(1)
@@ -996,6 +1002,7 @@ extension View {
 /// it — keeps the poster a clean tile and the title a free-floating label.
 struct ATVCardCaption: View {
     @EnvironmentObject private var theme: ThemeManager
+    @ObservedObject private var perf = PerformanceSettingsStore.shared
     let title: String
     var subtitle: String? = nil
     var width: CGFloat
@@ -1022,8 +1029,14 @@ struct ATVCardCaption: View {
         }
         .frame(width: width, alignment: .leading)
         .padding(.top, 4)
-        .offset(y: lowered ? dropDistance : 0)
-        .animation(.spring(response: 0.32, dampingFraction: 0.85), value: lowered)
+        // The drop exists to keep a constant gap as the native platter grows the
+        // artwork downward — so it must not happen when the platter is off. With
+        // the parallax suppressed (Reduce Motion, or the Apple TV HD's own tier
+        // defaults) the caption used to slide 18pt away from a poster that had
+        // not moved: an unrequested animation AND a layout bug. It also had no
+        // Reduce Motion gate of its own, unlike everything else on the card.
+        .offset(y: lowered && perf.cardParallaxEffective ? dropDistance : 0)
+        .animation(perf.motion(FusionMotion.focusEntry), value: lowered)
     }
 }
 

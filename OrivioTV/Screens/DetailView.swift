@@ -174,6 +174,7 @@ struct DetailView: View {
     @EnvironmentObject private var layout: HomeCatalogSettingsStore
     @EnvironmentObject private var playerSettings: PlayerSettingsStore
     @EnvironmentObject private var profiles: ProfileStore
+    @ObservedObject private var perf = PerformanceSettingsStore.shared
     @StateObject private var viewModel: DetailViewModel
 
     let onPlay: (MetaItem, MetaVideo?) -> Void
@@ -395,6 +396,11 @@ struct DetailView: View {
 
     private func startBackdropTrailerIfEnabled() async {
         let delay = playerSettings.settings.autoPlayTrailerSeconds
+        // Reduce Motion keeps the still backdrop. An auto-starting, looping
+        // trailer is unrequested motion by definition, and it escalates itself
+        // to full screen a few seconds later — a large positional transition
+        // the viewer never asked for and the setting's copy never mentions.
+        guard !perf.reduceMotion else { return }
         guard delay > 0, let trailer = viewModel.trailers.first else { return }
         // Resolve WHILE the idle delay runs, not after it — extraction (and
         // the remote fallback especially) can take several seconds, and

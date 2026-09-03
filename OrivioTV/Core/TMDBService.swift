@@ -490,7 +490,16 @@ enum TMDBService {
     /// Higher than the addon sweep limits on purpose: these are tiny JSON
     /// responses (and, after the first pass over a folder, mostly cache hits),
     /// so the peak-memory argument behind `AddonSweepLimits` barely applies.
-    private static var imdbResolveWindow: Int { PerformanceProfile.isLowPower ? 6 : 12 }
+    ///
+    /// Widened because this sits IN FRONT OF FIRST PAINT: a 60-item collection
+    /// page at a window of 12 is five sequential round-trip rounds before a
+    /// single poster appears. These are tiny responses and mostly cache hits
+    /// after the first pass, so the window is the only thing setting the wait.
+    private static var imdbResolveWindow: Int { PerformanceProfile.isLowPower ? 12 : 24 }
+
+    /// How many recommendations get an IMDb id resolved up front. The row is
+    /// horizontally scrolling and this many comfortably fills it.
+    private static let moreLikeThisResolveCap = 12
 
     private static func mapToMetaItems(_ raw: [TMDBRawItem]) async -> [MetaItem] {
         // Resolve EVERY item's IMDb id, not just `raw.prefix(40)`. The task
@@ -981,7 +990,13 @@ enum TMDBService {
                 rating: r.vote_average
             )
         }
-        detail.moreLikeThis = await mapToMetaItems(raw)
+        // Only the items the row actually shows. This resolve sits INSIDE
+        // `detail()`, so every id looked up here delayed the publication of the
+        // cast, crew, director, trailers and content rating — holding the top of
+        // the title page hostage to a row further down that most viewers never
+        // scroll to. Anything past the cap keeps its `tmdb:` id, which opens
+        // correctly: `DetailViewModel.load` canonicalises on open.
+        detail.moreLikeThis = await mapToMetaItems(Array(raw.prefix(moreLikeThisResolveCap)))
         if let bt = body.belongs_to_collection {
             detail.collection = CollectionRef(id: bt.id, name: bt.name,
                                               backdropURL: imageURL(bt.backdrop_path, size: "w780"))

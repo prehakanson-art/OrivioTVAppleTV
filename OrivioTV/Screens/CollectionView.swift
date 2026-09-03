@@ -340,8 +340,19 @@ struct CollectionFolderCard: View, Equatable {
     /// The folder's focus GIF, when it has one AND hasn't switched it off.
     /// `focusGifEnabled` is nil on older/imported folders — treat a present URL
     /// as opt-in there, matching how the Android app behaves.
+    /// The quality actually used, after Reduce Motion.
+    ///
+    /// `.partial` is the right answer for that setting: the focus art still
+    /// swaps in, so the state change stays visible, but nothing loops. Without
+    /// it a focused folder played a 24-60 frame animation for a viewer who
+    /// asked the system to stop moving things. `.off` stays off.
+    private var effectiveGifQuality: CollectionGifQuality {
+        guard perf.reduceMotion else { return perf.settings.collectionGifQuality }
+        return perf.settings.collectionGifQuality == .off ? .off : .partial
+    }
+
     private var focusGifURL: String? {
-        guard perf.settings.collectionGifQuality != .off,
+        guard effectiveGifQuality != .off,
               let url = folder?.focusGifUrl, !url.isEmpty,
               folder?.focusGifEnabled != false else { return nil }
         return url
@@ -402,7 +413,7 @@ struct CollectionFolderCard: View, Equatable {
                 // hundred GIFs at once, and it fades in over the still art.
                 if let gif = focusGifURL, isFocused {
                     AnimatedGIFView(url: gif, contentMode: .scaleAspectFill,
-                                    stillOnly: perf.settings.collectionGifQuality == .partial) { ok in
+                                    stillOnly: effectiveGifQuality == .partial) { ok in
                         withAnimation(.easeOut(duration: 0.22)) { gifPlaying = ok }
                     }
                     // Pin to the tile explicitly. Without a hard frame the
