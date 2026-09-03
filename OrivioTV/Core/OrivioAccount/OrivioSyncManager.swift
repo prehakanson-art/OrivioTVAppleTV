@@ -299,6 +299,14 @@ final class OrivioSyncManager: ObservableObject {
         // recorded a tombstone for each, which would then suppress the incoming
         // account's collections sharing those ids.
         collectionsStore.clearAll()
+        // Add-ons and plugin repos too. The `pulledAddonProfiles` gate below only
+        // stops a push that runs BEFORE the first pull, and in `syncNow` the pull
+        // always comes first — so without this the additive first pull unioned
+        // the previous user's add-ons with the new account's, and the replace
+        // push at the end of the same run uploaded that union (including manifest
+        // URLs carrying the previous user's debrid token) into the new account.
+        addonManager.clearAll()
+        pluginStore?.clearAll()
 
         // In-memory proof that a profile's library has been pulled THIS
         // session. It belongs to the account we just left; left set, the new
@@ -482,7 +490,10 @@ final class OrivioSyncManager: ObservableObject {
         libraryStore.onLocalChange = { [weak self] in self?.scheduleLibraryPush() }
         libraryStore.onRemove = { [weak self] items in self?.queueLibraryDeletes(items) }
         watchedStore.onLocalChange = { [weak self] in self?.scheduleWatchedPush() }
-        watchedStore.onRemove = { [weak self] items in self?.deleteWatchedItems(items) }
+        watchedStore.onRemove = { [weak self] items in
+            guard let self else { return }
+            self.deleteWatchedItems(items, profile: self.pid)
+        }
         profileStore.onLocalChange = { [weak self] in self?.scheduleProfilePush() }
         profileStore.onSwitch = { [weak self] id in self?.handleProfileSwitch(id) }
         collectionsStore.onLocalChange = { [weak self] in
@@ -1123,7 +1134,7 @@ final class OrivioSyncManager: ObservableObject {
             await drainPendingDeletes(profile: profile)
         }
         if !watchedItems.isEmpty {
-            deleteWatchedItems(watchedItems)
+            deleteWatchedItems(watchedItems, profile: profile)
             await drainPendingWatchedDeletes(profile: profile)
         }
         await pushAppPreferences(profile: profile)   // ship the clear point account-wide now
@@ -1718,11 +1729,13 @@ final class OrivioSyncManager: ObservableObject {
         return WatchedItem.key(contentID: parts[0], season: Int(parts[1]), episode: Int(parts[2]))
     }
 
-    private func deleteWatchedItems(_ items: [WatchedItem]) {
+    /// - Parameter profile: the profile the un-mark happened on. Pass it
+    ///   explicitly from any caller that has already suspended — reading `pid`
+    ///   here would queue one profile's tokens against whichever profile is
+    ///   active when the caller resumes, and drain them against that account.
+    private func deleteWatchedItems(_ items: [WatchedItem], profile: Int) {
         let tokens = items.map { watchedDeleteToken($0) }
         guard !tokens.isEmpty else { return }
-        // Queued and drained under the profile the un-mark happened on.
-        let profile = pid
         var pending = loadPendingWatchedDeletes(profile: profile)
         pending.formUnion(tokens)
         savePendingWatchedDeletes(pending, profile: profile)

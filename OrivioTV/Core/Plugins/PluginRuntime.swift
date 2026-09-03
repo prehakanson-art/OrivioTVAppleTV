@@ -157,13 +157,29 @@ final class PluginRuntime: @unchecked Sendable {
         // plugin queued behind it was stuck until relaunch.
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout + 1) { [weak self] in
             guard finish([]) else { return }
-            // We resumed instead of the script, so this run never came back:
-            // `queue`'s thread and this JSContext are gone for good. Remember the
-            // scraper so the rest of the session skips it — otherwise every
-            // subsequent search leaks another thread and another JSContext.
-            self?.markTimedOut(scraperID)
-            NSLog("[Plugin] '%@' timed out after %.0fs — its thread and JSContext can't be reclaimed (tvOS exposes no JS execution time limit), so it will be skipped for the rest of this session.",
-                  scraperName, timeout + 1)
+            // Losing the race does NOT prove the script is wedged: a healthy
+            // scraper making several sequential fetches on a slow network can
+            // simply take longer than the deadline, and banning it would
+            // permanently disable a working plugin for the session — the exact
+            // opposite of the intent. Probe the queue instead. A synchronous
+            // infinite loop owns its queue forever, so the sentinel never runs;
+            // a merely slow async chain drains it immediately.
+            let alive = Atomic(wrappedValue: false)
+            queue.async { alive.wrappedValue = true }
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2) {
+                guard !alive.wrappedValue else {
+                    NSLog("[Plugin] '%@' overran %.0fs but its queue is still live — treating it as slow, not wedged; it stays enabled.",
+                          scraperName, timeout + 1)
+                    return
+                }
+                // The queue never drained a trivial block in two seconds, so the
+                // thread and this JSContext are gone for good. Skip the scraper
+                // for the rest of the session; otherwise every later search
+                // leaks another thread and another JSContext.
+                self?.markTimedOut(scraperID)
+                NSLog("[Plugin] '%@' is wedged (its queue no longer drains) — tvOS exposes no JS execution time limit, so it will be skipped for the rest of this session.",
+                      scraperName)
+            }
         }
     }
 

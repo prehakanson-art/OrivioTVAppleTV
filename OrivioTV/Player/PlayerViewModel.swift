@@ -937,6 +937,14 @@ final class PlayerViewModel: ObservableObject {
                 guard let self, self.dvDirectEngine === engine else { return }
                 if ok {
                     Self.dvTrail("direct sample engine started")
+                    // A successful open proves the source is alive, so hand
+                    // over to the 20s STALL watchdog. The 30s load watchdog
+                    // otherwise had to cover the probe, the open, the display
+                    // handshake (up to 8.5s, during which the clock is
+                    // deliberately pinned at zero) and the preroll — a budget a
+                    // slow debrid link plus a fussy panel can genuinely exceed,
+                    // failing over a session that was opening normally.
+                    self.markLoadStarted()
                     // Report what the ENGINE found in the stream itself, not
                     // the preflight's guess — and name a converted P7 as the
                     // conversion it is, the same honesty the remux path kept.

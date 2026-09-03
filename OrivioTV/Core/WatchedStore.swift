@@ -146,6 +146,10 @@ final class WatchedStore: ObservableObject {
         let now = Date()
         if tombstone {
             for item in removedItems { tombstones[item.key] = now }
+        } else {
+            // Retiring the previous account: its removals must not suppress the
+            // incoming account's rows sharing those keys.
+            tombstones.removeAll()
         }
         items.removeAll()
         save()

@@ -897,9 +897,17 @@ final class ProgressStore: ObservableObject {
         // The Next Up dismissals are this profile's state too, and on an account
         // switch they would keep suppressing shows for a user who never removed
         // them. Cleared even when there are no rows to remove.
-        if !tombstone, !dismissedNextUpShows.isEmpty {
-            dismissedNextUpShows = []
-            UserDefaults.standard.removeObject(forKey: dismissedNextUpKey)
+        if !tombstone {
+            if !dismissedNextUpShows.isEmpty {
+                dismissedNextUpShows = []
+                UserDefaults.standard.removeObject(forKey: dismissedNextUpKey)
+            }
+            // The memory of what the PREVIOUS account deleted must go too, or it
+            // suppresses the incoming account's rows sharing those keys for the
+            // whole grace period.
+            tombstones.removeAll()
+            externallyMerged.removeAll()
+            awaitingServerAck.removeAll()
         }
         guard !removedKeys.isEmpty else { return [] }
         let now = Date()
@@ -1072,12 +1080,17 @@ final class ProgressStore: ObservableObject {
 /// the newer one.
 private actor ProgressPersister {
     static let shared = ProgressPersister()
-    private var lastSequence: UInt64 = 0
+    /// Per STORAGE KEY, not global. One counter compared across different
+    /// profiles' keys meant a burst of writes to several profiles — which is
+    /// exactly what an account switch does — could drop a whole profile's write
+    /// as "out of order" when it was simply for a different key, silently
+    /// leaving that profile's history on disk.
+    private var lastSequence: [String: UInt64] = [:]
 
     func write(_ snapshot: [String: WatchProgress], key: String,
                sequence: UInt64, shelf: [TopShelfExporter.Entry]?) {
-        guard sequence > lastSequence else { return }
-        lastSequence = sequence
+        guard sequence > (lastSequence[key] ?? 0) else { return }
+        lastSequence[key] = sequence
         guard let data = try? JSONEncoder().encode(snapshot) else { return }
         UserDefaults.standard.set(data, forKey: key)
         if let shelf { TopShelfExporter.write(shelf) }

@@ -1293,6 +1293,12 @@ private struct AutoLinkLoadingScreen: View {
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
+            // Nothing else here is focusable, and this screen owns the whole
+            // view for the length of an Auto Link Selector sweep (up to the 45s
+            // stream deadline). With NOTHING focused a Menu press falls through
+            // to tvOS and suspends the app — the same reason OrivioLoadingView
+            // takes `holdsFocus`.
+            FocusAnchor()
             RemoteImage(url: meta.background ?? meta.poster)
                 .ignoresSafeArea()
             LinearGradient(

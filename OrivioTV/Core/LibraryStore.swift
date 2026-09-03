@@ -217,6 +217,9 @@ final class LibraryStore: ObservableObject {
         if tombstone {
             let now = Date()
             for item in removed { tombstones[item.key] = now }
+        } else {
+            // Retiring the previous account: see ProgressStore.clearAllProgress.
+            tombstones.removeAll()
         }
         items.removeAll()
         save()

@@ -221,6 +221,22 @@ final class AddonManager: ObservableObject {
         notifyLocalChange()
     }
 
+    /// Remove every installed add-on. For an ACCOUNT SWITCH only.
+    ///
+    /// A configured add-on's manifest URL routinely embeds the user's own debrid
+    /// token (Torrentio and friends), and the first pull for a new account is
+    /// additive (its seeded flag was just cleared), so leaving these installed
+    /// meant the end-of-sync replace push uploaded the PREVIOUS user's manifest
+    /// URLs — token and all — into the new user's account.
+    ///
+    /// Deliberately silent: the caller is retiring the previous account's state
+    /// and must not arm a push of the result.
+    func clearAll() {
+        guard !addons.isEmpty else { return }
+        addons.removeAll()
+        save()
+    }
+
     func remove(_ addon: InstalledAddon) {
         addons.removeAll { $0.id == addon.id }
         save()

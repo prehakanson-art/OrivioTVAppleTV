@@ -683,6 +683,14 @@ final class DVSampleEngine {
         queueLock.lock()
         videoQueue.removeAll()
         audioQueue.removeAll()
+        // Clear the end flag HERE, in the same lock hold that empties the
+        // queues. Both feed paths test `demuxEOF && queues empty` to mean "the
+        // movie is over", and leaving the flag set until the parked demux thread
+        // gets scheduled left that window open with the queues already emptied:
+        // a feed block running in between reported the end, so rewinding inside
+        // the final ten seconds raised Up Next and saved the title as complete
+        // while the seek was still landing underneath it.
+        demuxEOF = false
         // BROADCAST, not signal: the demux thread may be parked at EOF
         // (`waitForSeekAfterEOF`) rather than waiting for queue room, and a
         // seek that failed to wake it would leave the rewind unserved — the
@@ -1243,7 +1251,13 @@ final class DVSampleEngine {
                 // ordinary seek takes. One thread, always exactly one: parking
                 // rather than exiting is what keeps `start()` from ever needing
                 // to spawn a second demuxer.
-                queueLock.lock(); demuxEOF = true; queueLock.broadcast(); queueLock.unlock()
+                queueLock.lock()
+                // Only if no seek landed while this read was in flight — a seek
+                // clears the flag, and setting it again here would re-open the
+                // same spurious-end window from the other side.
+                if seekGeneration == myGeneration { demuxEOF = true }
+                queueLock.broadcast()
+                queueLock.unlock()
                 guard waitForSeekAfterEOF(currentGeneration: myGeneration) else { break }
                 rearmAfterEOF()
                 eagainRetries = 0   // the post-seek reads are a fresh budget

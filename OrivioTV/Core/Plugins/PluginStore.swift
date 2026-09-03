@@ -96,6 +96,16 @@ final class PluginStore: ObservableObject {
         }
     }
 
+    /// Drop every repository and scraper. For an ACCOUNT SWITCH only — see
+    /// `AddonManager.clearAll`. Silent, so retiring the previous account's
+    /// state cannot arm a push of the result.
+    func clearAll() {
+        guard !repositories.isEmpty || !scrapers.isEmpty else { return }
+        repositories.removeAll()
+        scrapers.removeAll()
+        save()
+    }
+
     func removeRepository(_ id: String) {
         repositories.removeAll { $0.id == id }
         scrapers.removeAll { $0.repoID == id }
