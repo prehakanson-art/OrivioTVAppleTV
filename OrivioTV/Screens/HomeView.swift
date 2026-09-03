@@ -73,7 +73,12 @@ final class HomeViewModel: ObservableObject {
     /// `HeroFocus` object so its frequent animated updates only re-render the
     /// billboard, NOT the poster rows. That full re-render was cancelling the
     /// first long-press on a card right after moving to it.
-    var initialHero: MetaItem?
+    /// Published, so the hero can paint the MOMENT the disk cache decodes it.
+    /// As a plain var the view only read it after `loadIfNeeded` returned — i.e.
+    /// after every add-on had answered or timed out — so on a warm launch the
+    /// whole first screen, an 880pt hero, sat blank while the rows underneath it
+    /// were already drawn from cache and the answer was sitting right here.
+    @Published var initialHero: MetaItem?
 
     private var loadedFingerprint: [String] = []
     /// Bumped by every `load`. Loads overlap constantly on launch —
@@ -836,6 +841,23 @@ struct HomeView: View {
         .onChange(of: homeCatalogSettings.catalogTypeSuffixEnabled) { _, _ in Task { await reload() } }
         .onChange(of: homeCatalogSettings.hideUnreleasedContent) { _, _ in Task { await reload() } }
         .task(id: nextUpRefreshKey) { await refreshNextUpContinueItems() }
+        // Paint the hero from the cached rows without waiting for the network.
+        .onChange(of: viewModel.initialHero) { _, item in seedHero(item) }
+    }
+
+    /// Put a title in the billboard and land initial focus on its Play button.
+    /// Idempotent and one-shot for focus: called both from the cache (early, via
+    /// `onChange`) and after the live load, whichever happens first.
+    private func seedHero(_ item: MetaItem?) {
+        guard let item, hero.item == nil else { return }
+        hero.item = item
+        hero.setSpotlight(viewModel.spotlightItems(max: 10))
+        guard !didSeedHeroFocus, perf.settings.heroBackdrop else { return }
+        didSeedHeroFocus = true
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            heroPlayFocused = true
+        }
     }
 
     private var layoutContent: some View { fusionModernLayout }
@@ -889,17 +911,13 @@ struct HomeView: View {
             collections: collections,
             settings: homeCatalogSettings
         )
-        if hero.item == nil { hero.item = viewModel.initialHero }
-        // Seed the auto-rotating spotlight with the top titles (first catalog
-        // row's items that have backdrop art) so the hero cycles when idle.
+        // Usually already done from the cache above; this covers a cold launch
+        // where there was nothing to seed from.
+        seedHero(viewModel.initialHero)
+        // Re-seed the auto-rotating spotlight now the live rows are in, so it
+        // cycles the fresh top titles rather than the cached ones.
         hero.setSpotlight(viewModel.spotlightItems(max: 10))
         onContentReady()
-        // Land initial focus on the hero's Play button (see heroPlayFocused).
-        if !didSeedHeroFocus, hero.item != nil && perf.settings.heroBackdrop {
-            didSeedHeroFocus = true
-            try? await Task.sleep(nanoseconds: 100_000_000)
-            heroPlayFocused = true
-        }
     }
 
     @ViewBuilder
@@ -1102,12 +1120,26 @@ struct HomeView: View {
             .filter { !progressStore.dismissedNextUpShows.contains($0.contentID) }
             .prefix(20)
 
-        var rows: [WatchProgress] = []
-        for item in watchedSeries {
+        // Bounded-concurrent, not serial. These are full-series metadata
+        // responses — among the largest payloads in the app — and fetching up to
+        // twenty of them one after another meant ten to twenty seconds on a cold
+        // cache before a single Next Up card appeared. `boundedConcurrentMap`
+        // preserves order, and the result is re-sorted below anyway.
+        let fetched = await boundedConcurrentMap(
+            Array(watchedSeries), limit: AddonSweepLimits.catalogs
+        ) { item -> (meta: MetaItem, watchedAt: Date)? in
             guard let addon = addonManager.metaAddon(for: item.contentType, id: item.contentID),
-                  let meta = try? await StremioAPI.meta(addon: addon, type: item.contentType, id: item.contentID),
-                  let next = nextUpEpisode(in: meta) else { continue }
-            rows.append(nextUpProgress(meta: meta, episode: next, lastWatchedAt: item.watchedAt))
+                  let meta = try? await StremioAPI.meta(
+                      addon: addon, type: item.contentType, id: item.contentID
+                  )
+            else { return nil }
+            return (meta, item.watchedAt)
+        }
+        // `nextUpEpisode` reads the watched store, so it stays on the main actor.
+        var rows: [WatchProgress] = []
+        for case let entry? in fetched {
+            guard let next = nextUpEpisode(in: entry.meta) else { continue }
+            rows.append(nextUpProgress(meta: entry.meta, episode: next, lastWatchedAt: entry.watchedAt))
         }
         if !Task.isCancelled {
             nextUpContinueItems = rows

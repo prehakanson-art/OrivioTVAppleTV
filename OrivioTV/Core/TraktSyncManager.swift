@@ -50,7 +50,18 @@ final class TraktSyncManager: ObservableObject {
             .map { $0 != nil }
             .removeDuplicates()
             .sink { [weak self] signedIn in
-                if signedIn { self?.syncNow(force: true) }
+                guard signedIn else { return }
+                // Deferred, like the Stremio and account syncs already are.
+                // `@Published` delivers its CURRENT value on subscribe, so this
+                // fired during app construction and ran four network phases in
+                // series against the Home catalog sweep — and its watched-store
+                // merge then re-triggered the Next Up refetch on top. Nothing
+                // here needs to happen before the first screen is usable.
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(nanoseconds: 5_000_000_000)
+                    guard !Task.isCancelled else { return }
+                    self?.syncNow(force: true)
+                }
             }
             .store(in: &cancellables)
     }
@@ -93,14 +104,14 @@ final class TraktSyncManager: ObservableObject {
             let n = await pullPlayback(token: token)
             if n > 0 { parts.append("\(n) in-progress") }
         }
-        if trakt.syncWatchlist {
-            let n = await syncWatchlist(token: token)
-            parts.append("\(n) watchlist")
-        }
-        if trakt.syncRatings {
-            let n = await syncRatings(token: token)
-            parts.append("\(n) ratings")
-        }
+        // Watchlist and ratings touch different stores from each other and from
+        // the two phases above (LibraryStore and RatingsStore respectively), so
+        // they run together. History and playback stay sequential: both write
+        // progress/watched state and the order between them is load-bearing.
+        async let watchlistCount: Int? = trakt.syncWatchlist ? await syncWatchlist(token: token) : nil
+        async let ratingsCount: Int? = trakt.syncRatings ? await syncRatings(token: token) : nil
+        if let n = await watchlistCount { parts.append("\(n) watchlist") }
+        if let n = await ratingsCount { parts.append("\(n) ratings") }
         NSLog("[OrivioTrakt] runSync done: %@", parts.joined(separator: ", "))
         trakt.setSyncStatus(parts.isEmpty ? "Trakt: nothing to sync" : "Trakt synced (\(parts.joined(separator: ", ")))")
     }
