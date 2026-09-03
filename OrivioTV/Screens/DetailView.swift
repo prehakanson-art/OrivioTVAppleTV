@@ -891,39 +891,22 @@ struct DetailView: View {
                     LazyHStack(alignment: .top, spacing: OrivioSpacing.lg) {
                         ForEach(viewModel.meta.episodesIncludingLinkedSpecials(season: season)) { episode in
                             let extra = episode.episode.flatMap { viewModel.episodeExtras[season]?[$0] }
-                            Button {
-                                onPlay(viewModel.meta, episode)
-                            } label: {
-                                LandscapeCard(
-                                    imageURL: episode.thumbnail ?? extra?.still ?? viewModel.meta.background,
-                                    title: episodeTitle(episode),
-                                    subtitle: episodeSubtitle(episode, extra: extra),
-                                    progress: progressStore.progress(for: episode.id)?.fraction,
-                                    watched: watched.isWatched(
-                                        contentID: viewModel.meta.id,
-                                        season: season,
-                                        episode: episode.episode
-                                    ),
-                                    rating: extra?.rating.map { String(format: "%.1f", $0) },
-                                    width: 400,
-                                    subtitleBehavior: .readableOnFocus,
-                                    detailLine: episodeCastLine(viewModel.episodeCasts[episode.id]),
-                                    blurImage: shouldBlurEpisode(episode, season: season)
-                                )
-                            }
-                            .buttonStyle(PlainCardButtonStyle())
-                            // Hold Select on an episode to flip its watched
-                            // state without opening it.
-                            .contextMenu {
-                                Button {
-                                    toggleWatched(episode, season: season)
-                                } label: {
-                                    Label(isWatched(episode, season: season)
-                                          ? "Mark as Unwatched" : "Mark as Watched",
-                                          systemImage: isWatched(episode, season: season)
-                                          ? "eye.slash" : "checkmark.circle")
-                                }
-                            }
+                            EpisodeCell(
+                                imageURL: episode.thumbnail ?? extra?.still ?? viewModel.meta.background,
+                                title: episodeTitle(episode),
+                                subtitle: episodeSubtitle(episode, extra: extra),
+                                progress: progressStore.progress(for: episode.id)?.fraction,
+                                isWatched: watched.isWatched(
+                                    contentID: viewModel.meta.id,
+                                    season: season,
+                                    episode: episode.episode
+                                ),
+                                rating: extra?.rating.map { String(format: "%.1f", $0) },
+                                detailLine: episodeCastLine(viewModel.episodeCasts[episode.id]),
+                                blurImage: shouldBlurEpisode(episode, season: season),
+                                onPlay: { onPlay(viewModel.meta, episode) },
+                                onToggleWatched: { toggleWatched(episode, season: season) }
+                            )
                             .task { await viewModel.loadCast(for: episode) }
                         }
                     }
@@ -1125,6 +1108,78 @@ struct DetailView: View {
 /// invisible input-capture button.
 private struct InertButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View { configuration.label }
+}
+
+/// One episode in the season row. The still is the only thing inside the
+/// button, so the native platter raises and sheens JUST the artwork; the
+/// caption is a sibling below it and stays put, easing down only far enough to
+/// hold its gap as the platter grows the still downward. Putting the caption
+/// inside the button instead bridged art and text into one lifting slab.
+private struct EpisodeCell: View {
+    let imageURL: String?
+    let title: String
+    var subtitle: String?
+    var progress: Double?
+    var isWatched: Bool
+    var rating: String?
+    var detailLine: String?
+    var blurImage: Bool
+    let onPlay: () -> Void
+    let onToggleWatched: () -> Void
+
+    /// Focus mirrored out of the button: a sibling caption cannot read
+    /// `\.isFocused`, which only resolves inside the focusable view.
+    @State private var focused = false
+
+    private static let cardWidth: CGFloat = 400
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: OrivioSpacing.sm) {
+            Button(action: onPlay) {
+                LandscapeCard(
+                    imageURL: imageURL,
+                    title: title,
+                    subtitle: subtitle,
+                    progress: progress,
+                    watched: isWatched,
+                    rating: rating,
+                    width: Self.cardWidth,
+                    subtitleBehavior: .readableOnFocus,
+                    detailLine: detailLine,
+                    blurImage: blurImage,
+                    showsCaption: false
+                )
+                .onFocusChange { focused = $0 }
+            }
+            // The same focus treatment every other card in the app gets — the
+            // native platter, or a scale lift when "Card wiggle & lift" is off.
+            // It was PlainCardButtonStyle, which is neither, and LandscapeCard
+            // suppresses its own focus ring whenever the GLOBAL parallax/zoom
+            // settings are on (assuming a platter is carrying the highlight).
+            // With the defaults that left a focused episode with no ring, no
+            // platter and no lift — only the caption brightening — so you could
+            // not tell which episode you were on.
+            .mediaCardButtonStyle()
+            // Hold Select on an episode to flip its watched state without
+            // opening it.
+            .contextMenu {
+                Button(action: onToggleWatched) {
+                    Label(isWatched ? "Mark as Unwatched" : "Mark as Watched",
+                          systemImage: isWatched ? "eye.slash" : "checkmark.circle")
+                }
+            }
+
+            LandscapeCardCaption(
+                title: title,
+                subtitle: subtitle,
+                detailLine: detailLine,
+                width: Self.cardWidth,
+                subtitleBehavior: .readableOnFocus,
+                isFocused: focused,
+                lowered: focused
+            )
+        }
+    }
 }
 
 /// Circular cast headshot with name + character, focusable and clickable

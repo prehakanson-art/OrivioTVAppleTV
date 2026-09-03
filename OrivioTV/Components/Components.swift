@@ -810,11 +810,6 @@ struct LandscapeCard: View {
     var detailLine: String? = nil
     var remainingText: String? = nil
     var hasNewEpisode: Bool = false
-    /// Flip to false to revert episode cards to the compact caption if the taller
-    /// focused description treatment does not feel right on-device.
-    private static let expandedEpisodeDescriptionsEnabled = true
-    /// Flip to false to hide per-episode cast captions without removing the fetch/cache path.
-    private static let episodeCastLineEnabled = true
     /// Spoiler-blur the still until the card is focused (then it reveals).
     var blurImage: Bool = false
     /// When false, the title/subtitle caption is omitted — the Apple TV theme
@@ -886,6 +881,49 @@ struct LandscapeCard: View {
     }
 
     private var caption: some View {
+        LandscapeCardCaption(
+            title: title,
+            subtitle: subtitle,
+            detailLine: detailLine,
+            width: width,
+            subtitleBehavior: subtitleBehavior,
+            isFocused: isFocused
+        )
+    }
+}
+
+/// A `LandscapeCard`'s title / description / cast block. It lives out here so a
+/// caller can draw it as a SIBLING of the button rather than inside it (pass
+/// `showsCaption: false` to the card) — then the native platter raises and
+/// sheens only the still, and the text underneath stays put instead of riding
+/// up with the artwork as one slab. Same reason `ATVCardCaption` exists for
+/// posters; this one keeps the episode caption's expanding description and
+/// cast line, which that simpler caption has no room for.
+struct LandscapeCardCaption: View {
+    @EnvironmentObject private var theme: ThemeManager
+    @ObservedObject private var perf = PerformanceSettingsStore.shared
+
+    let title: String
+    var subtitle: String? = nil
+    var detailLine: String? = nil
+    var width: CGFloat
+    var subtitleBehavior: LandscapeSubtitleBehavior = .compact
+    /// Focus is passed IN: outside the button `\.isFocused` never turns true,
+    /// so a sibling caption has to be told (see `.onFocusChange` on the label).
+    var isFocused: Bool = false
+    /// Ease down while focused so the gap to the still stays constant as the
+    /// platter grows the artwork downward. Gated on the platter actually being
+    /// on, like ATVCardCaption — otherwise it slides away from a card that
+    /// never moved.
+    var lowered: Bool = false
+    var dropDistance: CGFloat = 13
+
+    /// Whether the caller draws this itself; the card reserves the same height
+    /// either way so rows don't change height when the treatment changes.
+    static let expandedEpisodeDescriptionsEnabled = true
+    static let episodeCastLineEnabled = true
+
+    var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             MarqueeText(
                 text: title,
@@ -912,6 +950,8 @@ struct LandscapeCard: View {
         }
         .frame(width: width, height: captionHeight, alignment: .topLeading)
         .clipped()
+        .offset(y: lowered && perf.cardParallaxEffective ? dropDistance : 0)
+        .animation(perf.motion(FusionMotion.focusEntry), value: lowered)
     }
 
     @ViewBuilder
@@ -947,7 +987,6 @@ struct LandscapeCard: View {
         let expanded = subtitleBehavior == .readableOnFocus && Self.expandedEpisodeDescriptionsEnabled
         return expanded ? (Self.episodeCastLineEnabled && detailLine?.isEmpty == false ? 156 : 132) : 72
     }
-
 }
 
 private struct RemainingTimeBadge: View {
