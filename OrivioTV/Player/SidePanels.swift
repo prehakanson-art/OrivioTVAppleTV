@@ -199,7 +199,7 @@ private struct EpisodeRow: View {
                     .clipShape(RoundedRectangle(cornerRadius: OrivioRadius.sm, style: .continuous))
                 if isCurrent {
                     Image(systemName: "play.fill")
-                        .font(.system(size: 15, weight: .bold))
+                        .font(.system(size: 18, weight: .bold))
                         .foregroundStyle(.white)
                         .padding(6)
                         .background(theme.palette.secondary, in: Circle())
@@ -210,7 +210,7 @@ private struct EpisodeRow: View {
             VStack(alignment: .leading, spacing: 3) {
                 if isCurrent {
                     Text("NOW PLAYING")
-                        .font(.system(size: 13, weight: .heavy))
+                        .font(.system(size: 18, weight: .heavy))
                         .kerning(1.1)
                         .foregroundStyle(theme.palette.secondary)
                 }

@@ -421,6 +421,13 @@ final class PlaybackClock: ObservableObject {
     @Published var scrubTarget: Double?
     /// Wheel indicator angle, likewise high-frequency.
     @Published var wheelAngle: Double = 0
+    /// Fast-forward / rewind preview position (nil = not scanning). Same reason
+    /// as `scrubTarget`: a continuous sweep restamps this four times a second,
+    /// and while it lived on the view model every one of those ticks invalidated
+    /// the whole player ZStack — the video view included — for a bar that moves
+    /// a few points. `PlayerViewModel.scanPreview` proxies through to here so
+    /// the playback logic reads and writes it exactly as before.
+    @Published var scanPreview: Double?
 }
 
 @MainActor
@@ -558,7 +565,10 @@ final class PlayerViewModel: ObservableObject {
     /// new content loads until the user commits with Play (`scanCommit`).
     /// `scanRate` is the continuous-sweep speed/direction (0 = paused-preview,
     /// +2/+3 = sweeping forward Nx, −2/−3 = sweeping back Nx).
-    @Published var scanPreview: Double?
+    var scanPreview: Double? {
+        get { clock.scanPreview }
+        set { clock.scanPreview = newValue }
+    }
     @Published private(set) var scanRate: Int = 0
     private var wasPlayingBeforeScan = false
 

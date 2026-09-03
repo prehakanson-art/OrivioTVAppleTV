@@ -281,7 +281,7 @@ private struct FusionBottomBlock<Trailing: View>: View {
 
     private var mode: FusionBarMode {
         if forcedScrub { return viewModel.wheelEngaged ? .fineTuning : .scrubbing }
-        if viewModel.scanPreview != nil { return .scanning }
+        if clock.scanPreview != nil { return .scanning }
         if viewModel.pendingSeekDelta != 0 { return .nudging }
         return .idle
     }
@@ -289,7 +289,7 @@ private struct FusionBottomBlock<Trailing: View>: View {
     /// The position the bar is POINTING at: a scan preview, a scrub target, or
     /// playback plus any pending nudge.
     private var target: Double {
-        let raw = viewModel.scanPreview ?? clock.scrubTarget
+        let raw = clock.scanPreview ?? clock.scrubTarget
             ?? (clock.position + viewModel.pendingSeekDelta)
         return min(max(raw, 0), duration)
     }
@@ -377,7 +377,7 @@ private struct FusionBottomBlock<Trailing: View>: View {
     /// will finish.
     private func wallClock(_ text: String) -> some View {
         Text(text)
-            .font(.system(size: 16, weight: .medium))
+            .font(.system(size: 20, weight: .medium))
             .foregroundStyle(.white.opacity(0.45))
             .lineLimit(1)
             .fixedSize()
@@ -502,9 +502,9 @@ private struct FusionSceneWindow: View {
                 if rate != 0 {
                     HStack(spacing: 5) {
                         Image(systemName: rate > 0 ? "forward.fill" : "backward.fill")
-                            .font(.system(size: 15, weight: .bold))
+                            .font(.system(size: 19, weight: .bold))
                         Text("\(abs(rate))×")
-                            .font(.system(size: 16, weight: .bold).monospacedDigit())
+                            .font(.system(size: 21, weight: .bold).monospacedDigit())
                     }
                     .foregroundStyle(.white)
                     .padding(.horizontal, 10)
@@ -557,7 +557,7 @@ private struct FusionPlayheadReadout: View {
             .shadow(color: .black.opacity(0.8), radius: 6)
             if let note {
                 Text(note)
-                    .font(.system(size: 16, weight: .medium))
+                    .font(.system(size: 20, weight: .medium))
                     .foregroundStyle(.white.opacity(0.6))
                     .lineLimit(1)
             }
@@ -644,7 +644,7 @@ private struct FusionOptionsGlyph: View {
                 .overlay(Circle().strokeBorder(.white.opacity(isFocused ? 0 : 0.18), lineWidth: 1))
                 .focusLift(OrivioFocus.control, isFocused)
             Text("Options")
-                .font(.system(size: 16, weight: .medium))
+                .font(.system(size: 20, weight: .medium))
                 .foregroundStyle(.white.opacity(0.9))
                 .opacity(isFocused ? 1 : 0)
                 .lineLimit(1)
@@ -723,7 +723,7 @@ private struct FusionOptionsPopup: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             Text("Options")
-                .font(.system(size: 15, weight: .semibold))
+                .font(.system(size: 20, weight: .semibold))
                 .kerning(1.3)
                 .textCase(.uppercase)
                 .foregroundStyle(.white.opacity(0.42))

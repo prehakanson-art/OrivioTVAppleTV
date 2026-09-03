@@ -1100,9 +1100,9 @@ struct InfoPullDownPanel: View {
     private func shortcutHint(icon: String, text: String) -> some View {
         HStack(spacing: 6) {
             Image(systemName: icon)
-                .font(.system(size: 14, weight: .semibold))
+                .font(.system(size: 18, weight: .semibold))
             Text(text)
-                .font(.system(size: 16, weight: .medium))
+                .font(.system(size: 21, weight: .medium))
         }
         .foregroundStyle(.white.opacity(0.4))
     }
@@ -1230,16 +1230,16 @@ struct InfoPullDownPanel: View {
             ForEach(infoSections) { section in
                 VStack(alignment: .leading, spacing: OrivioSpacing.sm) {
                     Text(section.title.uppercased())
-                        .font(.system(size: 15, weight: .bold))
+                        .font(.system(size: 20, weight: .bold))
                         .kerning(1.2)
                         .foregroundStyle(.white.opacity(0.45))
                     ForEach(section.rows) { row in
                         VStack(alignment: .leading, spacing: 1) {
                             Text(row.label)
-                                .font(.system(size: 14, weight: .medium))
+                                .font(.system(size: 20, weight: .medium))
                                 .foregroundStyle(.white.opacity(0.45))
                             Text(row.value)
-                                .font(.system(size: 19, weight: .semibold))
+                                .font(.system(size: 24, weight: .semibold))
                                 .foregroundStyle(.white.opacity(0.95))
                                 // Playback Path rows carry full sentences — a
                                 // remux failure REASON most of all. Truncating
@@ -1281,12 +1281,12 @@ private struct InfoCastChip: View {
                 .clipShape(Circle())
                 .overlay(Circle().strokeBorder(.white.opacity(0.12), lineWidth: 1))
             Text(member.name)
-                .font(.system(size: 16, weight: .semibold))
+                .font(.system(size: 22, weight: .semibold))
                 .foregroundStyle(.white.opacity(0.9))
                 .lineLimit(1)
             if let character = member.character, !character.isEmpty {
                 Text(character)
-                    .font(.system(size: 14))
+                    .font(.system(size: 19))
                     .foregroundStyle(.white.opacity(0.5))
                     .lineLimit(1)
             }
