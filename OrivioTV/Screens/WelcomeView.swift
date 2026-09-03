@@ -12,10 +12,19 @@ import SwiftUI
 struct WelcomeView: View {
     @EnvironmentObject private var theme: ThemeManager
     @ObservedObject var account: OrivioAccountManager
+    @ObservedObject var addonManager: AddonManager
     let onFinished: () -> Void
 
-    private enum Step { case choose, email }
-    @State private var step: Step = .choose
+    /// `offerAddons` and `addAddons` are only reachable from "Use without an
+    /// account". Someone who SIGNED IN has their add-ons arriving from their
+    /// account moments later, so asking them to add some would be both
+    /// redundant and confusing.
+    private enum Step { case choose, email, offerAddons, addAddons }
+    @State private var step: Step =
+        ProcessInfo.processInfo.arguments.contains("-welcomeOfferDemo") ? .offerAddons : .choose
+    /// The offer's primary action holds focus, so a Select arriving as the
+    /// screen appears takes the additive choice rather than dismissing it.
+    @FocusState private var offerFocus: Bool
     @State private var email = ""
     @State private var password = ""
     @State private var signingIn = false
@@ -39,6 +48,9 @@ struct WelcomeView: View {
                 switch step {
                 case .choose: chooser
                 case .email: emailForm
+                case .offerAddons: addonOffer
+                case .addAddons:
+                    AddonPhoneAddView(addonManager: addonManager, onDone: onFinished)
                 }
             }
             .padding(OrivioSpacing.huge)
@@ -114,9 +126,35 @@ struct WelcomeView: View {
                         step = .email
                     }
                 }
-                Button("Use without an account", action: onFinished)
+                Button("Use without an account") {
+                    account.cancelQRLogin()
+                    step = .offerAddons
+                }
             }
             .padding(.top, OrivioSpacing.sm)
+        }
+    }
+
+    // MARK: Add-ons offer
+
+    private var addonOffer: some View {
+        VStack(spacing: OrivioSpacing.lg) {
+            Text("Add add-ons?")
+                .font(FusionType.pageTitle(theme.font))
+                .foregroundStyle(theme.palette.textPrimary)
+            Text("Add-ons are where Orivio gets its catalogs, artwork and streams. Cinemeta and OpenSubtitles are already installed. You can add more from your phone now — no typing on the remote — or any time from Settings → Add-ons.")
+                .font(FusionType.bodyText(theme.font))
+                .foregroundStyle(theme.palette.textSecondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 900)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: OrivioSpacing.md) {
+                Button("Add add-ons now") { step = .addAddons }
+                    .focused($offerFocus)
+                Button("Later, in Settings", action: onFinished)
+            }
+            .padding(.top, OrivioSpacing.sm)
+            .onAppear { offerFocus = true }
         }
     }
 

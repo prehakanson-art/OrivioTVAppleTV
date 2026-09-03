@@ -212,18 +212,21 @@ final class AddonImportServer: ObservableObject {
         body{margin:0;padding:24px;background:#0d0f14;color:#f2f2f7;
              font:16px/1.5 -apple-system,system-ui,sans-serif}
         h1{font-size:22px;margin:0 0 4px} p{color:#9a9aa6;margin:0 0 20px}
-        input{width:100%;box-sizing:border-box;padding:14px;font-size:16px;
-              border-radius:12px;border:1px solid #2c2f3a;background:#161923;color:#fff}
+        textarea{width:100%;box-sizing:border-box;padding:14px;font-size:16px;
+              border-radius:12px;border:1px solid #2c2f3a;background:#161923;color:#fff;
+              font-family:ui-monospace,Menlo,monospace;resize:vertical}
         button{margin-top:12px;width:100%;padding:14px;font-size:17px;font-weight:600;
                border:0;border-radius:12px;background:#7c3aed;color:#fff}
         .note{margin:16px 0 0;color:#c7c7d1}
         ul{padding-left:20px} li{margin:4px 0}
         </style></head><body>
         <h1>Add add-ons</h1>
-        <p>Paste a manifest URL. One per line for several.</p>
+        <p>Paste one manifest URL, or a whole Add-on Setup export — one URL
+        per line. Scanning the Export Add-on Setup QR from another Orivio
+        gives you exactly that list.</p>
         <form method=post action="/">
-        <input name=url autocapitalize=off autocorrect=off spellcheck=false
-               inputmode=url placeholder="https://…/manifest.json" autofocus>
+        <textarea name=url rows=6 autocapitalize=off autocorrect=off
+                  spellcheck=false placeholder="https://&hellip;/manifest.json" autofocus></textarea>
         <button type=submit>Add to Orivio</button>
         </form>\(note)\(list)
         </body></html>

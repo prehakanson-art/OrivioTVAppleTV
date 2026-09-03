@@ -110,6 +110,7 @@
 		A8B618F01648F09355B4AD37 /* OrivioSyncManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 343918D06B3BE0D50D514515 /* OrivioSyncManager.swift */; };
 		AC3D606BB8156028236C51C2 /* DiagnosticsService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A9D51722BFE9BE21746795F /* DiagnosticsService.swift */; };
 		AC455BAF271DD72DE6BE2983 /* StreamProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = E26267002F066B9550A6AA41 /* StreamProbe.swift */; };
+		AD70F6C9931E5401C714885E /* AddonPhoneAddView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E28A3B8B2BEAAE5B89B4B452 /* AddonPhoneAddView.swift */; };
 		B41A90FFA692D997DA4A16B1 /* CollectionSourcePickerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D8AAB5DE5A3C8C166957C0C /* CollectionSourcePickerView.swift */; };
 		B69BFAF902737DCAB1312EEC /* PictureInPicture.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE159BBC1CE7195160E54884 /* PictureInPicture.swift */; };
 		BE8530C761041E0641F13AA9 /* LiveTVSettingsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9845B0EA1C787B090833EDC4 /* LiveTVSettingsStore.swift */; };
@@ -279,6 +280,7 @@
 		DEFF051B946AA2A704F5AE4B /* OrivioConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrivioConfig.swift; sourceTree = "<group>"; };
 		E13A33496D93F8B432057F04 /* ATVSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ATVSettingsView.swift; sourceTree = "<group>"; };
 		E26267002F066B9550A6AA41 /* StreamProbe.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamProbe.swift; sourceTree = "<group>"; };
+		E28A3B8B2BEAAE5B89B4B452 /* AddonPhoneAddView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AddonPhoneAddView.swift; sourceTree = "<group>"; };
 		E28E10356B1135B4BFF354D5 /* AddonImportServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AddonImportServer.swift; sourceTree = "<group>"; };
 		E2AF54A21166EC2FE7E70FA8 /* PlayerViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerViewModel.swift; sourceTree = "<group>"; };
 		E57FA38C482F71DE9C65359D /* SettingsTraktView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsTraktView.swift; sourceTree = "<group>"; };
@@ -391,6 +393,7 @@
 			children = (
 				1091EB872A06CA1C9AE5E569 /* AccountView.swift */,
 				02830E2CD2474508165BC44F /* AddonDiscoverView.swift */,
+				E28A3B8B2BEAAE5B89B4B452 /* AddonPhoneAddView.swift */,
 				E13A33496D93F8B432057F04 /* ATVSettingsView.swift */,
 				4940B856E21E842BB598723F /* CastDetailView.swift */,
 				78D74FCDE486BE869E0193FA /* CatalogSeeAllView.swift */,
@@ -731,6 +734,7 @@
 				863516B242BE074238412A8B /* AddonDiscoverView.swift in Sources */,
 				1D846EC0580C64ECC402D963 /* AddonImportServer.swift in Sources */,
 				148670B15320178A243421F4 /* AddonManager.swift in Sources */,
+				AD70F6C9931E5401C714885E /* AddonPhoneAddView.swift in Sources */,
 				321709B26C90C869D0ECE1FE /* AnimatedGIFView.swift in Sources */,
 				04409CF4F100848004803ED6 /* AnimeSkipService.swift in Sources */,
 				5661971DB8D72E70B847E90E /* AppGroupResolver.swift in Sources */,

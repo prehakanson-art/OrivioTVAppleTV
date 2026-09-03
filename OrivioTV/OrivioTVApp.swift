@@ -547,7 +547,7 @@ struct RootView: View {
             // top: on a fresh install both would otherwise want the screen,
             // and "who's watching" makes no sense before "who are you".
             .fullScreenCover(isPresented: $showWelcome) {
-                WelcomeView(account: account) {
+                WelcomeView(account: account, addonManager: addonManager) {
                     OnboardingState.completed = true
                     showWelcome = false
                 }
