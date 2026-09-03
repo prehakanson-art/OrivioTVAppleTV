@@ -775,21 +775,45 @@ struct RootView: View {
     /// the left edge over full-bleed content. OVERLAY layout (not an HStack)
     /// so the expanding panel just draws over the dimmed content — the content
     /// column never re-lays-out during the spring.
+    /// The rail is open and holding focus, so the content is dimmed and slid
+    /// aside beneath it.
+    private var sidebarExpanded: Bool { sidebarFocus != nil && showSidebar }
+
     private var tabLayout: some View {
         ZStack(alignment: .leading) {
             selectedContent
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                // Fade the incoming tab up instead of cutting to it. Removal
+                // is `.identity` on purpose: the outgoing screen leaves the
+                // tree at once, so two full tab hierarchies are never live
+                // together (and never both focusable) — only the arriving one
+                // animates. `.id` is what makes a tab change read as an
+                // insertion rather than an in-place update.
+                .id(selectedTab)
+                .transition(.asymmetric(insertion: .opacity, removal: .identity))
+                .animation(perf.sidebarAnimationEffective ? .easeOut(duration: 0.22) : nil,
+                           value: selectedTab)
                 .overlay {
                     // Dim the content while the rail is expanded/focused, so
                     // the glass panel reads above it.
                     Color.black.opacity(0.55)
                         .ignoresSafeArea()
                         .allowsHitTesting(false)
-                        .opacity(sidebarFocus != nil && showSidebar ? 1 : 0)
+                        .opacity(sidebarExpanded ? 1 : 0)
                 }
                 // Home runs full-bleed (hero art sweeps under the floating
                 // pill); other tabs clear the rail.
                 .padding(.leading, showSidebar && selectedTab != 0 ? GlassSidebar.collapsedWidth : 0)
+                // Slide out from under the expanded panel. Still an OFFSET,
+                // not layout: the content column keeps its geometry through
+                // the spring, it just rides sideways. Without it the panel
+                // opened straight over the page and cut the screen title in
+                // half — on Settings you were reading "ayout" with the rest of
+                // the heading behind glass. The shift clears the panel's right
+                // edge (28 leading + 240 wide) less the inset the content
+                // already keeps, and the gap it opens on the left is exactly
+                // the strip the panel is covering, so nothing shows through.
+                .offset(x: sidebarExpanded ? GlassSidebar.expandedWidth + 28 - GlassSidebar.collapsedWidth : 0)
                 .focusSection()
 
             if showSidebar {
