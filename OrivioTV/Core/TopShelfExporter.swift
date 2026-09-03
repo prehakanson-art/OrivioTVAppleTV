@@ -17,6 +17,10 @@ enum TopShelfExporter {
         let title: String
         let subtitle: String?
         let imageURL: String?
+        /// How far in, 0...1 — drawn as the bar across the bottom of the card.
+        /// Optional so a snapshot written by an older build still decodes; it
+        /// reads back as nil and the card simply has no bar.
+        var progress: Double? = nil
     }
 
     /// Build the export entries on the caller's (main) side — cheap — so the
@@ -35,7 +39,12 @@ enum TopShelfExporter {
                 subtitle: subtitle,
                 // Wide art to match the .hdtv shape: episode still, then
                 // backdrop, then poster as a last resort.
-                imageURL: p.episodeThumbnail ?? p.background ?? p.poster
+                imageURL: p.episodeThumbnail ?? p.background ?? p.poster,
+                // `fraction` is already position/duration guarded against a
+                // zero duration; clamp anyway because playbackProgress is
+                // documented as 0...1 and a row restored from another device
+                // can carry a position past its duration.
+                progress: min(max(p.fraction, 0), 1)
             )
         }
     }

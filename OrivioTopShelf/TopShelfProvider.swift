@@ -23,6 +23,7 @@ final class TopShelfProvider: TVTopShelfContentProvider {
         let title: String
         let subtitle: String?
         let imageURL: String?
+        var progress: Double? = nil
     }
 
     override func loadTopShelfContent(completionHandler: @escaping (TVTopShelfContent?) -> Void) {
@@ -43,6 +44,9 @@ final class TopShelfProvider: TVTopShelfContentProvider {
             let item = TVTopShelfSectionedItem(identifier: entry.id)
             item.title = entry.subtitle.map { "\(entry.title) — \($0)" } ?? entry.title
             item.imageShape = .hdtv   // 16:9, matching the in-app CW cards
+            // The bar across the bottom of the card — the whole point of a
+            // Continue Watching shelf is seeing how far in you are.
+            if let progress = entry.progress { item.playbackProgress = progress }
             if let urlString = entry.imageURL, let url = URL(string: urlString) {
                 item.setImageURL(url, for: [.screenScale1x, .screenScale2x])
             }
