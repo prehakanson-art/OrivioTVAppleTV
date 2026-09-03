@@ -263,6 +263,9 @@ struct RootView: View {
                         // than waiting for a tick.
                         SyncCoordinator.shared.requestFullSync("profile switched")
                     }
+                    profiles.onProfileLockChanged = { [weak progressStore] in
+                        progressStore?.refreshTopShelf()
+                    }
                     profiles.onProfileDeleted = { [weak trakt] id in
                         trakt?.forgetProfile(id)
                         SyncCoordinator.shared.requestFullSync("profile deleted")

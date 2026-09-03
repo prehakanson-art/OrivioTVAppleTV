@@ -287,10 +287,19 @@ final class ProfileStore: ObservableObject {
         onSwitch?(id)
     }
 
+    /// Called after a profile's PIN is switched on or off, so the Top Shelf
+    /// can drop (or resume showing) that profile's Continue Watching. Set by
+    /// the app; nil in tests and previews.
+    var onProfileLockChanged: (() -> Void)?
+
     func setPinEnabled(id: Int, _ enabled: Bool) {
         guard let idx = profiles.firstIndex(where: { $0.id == id }) else { return }
         profiles[idx].pinEnabled = enabled
         saveList()
+        // Only the ACTIVE profile's data is on the shelf, but firing
+        // unconditionally is both cheaper and safer than deciding here — the
+        // exporter re-reads which profile is active anyway.
+        onProfileLockChanged?()
     }
 
     func setAvatar(id: Int, avatarID: String?) {

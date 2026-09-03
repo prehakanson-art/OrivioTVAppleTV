@@ -297,6 +297,17 @@ final class ProgressStore: ObservableObject {
         suppressChange = false
     }
 
+    /// Re-export the Top Shelf snapshot without touching stored progress.
+    /// Needed when something OTHER than progress changes what may be shown —
+    /// today, a profile's PIN being switched on or off, which changes whether
+    /// this profile's Continue Watching may appear on the home screen at all.
+    /// Without this the shelf kept the pre-PIN rows until the next playback
+    /// save or relaunch.
+    func refreshTopShelf() {
+        let shelf = TopShelfExporter.entries(from: continueWatching)
+        Task.detached(priority: .utility) { TopShelfExporter.write(shelf) }
+    }
+
     /// All entries, for a full push to the account backend.
     func allForSync() -> [WatchProgress] { Array(items.values) }
 
