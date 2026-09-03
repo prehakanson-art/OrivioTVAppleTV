@@ -60,7 +60,14 @@ final class WatchedStore: ObservableObject {
         for key in keys { tombstones[key] = now }
     }
 
-    private var profileID = 1
+    /// Read from the SAME key `ProfileStore` persists, so the scope is right
+    /// from LAUNCH. The sync manager rescopes every store shortly after start,
+    /// but defaulting to 1 here meant a device on any other profile decoded
+    /// profile 1's blob on the main actor and then decoded the correct one a
+    /// moment later — twice the launch cost, and a reload cascade on top.
+    /// `RatingsStore` and `TraktStore` already do this.
+    private static let activeProfileKey = "orivio.profiles.active"
+    private var profileID = UserDefaults.standard.object(forKey: activeProfileKey) as? Int ?? 1
     private var storageKey: String {
         profileID == 1 ? "orivio.watched.v1" : "orivio.watched.v1.p\(profileID)"
     }

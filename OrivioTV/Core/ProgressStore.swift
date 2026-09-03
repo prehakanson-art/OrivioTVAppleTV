@@ -219,7 +219,14 @@ final class ProgressStore: ObservableObject {
 
     /// Active profile scope. Profile 1 uses the original (unsuffixed) key so
     /// existing data is preserved; other profiles get a suffixed namespace.
-    private var profileID = 1
+    /// Read from the SAME key `ProfileStore` persists, so the scope is right
+    /// from LAUNCH. The sync manager rescopes every store shortly after start,
+    /// but defaulting to 1 here meant a device on any other profile decoded
+    /// profile 1's blob on the main actor and then decoded the correct one a
+    /// moment later — twice the launch cost, and a reload cascade on top.
+    /// `RatingsStore` and `TraktStore` already do this.
+    private static let activeProfileKey = "orivio.profiles.active"
+    private var profileID = UserDefaults.standard.object(forKey: activeProfileKey) as? Int ?? 1
     private var storageKey: String {
         profileID == 1 ? "orivio.progress.v1" : "orivio.progress.v1.p\(profileID)"
     }

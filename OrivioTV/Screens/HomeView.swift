@@ -462,6 +462,12 @@ final class HomeViewModel: ObservableObject {
             // the Sources sweep uses.
             var lastFlush = Date.distantPast
             for await (index, key, entry) in group {
+                // Stop the whole sweep once superseded, rather than only muting
+                // its results. The generation check below prevented a stale
+                // publish, but the abandoned run carried on issuing and decoding
+                // every remaining catalog page — so the duplicated work and the
+                // memory peak both survived it.
+                guard isCurrent() else { group.cancelAll(); break }
                 startNext()
                 guard let entry else { continue }
                 fetched.append((index: index, key: String?.some(key), entry: entry))
@@ -763,6 +769,8 @@ struct HomeView: View {
     /// in the background), and re-seeding there yanked focus out of whatever
     /// row you were browsing back up to the hero.
     @State private var didSeedHeroFocus = false
+    /// Coalesces the launch burst of store publishes into one reload.
+    @State private var reloadDebounce: Task<Void, Never>?
     @State private var nextUpContinueItems: [WatchProgress] = []
 
     /// Drives the Apple TV hero's spotlight rotation. Ticks every 2s; the hero
@@ -829,17 +837,22 @@ struct HomeView: View {
                 )
             }
         }
-        .onChange(of: addonManager.addons) { _, _ in Task { await reload() } }
-        .onChange(of: collections.collections) { _, _ in Task { await reload() } }
-        .onChange(of: homeCatalogSettings.orderKeys) { _, _ in Task { await reload() } }
-        .onChange(of: homeCatalogSettings.disabledKeys) { _, _ in Task { await reload() } }
-        .onChange(of: homeCatalogSettings.customTitles) { _, _ in Task { await reload() } }
+        // Eight separate triggers, ONE debounced reload. Each of these used to
+        // fire its own unthrottled `reload()`, and at launch they arrive in a
+        // burst: the first load runs, then the collections library finishes
+        // decoding, then profile scoping republishes four settings at once — so
+        // a cold start ran the whole catalog sweep two to four times over.
+        .onChange(of: addonManager.addons) { _, _ in scheduleReload() }
+        .onChange(of: collections.collections) { _, _ in scheduleReload() }
+        .onChange(of: homeCatalogSettings.orderKeys) { _, _ in scheduleReload() }
+        .onChange(of: homeCatalogSettings.disabledKeys) { _, _ in scheduleReload() }
+        .onChange(of: homeCatalogSettings.customTitles) { _, _ in scheduleReload() }
         // Same reason as the three above: these three change what the loader
         // produces, and nothing else asked Home to rebuild when they flipped —
         // the row titles (and the unreleased filter) stayed stale.
-        .onChange(of: homeCatalogSettings.catalogAddonNameEnabled) { _, _ in Task { await reload() } }
-        .onChange(of: homeCatalogSettings.catalogTypeSuffixEnabled) { _, _ in Task { await reload() } }
-        .onChange(of: homeCatalogSettings.hideUnreleasedContent) { _, _ in Task { await reload() } }
+        .onChange(of: homeCatalogSettings.catalogAddonNameEnabled) { _, _ in scheduleReload() }
+        .onChange(of: homeCatalogSettings.catalogTypeSuffixEnabled) { _, _ in scheduleReload() }
+        .onChange(of: homeCatalogSettings.hideUnreleasedContent) { _, _ in scheduleReload() }
         .task(id: nextUpRefreshKey) { await refreshNextUpContinueItems() }
         // Paint the hero from the cached rows without waiting for the network.
         .onChange(of: viewModel.initialHero) { _, item in seedHero(item) }
@@ -893,6 +906,19 @@ struct HomeView: View {
             // edge to edge (like the Detail page); rows re-inset themselves above.
             .ignoresSafeArea(edges: [.top, .horizontal])
             .scrollClipDisabled()
+        }
+    }
+
+    /// Coalesce a burst of store publishes into one reload. `loadIfNeeded` is
+    /// fingerprint-guarded, so a redundant call is cheap — but only after it has
+    /// already re-derived the whole request list, and at launch these arrive
+    /// several at a time.
+    private func scheduleReload() {
+        reloadDebounce?.cancel()
+        reloadDebounce = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard !Task.isCancelled else { return }
+            await reload()
         }
     }
 
