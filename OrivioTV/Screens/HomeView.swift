@@ -364,6 +364,13 @@ final class HomeViewModel: ObservableObject {
             if !stale.isEmpty {
                 entries = stale
                 if initialHero == nil { initialHero = Self.firstHero(stale) }
+                // As early as the rows exist, before the network revalidation
+                // even starts. Backdrops are the one image class nothing warms:
+                // the poster prefetch below only takes `\.poster` from rows 3+,
+                // so every spotlight title used to hit the network at the
+                // moment it rotated in — a full-screen download while you are
+                // looking at the frame it belongs in.
+                warmSpotlightArt()
             }
         }
 
@@ -509,6 +516,9 @@ final class HomeViewModel: ObservableObject {
         if !toCache.isEmpty { HomeCatalogCache.save(toCache) }
 
         if initialHero == nil { initialHero = Self.firstHero(entries) }
+        // Again with the live rows: the fresh top titles may differ from the
+        // cached ones, and an already-cached URL costs a `fileExists` here.
+        warmSpotlightArt()
         if entries.isEmpty {
             loadError = "No catalogs available. Check your addons and network connection."
         }
@@ -558,6 +568,15 @@ final class HomeViewModel: ObservableObject {
             return nil
         }.first
         return firstCatalog?.items.first { $0.background != nil } ?? firstCatalog?.items.first
+    }
+
+    /// Pull the spotlight's backdrops into the image cache. Gated on the same
+    /// switch as the poster prefetch — this is art that is not on screen yet.
+    private func warmSpotlightArt() {
+        guard PerformanceSettingsStore.shared.settings.artworkPrefetch else { return }
+        let art = spotlightItems(max: 6).compactMap { $0.background ?? $0.poster }
+        guard !art.isEmpty else { return }
+        ImageCache.shared.warm(urls: art)
     }
 
     /// The top titles for the Apple TV hero's spotlight rotation: the first

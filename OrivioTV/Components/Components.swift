@@ -307,6 +307,32 @@ final class ImageCache: @unchecked Sendable {
         }
     }
 
+    /// Warm a SHORT list of high-priority URLs — the hero backdrops — outside
+    /// the row prefetch above.
+    ///
+    /// Deliberately not routed through `prefetch(urls:)`: that keeps a single
+    /// cancellable task handle, so the hero and the poster warm-up would cancel
+    /// each other depending on which ran last, and the loser would silently do
+    /// nothing. These also run at `.userInitiated` rather than `.utility`,
+    /// because a hero backdrop is the largest image on the screen and the one
+    /// the viewer is looking at, not something below the fold.
+    func warm(urls: [String]) {
+        var seen = Set<String>()
+        let unique = urls.filter { seen.insert($0).inserted }.prefix(8)
+        for urlString in unique {
+            guard let url = URL(string: urlString) else { continue }
+            Task.detached(priority: .userInitiated) { [weak self] in
+                guard let self else { return }
+                let fileURL = self.fileURL(for: urlString)
+                if self.fm.fileExists(atPath: fileURL.path) { return }
+                // `download` coalesces, so warming a URL a visible view is
+                // already fetching costs one request, not two.
+                guard let data = try? await self.download(url) else { return }
+                self.ioQueue.async { self.writeCacheFile(data, to: fileURL) }
+            }
+        }
+    }
+
     // MARK: Pre-blurred renditions (hero "progressive blur")
 
     /// Shared CIContext for the pre-blur path. Creating one per blur would
