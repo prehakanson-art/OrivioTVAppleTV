@@ -788,12 +788,16 @@ struct LandscapeCard: View {
             }
             .overlay(
                 RoundedRectangle(cornerRadius: cardRadius, style: .continuous)
-                    // ATV theme: the accent glow normally carries focus, but it
-                    // rides the Card Shadows switch — when that's off (A8/A10X
-                    // tier defaults), fall back to the ring so the focused card
-                    // is always marked. One vector stroke, no offscreen pass
-                    // (see PosterCard.showsFocusRing). Stremio: thicker purple.
-                    .strokeBorder(isFocused && !perf.settings.cardShadows
+                    // Same rule as `PosterCard.showsFocusRing`, which this used
+                    // to disagree with. Keying the ring on the Card Shadows
+                    // switch was wrong twice over: the accent glow it deferred to
+                    // no longer exists, and this card draws no shadow of its own
+                    // — so with shadows ON (the default on 4K gen 2/3) a focused
+                    // Continue Watching or episode card had NO marker at all
+                    // once the platter and the zoom were suppressed, which is
+                    // exactly what Reduce Motion does. Ring unless something else
+                    // actually moves the card.
+                    .strokeBorder(isFocused && !(perf.cardParallaxEffective || perf.focusZoomEffective)
                                       ? theme.palette.focusRing : .clear,
                                   lineWidth: 3)
             )

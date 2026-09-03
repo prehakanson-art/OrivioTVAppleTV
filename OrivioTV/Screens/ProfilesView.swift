@@ -377,12 +377,16 @@ struct PinEntryView: View {
 private struct PinKeyStyle: ButtonStyle {
     @Environment(\.isFocused) private var isFocused
     func makeBody(configuration: Configuration) -> some View {
+        // ONE foregroundStyle. An inner `.foregroundStyle(.white)` used to sit
+        // above this and resolve the label first, so the outer conditional never
+        // reached the glyph: a focused key drew white-on-0.9-white and the digit
+        // vanished — on the keypad guarding a profile's PIN.
         configuration.label
-            .foregroundStyle(.white)
+            .foregroundStyle(isFocused ? .black : .white)
             .frame(width: 90, height: 90)
             .background(Circle().fill(isFocused ? Color.white.opacity(0.9) : Color.white.opacity(0.12)))
-            .foregroundStyle(isFocused ? .black : .white)
             .focusLift(OrivioFocus.control, isFocused)
+            .cardPressDip(configuration.isPressed)
     }
 }
 
