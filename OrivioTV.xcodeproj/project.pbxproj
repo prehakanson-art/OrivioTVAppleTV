@@ -45,6 +45,7 @@
 		37A27074B3CA714A0E4B1048 /* SourceSelection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0DA8AE05972975B40C348D53 /* SourceSelection.swift */; };
 		3A150FCF47AD0E4A092282C7 /* VLCKitSPM in Frameworks */ = {isa = PBXBuildFile; productRef = 5A930D532CFC69BF7F7D70D3 /* VLCKitSPM */; };
 		3A2E60AE52C9F47B2A3C1377 /* SearchView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 77A0EDEBE8855BE03D3FF362 /* SearchView.swift */; };
+		3A41FBF2EB0B8D86395FEA6A /* SimklService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D5D90DE05390256E6F7CD6F /* SimklService.swift */; };
 		3E3451CA265EE2A54A49BD96 /* OrivioRenameMigration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 50258073F04AAA26F8BAD73A /* OrivioRenameMigration.swift */; };
 		3EA4E4F978DE16D7EDE66BCC /* LibraryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0B1171B30A9B7C0990BFE3CF /* LibraryView.swift */; };
 		40CD01278A170E0F9A840801 /* PlaybackMemory.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CDC06B1C4E03B40E71C6410 /* PlaybackMemory.swift */; };
@@ -212,6 +213,7 @@
 		9BBE97BCD49F9A7D427F1055 /* TraktSyncManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TraktSyncManager.swift; sourceTree = "<group>"; };
 		9D1CE0249C1AE5940C106667 /* M3UService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = M3UService.swift; sourceTree = "<group>"; };
 		9D2952EE61E74C62C1F3FB32 /* PlayerSettingsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerSettingsStore.swift; sourceTree = "<group>"; };
+		9D5D90DE05390256E6F7CD6F /* SimklService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SimklService.swift; sourceTree = "<group>"; };
 		9E056E9745C95EAC5F152F2E /* ProfilesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfilesView.swift; sourceTree = "<group>"; };
 		A1B5541ACD04013E9000101D /* OrivioAuthModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrivioAuthModels.swift; sourceTree = "<group>"; };
 		A8DCE70635C3C65E8553BFE1 /* RemoteInput.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteInput.swift; sourceTree = "<group>"; };
@@ -401,6 +403,7 @@
 				DB7D8398AE932BEFD48DD535 /* ProgressStore.swift */,
 				FFEF8269DCFC5B5CBBD63E95 /* RatingsStore.swift */,
 				5D116BB391F1350665E457F7 /* RequestCache.swift */,
+				9D5D90DE05390256E6F7CD6F /* SimklService.swift */,
 				0DA8AE05972975B40C348D53 /* SourceSelection.swift */,
 				669630524318B915E627A870 /* StreamBadges.swift */,
 				71F10A0E3EDFA7EA1AF9E620 /* StremioAccount.swift */,
@@ -733,6 +736,7 @@
 				4F19B3771A6C77A2FCFB4ACC /* SettingsTraktView.swift in Sources */,
 				224323A6B3C794CAA2848163 /* SettingsView.swift in Sources */,
 				DC0E9E70DB221F0950F6894A /* SidePanels.swift in Sources */,
+				3A41FBF2EB0B8D86395FEA6A /* SimklService.swift in Sources */,
 				37A27074B3CA714A0E4B1048 /* SourceSelection.swift in Sources */,
 				63062C6AE27B38290E3D9D37 /* StreamBadges.swift in Sources */,
 				AC455BAF271DD72DE6BE2983 /* StreamProbe.swift in Sources */,

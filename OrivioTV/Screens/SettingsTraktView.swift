@@ -1,9 +1,11 @@
 import SwiftUI
 
-/// Settings → Trakt: device-code sign-in, scrobble toggle, and account status.
+/// Settings → Trakt & SIMKL: device-code sign-in, scrobble toggle, and account
+/// status for Trakt, plus SIMKL's PIN login in its own section below.
 struct TraktDetail: View {
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var trakt: TraktStore
+    @EnvironmentObject private var simkl: SimklStore
     @EnvironmentObject private var profiles: ProfileStore
 
     @State private var deviceCode: TraktDeviceCode?
@@ -13,6 +15,14 @@ struct TraktDetail: View {
     @State private var showConnect = false
     @State private var confirmClearPlayback = false
     @State private var codeExpiresAt: Date?
+
+    // SIMKL's PIN login runs the same shape of flow on its own state, so a
+    // Trakt code left mid-poll can't be confused for a SIMKL one.
+    @State private var simklCode: SimklDeviceCode?
+    @State private var simklPollTask: Task<Void, Never>?
+    @State private var simklStatus: String?
+    @State private var showSimklConnect = false
+    @State private var simklExpiresAt: Date?
 
     var body: some View {
         DetailScaffold(title: SettingsCategory.trakt.title, subtitle: SettingsCategory.trakt.subtitle) {
@@ -36,8 +46,16 @@ struct TraktDetail: View {
             } else {
                 signedOutView
             }
+
+            SettingsGroupCard(
+                title: "SIMKL",
+                subtitle: "A second tracking service, connected separately from Trakt"
+            ) {
+                simklSection
+            }
+            .padding(.top, OrivioSpacing.md)
         }
-        .onDisappear { pollTask?.cancel() }
+        .onDisappear { pollTask?.cancel(); simklPollTask?.cancel() }
         // The device-code QR gets its OWN full-screen page (APK-style) instead
         // of squeezing into the settings pane.
         .fullScreenCover(isPresented: $showConnect) {
@@ -52,6 +70,125 @@ struct TraktDetail: View {
             }
             .environmentObject(theme)
             .onExitCommand { cancelConnect() }
+        }
+        .fullScreenCover(isPresented: $showSimklConnect) {
+            ZStack {
+                ATVBackground()
+                if let code = simklCode {
+                    SimklConnectPage(code: code, expiresAt: simklExpiresAt ?? Date())
+                        .id(code.userCode)
+                }
+            }
+            .environmentObject(theme)
+            .onExitCommand { cancelSimklConnect() }
+        }
+    }
+
+    // MARK: SIMKL
+
+    @ViewBuilder
+    private var simklSection: some View {
+        if simkl.isSignedIn {
+            HStack(spacing: OrivioSpacing.lg) {
+                Image(systemName: "checkmark.seal.fill")
+                    .font(.system(size: 40))
+                    .foregroundStyle(OrivioPrimitives.success)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(simkl.username ?? "Connected")
+                        .font(.system(size: 28, weight: .bold))
+                        .foregroundStyle(theme.palette.textPrimary)
+                    Text("SIMKL account linked")
+                        .font(.system(size: 20))
+                        .foregroundStyle(theme.palette.textSecondary)
+                }
+            }
+            .integrationRowBackground(theme)
+
+            Button { simkl.signOut() } label: {
+                DestructivePillLabel(title: "Sign Out of SIMKL")
+            }
+            .buttonStyle(PlainCardButtonStyle())
+            .padding(.top, OrivioSpacing.sm)
+        } else if SimklStore.isConfigured {
+            Button(action: startSimklLogin) {
+                SettingsActionRow(
+                    title: "Login",
+                    subtitle: "Sign in with a code on simkl.com/pin",
+                    leadingIcon: "link"
+                )
+            }
+            .buttonStyle(PlainCardButtonStyle())
+
+            if let simklStatus {
+                Text(simklStatus)
+                    .font(.system(size: 20))
+                    .foregroundStyle(theme.palette.textSecondary)
+            }
+        } else {
+            // No client id in this build. Say so plainly rather than offering a
+            // Login button whose only possible outcome is an error.
+            Text("This build has no SIMKL client id, so SIMKL login is unavailable. Register an app at simkl.com/settings/developer and put its id in Secrets.swift as simklClientID.")
+                .font(.system(size: 20))
+                .foregroundStyle(theme.palette.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func startSimklLogin() {
+        showSimklConnect = true
+        Task { await loadSimklCode() }
+    }
+
+    /// Request a fresh PIN and (re)start polling. Also the auto-refresh path
+    /// when a code expires while the page is still open.
+    private func loadSimklCode() async {
+        simklStatus = nil
+        do {
+            let code = try await SimklService.startDeviceCode()
+            simklCode = code
+            simklExpiresAt = Date().addingTimeInterval(TimeInterval(code.expiresIn))
+            beginSimklPolling(code)
+        } catch {
+            simklStatus = "Couldn't start SIMKL login — \(error.localizedDescription)"
+            showSimklConnect = false
+        }
+    }
+
+    private func cancelSimklConnect() {
+        simklPollTask?.cancel()
+        simklCode = nil
+        simklExpiresAt = nil
+        showSimklConnect = false
+    }
+
+    private func beginSimklPolling(_ code: SimklDeviceCode) {
+        simklPollTask?.cancel()
+        simklPollTask = Task {
+            let deadline = Date().addingTimeInterval(TimeInterval(code.expiresIn))
+            while !Task.isCancelled && Date() < deadline {
+                switch await SimklService.pollToken(userCode: code.userCode) {
+                case .authorized(let access):
+                    simkl.store(access: access)
+                    let name = await SimklService.fetchUsername(accessToken: access)
+                    simkl.setUsername(name)
+                    simklCode = nil
+                    simklExpiresAt = nil
+                    showSimklConnect = false
+                    return
+                case .expired:
+                    if !Task.isCancelled && showSimklConnect { await loadSimklCode() }
+                    return
+                case .failed(let message):
+                    simklCode = nil
+                    simklExpiresAt = nil
+                    showSimklConnect = false
+                    simklStatus = message
+                    return
+                case .pending:
+                    try? await Task.sleep(nanoseconds: UInt64(max(code.interval, 1)) * 1_000_000_000)
+                }
+            }
+            if !Task.isCancelled && showSimklConnect { await loadSimklCode() }
         }
     }
 
@@ -296,6 +433,10 @@ struct TraktConnectPage: View {
                     .foregroundStyle(theme.palette.textSecondary)
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: 900)
+                    // Without this the line TRUNCATES at 900pt instead of
+                    // wrapping — the verification URL is interpolated, so how
+                    // close it runs to the edge depends on the service.
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             // Scanning opens the Trakt authorize page with the code pre-filled.
@@ -314,6 +455,70 @@ struct TraktConnectPage: View {
             }
 
             // Live countdown; a new code is fetched automatically when it hits 0.
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                let seconds = expiresAt.timeIntervalSince(context.date)
+                let remaining = seconds.isFinite ? Int(min(max(seconds, 0), 86_400)) : 0
+                Text(remaining > 0
+                     ? "Code expires in \(remaining / 60):\(String(format: "%02d", remaining % 60))"
+                     : "Refreshing code…")
+                    .font(.system(size: 20))
+                    .foregroundStyle(theme.palette.textTertiary)
+            }
+
+            Text("Press Menu to cancel")
+                .font(.system(size: 20))
+                .foregroundStyle(theme.palette.textTertiary)
+            // Nothing else here is focusable; without this Menu never reaches
+            // the presenter's onExitCommand.
+            FocusAnchor()
+        }
+        .padding(OrivioSpacing.huge)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+/// Full-screen SIMKL PIN page — the same shape as `TraktConnectPage`.
+///
+/// SIMKL's own verification URL is the bare `simkl.com/pin`, but the site also
+/// accepts the code in the path, so the QR carries `/pin/<code>` and scanning
+/// lands on the page with the code already filled in. The typed-in fallback
+/// underneath is what the returned URL is for.
+struct SimklConnectPage: View {
+    @EnvironmentObject private var theme: ThemeManager
+    let code: SimklDeviceCode
+    let expiresAt: Date
+
+    var body: some View {
+        VStack(spacing: OrivioSpacing.xl) {
+            VStack(spacing: OrivioSpacing.sm) {
+                Text("Connect SIMKL")
+                    .font(FusionType.pageTitle(theme.font))
+                    .foregroundStyle(theme.palette.textPrimary)
+                Text("Scan the code with your phone, or go to \(code.verificationURL) and enter the code below.")
+                    .font(.system(size: 24))
+                    .foregroundStyle(theme.palette.textSecondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 900)
+                    // Without this the line TRUNCATES at 900pt instead of
+                    // wrapping — the verification URL is interpolated, so how
+                    // close it runs to the edge depends on the service.
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            QRCodeView(string: "https://simkl.com/pin/\(code.userCode)", side: 360)
+
+            Text(code.userCode)
+                .font(.system(size: 68, weight: .heavy, design: .monospaced))
+                .tracking(10)
+                .foregroundStyle(theme.palette.secondary)
+
+            HStack(spacing: OrivioSpacing.sm) {
+                ProgressView().tint(theme.palette.secondary)
+                Text("Waiting for authorization…")
+                    .font(.system(size: 22))
+                    .foregroundStyle(theme.palette.textTertiary)
+            }
+
             TimelineView(.periodic(from: .now, by: 1)) { context in
                 let seconds = expiresAt.timeIntervalSince(context.date)
                 let remaining = seconds.isFinite ? Int(min(max(seconds, 0), 86_400)) : 0

@@ -30,6 +30,10 @@ enum Secrets {
     static let traktClientID = ""
     static let traktClientSecret = ""
 
+    // SIMKL client id (create an app at https://simkl.com/settings/developer).
+    // SIMKL's PIN login needs only the id — there is no secret to supply.
+    static let simklClientID = ""
+
     // TMDB API key (https://www.themoviedb.org/settings/api).
     static let tmdbAPIKey = ""
 }

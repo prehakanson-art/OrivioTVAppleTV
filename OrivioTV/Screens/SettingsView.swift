@@ -23,7 +23,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable {
         case .plugins: return "Plugins"
         case .playback: return "Playback"
         case .performance: return "Performance"
-        case .trakt: return "Trakt"
+        case .trakt: return "Trakt & SIMKL"
         case .about: return "About"
         }
     }
@@ -38,7 +38,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable {
         case .plugins: return "Scraper repositories and plugins"
         case .playback: return "Auto-play and next-episode behavior"
         case .performance: return "Turn effects off for a faster UI on older Apple TVs"
-        case .trakt: return "Scrobble and sync your watch history"
+        case .trakt: return "Scrobble and sync your watch history, or connect SIMKL"
         case .about: return "App information, updates, and legal links"
         }
     }

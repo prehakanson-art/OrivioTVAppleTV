@@ -27,6 +27,7 @@ struct OrivioTVApp: App {
     @StateObject private var mdblistSettings = MDBListSettingsStore()
     @StateObject private var debrid = DebridStore()
     @StateObject private var trakt = TraktStore()
+    @StateObject private var simkl = SimklStore()
     @StateObject private var stremioAccount = StremioAccountStore()
     @StateObject private var playerSettings = PlayerSettingsStore()
     @StateObject private var streamBadges = StreamBadgeStore()
@@ -51,6 +52,7 @@ struct OrivioTVApp: App {
                 .environmentObject(mdblistSettings)
                 .environmentObject(debrid)
                 .environmentObject(trakt)
+                .environmentObject(simkl)
                 .environmentObject(stremioAccount)
                 .environmentObject(playerSettings)
                 .environmentObject(streamBadges)
@@ -288,7 +290,7 @@ struct RootView: View {
                     // the user had enabled protected nothing.
                     // Skipped in the demo modes so the screen isn't covered.
                     let args = ProcessInfo.processInfo.arguments
-                    let demoArgs = ["-detailDemo", "-detailDemoSeries", "-homeDemo", "-settingsDemo", "-liveTVDemo", "-searchDemo", "-libraryDemo", "-discoverDemo", "-traktQRDemo", "-accountDemo", "-settingsTabDemo"]
+                    let demoArgs = ["-detailDemo", "-detailDemoSeries", "-homeDemo", "-settingsDemo", "-liveTVDemo", "-searchDemo", "-libraryDemo", "-discoverDemo", "-traktQRDemo", "-simklQRDemo", "-accountDemo", "-settingsTabDemo"]
                     let demoMode = demoArgs.contains { args.contains($0) }
                     showProfileGate = (profiles.profiles.count >= 2 || profiles.active.pinEnabled) && !demoMode
                     if args.contains("-settingsDemo") { selectedTab = 3 }
@@ -501,6 +503,20 @@ struct RootView: View {
         if ProcessInfo.processInfo.arguments.contains("-accountDemo") {
             return AnyView(
                 ZStack { theme.palette.background.ignoresSafeArea(); AccountView() }
+            )
+        }
+        if ProcessInfo.processInfo.arguments.contains("-simklQRDemo") {
+            return AnyView(
+                ZStack {
+                    theme.palette.background.ignoresSafeArea()
+                    SimklConnectPage(
+                        code: SimklDeviceCode(userCode: "AB12CD34",
+                                              verificationURL: "https://simkl.com/pin",
+                                              interval: 5, expiresIn: 600),
+                        expiresAt: Date().addingTimeInterval(600)
+                    )
+                }
+                .environmentObject(theme)
             )
         }
         if ProcessInfo.processInfo.arguments.contains("-traktQRDemo") {
