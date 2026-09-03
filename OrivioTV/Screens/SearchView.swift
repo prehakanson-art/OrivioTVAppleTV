@@ -21,42 +21,113 @@ final class SearchViewModel: ObservableObject {
             return
         }
         isSearching = true
-        let targets: [(InstalledAddon, ManifestCatalog)] = addonManager.catalogAddons
-            .flatMap { addon in
-                (addon.manifest.catalogs ?? [])
-                    .filter { $0.supportsSearch }
-                    .map { (addon, $0) }
-            }
+        let targets: [(InstalledAddon, ManifestCatalog)] = Self.searchTargets(addonManager)
         searchTask = Task {
             try? await Task.sleep(nanoseconds: 350_000_000)
             guard !Task.isCancelled else { return }
 
-            var merged: [MetaItem] = []
-            var seen = Set<String>()
-            await withTaskGroup(of: [MetaItem].self) { group in
-                for (addon, catalog) in targets {
+            // Collect by target INDEX, not by completion. `for await` on a task
+            // group yields in the order tasks finish, so the merged list was
+            // ordered by whichever add-on answered fastest — a race. A slow
+            // Cinemeta behind a fast torrent aggregator put junk on top, and
+            // the same search could come back in a different order twice in a
+            // row. Now the order is the one `searchTargets` decided.
+            var byTarget = [Int: [MetaItem]](minimumCapacity: targets.count)
+            await withTaskGroup(of: (Int, [MetaItem]).self) { group in
+                for (index, target) in targets.enumerated() {
+                    // Resolved out here: the class is @MainActor, so the
+                    // task's body can't reach its static members.
+                    let cap = Self.limit(for: target.0)
                     group.addTask {
-                        (try? await StremioAPI.catalog(addon: addon, catalog: catalog, search: trimmed)) ?? []
+                        let items = (try? await StremioAPI.catalog(
+                            addon: target.0, catalog: target.1, search: trimmed)) ?? []
+                        // Cap each catalog's contribution. One add-on
+                        // returning hundreds of per-release rows buried every
+                        // other add-on's real titles.
+                        return (index, Array(items.prefix(cap)))
                     }
                 }
-                for await items in group {
-                    for item in items where !seen.contains(item.id + item.type) {
-                        seen.insert(item.id + item.type)
-                        merged.append(item)
-                    }
-                }
+                for await (index, items) in group { byTarget[index] = items }
             }
             guard !Task.isCancelled else { return }
+
+            var merged: [MetaItem] = []
+            var seen = Set<String>()
+            for index in targets.indices {
+                for item in byTarget[index] ?? [] where !seen.contains(item.id + item.type) {
+                    seen.insert(item.id + item.type)
+                    merged.append(item)
+                }
+            }
             results = merged
             isSearching = false
         }
+    }
+
+    /// Most results one catalog may contribute to a search.
+    private static let perCatalogLimit = 40
+    /// A much tighter cap for stream-only source add-ons. Ranking them last
+    /// stops them leading the results but not from filling the tail: four
+    /// searchable catalogs at the normal cap is still 160 per-release rows
+    /// behind the real titles. They keep a foothold rather than a flood.
+    private static let sourceAddonLimit = 8
+
+    private static func limit(for addon: InstalledAddon) -> Int {
+        searchRank(addon) == 2 ? sourceAddonLimit : perCatalogLimit
+    }
+
+    /// Every searchable catalog, metadata add-ons first.
+    ///
+    /// Search is for finding TITLES. An add-on that provides `meta` describes
+    /// titles; one that only provides `stream` is a source aggregator whose
+    /// catalog lists individual releases. When such an add-on sat above
+    /// Cinemeta in the list, search filled up with single torrents for random
+    /// episodes and users had to reorder their add-ons by hand to get it back.
+    /// Ordering by capability rather than by install position is that
+    /// workaround, done automatically.
+    ///
+    /// Source add-ons are still searched, just last — excluding them outright
+    /// would silently drop results from a legitimately configured add-on.
+    static func searchTargets(_ addonManager: AddonManager) -> [(InstalledAddon, ManifestCatalog)] {
+        addonManager.catalogAddons
+            .enumerated()
+            // `sorted` is not documented as stable, so the install index is an
+            // explicit tiebreaker — without it, add-ons of equal rank could
+            // reshuffle between searches.
+            .sorted { a, b in
+                let (ra, rb) = (Self.searchRank(a.element), Self.searchRank(b.element))
+                return ra == rb ? a.offset < b.offset : ra < rb
+            }
+            .flatMap { entry in
+                (entry.element.manifest.catalogs ?? [])
+                    .filter { $0.supportsSearch }
+                    .map { (entry.element, $0) }
+            }
+    }
+
+    /// Lower sorts first: metadata providers, then anything else, then
+    /// stream-only source add-ons.
+    private static func searchRank(_ addon: InstalledAddon) -> Int {
+        if addon.manifest.providesMeta { return 0 }
+        if addon.manifest.providesStreams { return 2 }
+        return 1
     }
 
     /// First extra-free catalog's top titles, fetched once per session.
     func loadTrendingIfNeeded(addonManager: AddonManager) async {
         guard !loadedTrending else { return }
         loadedTrending = true
-        for addon in addonManager.catalogAddons {
+        // Same ordering problem as search: "the first add-on with an
+        // extra-free catalog" made a torrent aggregator's release listing the
+        // Trending shelf whenever one happened to be installed above Cinemeta.
+        let ranked = addonManager.catalogAddons
+            .enumerated()
+            .sorted { a, b in
+                let (ra, rb) = (Self.searchRank(a.element), Self.searchRank(b.element))
+                return ra == rb ? a.offset < b.offset : ra < rb
+            }
+            .map(\.element)
+        for addon in ranked {
             guard let catalog = (addon.manifest.catalogs ?? []).first(where: { !$0.requiresExtra })
             else { continue }
             if let items = try? await StremioAPI.catalog(addon: addon, catalog: catalog),

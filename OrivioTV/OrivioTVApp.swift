@@ -341,10 +341,45 @@ struct RootView: View {
                         selectedTab = 1
                         searchPath.append(Route.discover)
                     }
-                    // Dev: report what Trakt resolves to for the ACTIVE profile,
-                    // after sync has had a chance to interfere. Reading the raw
-                    // defaults keys can't answer this — the answer depends on
-                    // which scope the store chose.
+                    // Dev: what search will query, in order, and what one real
+                    // query returns from each — the ordering is the whole point
+                    // of searchTargets and is otherwise invisible.
+                    if args.contains("-searchProbe") {
+                        Task { @MainActor in
+                            try? await Task.sleep(nanoseconds: 6_000_000_000)
+                            let targets = SearchViewModel.searchTargets(addonManager)
+                            var lines: [String] = []
+                            for (i, t) in targets.enumerated() {
+                                let m = t.0.manifest
+                                lines.append("\(i). \(m.name) [\(t.1.type)/\(t.1.id)]"
+                                             + " meta=\(m.providesMeta) stream=\(m.providesStreams)")
+                            }
+                            // Write the ORDER first: the slow part below is a
+                            // real query per catalog and must not be able to
+                            // lose the answer we already have.
+                            UserDefaults.standard.set(lines.joined(separator: "\n"),
+                                                      forKey: "dev.searchProbe")
+                            NSLog("[OrivioSearch] order written (%d targets)", targets.count)
+                            await withTaskGroup(of: (Int, [MetaItem]).self) { group in
+                                for (i, t) in targets.enumerated() {
+                                    group.addTask {
+                                        ((i, (try? await StremioAPI.catalog(
+                                            addon: t.0, catalog: t.1, search: "breaking bad")) ?? []))
+                                    }
+                                }
+                                var got: [Int: [MetaItem]] = [:]
+                                for await (i, items) in group { got[i] = items }
+                                for i in targets.indices {
+                                    let items = got[i] ?? []
+                                    lines.append("RESULT \(i) \(targets[i].0.manifest.name): \(items.count) — "
+                                                 + items.prefix(3).map(\.name).joined(separator: " | "))
+                                }
+                            }
+                            UserDefaults.standard.set(lines.joined(separator: "\n"),
+                                                      forKey: "dev.searchProbe")
+                            NSLog("[OrivioSearch] probe written")
+                        }
+                    }
                     // Dev: dump the SIMKL request bodies (see debugEnvelope).
                     if args.contains("-simklEnvelopeReport") {
                         let now = Date(timeIntervalSince1970: 1_700_000_000)
@@ -367,6 +402,10 @@ struct RootView: View {
                             + "\n\nWATCHLIST\n" + SimklService.debugEnvelope(watchlist, listTarget: "plantowatch")
                         UserDefaults.standard.set(report, forKey: "dev.simklEnvelope")
                     }
+                    // Dev: report what Trakt resolves to for the ACTIVE profile,
+                    // after sync has had a chance to interfere. Reading the raw
+                    // defaults keys can't answer this — the answer depends on
+                    // which scope the store chose.
                     if args.contains("-traktReport") {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
                             let report = "profile=\(profiles.activeProfileID)"
