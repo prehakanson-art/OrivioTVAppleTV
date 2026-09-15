@@ -49,6 +49,15 @@ final class StremioResponseCache: @unchecked Sendable {
         return entry.data
     }
 
+    /// Forget one entry, so the next caller goes back to the network.
+    ///
+    /// For results that are VALID but not worth remembering — a subtitle addon
+    /// answering 200 with an empty list, which is how those fail transiently.
+    func remove(_ key: String) {
+        lock.lock(); defer { lock.unlock() }
+        store.removeValue(forKey: key)
+    }
+
     func store(_ data: Data, for key: String) {
         lock.lock(); defer { lock.unlock() }
         store[key] = Entry(data: data, time: Date())
@@ -98,6 +107,20 @@ enum StremioAPI {
 
     /// `ttl` = how long a cached body stays fresh (0 disables caching for this
     /// request — used for streams, whose links can be short-lived).
+    ///
+    /// `ttl == 0` MUST ALSO OPT OUT OF THE URL LOADING SYSTEM'S OWN CACHE, or
+    /// the "don't cache this" above is only half true. The session runs
+    /// `.useProtocolCachePolicy` over a 256 MB DISK `URLCache`, so a stream
+    /// response the app deliberately refused to cache was still stored and
+    /// replayed by URLSession underneath — for whatever freshness the addon's
+    /// headers allow, and (being on disk) across app launches. An addon that
+    /// answered badly once then kept answering badly from disk without the
+    /// request ever reaching the server, and the short-lived links in a stale
+    /// body were already dead, so the sources that did come back failed to
+    /// play. That is a self-hosted aggregator "failing" while it is demonstrably
+    /// up, staying broken across a relaunch, and coming right only once the
+    /// entry expired. Requests with a real `ttl` are unaffected: the app's own
+    /// cache is the one that serves them.
     /// `bypassCache` skips the cache READ (and the coalescer, so a health
     /// check times its own request rather than joining one in flight) but
     /// still stores the response for later callers.
@@ -112,6 +135,9 @@ enum StremioAPI {
             guard let url = URL(string: urlString) else { throw StremioAPIError.badURL(urlString) }
             var request = URLRequest(url: url)
             if timeout > 0 { request.timeoutInterval = timeout }
+            // A health check that can be answered from the URL cache is not a
+            // health check. Same reasoning as the ttl == 0 case below.
+            request.cachePolicy = .reloadIgnoringLocalCacheData
             request.setValue("application/json", forHTTPHeaderField: "Accept")
             let (data, response) = try await session.data(for: request)
             if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
@@ -127,6 +153,7 @@ enum StremioAPI {
             guard let url = URL(string: urlString) else { throw StremioAPIError.badURL(urlString) }
             var request = URLRequest(url: url)
             if timeout > 0 { request.timeoutInterval = timeout }
+            if ttl == 0 { request.cachePolicy = .reloadIgnoringLocalCacheData }
             request.setValue("application/json", forHTTPHeaderField: "Accept")
             let (data, response) = try await session.data(for: request)
             if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
@@ -249,6 +276,23 @@ enum StremioAPI {
         // token) rides along after `.json` instead of being dropped.
         let url = addon.resourceURL("/subtitles/\(encodePathComponent(type))/\(encodePathComponent(id)).json")
         let response: SubtitlesResponse = try await get(url, ttl: 600)
-        return response.subtitles ?? []
+        let subtitles = response.subtitles ?? []
+        // AN EMPTY LIST IS NOT AN ANSWER WORTH REMEMBERING FOR TEN MINUTES.
+        //
+        // A subtitle addon that is rate-limited or briefly unwell does not
+        // return an HTTP error — OpenSubtitles v3 in particular answers 200
+        // with `{"subtitles":[]}`. The failure paths above all throw before
+        // reaching the cache, so those are safe; this one looks like a
+        // perfectly good response and gets stored, and every later open of the
+        // same title is then served "no subtitles" from memory without the
+        // request ever leaving the box. That is the reported "subtitles
+        // occasionally fail even though they exist, and only a restart fixes
+        // it" — a restart being the one thing that clears this in-memory cache.
+        //
+        // Dropping the entry costs one round trip per open of a title that
+        // genuinely has none, and buys a retry for every title that briefly
+        // looked that way. A non-empty result is cached exactly as before.
+        if subtitles.isEmpty { cache.remove(url) }
+        return subtitles
     }
 }
