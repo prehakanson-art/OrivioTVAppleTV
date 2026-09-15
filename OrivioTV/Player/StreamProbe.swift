@@ -69,6 +69,23 @@ enum StreamProbe {
         av_dict_set(&opts, "rw_timeout", String(Int(timeoutSeconds * 1_000_000)), 0)
         av_dict_set(&opts, "timeout", String(Int(timeoutSeconds * 1_000_000)), 0)
         av_dict_set(&opts, "reconnect", "1", 0)
+        // AND BOUND THE RECONNECT, or the two timeouts above are not a bound at
+        // all. `reconnect` retries after every `rw_timeout`, and its delay
+        // ladder defaults to a 120-SECOND ceiling — so a read that cannot
+        // complete turns a caller's 5-second budget into minutes of
+        // 0/1/3/7/15/31/63s retries against the same offset, holding the
+        // connection and its buffers the whole time.
+        //
+        // Observed doing exactly that: a 55.5 GB Profile-7 MKV whose tail (the
+        // matroska cues, needed to read the header) never arrived from the
+        // cache's side-fetch. The preflight was asked for 5 seconds and was
+        // still reconnecting to byte 55,477,368,952 six minutes later, while
+        // memory climbed until the box took an out-of-memory kernel panic.
+        //
+        // In SECONDS (unlike rw_timeout above, which is microseconds). Giving
+        // up early costs nothing: the caller falls back to the ordinary engine
+        // load, which is the same path a declined preflight already takes.
+        av_dict_set(&opts, "reconnect_delay_max", String(max(1, Int(timeoutSeconds))), 0)
 
         defer { av_dict_free(&opts) }
         guard avformat_open_input(&ctx, url, nil, &opts) == 0, let ctx else { return result }
