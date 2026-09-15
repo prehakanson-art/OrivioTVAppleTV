@@ -208,14 +208,6 @@ struct PlaybackSettingsDetail: View {
                     options: PlaybackMode.allCases.map { OrivioDropdownOption($0.rawValue, $0.label) }
                 ) { store.settings.playbackMode = PlaybackMode(rawValue: $0) ?? .automatic }
 
-                OrivioDropdown(
-                    title: "Buffer ahead",
-                    subtitle: "How much of the video to download ahead so a slow/bursty connection doesn't rebuffer. Auto sizes to the file. The MB/GB options pre-load roughly that much of the movie before it's needed. Capped to what your Apple TV's memory can hold, so on a 3 GB model the big options top out ~600 MB — for more, see Hybrid disk cache below.",
-                    icon: "gauge.with.dots.needle.50percent",
-                    selection: store.settings.bufferProfile.rawValue,
-                    options: BufferProfile.allCases.map { OrivioDropdownOption($0.rawValue, $0.label) }
-                ) { store.settings.bufferProfile = BufferProfile(rawValue: $0) ?? .auto }
-
                 PlaybackToggleRow(
                     icon: "internaldrive.fill",
                     title: "Hybrid disk cache",
@@ -258,37 +250,6 @@ struct PlaybackSettingsDetail: View {
                         }
                     }
                 }
-
-                PlaybackToggleRow(
-                    icon: "rectangle.on.rectangle.badge.gearshape",
-                    title: "HDR10+ passthrough",
-                    subtitle: "Send HDR10+ dynamic metadata to the TV instead of the plain HDR10 base layer, so brightness is mapped scene by scene. The metadata lives inside the video, and only Apple's own pipeline carries it through — so a matching file is remuxed on-device the same way Dolby Vision is, and falls back to HDR10 if anything fails. Needs an Apple TV 4K (3rd gen) or newer on tvOS 18.4+, an HDR10+ TV, and an HDR10+ file; Dolby Vision always wins when a file has both.",
-                    isOn: s.hdr10PlusPassthrough,
-                    unavailable: PerformanceProfile.hdr10PlusUnavailableReason
-                )
-
-                PlaybackToggleRow(
-                    icon: "sparkles.tv.fill",
-                    title: "Native Dolby Vision",
-                    subtitle: "Play Dolby Vision files (profile 5/8) through Apple's video pipeline for true dynamic DV on DV-capable TVs. Remuxes on-device; falls back to the standard HDR10 engine automatically if anything fails. Off = always use the standard engine.",
-                    isOn: s.nativeDolbyVision
-                )
-
-                if s.nativeDolbyVision.wrappedValue {
-                    PlaybackToggleRow(
-                        icon: "square.stack.3d.up.fill",
-                        title: "Dolby Vision Profile 7",
-                        subtitle: "Also handle dual-layer Profile 7 files (UHD Blu-ray remuxes) by converting them to Profile 8.1 on the fly, for native DV instead of the HDR10 tone-map. \(PerformanceProfile.recommendsDolbyVisionProfile7 ? "On by default on \(PerformanceProfile.tierLabel)." : "Off by default on \(PerformanceProfile.tierLabel): the on-the-fly conversion re-processes the whole file and can freeze playback on this box — turn on only if you accept that.") If a P7 title looks wrong, turn this off and it reverts to HDR10. Needs Native Dolby Vision on.\(ExternalPlayers.player(id: "senplayer")?.isInstalled == true ? " SenPlayer is installed on this Apple TV and does the same P7 → 8.1 conversion in its own app — set Playback engine to External and pick it there to hand P7 titles off instead of converting them here." : "")",
-                        isOn: s.dolbyVisionProfile7
-                    )
-                }
-
-                PlaybackToggleRow(
-                    icon: "tv.fill",
-                    title: "Match content display mode",
-                    subtitle: "Also switch the TV into the matching HDR mode and refresh rate for non-Dolby-Vision videos (HDR10/SDR). Dolby Vision always switches — that's the point of DV — and the mode is held until you leave the app, so the TV only ever sees one switch per session. Off = non-DV videos tone-map into the home screen's format.",
-                    isOn: s.matchContentDisplayMode
-                )
 
                 OrivioDropdown(
                     title: "Video scaling",

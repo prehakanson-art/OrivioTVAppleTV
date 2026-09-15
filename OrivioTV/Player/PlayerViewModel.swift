@@ -177,6 +177,21 @@ enum SessionDisplayMode {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var pinned = false
     nonisolated(unsafe) private static var pinnedRate: Float = 0
+    /// The DYNAMIC RANGE the pin was taken for (-1 until something is pinned).
+    ///
+    /// The pin used to record only the rate, which made it range-BLIND: the
+    /// first title of a foreground stint negotiated a mode and every later one
+    /// was refused, whatever it asked for. So a Dolby Vision title opened after
+    /// any HDR10 or SDR title could not move the panel into DV and played out
+    /// as plain HDR — and a DV-only (profile 5) file, whose IPT colour is
+    /// meaningless outside DV mode, came out with broken colour. The reverse
+    /// washout was already known and instrumented at the `display gate` probe
+    /// in `updateVideo` ("a panel pinned by an earlier title in the same
+    /// foreground stint keeps that title's dynamic range") but never acted on.
+    ///
+    /// Rate churn is what the pin exists to stop; a genuine change of dynamic
+    /// range is not churn, it is the whole point of matching content.
+    nonisolated(unsafe) private static var pinnedRange: Int32 = -1
     /// What the panel reported after the pinned switch settled (0 until known).
     nonisolated(unsafe) private static var settledRate: Float = 0
     nonisolated(unsafe) private static var observing = false
@@ -198,7 +213,7 @@ enum SessionDisplayMode {
             object: nil, queue: .main
         ) { _ in
             UIApplication.shared.ks_keyWindow?.avDisplayManager.preferredDisplayCriteria = nil
-            lock.lock(); pinned = false; pinnedRate = 0; lock.unlock()
+            lock.lock(); pinned = false; pinnedRate = 0; pinnedRange = -1; lock.unlock()
             NSLog("[OrivioDisplay] backgrounded — pin cleared (display already reverted by tvOS)")
         }
     }
@@ -234,7 +249,8 @@ enum SessionDisplayMode {
 
     static func applyOnce(_ criteria: AVDisplayCriteria,
                           via manager: AVDisplayManager,
-                          rate: Float = 0) -> Bool {
+                          rate: Float = 0,
+                          range: Int32) -> Bool {
         // TRUST BUT VERIFY the pin: tvOS can revert the panel to its home
         // rate when playback ends even while our criteria stay set. The pin
         // then blocked the next playback's request and 24fps content played
@@ -254,8 +270,24 @@ enum SessionDisplayMode {
             NSLog("[OrivioDisplay] pin stale (panel %.0f vs settled %.0f) — re-requesting", current, settledRate)
             pinned = false
         }
+        // A DIFFERENT DYNAMIC RANGE IS NOT THE CHURN THIS PIN EXISTS TO STOP.
+        // Refusing it is what left Dolby Vision playing as HDR: the pin taken
+        // by whatever ran first in this stint held the panel in that title's
+        // range for the rest of the stint. Rate-only differences are still
+        // refused, which is the case the pin was built for (24fps content
+        // re-requesting a switch the panel had already settled).
+        //
+        // This is still only ever a switch INTO a content mode. Nothing here
+        // reverts the panel toward its home mode, which is the sequence the
+        // grey-screen wedge came from and which `releaseDisplayForExit`
+        // deliberately no-ops.
+        if pinned, pinnedRange != range {
+            NSLog("[OrivioDisplay] pin was for range %d, this title wants %d — re-requesting",
+                  pinnedRange, range)
+            pinned = false
+        }
         let first = !pinned
-        if first { pinned = true; pinnedRate = rate; settledRate = 0 }
+        if first { pinned = true; pinnedRate = rate; pinnedRange = range; settledRate = 0 }
         lock.unlock()
         guard first else { return false }
         installBackgroundReleaseIfNeeded()
@@ -288,6 +320,25 @@ enum SessionDisplayMode {
         return true
     }
 
+    /// Put the panel back the way playback found it.
+    ///
+    /// This is BYTE-FOR-BYTE what `installBackgroundReleaseIfNeeded`'s observer
+    /// already does every single time the app backgrounds — clear the criteria,
+    /// drop the pin — so it is not a new operation, only a new moment to run it
+    /// at. That is the whole safety argument for calling it on exit: the code
+    /// path is already exercised on every Home press in production.
+    ///
+    /// The caller is responsible for the SEQUENCING, which is the part that
+    /// historically mattered: `PlayerScreen.exitPlayer` holds an opaque cover,
+    /// lets `prepareForExit` detach the video surface, and only then calls
+    /// this — so the HDMI renegotiation happens over a static black screen
+    /// instead of over a surface being destroyed underneath it.
+    static func releaseForExit() {
+        UIApplication.shared.ks_keyWindow?.avDisplayManager.preferredDisplayCriteria = nil
+        lock.lock(); pinned = false; pinnedRate = 0; pinnedRange = -1; settledRate = 0; lock.unlock()
+        NSLog("[OrivioDisplay] released on exit — panel returns to its home format")
+    }
+
     /// Diagnostics: whether an earlier title in THIS foreground stint already
     /// pinned the panel — in which case nothing this title asks for can move
     /// it, and it is playing into whatever mode that earlier title negotiated.
@@ -295,7 +346,8 @@ enum SessionDisplayMode {
         lock.lock()
         defer { lock.unlock() }
         return pinned
-            ? "PINNED by an earlier title this stint (rate=\(pinnedRate), settled=\(settledRate)) — this title cannot change the panel"
+            ? "PINNED by an earlier title this stint (rate=\(pinnedRate), range=\(pinnedRange),"
+                + " settled=\(settledRate)) — this title can only change the panel by asking for a different range"
             : "not pinned"
     }
 }
@@ -456,19 +508,28 @@ final class OrivioPlayerOptions: KSOptions {
             else if available.contains(.hlg) { target = .hlg }
             else { target = .sdr }
         }
-        // Refresh rate. By default we DON'T switch it — keep the panel at its
-        // current rate so the only thing that changes is dynamic range. A rate
-        // switch is a heavier HDMI renegotiation, and reverting it on exit is
-        // what drops some TVs to standby / turns them off. `matchFrameRate`
-        // (Settings → Playback) opts into the real rate switch (with the
-        // 23.976 AFR bias: FFmpeg reports film as 23.97/23.98/24.0 but nearly
-        // all "24fps" releases are 24000/1001, so bias near-24 to 23.976).
-        // ALWAYS match the content's rate on the one pinned switch (with the
-        // 23.976 AFR bias: FFmpeg reports film as 23.97/23.98/24.0 but nearly
-        // all "24fps" releases are 24000/1001). The rate switch was never the
-        // wedge — the REVERT was, and no in-app revert exists anymore. A 24fps
-        // movie in a 60Hz envelope is 3:2 pulldown judder, the thing a real
-        // player exists to avoid.
+        // REFRESH RATE: always ask for the content's, and let tvOS decide.
+        //
+        // This is the model every streaming app on the platform uses. The app
+        // hands `AVDisplayCriteria` a rate AND a dynamic range; tvOS then
+        // applies whichever of them the viewer enabled under
+        // Settings -> Video and Audio -> Match Content. Asking for both is not
+        // overreach — it is the only way to express "here is what the content
+        // is", and Match Frame Rate off simply means the rate half is ignored.
+        //
+        // TWO STALE CLAIMS USED TO SIT HERE, and both would send the next
+        // reader the wrong way:
+        //   * that the rate is not switched by default and
+        //     `options.matchFrameRate` opts into it. That property is written
+        //     in `configureOptions` and READ NOWHERE — the rate below is
+        //     unconditional, so the flag has no effect at all.
+        //   * that "no in-app revert exists anymore". One does again:
+        //     `releaseDisplayForExit` puts the panel back when the player
+        //     closes, which is what stops the whole UI being left running at
+        //     the film's rate.
+        //
+        // A 24fps movie in a 60Hz envelope is 3:2 pulldown judder, which is
+        // the thing a real player exists to avoid.
         // The SAME snap the two direct-engine display requests use. This path
         // still carried the original rule — fold anything in 23.5…24.2 onto
         // 23.976 — which `snapToBroadcastRate` was written to replace: it
@@ -493,7 +554,8 @@ final class OrivioPlayerOptions: KSOptions {
         lastAppliedRefreshRate = rate
         guard let criteria = AVDisplayCriteria(refreshRate: rate, videoDynamicRange: target.rawValue)
         else { return }
-        guard SessionDisplayMode.applyOnce(criteria, via: displayManager, rate: rate) else { return }
+        guard SessionDisplayMode.applyOnce(criteria, via: displayManager, rate: rate,
+                                           range: target.rawValue) else { return }
         // The panel is being driven TO the content's cadence, so there is no
         // 3:2 pulldown to soften — leaving the softening on made
         // videoClockSync fight a cadence that isn't there. Cleared ONLY when a
@@ -730,7 +792,22 @@ final class PlayerViewModel: ObservableObject {
 
     private func updateBufferSpinner() {
         bufferSpinnerTask?.cancel()
-        if isBuffering {
+        // NOT WHILE THE VIEWER HAS PAUSED. `isBuffering` is the engine's own
+        // state; the spinner is a promise to the viewer that we are waiting on
+        // the network. On a paused session those are not the same thing, and
+        // this app already draws that distinction — `updateStallWatchdog`
+        // stands down on `pauseIntent` with the note "a paused viewer is not a
+        // stall".
+        //
+        // Measured on the device: waking from tvOS display sleep runs
+        // `resyncPipeline`, whose flush-seek with `autoPlay: false` puts the
+        // engine into `.buffering` — and a paused engine never pumps enough to
+        // report its way back out. The probe caught 52 seconds of it (RESYNC at
+        // t=1901.1, no engine state event at all until the viewer pressed play
+        // at t=1953.5, which reported `bufferFinished` 17ms later). Nothing was
+        // wrong with the stream; the spinner was, and the stall watchdog that
+        // would normally rescue one was already standing down on the same flag.
+        if isBuffering, !pauseIntent {
             guard !showBufferSpinner else { return }
             bufferSpinnerTask = Task { [weak self] in
                 try? await Task.sleep(nanoseconds: 500_000_000)
@@ -1077,7 +1154,17 @@ final class PlayerViewModel: ObservableObject {
         // another false→true transition to re-arm it. A film frozen while
         // "paused" then had NO rescue once the user pressed play again.
         didSet {
+            // Only on a real transition. `pauseIntent` is written from several
+            // paths with the value it already has, and `updateBufferSpinner`
+            // cancels and respawns its 500ms debounce on every call — the same
+            // churn the `isBuffering` didSet guards against for the same reason.
+            guard oldValue != pauseIntent else { return }
             if oldValue, !pauseIntent { updateStallWatchdog() }
+            // The spinner is gated on intent too (see updateBufferSpinner), and
+            // `isBuffering` may not transition again to drive it: pausing must
+            // take a visible spinner down, and resuming must be able to put it
+            // back up for a stream that really is stuck.
+            updateBufferSpinner()
         }
     }
 
@@ -1276,8 +1363,9 @@ final class PlayerViewModel: ObservableObject {
 
     /// Cheap synchronous gates for the direct-DV start.
     private func shouldTryDVFirst(url: URL) -> Bool {
-        guard settings.nativeDolbyVision,
-              effectiveEngine == .auto || effectiveEngine == .ffmpeg,
+        // Native DV is no longer optional — it is how this app plays Dolby
+        // Vision. The remaining gates below are capability, not preference.
+        guard effectiveEngine == .auto || effectiveEngine == .ffmpeg,
               !url.isFileURL,
               DynamicRange.availableHDRModes.contains(.dolbyVision),
               Self.memoryFootprintMB() < 850,
@@ -1345,7 +1433,16 @@ final class PlayerViewModel: ObservableObject {
                   // engine on top of the stream already playing, doubling audio.
                   self.dvFirstGeneration == generation
             else { return }
-            let p7ok = self.activeMode == .fidelity || self.settings.dolbyVisionProfile7
+            // Profile 7 conversion is decided by the DEVICE, not by a setting
+            // and not unconditionally. The on-the-fly P7 -> 8.1 conversion
+            // re-processes the whole file, which the 2-3 GB boxes cannot
+            // absorb alongside decode — `recommendsDolbyVisionProfile7` is
+            // exactly that judgement (`!isLowPower && !isMidPower`), and it was
+            // already this setting's default before the control was retired.
+            // Maximum Fidelity still overrides, because that mode's contract is
+            // that it never downgrades and it is still a setting the user picks.
+            let p7ok = self.activeMode == .fidelity
+                || PerformanceProfile.recommendsDolbyVisionProfile7
             // profile 0 = plain HEVC (HDR10/HDR10+/SDR) — the engine plays it
             // natively with every bitstream SEI intact, so a DV-hinted title
             // that turns out non-DV still direct-starts instead of falling to
@@ -1410,10 +1507,17 @@ final class PlayerViewModel: ObservableObject {
             let titleMemory = PlaybackMemory.memory(for: self.meta.id)
             let engine = DVSampleEngine(
                 input: url.absoluteString, startAt: resume,
-                // Per-title memory outranks the global preference: the track you
-                // picked for this movie/show is what you meant for it.
-                preferredAudioLanguage: titleMemory?.audioLanguage
-                    ?? self.settings.preferredAudioLanguage,
+                // THE SETTINGS LANGUAGE LEADS. It used to be the other way —
+                // per-title memory first — which meant one hand-picked track on
+                // one episode pinned that language to the whole series for good
+                // (the memory is keyed by show and never expires), and
+                // Settings -> Audio was then quietly outranked on every later
+                // release. The per-title memory is still consulted, but as a
+                // FALLBACK for files carrying nothing in the chosen language —
+                // see `applyPreferredDVAudioSecondTurn`.
+                preferredAudioLanguage: self.settings.preferredAudioLanguage.isEmpty
+                    ? (titleMemory?.audioLanguage ?? "")
+                    : self.settings.preferredAudioLanguage,
                 convertProfile7: p7ok,
                 requestHeaders: entry.stream.behaviorHints?.proxyHeaders?.requestHeaders,
                 downmixToStereo: !spatial,
@@ -1784,7 +1888,8 @@ final class PlayerViewModel: ObservableObject {
         guard let criteria = AVDisplayCriteria(
             refreshRate: rate, videoDynamicRange: target.rawValue
         ) else { return false }
-        if SessionDisplayMode.applyOnce(criteria, via: displayManager, rate: rate) {
+        if SessionDisplayMode.applyOnce(criteria, via: displayManager, rate: rate,
+                                        range: target.rawValue) {
             displayCriteriaApplied = true
             return true
         }
@@ -1794,8 +1899,12 @@ final class PlayerViewModel: ObservableObject {
     /// HDR10-range request for non-DV direct sessions, same pin discipline.
     @discardableResult
     private func requestHDR10DisplayMode(fps: Float) -> Bool {
-        guard settings.matchContentDisplayMode,
-              let displayManager = UIApplication.shared.ks_keyWindow?.avDisplayManager,
+        // NO APP-LEVEL TOGGLE ANY MORE. The Apple TV's own Video and Audio →
+        // Match Content is the switch, and it is exactly what
+        // `isDisplayCriteriaMatchingEnabled` reports — so the app simply
+        // honours the system setting instead of gating it behind a second one
+        // that could disagree with it.
+        guard let displayManager = UIApplication.shared.ks_keyWindow?.avDisplayManager,
               displayManager.isDisplayCriteriaMatchingEnabled else { return false }
         var rate = Float(UIScreen.main.maximumFramesPerSecond)
         if SessionDisplayMode.isPlausibleRate(fps) {   // match the content rate when it's real
@@ -1805,7 +1914,8 @@ final class PlayerViewModel: ObservableObject {
               let criteria = AVDisplayCriteria(
                 refreshRate: rate, videoDynamicRange: DynamicRange.hdr10.rawValue
               ) else { return false }
-        if SessionDisplayMode.applyOnce(criteria, via: displayManager, rate: rate) {
+        if SessionDisplayMode.applyOnce(criteria, via: displayManager, rate: rate,
+                                        range: DynamicRange.hdr10.rawValue) {
             displayCriteriaApplied = true
             return true
         }
@@ -2585,8 +2695,10 @@ final class PlayerViewModel: ObservableObject {
         // HDR10+ is only worth probing for when this box can actually output
         // it — otherwise the honest answer is already known (HDR10 base), and
         // a scan on an A10X would cost startup for nothing.
-        let wantHDR10Plus = settings.hdr10PlusPassthrough
-            && PerformanceProfile.supportsHDR10Plus
+        // No user toggle any more: whether this box can output HDR10+ IS the
+        // answer (3rd-gen Apple TV 4K on tvOS 18.4+). Compatibility mode still
+        // opts out, since its contract is the most forgiving path.
+        let wantHDR10Plus = PerformanceProfile.supportsHDR10Plus
             && activeMode != .compatibility
         guard wantASS || wantHDR10Plus else { return }
         probedURLs.insert(url)
@@ -3204,7 +3316,10 @@ final class PlayerViewModel: ObservableObject {
         // even when on it only varies dynamic range, never refresh rate — so
         // the panel stays at its home rate and the softened-drop pacing is
         // always the right policy for 24fps content.
-        options.matchDisplayCriteria = settings.matchContentDisplayMode
+        // The engine path keeps its own `isDisplayCriteriaMatchingEnabled`
+        // check, which IS the Apple TV's Match Content setting; this app-level
+        // term is retired, so leave it permissive and let tvOS decide.
+        options.matchDisplayCriteria = true
         options.matchFrameRate = settings.matchFrameRate
         options.pulldown60Hz = true
         // Native-DV session: if the user also enabled display matching, let
@@ -3401,7 +3516,7 @@ final class PlayerViewModel: ObservableObject {
         // and get their real (byte-target → seconds) value applied at
         // readyToPlay (applyBufferSizeTarget). A bigger socket buffer helps
         // the size profiles sustain the deeper fill.
-        switch settings.bufferProfile {
+        switch effectiveBufferProfile(for: url) {
         case .auto:
             break
         case .conservative:
@@ -3568,6 +3683,21 @@ final class PlayerViewModel: ObservableObject {
     /// jetsam the app. Only the FFmpeg engine has this seconds-based cache;
     /// the native AVPlayer path manages its own buffer. `currentOptions` is
     /// read live by KSPlayer, so updating it here takes effect immediately.
+    /// Buffer ahead applies ONLY to streams the hybrid disk cache cannot serve.
+    ///
+    /// When the cache IS in front of a stream it downloads the whole file to
+    /// storage at full speed and serves seeks from disk, so a second, larger
+    /// RAM read-ahead buys nothing and competes with decode for memory on the
+    /// 3 GB boxes. The control is retired from Settings for the same reason;
+    /// what remains of the profile is for the streams the cache declines —
+    /// HLS and anything else it can't range-request.
+    ///
+    /// `url` is the PLAYBACK url, so a hybrid-cached session is the one being
+    /// served from the loopback proxy.
+    private func effectiveBufferProfile(for url: URL?) -> BufferProfile {
+        url?.host == "127.0.0.1" ? .auto : settings.bufferProfile
+    }
+
     private func applyBufferSizeTarget(player: some MediaPlayerProtocol) {
         guard let options = currentOptions, player is KSMEPlayer else { return }
         // The DEFAULT (Auto) profile has no byte target, and this method used to
@@ -3581,7 +3711,8 @@ final class PlayerViewModel: ObservableObject {
         // A missing `videoSize` hint (very common — Continue Watching resumes
         // carry none) lands such a stream on the 36s "unknown" tier. Treat the
         // device ceiling as the target when the user hasn't picked one.
-        let target = settings.bufferProfile.targetBytes ?? PerformanceProfile.maxBufferBytes
+        let target = effectiveBufferProfile(for: currentURL).targetBytes
+            ?? PerformanceProfile.maxBufferBytes
 
         // Bitrate (bits/s): prefer file size ÷ duration; fall back to the sum
         // of the track bitrates. Guard against unknowns so we never divide by
@@ -3615,7 +3746,7 @@ final class PlayerViewModel: ObservableObject {
         // (a low-bitrate file would otherwise be handed 30 minutes of buffer).
         // An explicitly chosen size profile stays authoritative in both
         // directions — that is what the user asked for.
-        if settings.bufferProfile.targetBytes == nil {
+        if effectiveBufferProfile(for: currentURL).targetBytes == nil {
             clamped = max(min(clamped, options.maxBufferDuration), floor)
         }
         options.maxBufferDuration = clamped
@@ -4071,7 +4202,8 @@ final class PlayerViewModel: ObservableObject {
         let remembered = PlaybackMemory.memory(for: meta.id)?.audioLanguage
         // Remembered, then the Settings default — see `loadTracks` for why
         // both get a turn rather than the first one winning outright.
-        let wants = [remembered, settings.preferredAudioLanguage]
+        // Settings first, per-title memory second — see `loadTracks`.
+        let wants = [settings.preferredAudioLanguage, remembered]
             .compactMap { $0 }.filter { !$0.isEmpty }
         // No preference configured: settled by definition (and the wave watch
         // in `vlcTimeChanged` can stand down).
@@ -4082,8 +4214,9 @@ final class PlayerViewModel: ObservableObject {
             let inLanguage = audioOptions.filter { audioTrackMatchesLanguage($0, want) }
             guard let match = inLanguage.first(where: { !AudioLanguageMatch.isSecondary(label: $0.displayName) })
                     ?? inLanguage.first else { continue }
-            chosen = (match, index == 0 && remembered != nil ? "remembered for this title"
-                                                            : "preferred audio language")
+            let usedSetting = index == 0 && !settings.preferredAudioLanguage.isEmpty
+            chosen = (match, usedSetting ? "preferred audio language"
+                                         : "remembered for this title")
             break
         }
         // Nothing in any of them YET — leave the latch open so the next wave
@@ -4120,24 +4253,31 @@ final class PlayerViewModel: ObservableObject {
     /// engine's own ranking (exact remembered label, channels, commentary
     /// demoted) is the better answer and stands untouched.
     private func applyPreferredDVAudioSecondTurn(engine: DVSampleEngine) {
-        let fallback = settings.preferredAudioLanguage
-        guard !fallback.isEmpty else { return }
+        // INVERTED WITH THE PRIORITY SWAP. The engine is now handed the
+        // SETTINGS language at open, so this turn is the mirror of what it
+        // was: it rescues a file that carries nothing in the chosen language
+        // by falling back to what the title remembers.
+        let primary = settings.preferredAudioLanguage
+        // No Settings language configured: the engine was handed the title's
+        // own memory instead and has already scored it. Nothing to add.
+        guard !primary.isEmpty else { return }
         let memory = PlaybackMemory.memory(for: meta.id)
-        // Nothing remembered for this title: the engine was handed the
-        // Settings default itself and has already scored it.
+        // Nothing remembered for this title either — the engine's own ranking
+        // is the whole answer.
         guard let remembered = memory?.audioLanguage, !remembered.isEmpty else { return }
         let tracks = engine.audioTracks
         guard tracks.count > 1 else { return }
-        // The remembered language is in this file after all — the viewer's own
-        // choice is playing. Same for an exact remembered LABEL, which
-        // outscores every language match inside the engine.
+        // The chosen language IS in this file — the engine already picked it,
+        // and that is exactly the outcome the priority swap exists to produce.
         guard !tracks.contains(where: {
-            AudioLanguageMatch.matches(code: $0.lang, label: $0.label, preferred: remembered)
+            AudioLanguageMatch.matches(code: $0.lang, label: $0.label, preferred: primary)
         }) else { return }
+        // An exact remembered LABEL is here and outscores every language match
+        // inside the engine, so the viewer's own track is already playing.
         if let label = memory?.audioTrackLabel,
            tracks.contains(where: { $0.label == label }) { return }
         let inLanguage = tracks.filter {
-            AudioLanguageMatch.matches(code: $0.lang, label: $0.label, preferred: fallback)
+            AudioLanguageMatch.matches(code: $0.lang, label: $0.label, preferred: remembered)
         }
         // Rank inside the language the way the engine does — never a
         // commentary/descriptive track, then channel count, ties to the first
@@ -4163,7 +4303,7 @@ final class PlayerViewModel: ObservableObject {
         engine.selectAudio(index: pick.index)
         selectedAudioID = "dvda-\(pick.index)"
         decisionLog.record("Audio Track", pick.label,
-                           because: "preferred audio language — this file carries nothing in the language remembered for the title")
+                           because: "remembered for this title — this file carries nothing in your preferred audio language")
     }
 
     /// Channel count read back off a `DVSampleEngine` track label's trailing
@@ -4199,8 +4339,8 @@ final class PlayerViewModel: ObservableObject {
         // in front of us carried no track in it the preference was never even
         // consulted. The stream then opened on whatever the file defaulted to
         // and the Settings default looked ignored.
-        for (want, why) in [(rememberedAudio, "remembered for this title"),
-                            (settings.preferredAudioLanguage, "preferred audio language")] {
+        for (want, why) in [(settings.preferredAudioLanguage, "preferred audio language"),
+                            (rememberedAudio, "remembered for this title")] {
             guard let want, !want.isEmpty else { continue }
             // Ranking inside the language: never a commentary/descriptive
             // track, then Atmos-capable (DD+ carries Atmos through tvOS
@@ -5103,6 +5243,24 @@ final class PlayerViewModel: ObservableObject {
                 // on where focus happened to be — invisible state deciding what
                 // a physical action does. On a glyph the swipe now belongs to
                 // the focus engine, which is what the viewer can actually see.
+                // AND IT MUST BE A REAL PULL, not the roll of a finger
+                // settling into a click. 45pt is the gate for DECIDING a
+                // direction; it is nowhere near enough to COMMIT on. Every
+                // other navigational gesture in this method already asks for a
+                // deliberate pull — 110pt to open the info sheet, 160pt to
+                // close it — while the one gesture that MOVES THE PLAYHEAD
+                // fired at 45. That is why tapping to bring up the controls
+                // occasionally jumped the film: a tap on this remote is a pad
+                // PRESS with a finger on the surface, and the finger rolls a
+                // few dozen points sideways as it presses. Held to the same
+                // floor as the sheet-close pull.
+                //
+                // Undecided, NOT consumed — the same thing the ambiguous
+                // diagonal above does. A gesture that really is a swipe keeps
+                // being re-read on every later sample and skips the moment it
+                // grows past the floor, so a deliberate swipe still lands;
+                // only the short one is dropped.
+                guard adx > 160 else { touchIntent = .undecided; return }
                 let step = Double(settings.skipSeconds)
                 debug(dx > 0 ? "swipe→ skip" : "swipe← skip")
                 nudgeSeek(dx > 0 ? step : -step, gesture: true)
@@ -6258,9 +6416,10 @@ final class PlayerViewModel: ObservableObject {
                 var name = "Dolby Vision · Profile \(profile)"
                 if profile == 8 { name += ".\(Int(dovi.dv_bl_signal_compatibility_id))" }
                 rows.append(("Dynamic Range", name))
-                rows.append(("Output", profile == 7 && !settings.dolbyVisionProfile7
-                    ? "HDR10 base layer (P7 conversion off)"
-                    : "HDR10 base layer"))
+                // Always the base layer here: this arm is the DECODE path, and
+                // P7 conversion (now always on) happens on the direct engine,
+                // which builds its rows above and never reaches this branch.
+                rows.append(("Output", "HDR10 base layer"))
             } else if hasHDR10Plus {
                 rows.append(("Dynamic Range", "HDR10+ · dynamic metadata"))
             } else if isPQ {
@@ -8114,9 +8273,47 @@ final class PlayerViewModel: ObservableObject {
                 currentEntry = preferred
                 load(entry: preferred)
                 overlay = .sources
+            } else if !presentSources, let resolver = torrentResolver,
+                      let torrent = panelEntries.first(where: \.stream.isTorrent) {
+                // ONLY TORRENTS, BUT A DEBRID RESOLVER IS CONFIGURED — so there
+                // IS a usable source here and the advance should not be handing
+                // the viewer a picker. Resolving one is what every other path
+                // in this file already does with a torrent candidate: the
+                // viewer's own source switch (`switchSource`) and the failover
+                // ladder both call `torrentResolver` and load the direct link
+                // it returns. Only the auto-advance refused, so an episode
+                // whose sources happened to come back as torrents interrupted a
+                // binge with the source list — "Auto Pick occasionally shows
+                // the source-selection screen between episodes".
+                //
+                // The curated-first torrent, which is exactly the row the
+                // picker below would have pre-selected, so the automatic choice
+                // and the manual default agree.
+                //
+                // Purely a FALLBACK: reached only where the picker was opening
+                // anyway. A directly-playable link still wins whenever one
+                // exists, and with Auto Pick off (`presentSources`) the viewer
+                // still gets the list they asked for.
+                currentEntry = torrent
+                let resolved = await resolver(torrent.stream)
+                // Debrid resolution takes seconds. Re-checked for the same
+                // reason `switchSource` re-checks its load generation: the
+                // viewer may have exited, or a later advance may have moved on
+                // to a different episode, and loading now would strand a stream
+                // behind them.
+                guard !isExiting, currentVideo?.id == episode.id else { return }
+                if let resolved {
+                    let direct = StreamEntry(addonName: torrent.addonName, stream: resolved)
+                    currentEntry = direct
+                    load(entry: direct)
+                } else {
+                    // Couldn't resolve — the picker is the right answer after
+                    // all, which is where this case landed before.
+                    overlay = .sources
+                }
             } else {
-                // Only torrents available (no direct link to auto-load) — go
-                // straight to the picker so the user resolves one.
+                // Only torrents available and nothing can resolve them (no
+                // debrid key) — go straight to the picker.
                 if let first = panelEntries.first { currentEntry = first }
                 overlay = .sources
             }
@@ -8307,26 +8504,49 @@ final class PlayerViewModel: ObservableObject {
         // is the only handshake, and exitPlayer holds the cover until it has
         // had time to settle.
         //
-        // Skipped entirely when the user has turned the restore off: some TVs
-        // mis-handshake no matter how gently the switch is sequenced, and not
-        // switching back at all is the only thing that always works. tvOS
-        // returns the display to its home-screen format on its own terms.
-        // Deliberately releases NOTHING, ever (the Infuse policy). A revert
-        // is a full HDMI renegotiation landing seconds after the player
-        // closes — exactly when this user's panel wedges grey. The display
-        // holds the video's mode for the rest of the foreground stint (the
-        // SDR UI is tone-mapped into it, same as running the tvOS Format at
-        // 4K Dolby Vision), and tvOS performs the single unavoidable revert
-        // invisibly when the app backgrounds — where SessionDisplayMode also
-        // clears the pin so the next stint negotiates fresh.
+        // NOTHING WAS SWITCHED, NOTHING TO RESTORE. An ordinary SDR exit never
+        // touched the panel, so it must not pay a handshake or a cover — this
+        // is what keeps the common exit instant.
+        guard displayCriteriaApplied else { return }
+        SessionDisplayMode.releaseForExit()
     }
+
+    // THIS USED TO RELEASE NOTHING, EVER, AND THAT WAS THE BUG.
+    //
+    // The reasoning it carried was real: a revert is a full HDMI
+    // renegotiation, and when one lands while the video surface is being torn
+    // down some panels wedge grey until they are power-cycled. The response
+    // was to stop reverting altogether and let the display hold the video's
+    // mode for the rest of the foreground stint, on the theory that the SDR UI
+    // would simply be tone-mapped into it.
+    //
+    // What that actually leaves behind is the whole app running at the FILM's
+    // refresh rate. At 24Hz the menus, scrolling, focus movement and
+    // animations are all quantised to 41ms — "the UI is sluggish after
+    // watching something", fixed only by turning Match Frame Rate off, which
+    // is not a fix. A player may change the display for playback; it may not
+    // keep it.
+    //
+    // The overlap that caused the grey wedge is addressed where it actually
+    // lives — in the SEQUENCING, which `exitDisplaySettleDelay` below restores:
+    // opaque cover up, video surface detached by `prepareForExit`, THEN the
+    // release, THEN a beat for the handshake, and only then the dismiss. That
+    // ordering was built for exactly this and had been left switched off.
+    //
+    // If a grey wedge ever comes back on a particular panel, the escape is one
+    // line: return 0 from `exitDisplaySettleDelay` and drop the
+    // `SessionDisplayMode.releaseForExit()` call above.
 
     /// Seconds the exit must hold its black cover before tearing the player
     /// down, so the display-mode handshake finishes over a static screen
     /// instead of a disappearing video surface. Zero when no switch was made
     /// this session (the common case — exits stay instant).
     var exitDisplaySettleDelay: Double {
-        0   // no in-app switch-back exists anymore, so there is no handshake to wait out
+        // Only a session that actually moved the panel has a handshake to wait
+        // out. `exitPlayer` adds its own 250ms before calling the release, so
+        // the cover is up for roughly a second in total on a switched exit and
+        // is not shown at all on any other.
+        displayCriteriaApplied ? 0.8 : 0
     }
 
     func teardown() {
@@ -9511,12 +9731,7 @@ final class PlayerViewModel: ObservableObject {
                 // session builds its Video rows from the engine above and never
                 // reaches here. The "Native Dolby Vision" arm was therefore
                 // unreachable even before its flag was retired.
-                video.append(.init(
-                    label: "DV Output",
-                    value: profile == 7 && !settings.dolbyVisionProfile7
-                        ? "HDR10 base layer (Profile 7 conversion off)"
-                        : "HDR10 base layer"
-                ))
+                video.append(.init(label: "DV Output", value: "HDR10 base layer"))
             } else if let range = track.formatDescription?.dynamicRange, range != .sdr {
                 // HDR10 / HLG — anything beyond SDR is worth surfacing.
                 video.append(.init(label: "HDR", value: range.description))
@@ -9531,9 +9746,7 @@ final class PlayerViewModel: ObservableObject {
                     // Same reasoning as DV Output: passthrough belongs to the
                     // direct engine, which never renders this section.
                     value: PerformanceProfile.supportsHDR10Plus
-                        ? (settings.hdr10PlusPassthrough
-                            ? "HDR10 base layer (passthrough didn't engage)"
-                            : "HDR10 base layer (passthrough off)")
+                        ? "HDR10 base layer (passthrough didn't engage)"
                         : "HDR10 base layer (\(PerformanceProfile.hdr10PlusUnavailableReason ?? "unsupported"))"
                 ))
             }
