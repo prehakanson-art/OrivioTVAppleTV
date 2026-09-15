@@ -1889,6 +1889,7 @@ private struct HomePosterRow: View {
                                 item: item,
                                 useLandscape: useLandscape,
                                 captionWidth: useLandscape ? 340 : homeCatalogSettings.posterSize.posterWidth,
+                                showLabel: homeCatalogSettings.showPosterLabels,
                                 heroFollowsFocus: heroFollowsFocus,
                                 hero: hero,
                                 onSelect: onSelect,
@@ -1987,6 +1988,14 @@ private struct HomePosterCell: View, Equatable {
     let item: MetaItem
     let useLandscape: Bool
     let captionWidth: CGFloat
+    /// Settings → Layout → Posters → "Poster labels".
+    ///
+    /// A PROPERTY, not an `@EnvironmentObject`: this cell is `Equatable` and is
+    /// rendered through `.equatable()`, so SwiftUI skips the body whenever `==`
+    /// says nothing changed. An environment read would be invisible to that
+    /// comparison and the row would keep its captions until something else
+    /// forced a rebuild. Included in `==` below for the same reason.
+    let showLabel: Bool
     let heroFollowsFocus: Bool
     let hero: HeroFocus
     let onSelect: (MetaItem) -> Void
@@ -1997,6 +2006,7 @@ private struct HomePosterCell: View, Equatable {
         lhs.item == rhs.item
             && lhs.useLandscape == rhs.useLandscape
             && lhs.captionWidth == rhs.captionWidth
+            && lhs.showLabel == rhs.showLabel
             && lhs.heroFollowsFocus == rhs.heroFollowsFocus
     }
 
@@ -2032,13 +2042,15 @@ private struct HomePosterCell: View, Equatable {
             .posterHoldMenu(item) { onSelect(item) }
             .onPlayPauseCommand { onPlayManually(item, nil) }
 
-            ATVCardCaption(
-                title: item.name,
-                subtitle: item.year,
-                width: captionWidth,
-                lowered: focused,
-                dropDistance: useLandscape ? 13 : 18
-            )
+            if showLabel {
+                ATVCardCaption(
+                    title: item.name,
+                    subtitle: item.year,
+                    width: captionWidth,
+                    lowered: focused,
+                    dropDistance: useLandscape ? 13 : 18
+                )
+            }
         }
     }
 }

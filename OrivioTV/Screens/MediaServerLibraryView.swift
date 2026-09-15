@@ -68,7 +68,9 @@ struct MediaServerPane: View {
             } else {
                 LazyVGrid(columns: columns, alignment: .leading, spacing: OrivioSpacing.xl) {
                     ForEach(items) { item in
-                        MediaServerPosterCell(item: item, captionWidth: posterLayout.posterSize.posterWidth) {
+                        MediaServerPosterCell(item: item,
+                                              captionWidth: posterLayout.posterSize.posterWidth,
+                                              showLabel: posterLayout.showPosterLabels) {
                             select(item)
                         }
                         .id(item.id)
@@ -138,6 +140,9 @@ struct MediaServerPane: View {
 private struct MediaServerPosterCell: View {
     let item: MediaServerItem
     let captionWidth: CGFloat
+    /// Settings → Layout → Posters → "Poster labels" — the pane says "across
+    /// the app", and these are poster cards like any other.
+    let showLabel: Bool
     let onSelect: () -> Void
     @State private var focused = false
 
@@ -148,8 +153,10 @@ private struct MediaServerPosterCell: View {
                     .onFocusChange { focused = $0 }
             }
             .mediaCardButtonStyle()
-            ATVCardCaption(title: item.title, subtitle: item.year.map(String.init),
-                           width: captionWidth, lowered: focused)
+            if showLabel {
+                ATVCardCaption(title: item.title, subtitle: item.year.map(String.init),
+                               width: captionWidth, lowered: focused)
+            }
         }
     }
 }
