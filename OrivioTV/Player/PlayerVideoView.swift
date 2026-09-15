@@ -123,7 +123,9 @@ struct SubtitleOverlayView: View {
 
     var body: some View {
         ZStack {
-            ForEach(model.parts) { part in
+            // Bitmap cues (PGS/VobSub) are pre-rendered images that carry their
+            // own layout; left exactly as they were.
+            ForEach(model.parts.filter { $0.image != nil }) { part in
                 if let image = part.image {
                     GeometryReader { geo in
                         Image(uiImage: image)
@@ -133,27 +135,113 @@ struct SubtitleOverlayView: View {
                             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                             .padding(.bottom, 60)
                     }
-                } else if let text = part.text {
-                    // Broadcast-caption look, styled from Playback settings:
-                    // text color, optional true outline, background plate with
-                    // adjustable opacity, and a vertical offset.
-                    VStack {
-                        Spacer()
-                        styledCaption(text)
-                            .padding(.horizontal, 22)
-                            .padding(.vertical, 9)
-                            .background(
-                                Color.black.opacity(settings.subtitleBackground
-                                    ? Double(settings.subtitleBackgroundOpacity) / 100 : 0),
-                                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            )
-                            .padding(.bottom, CGFloat(84 + settings.subtitleVerticalOffset))
-                            .frame(maxWidth: 1200)
+                }
+            }
+
+            // TEXT CUES, GROUPED BY WHERE THE TRACK SAYS THEY BELONG.
+            //
+            // `SubtitleModel.subtitle(currentTime:)` publishes EVERY cue
+            // overlapping the playhead, so a dialogue line and a sign/song
+            // translation arrive together — routinely, in anime fansubs. Every
+            // one of them used to be laid out identically (a full-screen VStack
+            // with a Spacer and the same bottom padding) inside a ZStack, so
+            // simultaneous cues were drawn on top of each other.
+            //
+            // Two things fix that. Cues are placed by their own
+            // `textPosition` — ASS carries an alignment per style and per `\an`
+            // override, which is exactly how a sign says "I belong at the top"
+            // — and cues that land in the SAME place are stacked in one VStack
+            // instead of overlaid.
+            //
+            // Nothing moves for ordinary subtitles: SRT has no position and
+            // gets `TextPosition()`'s default, and standard ASS dialogue is
+            // Alignment 2. Both are bottom-centre, where they already were.
+            ForEach(textGroups, id: \.slot) { group in
+                VStack(spacing: 6) {
+                    ForEach(group.parts) { part in
+                        if let text = part.text { caption(text) }
                     }
                 }
+                .frame(maxWidth: 1200)
+                .frame(maxWidth: .infinity, maxHeight: .infinity,
+                       alignment: Self.alignment(for: group.slot))
+                .padding(Self.padEdge(for: group.slot),
+                         Self.padInset(for: group.slot, offset: settings.subtitleVerticalOffset))
             }
         }
         .allowsHitTesting(false)
+    }
+
+    /// One caption: the broadcast look, styled from Playback settings — text
+    /// colour, optional true outline, background plate with adjustable opacity.
+    private func caption(_ text: NSAttributedString) -> some View {
+        styledCaption(text)
+            .padding(.horizontal, 22)
+            .padding(.vertical, 9)
+            .background(
+                Color.black.opacity(settings.subtitleBackground
+                    ? Double(settings.subtitleBackgroundOpacity) / 100 : 0),
+                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+            )
+    }
+
+    /// Text cues bucketed into the nine ASS screen positions, in a stable
+    /// order. `slot` is `vertical * 3 + horizontal` (0 = top/leading).
+    private var textGroups: [(slot: Int, parts: [SubtitlePart])] {
+        let texts = model.parts.filter { $0.image == nil && $0.text != nil }
+        return Dictionary(grouping: texts, by: Self.slot(of:))
+            .sorted { $0.key < $1.key }
+            .map { (slot: $0.key, parts: $0.value) }
+    }
+
+    /// No `textPosition` means SRT (or an addon's plain text) — bottom centre,
+    /// which is where every caption in this app has always gone.
+    private static func slot(of part: SubtitlePart) -> Int {
+        guard let position = part.textPosition else { return 2 * 3 + 1 }
+        let vertical: Int
+        if position.verticalAlign == .top { vertical = 0 }
+        else if position.verticalAlign == .center { vertical = 1 }
+        else { vertical = 2 }
+        let horizontal: Int
+        if position.horizontalAlign == .leading { horizontal = 0 }
+        else if position.horizontalAlign == .trailing { horizontal = 2 }
+        else { horizontal = 1 }
+        return vertical * 3 + horizontal
+    }
+
+    private static func alignment(for slot: Int) -> Alignment {
+        switch (slot / 3, slot % 3) {
+        case (0, 0): return .topLeading
+        case (0, 1): return .top
+        case (0, 2): return .topTrailing
+        case (1, 0): return .leading
+        case (1, 1): return .center
+        case (1, 2): return .trailing
+        case (2, 0): return .bottomLeading
+        case (2, 2): return .bottomTrailing
+        default:     return .bottom
+        }
+    }
+
+    /// The ASS margins are deliberately NOT applied — the app's own inset is
+    /// what "Vertical position" in Settings adjusts, and honouring a track's
+    /// margins as well would move every caption for everyone.
+    private static func padEdge(for slot: Int) -> Edge.Set {
+        switch slot / 3 {
+        case 0:  return .top
+        case 1:  return []
+        default: return .bottom
+        }
+    }
+
+    private static func padInset(for slot: Int, offset: Int) -> CGFloat {
+        switch slot / 3 {
+        // Only the bottom row follows the viewer's offset: that setting means
+        // "raise or lower the captions", and the captions are down there.
+        case 2:  return CGFloat(84 + offset)
+        case 0:  return 84
+        default: return 0
+        }
     }
 
     private var textColor: Color { Color(badgeHex: settings.subtitleTextColorHex) ?? .white }
