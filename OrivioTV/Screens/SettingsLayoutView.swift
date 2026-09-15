@@ -87,7 +87,7 @@ struct LayoutSettingsDetail: View {
 
                 SettingsToggleCard(
                     title: "Poster labels",
-                    subtitle: "Show the title beneath poster cards",
+                    subtitle: "Show the title and release year beneath poster cards, everywhere they appear — Home rows, Discover, Search, Library and your Plex/Jellyfin shelves. Off leaves just the artwork. Continue Watching keeps its labels either way: those name the episode and how much is left, which is information rather than decoration.",
                     isOn: $settings.showPosterLabels
                 )
 
