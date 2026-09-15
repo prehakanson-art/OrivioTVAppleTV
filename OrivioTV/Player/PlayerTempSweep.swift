@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import UIKit
 
 /// Reclaims the player's scratch space in `tmp/` at launch.
 ///
@@ -501,5 +502,174 @@ final class ColorProbeServer {
         """
         connection.send(content: Data(head.utf8) + body,
                         completion: .contentProcessed { _ in connection.cancel() })
+    }
+}
+
+/// App-wide flight recorder: one compact line every few seconds, kept in
+/// UserDefaults so it SURVIVES the failure.
+///
+/// The `:8123` live probe is the better read-out right up until the moment it
+/// matters, and then it is gone — a suspended app stops answering, a wedged one
+/// never accepts the connection, and a kernel panic takes the whole box with it.
+/// On 2026-09-14 the app froze and the Apple TV then died of an out-of-memory
+/// panic, and none of the live tooling could say a word about it. What DID
+/// survive was the persisted trail in UserDefaults, readable afterwards with
+/// `devicectl device copy from … Library/Preferences/<bundle>.plist`.
+///
+/// So this records the handful of numbers that incident needed and nobody had:
+///
+/// - **mainStall** — seconds since the main thread last ticked. THE datum that
+///   separates "deadlocked" from "out of memory", and the one whose absence
+///   sent that investigation down the wrong path for an hour. A heartbeat is
+///   bumped on the main queue; this thread only ever READS how stale it is, so
+///   a blocked main thread makes the number climb instead of hiding.
+/// - **mem** — footprint in MB, app-wide and continuous. The existing memory
+///   line only runs while the player is open, which is why the staircase that
+///   ended in the panic was invisible.
+/// - **vms** — live `PlayerViewModel` count. Leaked players are what fills the
+///   memory; the leak probe already counts them but only shouted into NSLog.
+/// - **state** — foreground / inactive / background, tracked from the lifecycle
+///   notifications rather than read from `UIApplication`, because
+///   `applicationState` is main-thread-only and this runs on a utility queue.
+/// - **cache** — the hybrid cache's own status line (file size, window, pool).
+///
+/// Deliberately cheap and deliberately boring: two timers, a few lock-guarded
+/// reads, a bounded ring, no retained references to anything it observes, and
+/// no UIKit access off the main thread.
+enum FlightRecorder {
+    /// Read it back with:
+    /// `plistlib.load(open(prefs))["dev.flight"]`
+    private static let key = "dev.flight"
+    /// ~40 minutes at the tick below. Bounded so it can never grow without
+    /// limit — the same discipline `dvTrail` learned the hard way.
+    private static let capacity = 240
+    private static let tick: TimeInterval = 10
+    /// How often the main queue stamps its heartbeat. Finer than the tick so a
+    /// stall is dated to within a second rather than within ten.
+    private static let beat: TimeInterval = 1
+
+    private static let queue = DispatchQueue(label: "orivio.flight", qos: .utility)
+
+    /// When the main queue last proved it was alive (`timeIntervalSince1970`).
+    /// An `Atomic` because it is written on main and read on `queue`.
+    private static let mainBeatAt = Atomic<TimeInterval>(
+        wrappedValue: Date().timeIntervalSince1970
+    )
+    private static let appState = Atomic<String>(wrappedValue: "launching")
+    /// A one-off marker the next tick will carry (see `mark`).
+    private static let pendingMark = Atomic<String?>(wrappedValue: nil)
+
+    nonisolated(unsafe) private static var started = false
+    nonisolated(unsafe) private static var beatTimer: DispatchSourceTimer?
+    nonisolated(unsafe) private static var tickTimer: DispatchSourceTimer?
+
+    /// Annotate the recording — "the freeze started here", a build stamp, a
+    /// deliberate reproduction step. Carried on the next tick. Safe from any
+    /// thread.
+    static func mark(_ note: String) {
+        pendingMark.wrappedValue = note
+        NSLog("[OrivioFlight] MARK %@", note)
+    }
+
+    static func start() {
+        #if DEBUG
+        guard !started else { return }
+        started = true
+        NSLog("[OrivioFlight] recorder armed — tick %.0fs, ring %d, key %@",
+              tick, capacity, key)
+
+        // A new run is a new recording. Keeping the previous launch's lines
+        // would make "what happened just before it died" ambiguous, and the
+        // crash/panic reports already carry the boundary.
+        //
+        // WRITTEN THROUGH `queue` like every other write, so the first tick
+        // cannot race the reset and lose itself.
+        let opening = line(mainStall: 0, note: "=== launch ===")
+        queue.async { UserDefaults.standard.set([opening], forKey: key) }
+
+        // Main-thread heartbeat. All it does is stamp the clock; if the main
+        // thread is blocked this simply stops happening and the tick below sees
+        // the gap grow.
+        let heart = DispatchSource.makeTimerSource(queue: .main)
+        heart.schedule(deadline: .now() + beat, repeating: beat, leeway: .milliseconds(200))
+        heart.setEventHandler { mainBeatAt.wrappedValue = Date().timeIntervalSince1970 }
+        heart.resume()
+        beatTimer = heart
+
+        let recorder = DispatchSource.makeTimerSource(queue: queue)
+        recorder.schedule(deadline: .now() + tick, repeating: tick, leeway: .seconds(1))
+        recorder.setEventHandler { record() }
+        recorder.resume()
+        tickTimer = recorder
+
+        observeLifecycle()
+        #endif
+    }
+
+    // MARK: - Internals
+
+    /// Lifecycle tracked from notifications, NOT from `UIApplication.shared
+    /// .applicationState`: that is main-thread-only, and reading UIKit off the
+    /// main thread is precisely the defect the Main Thread Checker caught in
+    /// the sample engine the same night this file was written.
+    private static func observeLifecycle() {
+        let centre = NotificationCenter.default
+        func watch(_ name: Notification.Name, _ label: String) {
+            centre.addObserver(forName: name, object: nil, queue: .main) { _ in
+                appState.wrappedValue = label
+                // Flush immediately: a suspension can freeze the process before
+                // the next tick, and the state it went away in is exactly what
+                // the next investigation wants.
+                queue.async { record(note: "lifecycle \(label)") }
+            }
+        }
+        watch(UIApplication.didBecomeActiveNotification, "active")
+        watch(UIApplication.willResignActiveNotification, "inactive")
+        watch(UIApplication.didEnterBackgroundNotification, "background")
+        watch(UIApplication.willEnterForegroundNotification, "foreground")
+        centre.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main
+        ) { _ in queue.async { record(note: "MEMORY WARNING") } }
+    }
+
+    /// Build one line. Pure reads — nothing here can block on the main thread,
+    /// which is the whole point: it has to keep recording while main is stuck.
+    private static func line(mainStall: Double, note: String?) -> String {
+        var out = String(
+            format: "%@ mem=%.0fMB vms=%d state=%@ mainStall=%.0fs",
+            Self.stamp(),
+            PlayerProbe.footprintMB(),
+            PlayerViewModel.liveInstanceCounter.wrappedValue,
+            appState.wrappedValue,
+            mainStall
+        )
+        // The cache's own snapshot is lock-guarded and built for cross-thread
+        // reads (`statusLine`), so this costs a lock and a string.
+        out += " | " + MediaCacheServer.shared.statusLine
+        if let note { out += " | " + note }
+        return out
+    }
+
+    private static func stamp() -> String {
+        let f = DateFormatter()
+        f.dateFormat = "MM-dd HH:mm:ss"
+        return f.string(from: Date())
+    }
+
+    /// Append one line. Always on `queue`.
+    private static func record(note: String? = nil) {
+        let stall = max(0, Date().timeIntervalSince1970 - mainBeatAt.wrappedValue)
+        var text = line(mainStall: stall, note: note)
+        if let mark = pendingMark.wrappedValue {
+            pendingMark.wrappedValue = nil
+            text += " | MARK: " + mark
+        }
+        // A stalled main thread is the headline, not a field to squint at.
+        if stall >= 3 { text += "  <-- MAIN THREAD STALLED" }
+
+        var trail = UserDefaults.standard.stringArray(forKey: key) ?? []
+        trail.append(text)
+        if trail.count > capacity { trail.removeFirst(trail.count - capacity) }
+        UserDefaults.standard.set(trail, forKey: key)
     }
 }

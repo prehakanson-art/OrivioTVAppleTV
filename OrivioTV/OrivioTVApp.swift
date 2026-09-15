@@ -16,6 +16,10 @@ struct OrivioTVApp: App {
         // Dev-only LAN read-out of the colour trail, so a session can be
         // watched live without `devicectl` backgrounding the app mid-playback.
         ColorProbeServer.shared.start()
+        // …and a recording that SURVIVES the failure, for when the live probe
+        // cannot answer: a suspended app, a wedged one, or a box that panics.
+        // See FlightRecorder for what it records and why each field is there.
+        FlightRecorder.start()
     }
 
     @StateObject private var theme = ThemeManager()
