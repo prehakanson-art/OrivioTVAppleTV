@@ -315,13 +315,42 @@ final class DVSampleEngine {
     /// so sample creation can never fail (the old jitter-chase regression).
     private var ptsGridAnchor: Double = -1   // demux-thread only
 
+    /// 23.976 AND 24.000 ARE DIFFERENT CADENCES AND THIS USED TO CONFLATE THEM.
+    ///
+    /// Every rate in 23.5...24.2 was folded onto the NTSC grid (1001/24000),
+    /// so a true-24.000 film was measured against a frame duration 0.042ms too
+    /// long. The snap index rounds, so the residual walks: it reaches half a
+    /// frame (20.8ms) after ~500 frames, wraps, and walks again. Frames more
+    /// than 2ms out are passed through raw by `snapVideoPTS` while the ones
+    /// inside 2ms are pulled onto the WRONG grid — so the engine alternated
+    /// between re-timing and not, and every crossing of that boundary handed
+    /// the synchronizer a step change.
+    ///
+    /// Measured on a 24.000 DV title (`avg_fps=24/1`, panel settled at 24Hz):
+    ///   pts census: 480 frames, 432 off-grid (worst 20.3ms)
+    ///   vsync probe: 237 refreshes, 4 repeats, 3 skips, decodeStalls=0
+    /// 90% off-grid is exactly the 48-in-500 duty cycle that drift predicts,
+    /// 20.3ms is exactly half a frame at 24fps, and `decodeStalls=0` rules out
+    /// decode, buffering and the cache. Those repeats and skips ARE the
+    /// reported micro-jumps.
+    ///
+    /// `videoFPS` comes from `av_q2d` of the stream's own rational, so 24/1
+    /// arrives as 24.0 and 24000/1001 as 23.976025 — the engine can tell them
+    /// apart and now does, at the midpoint of each NTSC/integer pair. Genuine
+    /// 23.976 / 29.97 / 59.94 content keeps the grid it always had; only rates
+    /// that really are integer stop being re-timed onto a cadence they do not
+    /// have. (`SessionDisplayMode.snapToBroadcastRate` draws the same
+    /// distinction for the display request, and for the same reason.)
     private var gridFrameDuration: Double {
         let fps = Double(videoFPS)
         guard fps > 10 else { return 0 }
         switch fps {
-        case 23.5...24.2: return 1001.0 / 24000.0
-        case 29.5...30.2: return 1001.0 / 30000.0
-        case 59.5...60.2: return 1001.0 / 60000.0
+        case 23.5 ..< 23.988:  return 1001.0 / 24000.0
+        case 23.988 ... 24.2:  return 1.0 / 24.0
+        case 29.5 ..< 29.985:  return 1001.0 / 30000.0
+        case 29.985 ... 30.2:  return 1.0 / 30.0
+        case 59.5 ..< 59.97:   return 1001.0 / 60000.0
+        case 59.97 ... 60.2:   return 1.0 / 60.0
         default: return 1.0 / fps
         }
     }
