@@ -550,8 +550,11 @@ final class ThemeManager: ObservableObject {
     func setPalette(_ palette: ThemePalette) { basePalette = palette }
 
     /// The tone full-bleed hero/backdrop scrims fade toward, tracking the
-    /// stage: graphite normally, near-black in Black Background mode.
-    var stageBlend: Color { amoled ? Color(hex: 0x08080A) : ATVStage.blend }
+    /// stage: graphite normally, the stage's own black in Black Background
+    /// mode. It was 0x08080A — near-black, which matched a stage that still
+    /// had an accent bloom over it. The stage is flat 0x000000 now, so
+    /// anything but the same black leaves a seam where the hero band ends.
+    var stageBlend: Color { amoled ? OrivioPrimitives.black : ATVStage.blend }
 
     // NOTE: `effectiveFocusGlow` and `ThemePalette.focusGlow` were removed.
     // `focusGlow` was only ever written by the never-called `ATVPalettes.adapt`,

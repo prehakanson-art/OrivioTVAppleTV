@@ -66,22 +66,26 @@ struct ATVBackground: View {
     var body: some View {
         ZStack {
             theme.palette.background
-            // Gentle grey depth wash — a touch lighter at top, slightly deeper
-            // at the bottom, but staying a medium GREY (not sinking to black).
-            // Black Background mode drops the wash so the stage is pure black,
-            // keeping only the accent bloom.
+            // Black Background mode is PURE black: no depth wash, and no accent
+            // bloom either. The bloom used to stay on at 0.12 — the stage was
+            // black in name but still carried a corner of accent colour, which
+            // is the one thing a black background is chosen to avoid. Nothing
+            // is layered over `palette.background` (0x000000) now.
             if !theme.amoled {
+                // Gentle grey depth wash — a touch lighter at top, slightly
+                // deeper at the bottom, but staying a medium GREY (not sinking
+                // to black).
                 LinearGradient(
                     colors: [Color(hex: 0x252931), Color(hex: 0x1B1E24)],
                     startPoint: .top, endPoint: .bottom
                 )
                 .opacity(0.92)
+                // Accent bloom, top-leading — keeps the stage from reading dead.
+                RadialGradient(
+                    colors: [theme.palette.secondary.opacity(0.14), .clear],
+                    center: .topLeading, startRadius: 0, endRadius: 1500
+                )
             }
-            // Accent bloom, top-leading — keeps the stage from reading dead.
-            RadialGradient(
-                colors: [theme.palette.secondary.opacity(theme.amoled ? 0.12 : 0.14), .clear],
-                center: .topLeading, startRadius: 0, endRadius: 1500
-            )
         }
         .ignoresSafeArea()
     }

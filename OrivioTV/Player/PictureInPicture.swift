@@ -69,6 +69,7 @@ final class PictureInPictureController: NSObject, ObservableObject {
         // container) BACKGROUNDS the app, which fires more of them.
         PlayerProbe.event("pip", line)
         NSLog("[OrivioPiP] %@", line)
+        #if DEBUG
         let stamped = "\(Date().formatted(date: .omitted, time: .standard)) \(line)"
         trailQueue.async {
             trailBuffer.append(stamped)
@@ -80,11 +81,29 @@ final class PictureInPictureController: NSObject, ObservableObject {
                 UserDefaults.standard.set(trailBuffer, forKey: trailKey)
             }
         }
+        #else
+        // DEBUG only, like `PlayerProbe.event` above: the trail is read by
+        // pulling the app container off a development box, so on a release
+        // install it is pure cost — and the cost is not small. 800 lines is
+        // ~97 KB, measured the biggest single key in the whole domain on a
+        // real Apple TV, against the ~1 MB where CFPreferences answers a write
+        // with abort() (see AddonManager's note). Clear what an earlier build
+        // left behind, once per process, on the queue the writes used to use.
+        trailQueue.async {
+            guard !clearedStaleTrail else { return }
+            clearedStaleTrail = true
+            UserDefaults.standard.removeObject(forKey: trailKey)
+        }
+        #endif
     }
     nonisolated private static let trailQueue = DispatchQueue(label: "orivio.pip.trail", qos: .utility)
+    #if DEBUG
     nonisolated(unsafe) private static var trailBuffer: [String] =
         UserDefaults.standard.stringArray(forKey: "dev.pipTrail") ?? []
     nonisolated(unsafe) private static var trailFlushScheduled = false
+    #else
+    nonisolated(unsafe) private static var clearedStaleTrail = false
+    #endif
     private var controller: AVPictureInPictureController?
     private var possibleObservation: NSKeyValueObservation?
     private weak var attachedLayer: AVPlayerLayer?

@@ -7,7 +7,7 @@ import UIKit
 /// Sentry / playback-issue reports are telemetry we don't ship in a sideloaded
 /// build — so this covers the genuinely portable pieces.
 enum DiagnosticsService {
-    /// Marketing version only — the About screen shows "Version 7", not the
+    /// Marketing version only — the About screen shows "Version 8", not the
     /// build number behind it.
     static var appVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"

@@ -2,9 +2,15 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!--
+	  The SAME group the Release entitlements use, because Debug now signs with
+	  the same registered ids (see project.yml). An App Group is a restricted
+	  entitlement: it has to appear in the provisioning profile, and the only
+	  group these profiles carry is this one.
+	-->
 	<key>com.apple.security.application-groups</key>
 	<array>
-		<string>group.com.orivio.tv.appletv.devbuild</string>
+		<string>group.com.innerapns.pubtest.CYCSPZ5MTR</string>
 	</array>
 </dict>
 </plist>

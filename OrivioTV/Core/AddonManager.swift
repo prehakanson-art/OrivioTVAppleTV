@@ -294,7 +294,8 @@ final class AddonManager: ObservableObject {
         }
         var resolvedAny = false
         for entry in resolved {
-            guard let manifest = entry.manifest,
+            // Same rule as the refresh: an empty manifest is not a resolution.
+            guard let manifest = entry.manifest, !manifest.isPlaceholder,
                   let index = addons.firstIndex(where: { $0.manifestURL == entry.url }) else { continue }
             addons[index] = InstalledAddon(
                 manifestURL: entry.url, manifest: manifest, enabled: entry.enabled
@@ -596,12 +597,14 @@ final class AddonManager: ObservableObject {
             try await onSyncRequested()
         } catch {
             NSLog("[OrivioAddonSync] sync FAILED: %@", String(describing: error))
+            AppProbe.warn("addon sync", "\(error)")
             return .failed(Self.shortReason(error))
         }
         let after = Set(addons.map(\.manifestURL))
         let added = after.subtracting(before).count
         let removed = before.subtracting(after).count
         NSLog("[OrivioAddonSync] sync ok: +%d -%d", added, removed)
+        AppProbe.sync("add-ons: +\(added) -\(removed)")
         return (added + removed) > 0
             ? .changed(added: added, removed: removed) : .alreadyUpToDate
     }
@@ -620,19 +623,36 @@ final class AddonManager: ObservableObject {
         // then reassemble in the original order.
         let current = addons
         guard !current.isEmpty else { return }
-        let refreshed = await boundedConcurrentMap(current, limit: AddonSweepLimits.manifests) { addon in
-            if let manifest = try? await StremioAPI.manifest(url: addon.manifestURL) {
-                // Preserve the user's enable/disable choice across a refresh.
-                return InstalledAddon(manifestURL: addon.manifestURL, manifest: manifest, enabled: addon.enabled)
+        let refreshed = await boundedConcurrentMap(current, limit: AddonSweepLimits.manifests) { addon -> (InstalledAddon, Bool) in
+            guard let manifest = try? await StremioAPI.manifest(url: addon.manifestURL) else {
+                return (addon, false)
             }
-            return addon
+            // A 200 THAT ISN'T A MANIFEST decodes to an EMPTY one: the decoder
+            // is deliberately tolerant, so a captive-portal page, a CDN error
+            // body or a WAF challenge all come back as a manifest with no
+            // catalogs and no resources — `isPlaceholder`. Written over a good
+            // entry and saved, that is an add-on gone from Home and Sources
+            // with nothing to bring it back before the next launch, which is
+            // exactly what a wake-time network hiccup produces. Keep what we
+            // have unless the answer is better than it.
+            guard !manifest.isPlaceholder || addon.manifest.isPlaceholder else {
+                return (addon, false)
+            }
+            // Preserve the user's enable/disable choice across a refresh.
+            return (InstalledAddon(manifestURL: addon.manifestURL, manifest: manifest, enabled: addon.enabled), true)
         }
         // Bail if the installed set changed while we were fetching (e.g. the
         // user added/removed an addon), so we don't clobber their edit.
         guard addons.map(\.manifestURL) == current.map(\.manifestURL) else { return }
-        addons = refreshed
+        addons = refreshed.map { $0.0 }
         save()
-        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.lastRefreshKey)
+        // Only a sweep that actually reached an add-on counts as "done for the
+        // hour". Stamping it after a sweep where every fetch failed burned the
+        // whole window, so the relaunch right after — the one the viewer makes
+        // BECAUSE something is missing — skipped the repair entirely.
+        if refreshed.contains(where: { $0.1 }) {
+            UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.lastRefreshKey)
+        }
     }
 
     private func load() {
@@ -641,15 +661,56 @@ final class AddonManager: ObservableObject {
         // other profiles start fresh with the defaults). Shared mode: the
         // legacy list IS the list.
         guard let data = ProfileScopedDefaults.data(Self.storageKey, feature: Self.feature, profileID),
-              let decoded = try? JSONDecoder().decode([InstalledAddon].self, from: data) else { return }
+              let decoded = try? JSONDecoder().decode([InstalledAddon].self, from: Self.inflated(data))
+        else { return }
         addons = decoded
     }
 
     private func save() {
         guard let data = try? JSONEncoder().encode(addons) else { return }
         UserDefaults.standard.set(
-            data, forKey: ProfileScopedDefaults.writeKey(Self.storageKey, feature: Self.feature, profileID)
+            Self.deflated(data),
+            forKey: ProfileScopedDefaults.writeKey(Self.storageKey, feature: Self.feature, profileID)
         )
+    }
+
+    /// The list is stored COMPRESSED, because a manifest is not a preference.
+    ///
+    /// Every installed addon is persisted here with its whole manifest, and a
+    /// catalog pack's manifest is enormous: one real Xperience profile is 746
+    /// catalogs, each with its genre list — 270 KB in this one key, per
+    /// profile that installs it. NSUserDefaults on tvOS is not sized for that.
+    /// A domain around 1 MB is where CFPreferences answered a write with
+    /// `__CFPREFERENCES_HAS_DETECTED_THIS_APP_TRYING_TO_STORE_TOO_MUCH_DATA__`
+    /// and abort() — the crash that moved the collections library out to a
+    /// file — and three such profiles on a box whose other keys already hold
+    /// ~450 KB clears that on their own. zlib takes the same list to ~10 KB
+    /// (25x), which puts it back in proportion without moving addons out of
+    /// the defaults they have always lived in (a file in Caches is purgeable,
+    /// and a viewer with no account would lose the list outright).
+    ///
+    /// Written by `save()`, read by `load()`, and nothing else touches the key.
+    /// An older build reading a compressed blob decodes nothing and falls back
+    /// to the default addons, so a DOWNGRADE re-seeds the list from the
+    /// account rather than keeping it.
+    private static let compressionMagic = Data([0x4F, 0x41, 0x5A, 0x31])   // "OAZ1"
+
+    /// Compressed, behind a magic prefix — or the plain JSON when compression
+    /// fails, which `inflated` reads just as happily.
+    private static func deflated(_ json: Data) -> Data {
+        guard let squeezed = try? (json as NSData).compressed(using: .zlib) as Data else { return json }
+        return compressionMagic + squeezed
+    }
+
+    /// The JSON back out. Anything without the magic is returned untouched:
+    /// the plain blob every build before this one wrote, and the argument-domain
+    /// overrides the UI tests launch with.
+    private static func inflated(_ stored: Data) -> Data {
+        guard stored.starts(with: compressionMagic),
+              let json = try? (Data(stored.dropFirst(compressionMagic.count)) as NSData)
+                .decompressed(using: .zlib) as Data
+        else { return stored }
+        return json
     }
 
     /// Add-ons every install gets, with or without an account.

@@ -85,6 +85,11 @@ final class StreamsViewModel: ObservableObject {
     var openedAt = Date()
     func stage(_ name: String) {
         NSLog("[OrivioPlay] +%.2fs %@", Date().timeIntervalSince(openedAt), name)
+        // Every stage of Play → picture, on the same clock as the browsing
+        // before it and the player after it. This is the seam the two probes
+        // used to meet at with a gap in the middle.
+        AppProbe.data(String(format: "play +%.2fs  %@",
+                             Date().timeIntervalSince(openedAt), name))
     }
 
     private func effectiveStreamID() async -> String {
@@ -619,6 +624,11 @@ final class StreamsViewModel: ObservableObject {
         NSLog("[OrivioSources] id=%@ querying=%@ skipped=%@",
               fetchID, queriedAddonNames.joined(separator: "|"),
               skipped.map { "\($0.name): \($0.reason)" }.joined(separator: "|"))
+        AppProbe.data("sources for \(fetchID): asking \(queriedAddonNames.count)"
+                      + " [\(queriedAddonNames.joined(separator: ", "))]"
+                      + (skipped.isEmpty ? ""
+                         : "  skipped \(skipped.count): "
+                           + skipped.map { "\($0.name) (\($0.reason))" }.joined(separator: "; ")))
         totalAddons = addons.count
         self.perTier = perTier
         self.filtersEnabled = filtersEnabled
@@ -706,6 +716,7 @@ final class StreamsViewModel: ObservableObject {
                         // wrong instead of a generic "didn't respond".
                         NSLog("[OrivioSources] %@ stream request failed: %@",
                               addon.manifest.name, String(describing: error))
+                        AppProbe.warn("sources", "\(addon.manifest.name) — \(error)")
                         return (addon.manifest.name, [], (addon.manifest.name, Self.shortReason(for: error)))
                     }
                 }

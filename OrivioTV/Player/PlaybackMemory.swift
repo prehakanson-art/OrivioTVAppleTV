@@ -70,6 +70,90 @@ enum ContainerSniffer {
     }
 }
 
+/// Learns which titles ship a Dolby track tvOS can BITSTREAM, so the next play
+/// takes the passthrough engine even when the add-on's stream name says nothing
+/// about the audio.
+///
+/// Separate from `TitleMemory` on purpose: that is a record of what the USER
+/// chose, and this is an observation the app made by itself. Same shape as
+/// `ContainerSniffer` — a capability the first play discovers for free and the
+/// next play spends instead of re-guessing.
+///
+/// Only recorded when BOTH halves are true: a multichannel E-AC-3/AC-3 track
+/// AND an HEVC video track. Both are required for the sample-feed engine to
+/// take the file, so remembering anything else would buy a header probe on
+/// every future play of a title that can never use it.
+enum DolbyMemory {
+    private static let key = "orivio.player.dolbyCapableTitles.v1"
+    private static let limit = 300
+
+    /// Has a previous play of this title been seen carrying bitstreamable
+    /// Dolby in an HEVC container?
+    static func bitstreamable(_ metaID: String) -> Bool {
+        guard !metaID.isEmpty else { return false }
+        return (UserDefaults.standard.array(forKey: key) as? [String])?.contains(metaID) ?? false
+    }
+
+    /// Record the observation. Idempotent and cheap; a no-op for an id already
+    /// known, so the common case does not write to defaults at all.
+    static func remember(_ metaID: String) {
+        guard !metaID.isEmpty else { return }
+        append(metaID, to: key)
+        // A title that turns out to bitstream after all clears any earlier
+        // "don't bother" verdict — a new release of the same show can differ.
+        forget(metaID, from: declinedKey)
+    }
+
+    // MARK: The negative
+
+    /// `.v2`: the `.v1` list was recorded when the sample-feed engine could
+    /// not take H.264 at all, so it is full of exactly the H.264+DD+ titles
+    /// the engine now accepts — its own doc note below names them. Reading it
+    /// would make the feature do nothing on every title the user had already
+    /// played once. The old key is left to rot; relearning a genuine decline
+    /// costs one bounded probe per title.
+    private static let declinedKey = "orivio.player.dolbyDeclinedTitles.v2"
+
+    /// A header probe has already looked at this title and found nothing the
+    /// sample-feed engine could use (no HEVC, or no bitstreamable Dolby).
+    ///
+    /// This is what keeps the WIDER audio hint honest. A file with no
+    /// bitstreamable Dolby track at all — or H.264 in a shape the engine
+    /// declines (Annex B, interlaced, anamorphic) — would otherwise buy the
+    /// same header probe on every single play and answer the same way. One
+    /// probe per title, ever, instead of one per play.
+    static func declined(_ metaID: String) -> Bool {
+        guard !metaID.isEmpty else { return false }
+        return (UserDefaults.standard.array(forKey: declinedKey) as? [String])?.contains(metaID) ?? false
+    }
+
+    /// Only ever called for a probe that actually READ the header — a probe
+    /// that timed out or failed answers all-false, which is indistinguishable
+    /// from "no HEVC", and recording that would blind the title permanently on
+    /// the strength of one bad network moment.
+    static func rememberDeclined(_ metaID: String) {
+        guard !metaID.isEmpty, !bitstreamable(metaID) else { return }
+        append(metaID, to: declinedKey)
+    }
+
+    private static func append(_ metaID: String, to storageKey: String) {
+        var ids = (UserDefaults.standard.array(forKey: storageKey) as? [String]) ?? []
+        guard !ids.contains(metaID) else { return }
+        // Cheap bound, same reasoning as ContainerSniffer: relearning costs
+        // one play of one title, so drop the oldest rather than carry an LRU.
+        if ids.count >= limit { ids.removeFirst(ids.count - limit + 1) }
+        ids.append(metaID)
+        UserDefaults.standard.set(ids, forKey: storageKey)
+    }
+
+    private static func forget(_ metaID: String, from storageKey: String) {
+        guard var ids = UserDefaults.standard.array(forKey: storageKey) as? [String],
+              let index = ids.firstIndex(of: metaID) else { return }
+        ids.remove(at: index)
+        UserDefaults.standard.set(ids, forKey: storageKey)
+    }
+}
+
 /// Remembered per-title playback choices. Only what the USER changed by hand
 /// is stored — defaults and automatic picks never overwrite a memory.
 struct TitleMemory: Codable {

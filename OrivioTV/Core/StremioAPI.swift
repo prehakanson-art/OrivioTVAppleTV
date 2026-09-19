@@ -70,6 +70,20 @@ final class StremioResponseCache: @unchecked Sendable {
     }
 }
 
+/// Settings → Layout → Posters → "Poster banners", readable from the fetch
+/// paths below. They run off the main actor, so they can't read the
+/// `@MainActor` HomeCatalogSettingsStore that owns the setting; the store
+/// writes every assignment through here.
+enum PosterBannerPreference {
+    private static let lock = NSLock()
+    private static var storage = true
+
+    static var showBanners: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return storage }
+        set { lock.lock(); storage = newValue; lock.unlock() }
+    }
+}
+
 enum StremioAPI {
     static let session: URLSession = {
         let config = URLSessionConfiguration.default
@@ -124,7 +138,34 @@ enum StremioAPI {
     /// `bypassCache` skips the cache READ (and the coalescer, so a health
     /// check times its own request rather than joining one in flight) but
     /// still stores the response for later callers.
+    /// EVERY add-on request in the app funnels through here — catalogs, meta,
+    /// streams, subtitles, manifests — so this is the one place that can
+    /// answer "what did the add-ons actually do while I was browsing".
+    ///
+    /// A thin timing shell around the real fetch rather than logging inside
+    /// it: the body has four exits (cache hit, bypass, coalesced, throw) and
+    /// instrumenting each one separately is how a log starts disagreeing with
+    /// the code. A request that hangs shows as a start line with no finish,
+    /// which is exactly what a hang looks like from the couch.
     private static func get<T: Decodable>(
+        _ urlString: String, ttl: TimeInterval = 0, timeout: TimeInterval = 0,
+        bypassCache: Bool = false
+    ) async throws -> T {
+        let name = AppProbe.requestName(urlString)
+        let done = AppProbe.begin("data", name)
+        do {
+            let value: T = try await fetch(urlString, ttl: ttl, timeout: timeout,
+                                           bypassCache: bypassCache)
+            done("ok")
+            return value
+        } catch {
+            done("FAILED")
+            AppProbe.warn("addon", "\(name) — \(error)")
+            throw error
+        }
+    }
+
+    private static func fetch<T: Decodable>(
         _ urlString: String, ttl: TimeInterval = 0, timeout: TimeInterval = 0,
         bypassCache: Bool = false
     ) async throws -> T {
@@ -226,18 +267,22 @@ enum StremioAPI {
         let response: CatalogResponse = try await get(url, ttl: ttl)
         // De-dup by id: duplicate identifiers in a catalog crash the tvOS focus
         // engine when rendered in a ForEach (aggregator addons emit them).
-        return (response.metas ?? []).filter { !$0.name.isEmpty }.deduplicatedByID()
+        let metas = (response.metas ?? []).filter { !$0.name.isEmpty }.deduplicatedByID()
+        return PosterBannerPreference.showBanners ? metas : metas.map { $0.withPlainPoster() }
     }
 
     static func meta(addon: InstalledAddon, type: String, id: String) async throws -> MetaItem {
         // Via `resourceURL` so a configured addon's manifest query (its
         // token) rides along after `.json` instead of being dropped.
         let url = addon.resourceURL("/meta/\(encodePathComponent(type))/\(encodePathComponent(id)).json")
-        if let cached = await metaDiskCache.value(for: url, ttl: metaDiskTTL) { return cached }
+        if let cached = await metaDiskCache.value(for: url, ttl: metaDiskTTL) {
+            return PosterBannerPreference.showBanners ? cached : cached.withPlainPoster()
+        }
         let response: MetaResponse = try await get(url, ttl: 600)
         guard let meta = response.meta else { throw StremioAPIError.emptyBody }
+        // Cached as the add-on sent it, so turning banners back on restores them.
         await metaDiskCache.store(meta, for: url)
-        return meta
+        return PosterBannerPreference.showBanners ? meta : meta.withPlainPoster()
     }
 
     static func streams(addon: InstalledAddon, type: String, id: String,

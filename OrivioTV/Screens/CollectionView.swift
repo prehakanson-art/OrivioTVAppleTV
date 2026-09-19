@@ -256,7 +256,7 @@ struct CollectionTileCard: View, Equatable {
     let collection: OrivioCollection
 
     private var firstFolder: OrivioCollectionFolder? { collection.folders.first }
-    private var cover: String? { firstFolder?.coverImageUrl }
+    private var cover: String? { firstFolder?.tileCoverImageUrl }
     private var emoji: String? { firstFolder?.coverEmoji }
     /// Keyed by the FOLDER's id (the stable per-category preset id), not the
     /// collection's — a group collection (e.g. "Streaming Services") holds
@@ -425,7 +425,7 @@ struct CollectionFolderCard: View, Equatable {
             ZStack {
                 RoundedRectangle(cornerRadius: OrivioRadius.md)
                     .fill(isBright ? AnyShapeStyle(OrivioPrimitives.neutral100) : AnyShapeStyle(theme.palette.surface))
-                if let cover = folder?.coverImageUrl, !cover.isEmpty {
+                if let cover = folder?.tileCoverImageUrl, !cover.isEmpty {
                     // Full-bleed for POSTER/LANDSCAPE card art; .fit + margin
                     // only for SQUARE logo marks. See CollectionCard above —
                     // padding full-bleed art inside the tile is what produced
@@ -656,12 +656,6 @@ struct CollectionView: View {
     private var hasTabs: Bool {
         viewMode == .grid && (collection.folders.count > 1 || !collection.showAllTab)
     }
-    /// Height reserved for the pinned header (title + optional tabs + the
-    /// sort/filter bar) — the grid starts below it and posters slide up UNDER
-    /// the scrim/header. Categories mode has no tab strip (every folder is a
-    /// row already), just the title + the view bar.
-    private var headerInset: CGFloat { (hasTabs ? 230 : 150) + 76 }
-
     var body: some View { collectionBody }
 
     private var collectionBody: some View {
@@ -685,40 +679,34 @@ struct CollectionView: View {
             )
             .ignoresSafeArea()
 
-            // Scrolling posters (full-bleed; content padded to clear the header).
-            grid(folderItems: folderItems, visibleItems: visibleItems(from: typeFilteredItems))
-
-            // The "grain bar": a background-toned scrim over the top that hides
-            // posters as they scroll up under the header, matching the pinned
-            // treatment elsewhere. Title/tabs draw ON TOP of it.
-            LinearGradient(
-                stops: [
-                    .init(color: theme.palette.background, location: 0),
-                    .init(color: theme.palette.background, location: 0.62),
-                    .init(color: theme.palette.background.opacity(0), location: 1)
-                ],
-                startPoint: .top, endPoint: .bottom
-            )
-            .frame(height: headerInset)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-            .ignoresSafeArea(edges: .top)
-            .allowsHitTesting(false)
-
-            // Pinned header — drawn last so it's in FRONT of the posters.
-            VStack(alignment: .leading, spacing: OrivioSpacing.lg) {
-                Text(collection.title)
-                    .font(FusionType.pageTitle(theme.font))
-                    .foregroundStyle(theme.palette.textPrimary)
-                    .padding(.horizontal, OrivioSpacing.huge)
-                // Tabs/sort only appear once content has loaded — no half-built
-                // filter bar over a spinner.
-                if !isLoading {
-                    folderTabs
-                    filterBar(genres: availableGenres(in: typeFilteredItems),
-                              mixedTypes: hasMixedTypes(folderItems))
+            // The header sits ABOVE the posters instead of over them: the scroll
+            // area starts where the header ends and clips at that edge, so
+            // nothing slides under the title, tabs or filters, and the focus
+            // engine — which keeps the focused card inside the scroll view —
+            // can't park a row behind them. (A full-screen scroll view used to
+            // run under a pinned header, with a hand-set inset that came up
+            // short of the real header and a black scrim hiding the overlap.)
+            VStack(alignment: .leading, spacing: 0) {
+                VStack(alignment: .leading, spacing: OrivioSpacing.lg) {
+                    Text(collection.title)
+                        .font(FusionType.pageTitle(theme.font))
+                        .foregroundStyle(theme.palette.textPrimary)
+                        .padding(.horizontal, OrivioSpacing.huge)
+                    // Tabs/sort only appear once content has loaded — no half-built
+                    // filter bar over a spinner.
+                    if !isLoading {
+                        folderTabs
+                        filterBar(genres: availableGenres(in: typeFilteredItems),
+                                  mixedTypes: hasMixedTypes(folderItems))
+                    }
                 }
+                .padding(.top, OrivioSpacing.xl)
+                // A gap under the header so the first row of artwork doesn't
+                // butt straight against the tabs and filter dropdowns.
+                .padding(.bottom, OrivioSpacing.md)
+
+                grid(folderItems: folderItems, visibleItems: visibleItems(from: typeFilteredItems))
             }
-            .padding(.top, OrivioSpacing.xl)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
         // Appearance-driven, so it re-ran on every return from a title (the
@@ -756,6 +744,7 @@ struct CollectionView: View {
                 let items = await CollectionResolver.resolveFolder(
                     folder,
                     addonManager: addonManager,
+                    addons: addonManager.addons,
                     providers: CollectionProviders(tmdb: tmdbSettings.isEnabled,
                                                    trakt: trakt.isSignedIn),
                     tmdbLanguage: tmdbSettings.settings.language,
@@ -772,9 +761,10 @@ struct CollectionView: View {
         }
     }
 
-    /// Collections are built out of TMDB and Trakt sources and nothing else,
-    /// so an empty folder is usually a missing connection rather than an empty
-    /// list — say which, and point at TMDB first.
+    /// Collections are built out of TMDB and Trakt sources (and, in a folder
+    /// with neither, add-on catalogs), so an empty folder is usually a missing
+    /// connection or add-on rather than an empty list — say which, and point
+    /// at TMDB first.
     /// What is blocking the folder ON SCREEN. For "All", only a collection
     /// where EVERY folder is blocked has a blocker worth naming — otherwise
     /// the tab has content and nothing needs saying.
@@ -800,8 +790,11 @@ struct CollectionView: View {
         case .needsTrakt:
             return "This folder's sources are Trakt lists — sign in to Trakt in "
                 + "Settings → Trakt to show them here."
+        case .needsAddon:
+            return "This folder's catalogs come from an add-on that isn't installed on this profile, "
+                + "or is switched off. Add it or switch it on in Settings → Add-ons to show them here."
         case .unsupportedSources:
-            return "This folder is built from add-on catalogs, which collections no longer use. "
+            return "This folder's sources aren't ones this app can load. "
                 + "Add TMDB or Trakt sources to it in Settings → Collections."
         case .empty:
             return "This folder has no sources. Add TMDB or Trakt sources to it in "
@@ -860,10 +853,8 @@ struct CollectionView: View {
                     .padding(.vertical, OrivioSpacing.lg)
                 }
             }
+            .padding(.top, OrivioSpacing.lg)
             .padding(.bottom, OrivioSpacing.xxl)
-        }
-        .safeAreaInset(edge: .top, spacing: 0) {
-            Color.clear.frame(height: headerInset)
         }
     }
 
@@ -911,15 +902,10 @@ struct CollectionView: View {
                     }
                 }
                 .padding(.horizontal, OrivioSpacing.huge)
+                // Room above the first row for a focused card's lift: the scroll
+                // area clips at the header's bottom edge.
+                .padding(.top, OrivioSpacing.lg)
                 .padding(.bottom, OrivioSpacing.xxl)
-            }
-            // Reserve the pinned header's height as a top safe-area inset (not a
-            // content padding): posters still scroll UP under the scrim, but the
-            // focus engine now keeps the FOCUSED poster below the header — before,
-            // navigating up through rows scrolled the focused card behind the
-            // title/tabs where you couldn't see it.
-            .safeAreaInset(edge: .top, spacing: 0) {
-                Color.clear.frame(height: headerInset)
             }
         }
     }
@@ -1058,10 +1044,11 @@ struct CollectionView: View {
         let providers = CollectionProviders(tmdb: tmdbSettings.isEnabled, trakt: trakt.isSignedIn)
         let tmdbLanguage = tmdbSettings.settings.language
         let manager = addonManager
+        let addons = addonManager.addons
         let hideUnreleased = layoutSettings.hideUnreleasedContent
         var blockers: [String: CollectionResolver.FolderBlocker] = [:]
         for folder in collection.folders {
-            let blocker = CollectionResolver.blocker(for: folder, providers: providers)
+            let blocker = CollectionResolver.blocker(for: folder, providers: providers, addons: addons)
             if blocker != .none { blockers[folder.id] = blocker }
         }
 
@@ -1072,7 +1059,7 @@ struct CollectionView: View {
                 for folder in folders {
                     group.addTask {
                         let items = await CollectionResolver.resolveFolder(
-                            folder, addonManager: manager,
+                            folder, addonManager: manager, addons: addons,
                             providers: providers, tmdbLanguage: tmdbLanguage,
                             maxTmdbPages: maxTmdbPages, tmdbStartPage: tmdbStartPage,
                             hideUnreleased: hideUnreleased

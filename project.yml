@@ -13,9 +13,16 @@ packages:
     path: Vendor/KSPlayer
   # Pure-Swift YouTube stream extractor — the only way to play trailer
   # YouTube keys on tvOS (no WebKit/WKWebView, so no iframe embed).
+  #
+  # VENDORED with one Orivio patch (see the "ORIVIO PATCH" comment in
+  # YouTube.swift): `streams` used to abort on an unreadable watch page before
+  # it had tried a single extraction method, which took the remote extractor
+  # down with it even though that one never touches the watch page. An
+  # unreadable page is what YouTube serves an address it distrusts, so this is
+  # what made trailers stop working the moment a VPN was switched on.
+  # Base revision: e5b7d0396ce12bf3444f0d209e8436c83373b7af (tag 0.4.9).
   YouTubeKit:
-    url: https://github.com/alexeichhorn/YouTubeKit
-    exactVersion: 0.4.9
+    path: Vendor/YouTubeKit
   # VLCKit as a binary xcframework; the tvOS slice vends module `TVVLCKit`.
   # Adds the VLC playback engine alongside KSPlayer.
   VLCKit:
@@ -120,7 +127,7 @@ targets:
         SWIFT_VERSION: "5.9"
         TARGETED_DEVICE_FAMILY: "3"
         # Tracks the Android APK release this port mirrors (v0.7.15-beta).
-        MARKETING_VERSION: "7"
+        MARKETING_VERSION: "8"
         CURRENT_PROJECT_VERSION: "1"
         # The sanitize script below writes into the built .app, so user
         # script sandboxing must be off or the phase is denied file access.
@@ -151,8 +158,21 @@ targets:
         # the Release identity above is what the published IPAs sign with and
         # must not move. The Top Shelf id below follows this one.
         Debug:
-          PRODUCT_BUNDLE_IDENTIFIER: com.orivio.tv.appletv.devbuild
-          # No App Groups on a free team — see the file's own comment.
+          # NO bundle-id override any more — Debug signs with the same
+          # `com.orivio.tv.appletv.dev` as Release. That is not cosmetic: an
+          # app EXTENSION cannot be signed with a wildcard profile, so the Top
+          # Shelf needs an explicit App ID of its own, prefixed by whatever the
+          # app uses. `…devbuild` was registered but `…devbuild.topshelf` never
+          # was, and a free Personal Team may create only ten App IDs every
+          # seven days — with that quota spent, Debug device builds died at
+          # signing and there was no way to create the id. The `.dev` pair
+          # (app AND topshelf) is already registered and provisioned, so it
+          # builds today and needs nothing from Apple.
+          #
+          # This does NOT collide with a sideloaded Orivio: the published IPAs
+          # carry `com.orivio.tv.appletv` (scripts/make-ipa.sh swaps it in
+          # after the build), so a Debug run still installs alongside them —
+          # two icons, separate data — exactly as before.
           CODE_SIGN_ENTITLEMENTS: Config/OrivioTV-Debug.entitlements
     preBuildScripts:
       # FFmpegKit (pulled in transitively by KSPlayer) ships
@@ -245,12 +265,14 @@ targets:
         CODE_SIGN_STYLE: Automatic
         SWIFT_VERSION: "5.9"
         TARGETED_DEVICE_FAMILY: "3"
-        MARKETING_VERSION: "7"
+        MARKETING_VERSION: "8"
         CURRENT_PROJECT_VERSION: "1"
         CODE_SIGN_ENTITLEMENTS: OrivioTopShelf/OrivioTopShelf.entitlements
       configs:
         Debug:
-          PRODUCT_BUNDLE_IDENTIFIER: com.orivio.tv.appletv.devbuild.topshelf
+          # Follows the app, which no longer overrides its id either — so this
+          # is `com.orivio.tv.appletv.dev.topshelf`, which IS registered. See
+          # the app target's Debug note for why that matters.
           CODE_SIGN_ENTITLEMENTS: OrivioTopShelf/OrivioTopShelf-Debug.entitlements
   # UI-test target: drives the tvOS remote (XCUIRemote) to verify focus/menu
   # behavior, which osascript keystroke automation can't do. Simulator only.

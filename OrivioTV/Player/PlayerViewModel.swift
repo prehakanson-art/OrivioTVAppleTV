@@ -88,6 +88,87 @@ enum PlayerOverlay: Equatable {
         if case .error = self { return "error" }
         return String(describing: self)
     }
+
+    /// States that draw the transport (`FusionPlayerControlsOverlay`): the bar
+    /// itself, the paused bar, and the two track popovers — which are that same
+    /// screen with a panel over one glyph.
+    ///
+    /// Defined once here because two places have to agree exactly on it:
+    /// `PlayerScreen.controlsVisible`, which mounts the overlay, and
+    /// `controlsSession`, which decides when its focus starts over. They drifting
+    /// apart is precisely how focus would end up somewhere nobody chose.
+    var showsTransport: Bool {
+        switch self {
+        case .controls, .pauseInfo, .audio, .subtitles: return true
+        default: return false
+        }
+    }
+}
+
+/// What the CURRENT output route can actually take, and how to ask tvOS for
+/// it. One place, because three engines each configured the session their own
+/// way and none of them ever told the session it would be playing multichannel.
+///
+/// `setSupportsMultichannelContent(true)` is not optional on tvOS: it is the
+/// app declaring that it has more than two channels to give. Left at its
+/// `false` default the session is entitled to hand the route a stereo fold,
+/// which is what every Dolby path in this app was doing.
+enum AudioOutputCapability {
+    /// Long-form video session, multichannel declared. Cheap and idempotent —
+    /// safe to call on every load from every engine.
+    ///
+    /// No route-sharing policy on tvOS, deliberately: see
+    /// `KSOptions.setAudioSession` for why `.longFormAudio` detached the
+    /// session from the user's Default Audio Output.
+    static func configureForMoviePlayback() {
+        let session = AVAudioSession.sharedInstance()
+        try? session.setCategory(.playback, mode: .moviePlayback)
+        if #available(tvOS 15.0, *) {
+            try? session.setSupportsMultichannelContent(true)
+        }
+    }
+
+    /// Channels the route reports it can take. Only meaningful once the
+    /// session is ACTIVE — an inactive session answers 2 for an Atmos AVR,
+    /// which is how a capable receiver got a stereo downmix.
+    static var maxOutputChannels: Int {
+        AVAudioSession.sharedInstance().maximumOutputNumberOfChannels
+    }
+
+    /// The route can carry more than stereo.
+    ///
+    /// NOT `isSpatialAudioEnabled`, which is a different question: that flag
+    /// reports Apple's own spatialization (head tracking, virtualisation) and
+    /// is routinely FALSE on exactly the equipment this matters for — an HDMI
+    /// receiver that decodes Dolby itself. Using it as the multichannel test
+    /// folded 7.1 to stereo on hardware that was perfectly capable.
+    static var supportsMultichannel: Bool { maxOutputChannels > 2 }
+
+    /// Whether tvOS will spatialize in software for this route (HomePods,
+    /// AirPods). Kept separate from `supportsMultichannel` on purpose.
+    static var routeIsSpatial: Bool {
+        AVAudioSession.sharedInstance().currentRoute.outputs.contains { $0.isSpatialAudioEnabled }
+    }
+
+    /// The route as a viewer would name it: "HDMI · up to 8 channels".
+    /// `portName` is the system's own label for the output.
+    static var routeShortDescription: String {
+        let ports = AVAudioSession.sharedInstance().currentRoute.outputs
+        let name = ports.first?.portName ?? "No output"
+        let max = maxOutputChannels
+        return max > 2 ? "\(name) · up to \(max) channels" : "\(name) · stereo"
+    }
+
+    /// One line for the diagnostics block.
+    static var routeDescription: String {
+        let session = AVAudioSession.sharedInstance()
+        let ports = session.currentRoute.outputs
+        let names = ports.map { "\($0.portType.rawValue)" }.joined(separator: "+")
+        let routeChannels = ports.compactMap { $0.channels?.count }.max() ?? 0
+        return "\(names.isEmpty ? "none" : names) max=\(maxOutputChannels)ch"
+            + " route=\(routeChannels)ch preferred=\(session.preferredOutputNumberOfChannels)ch"
+            + " spatial=\(routeIsSpatial ? "Y" : "n")"
+    }
 }
 
 enum AspectMode: String, CaseIterable {
@@ -386,6 +467,15 @@ final class OrivioPlayerOptions: KSOptions {
         // ~3 bytes/pixel: 4:2:0 biplanar at 10-bit (16-bit storage). Assumes
         // the worst case rather than sniffing bit depth — an 8-bit stream
         // just gets a slightly deeper queue than strictly needed.
+        //
+        // REVERTED 09-16: sizing this by the track's real bit depth gave 8-bit
+        // 4K thirteen frames instead of six — correct for a pure FFmpeg
+        // session, but it roughly DOUBLES the decoded-frame memory actually in
+        // use, and a DV Sample Feed session opens through the FFmpeg engine for
+        // its first couple of seconds before handing rendering over. That paid
+        // the extra allocation at exactly the moment playback is most fragile,
+        // for an engine that then throws it away. Worth revisiting once the DV
+        // path is settled; not worth it now.
         let area = max(naturalSize.width * naturalSize.height, 1920 * 1080)
         let frames = budgetBytes / (Double(area) * 3)
         return UInt8(min(max(frames.rounded(.down), 4), 16))
@@ -595,6 +685,39 @@ final class OrivioPlayerOptions: KSOptions {
     /// Consecutive badly-late frames, for the hard re-anchor below.
     private var badlyLateCount = 0
 
+    /// Wall-clock instant the current unbroken run of "video is late" began,
+    /// 0 when video is not currently late. Drives `fineCatchUp` below.
+    private var lateRunBegan: Double = 0
+
+    /// Wall-clock instant this options object first saw a sync decision, so
+    /// the correction can converge faster during the opening seconds (see
+    /// `fineCatchUp`). Options are built per load, so this is per session.
+    private var firstSyncAt: Double = 0
+
+    /// Sync telemetry, for the `[engine]` probe block. Written on the render
+    /// clock thread and read on main — plain counters on purpose: a torn read
+    /// costs a wrong digit in a diagnostic, and a lock here would sit in the
+    /// per-frame path. Same trade-off `pulldown60Hz` already makes.
+    ///
+    /// `queueStarved` is the one that matters: `frameCount` is the DECODED
+    /// frame queue's depth at the moment of the decision, so a session that
+    /// spends its life at depth 1 has no catch-up headroom at all and no
+    /// frame-dropping policy — stock's or ours — can shorten a deficit.
+    private(set) var syncDecisions = 0
+    private(set) var queueStarved = 0
+    private(set) var queueDepthSum = 0
+    private(set) var catchUpWanted = 0
+    private(set) var catchUpIssued = 0
+    private(set) var worstLateMs = 0
+
+    /// Snapshot for the probe. Main-actor callers only read.
+    var syncProbeLine: String {
+        let avg = syncDecisions > 0 ? Double(queueDepthSum) / Double(syncDecisions) : 0
+        let starvedPct = syncDecisions > 0 ? 100 * Double(queueStarved) / Double(syncDecisions) : 0
+        return String(format: "queue avg=%.2f starved=%.0f%% of %d | catchUp wanted=%d issued=%d | worstLate=%dms",
+                      avg, starvedPct, syncDecisions, catchUpWanted, catchUpIssued, worstLateMs)
+    }
+
     override func videoClockSync(main: KSClock, nextVideoTime: TimeInterval, fps: Double, frameCount: Int) -> (Double, ClockProcessType) {
         let (diff, action) = super.videoClockSync(main: main, nextVideoTime: nextVideoTime, fps: fps, frameCount: frameCount)
         // HARD RE-ANCHOR when video is seconds behind. The stock policy shows
@@ -614,6 +737,72 @@ final class OrivioPlayerOptions: KSOptions {
             }
         } else if diff > -0.2 {
             badlyLateCount = 0
+        }
+        // FINE LIP-SYNC CORRECTION — the fix for "the audio is ahead of the
+        // picture on every single title".
+        //
+        // KSPlayer's gate is ASYMMETRIC. A frame that is EARLY is held back
+        // until it is within half a frame of the master clock, so video can
+        // never lead by more than ~20ms. A frame that is LATE is simply shown,
+        // with no correction whatsoever, until it is more than `4/fps` behind
+        // — 167ms at 24fps (`KSOptions.videoClockSync`). The whole band from
+        // −167ms to 0 is a dead zone with no restoring force in it.
+        //
+        // So whatever lateness a session happens to START with is frozen in
+        // for its whole duration. And every session starts with some: the
+        // first picture cannot appear until it has been demuxed, decoded and
+        // handed to the layer, by which time the audio clock has already been
+        // running. Video then plays out at exactly 1.0x from wherever it
+        // entered, permanently behind — which is heard as the audio running
+        // early, on every title, by a fixed amount. Measured on the device:
+        // `avSync` sat at exactly −0.15s for minutes without moving, and at
+        // −0.05s in a previous session of the same file. Nothing in the stock
+        // policy was ever going to pull either of them back.
+        //
+        // Video cannot be advanced against a master audio clock except by
+        // showing one frame fewer, so that is what this does — gently. One
+        // single frame, only after the lateness has persisted long enough to
+        // be a standing offset rather than jitter, and only inside the band
+        // stock KSPlayer ignores (past `4/fps` its own catch-up takes over and
+        // this stays out of the way). Each drop recovers exactly one frame
+        // duration, so a 150ms offset is gone in four of them and the
+        // correction then stops firing because `diff` is back inside the
+        // threshold. It is a servo that converges on zero and costs nothing
+        // once it is there — not a fixed compensation bolted onto the clock.
+        //
+        // The threshold is 1.5 frame durations so that a single drop can never
+        // overshoot into video-early; convergence is quicker over the opening
+        // seconds, where a missing frame is invisible and the offset is at its
+        // largest and most noticeable.
+        //
+        // `frameCount` is the decoded queue's depth, and it is the hard limit
+        // on this working at all: `.dropNextFrame` shows the head frame and
+        // then discards the one BEHIND it, so with only the head decoded there
+        // is nothing to discard and the call is a no-op. Ask for a drop only
+        // when one can actually land; the deficit is unchanged either way, so
+        // a starved tick simply tries again on the next run of lateness.
+        syncDecisions &+= 1
+        queueDepthSum &+= frameCount
+        if frameCount <= 1 { queueStarved &+= 1 }
+        if diff < 0 { worstLateMs = max(worstLateMs, Int(-diff * 1000)) }
+        if fps > 0, action == .next, diff < -1.5 / fps, diff >= -4 / fps {
+            let now = CACurrentMediaTime()
+            if firstSyncAt == 0 { firstSyncAt = now }
+            if lateRunBegan == 0 { lateRunBegan = now }
+            let settle = now - firstSyncAt < 4 ? 0.15 : 0.4
+            if now - lateRunBegan >= settle {
+                // Require a fresh run of lateness before the next one, which
+                // is what paces the drops and stops this ever becoming the
+                // every-other-frame chop the softening below exists to avoid.
+                lateRunBegan = 0
+                catchUpWanted &+= 1
+                if frameCount >= 2 {
+                    catchUpIssued &+= 1
+                    return (diff, .dropNextFrame)
+                }
+            }
+        } else {
+            lateRunBegan = 0
         }
         // Only intervene at 60Hz pulldown, only for plain frame drops, and only
         // when lateness is mild — anything worse keeps default recovery.
@@ -845,9 +1034,26 @@ final class PlayerViewModel: ObservableObject {
     @Published private(set) var engineName = "Native"
 
     // UI state
+    /// Bumped each time the transport is RAISED from a state that wasn't
+    /// showing it. Not bumped for moves between transport states
+    /// (controls ↔ pauseInfo, controls ↔ a track popover), which must leave
+    /// focus exactly where the viewer put it.
+    ///
+    /// The transport resets focus to the bar in `onAppear`, which works only
+    /// when SwiftUI has actually torn the overlay down and built a new one. It
+    /// does not always: raising the transport again inside its own dismiss
+    /// transition leaves the outgoing copy on screen still holding focus on
+    /// whichever glyph it had, and a press then lands on Subtitles instead of
+    /// the bar. This counter is the same reset driven by state rather than by
+    /// view lifetime, so it fires either way.
+    @Published private(set) var controlsSession = 0
+
     @Published var overlay: PlayerOverlay = .none {
         didSet {
             guard overlay != oldValue else { return }
+            if overlay.showsTransport, !oldValue.showsTransport {
+                controlsSession &+= 1
+            }
             if case .error(let message) = overlay {
                 PlayerProbe.event("fail", "ERROR OVERLAY: \(message)")
                 PlayerProbe.count("error.overlay")
@@ -889,7 +1095,23 @@ final class PlayerViewModel: ObservableObject {
 
     // Content
     let meta: MetaItem
-    @Published private(set) var currentVideo: MetaVideo?
+    @Published private(set) var currentVideo: MetaVideo? {
+        didSet { refreshNextEpisodeAvailability() }
+    }
+    /// Whether `nextEpisode` would find one, cached.
+    ///
+    /// The transport's Next Episode glyph asks this on every body pass, and
+    /// the controls overlay is rebuilt on every clock tick while it is on
+    /// screen — `nextEpisode` itself filters and sorts the title's ENTIRE
+    /// episode list, which is a per-frame sort of a few hundred episodes on a
+    /// two-core box. The inputs are `currentVideo` and `enrichedMeta`, and
+    /// both refresh this when they change, so nothing has to remember to.
+    @Published private(set) var nextEpisodeAvailable = false
+
+    private func refreshNextEpisodeAvailability() {
+        let available = nextEpisode != nil
+        if nextEpisodeAvailable != available { nextEpisodeAvailable = available }
+    }
     @Published private(set) var currentEntry: StreamEntry
     @Published private(set) var allEntries: [StreamEntry]
     @Published private(set) var isSwitchingSource = false {
@@ -1361,26 +1583,86 @@ final class PlayerViewModel: ObservableObject {
     /// superseded to do nothing at all.
     private var dvFirstGeneration = 0
 
-    /// Cheap synchronous gates for the direct-DV start.
+    /// Cheap synchronous gates for the direct sample-feed start.
+    ///
+    /// TWO reasons to take this engine, not one. It was written for Dolby
+    /// Vision, but it is also the ONLY path in this app that hands a Dolby
+    /// AUDIO bitstream to tvOS: it feeds compressed E-AC-3 straight to
+    /// `AVSampleBufferAudioRenderer`, where the FFmpeg engine decodes every
+    /// codec to LPCM (`AudioSwresample`) and AVPlayer can't open the MKV these
+    /// releases ship in. So an Atmos-hinted title now qualifies on its own —
+    /// and, crucially, WITHOUT the Dolby Vision display requirement, because
+    /// Atmos is an audio feature and a TV with no DV mode has nothing to do
+    /// with it.
     private func shouldTryDVFirst(url: URL) -> Bool {
-        // Native DV is no longer optional — it is how this app plays Dolby
-        // Vision. The remaining gates below are capability, not preference.
         guard effectiveEngine == .auto || effectiveEngine == .ffmpeg,
               !url.isFileURL,
-              DynamicRange.availableHDRModes.contains(.dolbyVision),
               Self.memoryFootprintMB() < 850,
               !dvFailedURLs.contains(retryKey(for: url)),
               !dvFirstTried.contains(retryKey(for: url))
         else { return false }
-        // A native-friendly container plays DV through AVPlayer as-is — the
-        // remux is for the MKV world.
+        // A native-friendly container plays DV — and Dolby audio — through
+        // AVPlayer as-is. This engine is for the MKV world.
         let ext = url.pathExtension.lowercased()
         guard ext != "mp4", ext != "m4v", ext != "mov", ext != "m3u8" else { return false }
-        // Title hint: debrid stream names carry the DV marker. No hint means
-        // no preflight cost — the title still gets DV via the mid-play switch.
+        // Title hint, so an uninterested title pays no preflight at all.
+        // Add-on stream names carry both markers; the audio one covers the
+        // spellings that never say "Dolby" ("DDP5.1 Atmos", "TrueHD.Atmos",
+        // "EAC3"). A TrueHD hint counts on purpose: those files carry the
+        // E-AC-3 compatibility track this engine can actually bitstream.
         let haystack = "\(currentEntry.stream.name ?? "") \(currentEntry.stream.title ?? "") \(currentEntry.stream.description ?? "")".lowercased()
-        return haystack.range(of: "\\b(dv|dovi|dolby)\\b", options: .regularExpression) != nil
+        // NO TRAILING \\b, and the spellings spelled out. Release names glue
+        // the codec to the channel layout ("DDP5.1"), end on a symbol ("DD+")
+        // and drop dashes at random ("E-AC3", "EC-3") — a trailing word
+        // boundary missed every one of those, including DDP5.1, which is one
+        // of the most common namings there is. The one lookahead keeps a film
+        // called "Atmosphere" from buying a header probe it has no use for.
+        //
+        // Plain `ac-?3` is in here because tvOS bitstreams AC-3 too, and it is
+        // third on the priority list. Checked against the names that could
+        // collide — AAC, AAC5.1, FLAC, DTS-HD, x264, "MAC3S" — none of them
+        // match: `\b` will not start inside a word, so only a real "AC3"
+        // token does.
+        let learned = DolbyMemory.bitstreamable(meta.id)
+        var audioHint = haystack.range(
+            of: "\\b(atmos(?!phere)|joc|ddp|dd\\+|e-?ac-?3|ec-?3|ac-?3|true-?hd)",
+            options: .regularExpression
+        ) != nil
+            // A previous play of this title was SEEN carrying bitstreamable
+            // Dolby in an HEVC container (see DolbyMemory). That is knowledge,
+            // not a guess from a name, and it is what catches the titles whose
+            // add-on stream name says nothing about the audio at all — which
+            // no hint can reach on a first play.
+            || learned
+        // ...unless a probe has already looked and found nothing usable. The
+        // hint is a guess from a file NAME; this is what the file turned out
+        // to be. One probe per title, not one per play — see DolbyMemory.
+        //
+        // It clears the AUDIO reason ONLY, never the function. Returning early
+        // here would have let an audio verdict — recorded from some earlier
+        // H.264 release of this title — cancel the Dolby VISION path for a
+        // later release that deserves it. Two different reasons, judged apart.
+        if audioHint, !learned, DolbyMemory.declined(meta.id) {
+            audioHint = false
+        }
+        // The original video reason keeps its display gate: asking a panel
+        // with no DV mode to take a DV feed buys nothing.
+        let videoHint = DynamicRange.availableHDRModes.contains(.dolbyVision)
+            && haystack.range(of: "\\b(dv|dovi|dolby)\\b", options: .regularExpression) != nil
+        guard audioHint || videoHint else { return false }
+        // Audio-ONLY entries are a smaller prize than Dolby Vision, so they get
+        // a smaller budget: a header that hasn't answered in three seconds is
+        // not worth holding the picture for when all that's at stake is which
+        // audio path plays. A DV title keeps the original five.
+        dvFirstIsAudioOnly = !videoHint
+        return true
     }
+
+    /// The pending preflight was entered for AUDIO reasons alone (no Dolby
+    /// Vision hint). Sizes the probe budget and lets the preflight decline
+    /// early when the file turns out to have nothing this engine can
+    /// bitstream — see `startDVFirst`.
+    private var dvFirstIsAudioOnly = false
 
     /// True once the direct-sample session's first-tick setup has run for THIS
     /// load. Cleared by every `startDVFirst`, exactly like `vlcSessionPrepared`
@@ -1420,10 +1702,11 @@ final class PlayerViewModel: ObservableObject {
         dvFirstGeneration += 1
         let generation = dvFirstGeneration
         dvFirstTask = Task { [weak self] in
+            let audioOnly = self?.dvFirstIsAudioOnly ?? false
             let probe = await StreamProbe.inspect(
                 url: url.absoluteString,
                 needsStyledASS: false, needsHDR10Plus: false,
-                needsDolbyVision: true, timeoutSeconds: 5
+                needsDolbyVision: true, timeoutSeconds: audioOnly ? 3 : 5
             )
             guard let self, !Task.isCancelled, !self.isExiting,
                   // A newer load (source switch, episode change) superseded this
@@ -1448,8 +1731,67 @@ final class PlayerViewModel: ObservableObject {
             // that turns out non-DV still direct-starts instead of falling to
             // the decode path.
             let profile = probe.dvProfile ?? 0
-            let dvOK = profile == 0 || profile == 5 || profile == 8 || (profile == 7 && p7ok)
-            guard probe.hasHEVC, dvOK,
+            var dvOK = profile == 0 || profile == 5 || profile == 8 || (profile == 7 && p7ok)
+            // PROFILE 7 WITHOUT THE CONVERSION: keep the Dolby AUDIO.
+            //
+            // P7 is the UHD-remux profile, and on the 2-3 GB boxes the P7 → 8.1
+            // conversion is off by tier (`recommendsDolbyVisionProfile7`). That
+            // declined the whole engine, so the file fell to FFmpeg — which
+            // decodes every audio codec — and a P7 remux with a DD+ Atmos track
+            // lost Atmos for a reason that is entirely about VIDEO.
+            //
+            // The engine can play a P7 file's base layer instead: `forceHDR10`
+            // drops the DV NALs and publishes plain HEVC. P7's base layer IS
+            // HDR10, so the picture is native HDR10 — which is what the FFmpeg
+            // fallback was mapping to anyway, only now without the decode. And
+            // the reason the tier gate exists does not apply: this path does
+            // NOT run the whole-file conversion, it strips two NAL types.
+            //
+            // Scoped tightly: only when there is an audio prize to win. A P7
+            // file with nothing bitstreamable keeps the existing behaviour
+            // exactly, because then this would be a video change for nothing.
+            var p7BaseLayerForAudio = false
+            if profile == 7, !p7ok, probe.hasBitstreamableDolby {
+                dvOK = true
+                p7BaseLayerForAudio = true
+            }
+            // A display with NO Dolby Vision mode may still reach this engine
+            // now — an Atmos-hinted title qualifies on audio alone. It must
+            // only take the path when the file carries no DV at all (profile
+            // 0), where the engine publishes a plain HEVC format description
+            // and nothing DV-related happens. Handing a DV feed to a panel
+            // that has no DV mode is the one thing the old display gate was
+            // protecting against, and it still does its job here.
+            if profile > 0, !DynamicRange.availableHDRModes.contains(.dolbyVision) {
+                dvOK = false
+                Self.dvTrail("direct engine declined: DV profile \(profile) but the display has no DV mode")
+            }
+            // Entered for audio alone and the file has no track tvOS can
+            // bitstream: this engine would decode to LPCM exactly like the
+            // FFmpeg one, so there is nothing to win and a switch to buy it.
+            // Hand it straight back rather than changing the playback path for
+            // no reason. (A TrueHD-only file lands here, which is the honest
+            // answer to "can you pass TrueHD Atmos through?" — no.)
+            if audioOnly, !probe.hasBitstreamableDolby {
+                dvOK = false
+                Self.dvTrail("direct engine declined: no E-AC-3/AC-3 track to bitstream")
+            }
+            // Remember a STRUCTURAL no, so the next play of this title doesn't
+            // buy the same probe. Only when the header was actually read — a
+            // probe that timed out returns all-false, and recording that would
+            // blind the title on one bad network moment (see DolbyMemory).
+            // "Usable" now has two shapes: HEVC (any eligible audio — the
+            // original contract), or H.264 WITH a bitstreamable Dolby track.
+            // H.264 gets no free ride on a video hint: it exists on this
+            // engine solely for the audio bitstream, so a release name that
+            // says "Dolby" but carries H.264 + AAC declines here whichever
+            // hint let it in.
+            let videoUsable = probe.hasHEVC
+                || (probe.hasAVC && probe.hasBitstreamableDolby)
+            if audioOnly, probe.durationSeconds > 0, !videoUsable {
+                DolbyMemory.rememberDeclined(self.meta.id)
+            }
+            guard videoUsable, dvOK,
                   probe.hasEligibleAudio,
                   probe.durationSeconds > 60,
                   // A notice clip must not take the direct engine: failover
@@ -1466,7 +1808,7 @@ final class PlayerViewModel: ObservableObject {
                 self.runStreamProbe()
                 return
             }
-            Self.dvTrail("DV-first: profile \(profile == 0 ? "HEVC/\(probe.isPQ ? "HDR10" : "SDR")" : String(profile)), \(Int(probe.durationSeconds))s — direct native start")
+            Self.dvTrail("DV-first: profile \(profile == 0 ? "\(probe.hasHEVC ? "HEVC" : "H.264")/\(probe.isPQ ? "HDR10" : "SDR")" : String(profile)), \(Int(probe.durationSeconds))s — direct native start")
             self.dvAttempted = true
             self.nativeKind = .dolbyVision
             self.dvDirectIsPQ = probe.isPQ
@@ -1485,23 +1827,33 @@ final class PlayerViewModel: ObservableObject {
             // gap). Configure BEFORE reading the route below — an inactive
             // session reports no spatial outputs, which silently forced a
             // stereo downmix on Atmos rigs for cold-launched DV titles.
-            try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
+            AudioOutputCapability.configureForMoviePlayback()
             // Off the main actor: activation is an IPC round trip to
             // mediaserverd (100ms-1s, worse on AirPlay routes) and it sat on
             // the main thread in the middle of the load path.
             await Task.detached(priority: .userInitiated) {
                 try? AVAudioSession.sharedInstance().setActive(true)
             }.value
-            // Downmix in-engine when the route can't use multichannel —
-            // see DVSampleEngine.downmixToStereo.
-            let spatial = AVAudioSession.sharedInstance().currentRoute.outputs
-                .contains { $0.isSpatialAudioEnabled }
+            // Downmix in-engine only when the route genuinely cannot take more
+            // than stereo — see DVSampleEngine.downmixToStereo.
+            //
+            // This used to read `isSpatialAudioEnabled`, which answers a
+            // DIFFERENT question: whether tvOS will spatialize in software.
+            // An HDMI receiver that decodes Dolby itself reports false for it,
+            // so every 5.1/7.1 AVR was treated as a stereo route and the engine
+            // folded 8ch to 2ch before it ever left the app. `maximumOutput‑
+            // NumberOfChannels` is the capability, and it is read AFTER
+            // activation above because an inactive session answers 2.
+            let multichannel = AudioOutputCapability.supportsMultichannel
             // FEL titles keep true DV (user's choice). The HDR10-base-layer
             // experiment ran and EXONERATED the converted metadata: the one
             // stuttering FEL title stuttered identically as pure HDR10, and
             // a heavier FEL twin plays smooth as converted DV. forceHDR10
             // stays available as a diagnostic lever.
-            let felHDR10 = false
+            // See `p7BaseLayerForAudio`. Otherwise unchanged: FEL titles keep
+            // true DV (the HDR10-base experiment exonerated the converted
+            // metadata), and this stays available as a diagnostic lever.
+            let felHDR10 = p7BaseLayerForAudio
             // One read for both fields — this used to look the title up twice
             // in the same expression.
             let titleMemory = PlaybackMemory.memory(for: self.meta.id)
@@ -1520,11 +1872,13 @@ final class PlayerViewModel: ObservableObject {
                     : self.settings.preferredAudioLanguage,
                 convertProfile7: p7ok,
                 requestHeaders: entry.stream.behaviorHints?.proxyHeaders?.requestHeaders,
-                downmixToStereo: !spatial,
+                downmixToStereo: !multichannel,
                 forceHDR10: felHDR10,
                 preferredAudioLabel: titleMemory?.audioTrackLabel
             )
             self.dvDirectEngine = engine
+            // The title's remembered lip-sync offset, before any audio is fed.
+            engine.setAudioDelay(self.audioSyncOffset)
             self.duration = probe.durationSeconds
             self.clock.duration = probe.durationSeconds
             MediaCacheServer.shared.noteDuration(probe.durationSeconds)
@@ -1654,10 +2008,12 @@ final class PlayerViewModel: ObservableObject {
                     let realProfile = engine.detectedDVProfile > 0 ? engine.detectedDVProfile : profile
                     let dvLabel: String
                     if engine.forceHDR10 {
-                        dvLabel = "Native HDR10 (P7 FEL base layer, direct sample feed)"
+                        dvLabel = p7BaseLayerForAudio
+                            ? "Native HDR10 (P7 base layer — kept the Dolby audio bitstream)"
+                            : "Native HDR10 (P7 FEL base layer, direct sample feed)"
                     } else {
                     switch realProfile {
-                    case 0: dvLabel = "Native \(probe.isPQ ? "HDR10\(probe.hasHDR10Plus ? "+" : "")" : "HEVC") (direct sample feed)"
+                    case 0: dvLabel = "Native \(probe.isPQ ? "HDR10\(probe.hasHDR10Plus ? "+" : "")" : engine.videoCodecName) (direct sample feed)"
                     case 7: dvLabel = "Native DV (direct sample feed, Profile 7 → 8.1)"
                     default: dvLabel = "Native DV (direct sample feed, Profile \(realProfile))"
                     }
@@ -1666,6 +2022,28 @@ final class PlayerViewModel: ObservableObject {
                                             because: "compressed samples fed straight to the display pipeline — no remux, no server")
                     self.decisionLog.record("Engine", "DV Sample Feed",
                                             because: "AVSampleBufferDisplayLayer owns rendering for this session")
+                    // The audio verdict for the one engine that can bitstream
+                    // Dolby. `audioPath.summary` is deliberately blunt about
+                    // the decode case, including that a TrueHD track's Atmos
+                    // objects are gone — this is where a session that LOOKS
+                    // like Atmos and isn't has to say so.
+                    let audioPath = engine.audioPath
+                    self.decisionLog.record(
+                        "Dolby Audio",
+                        audioPath.passthrough ? "Bitstream to tvOS" : "Decoded to PCM in-app",
+                        because: audioPath.summary
+                    )
+                    // Remember the title as engine-capable from the engine's
+                    // own success — the only claim that can't be wrong,
+                    // because it just happened. This is how an H.264 title
+                    // learns: `noteDolbyCapability` stays HEVC-only on
+                    // purpose, since a track list can't see Annex-B extradata
+                    // or interlacing, and a wrong positive there would buy a
+                    // doomed probe + engine attempt on every future play.
+                    let lower = audioPath.codec.lowercased()
+                    if audioPath.passthrough, lower == "eac3" || lower == "ac3" {
+                        DolbyMemory.remember(self.meta.id)
+                    }
                     // FEL/MEL verdict arrives ~10s in, measured from the
                     // stream itself — surface it in the decision panel.
                     DVSampleEngine.onELVerdict = { [weak self] verdict in
@@ -1695,7 +2073,20 @@ final class PlayerViewModel: ObservableObject {
                             + " pin=\(SessionDisplayMode.pinDescription)"
                             + " panelSupports=[\(DynamicRange.availableHDRModes.map(\.description).joined(separator: ","))]"
                     )
-                    if profile > 0, !engine.forceHDR10 {
+                    // DEBUG A/B (`-dvDisplayHDR10` launch argument): ask for the HDR10
+                    // mode instead of Dolby Vision. With decode-ahead on, the layer is
+                    // handed finished PQ pixel buffers rather than dvh1 samples, so the
+                    // question is whether the TV's DV mode — fed pixels with no per-scene
+                    // DV metadata — is what makes the picture dark.
+                    #if DEBUG
+                    let debugForceHDR10Display = ProcessInfo.processInfo.arguments.contains("-dvDisplayHDR10")
+                    #else
+                    let debugForceHDR10Display = false
+                    #endif
+                    if debugForceHDR10Display {
+                        PlayerProbe.event("dv", "DEBUG -dvDisplayHDR10: requesting HDR10 instead of Dolby Vision")
+                    }
+                    if profile > 0, !engine.forceHDR10, !debugForceHDR10Display {
                         switching = self.requestDVDisplayMode(fps: engine.videoFPS)
                     } else if probe.isPQ {
                         switching = self.requestHDR10DisplayMode(fps: engine.videoFPS)
@@ -1793,6 +2184,16 @@ final class PlayerViewModel: ObservableObject {
                     self.trailMem("direct start")
                 } else {
                     Self.dvTrail("direct engine declined (\(reason)) — FFmpeg reload")
+                    // A shape verdict, not a transient: every H.264 gate
+                    // reason names the codec ("Annex B", "interlaced",
+                    // "anamorphic", the audio rule). The header probe cannot
+                    // see any of those, so this is the only place the negative
+                    // can be learned — without it the title would re-pay probe
+                    // + engine open + fallback on every play. Network/open
+                    // failures don't match and stay retryable.
+                    if audioOnly, reason.contains("H.264") {
+                        DolbyMemory.rememberDeclined(self.meta.id)
+                    }
                     self.fallBackFromDirect(entry: entry, reason: reason, profile: profile)
                 }
             }
@@ -2234,6 +2635,23 @@ final class PlayerViewModel: ObservableObject {
     private var toastTask: Task<Void, Never>?
     private var lastProgressSave = Date.distantPast
     private var transientSaveCount = 0
+    /// The episode `play(episode:)` is moving to, from the moment the outgoing
+    /// episode's progress is settled (saved, or retired as finished) until that
+    /// episode's own stream starts loading. Every progress save waits it out.
+    ///
+    /// In that window `currentVideo`, `position` and `duration` do not describe
+    /// one episode. The source lookup runs with the OUTGOING episode still
+    /// current, so a save — the exit's, or a periodic tick — wrote the episode
+    /// just retired straight back into Continue Watching as its newest row, and
+    /// the card went back to the episode the viewer had moved on from. After
+    /// the lookup, a debrid resolve or an opened source list leaves the NEW
+    /// episode current over the outgoing stream's clock, so a save recorded it
+    /// at the old episode's position — or, past 95%, marked it watched.
+    private var episodeSwitchTargetID: String?
+    /// The exit retired this episode as finished (see `prepareForExit`). The
+    /// teardown's save runs after it and would write the row straight back at
+    /// its credits-time position.
+    private var retiredEpisodeOnExit = false
     /// Seconds between periodic crash-safety progress writes.
     /// 10s: the worst-case loss on a crash. The Apple TV HD's two A8 cores
     /// are often SOFTWARE-decoding the stream this runs alongside, and each
@@ -2335,6 +2753,36 @@ final class PlayerViewModel: ObservableObject {
         KSOptions.secondPlayerType = KSMEPlayer.self
         KSOptions.isAutoPlay = true
         KSOptions.logLevel = .error
+        // PRESENT ON THE PANEL'S OWN VSYNC, not on a rate the panel does not
+        // have. This is the frame-pacing fix, and it is the reason 24p content
+        // juddered all the way through a film.
+        //
+        // The FFmpeg engine has no frame scheduler: `MetalPlayView` enqueues
+        // every picture with `presentationTimeStamp: .zero` and
+        // `kCMSampleAttachmentKey_DisplayImmediately`, so a frame appears when
+        // the display-link callback runs and at no other time — the callback
+        // cadence IS the on-screen cadence. With `preferredFrame` on, KSPlayer
+        // asks that link for `CAFrameRateRange(min: fps, max: 2*fps,
+        // preferred: fps)` — a preferred 24Hz. A 60Hz panel can only deliver
+        // 60/N, so the request lands on 30Hz, and 23.976fps content is then
+        // presented on a 30Hz grid: every frame held for one tick or two,
+        // 33ms/67ms/33ms, instead of the even 2:3 pattern 24p on 60Hz is
+        // supposed to have. That irregularity is the stutter, it is
+        // content-independent, and no amount of buffering can hide it.
+        //
+        // Off, the link runs at the panel's native vsync, `videoClockSync` is
+        // asked 60 times a second instead of 30, and each frame goes up on the
+        // vsync it is actually due — the correct 2:3 cadence falls out of the
+        // existing gate with no scheduling code at all.
+        //
+        // It also restores the CATCH-UP HEADROOM the 30Hz link removed. A gate
+        // that can only present 30 frames a second cannot outrun a 24fps
+        // decoder by much, and once the decoded queue is empty it cannot outrun
+        // it at all — which is why a session that started life a little behind
+        // stayed exactly that far behind for hours (measured: avSync pinned at
+        // −0.15s). At 60Hz the gate can present consecutive frames until the
+        // picture is level with the audio again.
+        KSOptions.preferredFrame = false
         // Fast startup: begin rendering as soon as the first frames decode
         // (isSecondOpen) instead of waiting for a comfortable buffer.
         //
@@ -2448,6 +2896,11 @@ final class PlayerViewModel: ObservableObject {
         // setups get the Atmos-capable path, everything else keeps the
         // battle-tested AVAudioEngine. Settings can force either side.
         selectAudioOutput()
+        // `didSet` does not run for the assignments an initializer makes, so
+        // the launch episode's neighbour has to be looked up by hand once.
+        // (A session launched from Continue Watching usually has no episode
+        // list yet; `fetchEnrichedMeta` below brings one and refreshes this.)
+        refreshNextEpisodeAvailability()
         fetchEnrichedMeta()
         configureWheelTracking()
         notificationTokens.append(NotificationCenter.default.addObserver(
@@ -2605,6 +3058,13 @@ final class PlayerViewModel: ObservableObject {
                         Double(info.videoBitrate) / 1_000_000,
                         Double(info.bytesRead) / 1_048_576))
                 }
+                // The A/V sync servo's own view: decoded-queue depth (the hard
+                // limit on any catch-up), how often it wanted to correct, and
+                // how often it could. `avSync` above says the picture is late;
+                // this says whether anything is able to do something about it.
+                if let opts = self.currentOptions as? OrivioPlayerOptions {
+                    lines.append("ks: " + opts.syncProbeLine)
+                }
             }
             // EVERY input to the picture transform, not just the mode. A
             // report of the picture zooming has three possible causes here —
@@ -2649,6 +3109,162 @@ final class PlayerViewModel: ObservableObject {
                 "wantAudio: remembered=\(remembered) setting=\(self.settings.preferredAudioLanguage.isEmpty ? "-" : self.settings.preferredAudioLanguage)",
             ]
         }
+        // The Atmos answer, in one block: what the source is, what this app is
+        // doing with it, and what the route can take. Built so the PCM case is
+        // impossible to mistake for a working Dolby one.
+        PlayerProbe.register("atmos") { [weak self] in
+            guard let self else { return [] }
+            return self.atmosDiagnostics
+        }
+    }
+
+    /// What the audio pipeline is actually doing, gathered ONCE.
+    ///
+    /// Both readers render from this: the `[atmos]` probe block and the info
+    /// panel's Audio tab. They used to be two hand-maintained lists of the same
+    /// facts, which is how a panel and a log start disagreeing — and then one of
+    /// them is lying about the thing this whole feature exists to answer.
+    struct AudioPipelineFacts {
+        var engine = "-"
+        /// The source codec as the engine names it ("eac3", "Dolby Digital+ Atmos").
+        var codec = "-"
+        /// 0 when unknown.
+        var channels = 0
+        var sampleRate = 0
+        /// The CONTAINER says Atmos. Metadata only — never a claim about what
+        /// the receiver is decoding. See `DVSampleEngine.streamSaysAtmos`.
+        var sourceSaysAtmos = false
+        /// This app is not decoding the audio.
+        ///
+        /// Kept separate from `dolbyBitstream` on purpose: AAC passes through
+        /// untouched and is not Dolby, and conflating the two would be the
+        /// "PCM labelled Atmos" mistake in reverse.
+        var passthrough = false
+        /// What leaves the app is Dolby a receiver can decode.
+        var dolbyBitstream = false
+        /// Multichannel folded to 2ch inside the app (decode path only).
+        var downmixedInApp = false
+        var decoder = "-"
+        var routeIsMultichannel = false
+        var routeMaxChannels = 2
+        var routeDescription = "-"
+
+        // MARK: Derived
+
+        /// THE ROUTE'S CHANNEL COUNT DOES NOT GATE A BITSTREAM.
+        ///
+        /// E-AC-3 JOC Atmos tunnels through a TWO-channel MAT carrier, so a
+        /// perfectly working Atmos chain can report
+        /// `maximumOutputNumberOfChannels == 2`. `outputNumberOfChannels` is the
+        /// LPCM limit, and an encoded bitstream is not LPCM. So a Dolby
+        /// bitstream leaving the app IS the native path; what the receiver does
+        /// with it is the receiver's business and no API on this side can see it.
+        var nativeDolbyPath: Bool { dolbyBitstream }
+        var pcmConversionInApp: Bool { !passthrough }
+
+        /// The route limit DOES bite decoded multichannel PCM: a 5.1/7.1 track
+        /// decoded here and handed to a 2-channel route is a real downmix, and
+        /// the usual cause is an HDMI handshake that landed in stereo PCM after
+        /// a reboot or a format change rather than anything in this app.
+        var pcmChannelsLostToRoute: Bool {
+            !passthrough && !routeIsMultichannel && channels > 2
+        }
+
+        var channelsText: String { channels > 0 ? "\(channels)" : "-" }
+        var rateText: String { sampleRate > 0 ? "\(sampleRate)Hz" : "-" }
+
+        var whyNotNative: String {
+            passthrough ? "the track is not a Dolby codec tvOS can bitstream"
+                        : "audio is decoded to PCM here"
+        }
+
+        var verdict: String {
+            nativeDolbyPath ? "YES — compressed Dolby leaves the app"
+                            : "no — " + whyNotNative
+        }
+
+        var finalOutput: String {
+            if nativeDolbyPath {
+                return "Dolby bitstream → tvOS → HDMI (Atmos rides a 2ch MAT carrier — the route's channel count says nothing about it)"
+            }
+            if passthrough, routeIsMultichannel {
+                return "compressed non-Dolby (\(codec)) → tvOS → HDMI"
+            }
+            return routeIsMultichannel ? "multichannel PCM → tvOS → HDMI"
+                                       : "stereo PCM → tvOS → HDMI"
+        }
+    }
+
+    /// Everything that decides whether a Dolby bitstream is reaching the
+    /// receiver, from whichever engine is running.
+    var audioPipelineFacts: AudioPipelineFacts {
+        var facts = AudioPipelineFacts()
+        facts.engine = engineLabelForProbe
+
+        if let dv = dvDirectEngine {
+            let path = dv.audioPath
+            facts.codec = path.codec
+            facts.channels = path.channels
+            facts.sampleRate = path.sampleRate
+            facts.passthrough = path.passthrough
+            facts.sourceSaysAtmos = path.sourceSaysAtmos
+            facts.downmixedInApp = path.downmixed
+            facts.decoder = path.passthrough
+                ? "none (tvOS decodes the bitstream)" : "FFmpeg → LPCM (in-app)"
+            let lower = path.codec.lowercased()
+            facts.dolbyBitstream = path.passthrough && (lower == "eac3" || lower == "ac3")
+        } else if usingVLC {
+            facts.decoder = "VLC (decodes to PCM)"
+        } else if let player = playerLayer?.player {
+            let native = !(player is KSMEPlayer)
+            if let track = player.tracks(mediaType: .audio).first(where: { $0.isEnabled }) {
+                let fmt = Self.audioFormat(track)
+                facts.codec = fmt.codec ?? track.name
+                facts.channels = Self.channelCount(track)
+                facts.sourceSaysAtmos = (fmt.codec ?? "").localizedCaseInsensitiveContains("atmos")
+                if let asbd = track.formatDescription?.audioStreamBasicDescription,
+                   asbd.mSampleRate > 0 {
+                    facts.sampleRate = Int(asbd.mSampleRate)
+                }
+                // On AVPlayer a Dolby codec is bitstreamed by tvOS itself; on
+                // the FFmpeg engine the same track is decoded here.
+                facts.passthrough = native && !fmt.decodedToPCM
+                // "Dolby Digital" / "Dolby Digital+" are the only two
+                // `audioFormat` labels tvOS bitstreams.
+                facts.dolbyBitstream = facts.passthrough
+                    && (fmt.codec ?? "").hasPrefix("Dolby Digital")
+            }
+            facts.decoder = native ? "AVPlayer / tvOS" : "FFmpeg → LPCM (in-app)"
+        }
+
+        facts.routeIsMultichannel = AudioOutputCapability.supportsMultichannel
+        facts.routeMaxChannels = AudioOutputCapability.maxOutputChannels
+        facts.routeDescription = AudioOutputCapability.routeDescription
+        return facts
+    }
+
+    /// The `[atmos]` probe block. Wording unchanged — notes and memory refer to
+    /// these exact lines.
+    var atmosDiagnostics: [String] {
+        let f = audioPipelineFacts
+        return [
+            "source codec=\(f.codec) channels=\(f.channelsText) rate=\(f.rateText)",
+            "source says Atmos=\(f.sourceSaysAtmos ? "yes" : "no / not tagged")"
+                + "  (container metadata only — see DVSampleEngine.streamSaysAtmos)",
+            "engine=\(f.engine)  decoder=\(f.decoder)",
+            "PCM conversion in-app=\(f.pcmConversionInApp ? "yes" : "no")"
+                + "  downmixed here=\(f.downmixedInApp ? "yes → 2ch" : "no")",
+            "transcoding/remuxing=no (this app never re-encodes audio)",
+            "route: \(f.routeDescription)",
+            "route LPCM limit=\(f.routeIsMultichannel ? "\(f.routeMaxChannels)ch" : "2ch (stereo)")"
+                + (f.pcmChannelsLostToRoute
+                   ? "  ⚠︎ this \(f.channelsText)ch PCM track WILL be downmixed by the route."
+                     + " Not this app: the HDMI sink is advertising stereo."
+                     + " Power-cycle the receiver, or flip Apple TV's audio format setting once, to renegotiate."
+                   : ""),
+            "NATIVE DOLBY PATH=" + f.verdict,
+            "final output=" + f.finalOutput,
+        ]
     }
 
     /// Read-only mirrors so the probe closures can see private per-load state
@@ -2736,6 +3352,9 @@ final class PlayerViewModel: ObservableObject {
     /// foreground handler knows to resync (and ignores stray foreground
     /// notifications that weren't preceded by a real background).
     private var didBackground = false
+    /// The process was SUSPENDED since the last resume, not merely paused.
+    /// `resumePlayback` needs that distinction — see the proxy note there.
+    private var didSuspendSincePlay = false
     /// Set on willResignActive (app switcher / system overlay) so the
     /// didBecomeActive handler knows a real interruption happened and the
     /// pipeline needs a resync on return — the app-switcher path never fires
@@ -2792,9 +3411,14 @@ final class PlayerViewModel: ObservableObject {
                 }
             }
         }
+        // NOT "Atmos-capable". Both outputs sit at the end of the FFmpeg
+        // pipeline, where `AudioSwresample` has already decoded every codec to
+        // LPCM — E-AC-3 JOC included. Whichever wins here is playing
+        // multichannel PCM, and calling one of them Atmos-capable is the
+        // mislabel that makes a PCM session look like a working Dolby one.
         decisionLog.record(
             "Audio Route",
-            useRenderer ? "Enhanced renderer (Atmos-capable)" : "Standard (AVAudioEngine)",
+            useRenderer ? "Sample-buffer renderer (multichannel PCM)" : "AVAudioEngine (multichannel PCM)",
             because: airPlay
                 ? "AirPlay output route — buffered renderer required"
                 : settings.playbackMode == .compatibility
@@ -2978,6 +3602,8 @@ final class PlayerViewModel: ObservableObject {
         // `KSOptions.canBackgroundPlay` is false and never overridden here, so
         // the engine's fallback pause does nothing before the first frame.
         didBackground = true
+        // Tells the next resume that this was a suspension, not a pause.
+        didSuspendSincePlay = true
         guard hasStartedPlayback else { return }
         cancelPendingTransportIntents()   // see handleResignActive
         enginePause("app went to the background")
@@ -3004,6 +3630,11 @@ final class PlayerViewModel: ObservableObject {
         // off through its `!didBackground` term for the rest of the session,
         // and every later app-switcher return would come back frozen.
         guard hasStartedPlayback else { return }
+        // The cache counted the frozen minutes as a stalled download; tell it
+        // the clock restarts here, before the resync asks it for bytes. Only on
+        // THIS path: a resign-only round trip never stopped the process, so its
+        // stall clocks are honest and must keep running.
+        MediaCacheServer.shared.noteAppResumed()
         claimUnattendedStart()
         resyncPipeline()
     }
@@ -3205,6 +3836,11 @@ final class PlayerViewModel: ObservableObject {
         clock.position = 0
         clock.duration = 0
         clock.buffered = 0
+        // The clock now belongs to this stream. When it is the episode a switch
+        // was waiting for, saves describe that episode again.
+        if let target = episodeSwitchTargetID, currentVideo?.id == target {
+            episodeSwitchTargetID = nil
+        }
         isBuffering = true
         pausedAt = nil
         // Any DV-first probe still in flight belongs to the PREVIOUS entry.
@@ -3417,6 +4053,18 @@ final class PlayerViewModel: ObservableObject {
             }
             decisionLog.record("Engine", needsFFmpeg ? "FFmpeg" : "Native (AVPlayer)", because: why)
         }
+        // What this engine can do with Dolby audio, said plainly and in the
+        // one place where the engine is already known. FFmpeg decodes every
+        // codec (`AudioSwresample`), so a session on it is multichannel PCM
+        // however the receiver is labelled; AVPlayer hands Dolby to tvOS
+        // untouched. The sample-feed engine records its own line at open.
+        decisionLog.record(
+            "Dolby Audio",
+            needsFFmpeg ? "Decoded to PCM in-app" : "Bitstreamed by tvOS when the track is Dolby",
+            because: needsFFmpeg
+                ? "the FFmpeg engine decodes every audio codec; a Dolby bitstream needs the sample-feed engine (MKV) or AVPlayer (MP4/HLS)"
+                : "AVPlayer passes Dolby Digital / DD+ straight to the HDMI route"
+        )
         // Unknown container: probe the real one in the background. This never
         // delays the open — FFmpeg is already the safe default — it informs
         // the decision panel now and routes the NEXT open of this link right.
@@ -3963,9 +4611,7 @@ final class PlayerViewModel: ObservableObject {
         // ducking, interruption and route policy for long-form video.
         // Default route-sharing policy: tvOS then follows the user's Default
         // Audio Output (HomePods). See KSOptions.setAudioSession.
-        try? AVAudioSession.sharedInstance().setCategory(
-            .playback, mode: .moviePlayback
-        )
+        AudioOutputCapability.configureForMoviePlayback()
         // Fire-and-forget off main: activation is an IPC round trip (see the
         // DV path's note); VLC tolerates it racing its own open.
         Task.detached(priority: .userInitiated) {
@@ -4391,6 +5037,8 @@ final class PlayerViewModel: ObservableObject {
                                because: "the file's default track is commentary or described video")
         }
 
+        noteDolbyCapability(player: player)
+
         if let dataSouce = player.subtitleDataSouce {
             subtitleModel.addSubtitle(dataSouce: dataSouce)
         }
@@ -4683,6 +5331,56 @@ final class PlayerViewModel: ObservableObject {
         return (nil, false, false)
     }
 
+    /// Learn, from the tracks this session already has in hand, whether this
+    /// title ships Dolby that tvOS could BITSTREAM — so the next play routes
+    /// straight to the passthrough engine.
+    ///
+    /// The point is the titles whose add-on stream name says nothing about the
+    /// audio: there is no hint to match, so `shouldTryDVFirst` declines and the
+    /// file plays as PCM forever. One play now teaches it. Free: the track list
+    /// is already built, nothing is probed, and nothing about THIS session
+    /// changes — no reload, no switch, no interruption.
+    ///
+    /// Requires an HEVC video track, DELIBERATELY still — even though the
+    /// engine takes H.264 now. A track list cannot see the things the H.264
+    /// shape gate declines on (Annex-B extradata, interlacing, anamorphic
+    /// SAR), so an H.264 positive recorded here could be wrong, and a wrong
+    /// positive buys a doomed probe + engine attempt on every future play.
+    /// H.264 titles learn from the engine's own success instead (see the
+    /// `DolbyMemory.remember` in `startDVFirst`); HEVC stays safe to learn
+    /// here because the engine takes any HEVC shape.
+    private func noteDolbyCapability(player: some MediaPlayerProtocol) {
+        guard !meta.id.isEmpty, !DolbyMemory.bitstreamable(meta.id) else { return }
+        // Too short for the engine to take anyway (`isNoticeClip` rules out
+        // anything under three minutes), so remembering it would buy a probe
+        // per play that can only ever decline. A duration we don't know yet is
+        // not a reason to skip — most sessions know it by now.
+        guard duration <= 0 || duration > 180 else { return }
+        let hasBitstreamDolby = player.tracks(mediaType: .audio).contains { track in
+            let format = Self.audioFormat(track)
+            // `atmosCapable` is exactly "DD+ / E-AC-3" — the codec tvOS
+            // bitstreams. Plain AC-3 counts too (it is also bitstreamed); it
+            // reports `atmosCapable: false` because it carries no Atmos, which
+            // is a different question.
+            let dolby = (format.codec ?? "").hasPrefix("Dolby Digital")
+            return dolby && Self.channelCount(track) > 2
+        }
+        guard hasBitstreamDolby else { return }
+        // Read the subtype as its four-character string, exactly as
+        // `audioFormat` does — a FourCharCode's own `description` is the
+        // DECIMAL number, which matches nothing (see the note there).
+        let hasHEVC = player.tracks(mediaType: .video).contains { track in
+            guard let sub = track.formatDescription?.mediaSubType.description
+                .trimmingCharacters(in: CharacterSet(charactersIn: "'")).lowercased()
+            else { return false }
+            // hvc1/hev1 plain HEVC; dvh1/dvhe Dolby Vision HEVC.
+            return ["hvc1", "hev1", "dvh1", "dvhe"].contains(sub)
+        }
+        guard hasHEVC else { return }
+        DolbyMemory.remember(meta.id)
+        PlayerProbe.event("audio", "learned: this title carries bitstreamable Dolby in HEVC — next play takes the passthrough engine")
+    }
+
     /// Tracks nobody wants auto-selected: commentaries and descriptive audio.
     /// They stay in the picker; they just never win the automatic choice.
     static func isSecondaryAudio(_ track: any MediaPlayerTrack) -> Bool {
@@ -4879,7 +5577,16 @@ final class PlayerViewModel: ObservableObject {
         // made every real pause (>12s) resume SEVERAL SECONDS BACK — the 1s
         // rewind snaps to the previous keyframe with inaccurate seek, and web
         // encodes carry 5-10s GOPs — then chop forward to catch up.
-        let proxied = currentURL?.host == "127.0.0.1" && MediaCacheServer.shared.hasLiveSession
+        // …and that premise is void again after a SUSPENSION. It holds while
+        // the app is RUNNING: the proxy is still serving and a localhost socket
+        // reconnects instantly. It does not hold once tvOS has frozen the
+        // process for minutes — the download workers are gone, the cache's
+        // stall clocks are wall-clock, and the first read after the wake can
+        // fail the session outright. Playing in place there is the press that
+        // does nothing, so take the reconnect-rewind this branch exists for.
+        let proxied = currentURL?.host == "127.0.0.1"
+            && MediaCacheServer.shared.hasLiveSession
+            && !didSuspendSincePlay
         let connectionLikelyStale = idleSeconds >= staleResumeThreshold && !proxied
         // The DV-direct engine has no KSPlayerLayer, so it was taking the plain
         // play path this reconnect exists to avoid.
@@ -4915,6 +5622,7 @@ final class PlayerViewModel: ObservableObject {
         } else {
             enginePlay()
         }
+        didSuspendSincePlay = false
     }
 
     func skip(_ seconds: Double) {
@@ -5055,6 +5763,22 @@ final class PlayerViewModel: ObservableObject {
                 }
                 try? await Task.sleep(nanoseconds: 400_000_000)
             }
+            // LAST RESORT, and the one the wake case needs. The poll above can
+            // only act once the engine reports it has stopped buffering — and
+            // after a wake it never does: `resyncPipeline`'s autoPlay:false
+            // flush-seek leaves the engine in `.buffering`, and a PAUSED engine
+            // never pumps enough to report its way back out (measured on the
+            // device; the buffer spinner carries the same note). So the loop
+            // ran out and returned in silence, leaving the viewer pressing play
+            // at a spinner that never clears. Nine seconds in, any real seek is
+            // long over — the reason this rescue waits at all — so ask once.
+            guard !Task.isCancelled, let self, !self.isExiting,
+                  !self.pauseIntent, !self.isScrubbing, !self.isSwitchingSource,
+                  !self.isPlaying else { return }
+            PlayerProbe.event("seek", "WATCHDOG: still stopped after the poll window — starting playback")
+            NSLog("[OrivioPlayer] seek autoplay never took (engine still buffering) — starting playback")
+            Self.dvTrail("seek autoplay never took while buffering — starting playback")
+            self.enginePlay()
         }
     }
 
@@ -6211,8 +6935,9 @@ final class PlayerViewModel: ObservableObject {
     /// case on TV/soundbar chains that delay video processing). Remembered
     /// per title, like speed. Wired on the FFmpeg engine (via the clock's
     /// `videoDelay` — the audio renderer is the master clock, so the offset
-    /// shifts when VIDEO is presented) and on VLC (its native audio-delay
-    /// knob); the native AVPlayer and DV sample engines are not adjustable.
+    /// shifts when VIDEO is presented), on VLC (its native audio-delay knob)
+    /// and on the DV sample engine (its audio timestamps); the native AVPlayer
+    /// engine is not adjustable. Zero is every engine's natural timing.
     @Published private(set) var audioSyncOffset: Double = 0
 
     static let audioSyncOptions: [Double] =
@@ -6224,11 +6949,29 @@ final class PlayerViewModel: ObservableObject {
         return ms > 0 ? "Voices +\(ms) ms later" : "Voices \(ms) ms earlier"
     }
 
-    var audioSyncAdjustable: Bool { vlcEngine != nil || (currentOptions != nil && !usingDVDirect) }
+    /// Audio Sync is only offered where the knob it writes is actually read.
+    ///
+    /// VLC has a real audio-side delay. The FFmpeg engine applies `videoDelay`
+    /// inside `videoClockSync`. The NATIVE AVPlayer engine has neither — it
+    /// never calls `videoClockSync`, so `videoDelay` is inert there — and the
+    /// old test only asked whether an options object existed, which is true on
+    /// the native path too. So the row was offered on native sessions and
+    /// every value in it did nothing, in both directions. The direct-DV engine
+    /// was already excluded for the same reason.
+    ///
+    /// The direct-DV engine now has a real knob too (`setAudioDelay`, which
+    /// re-stamps the audio it hands to its renderer), so the row is back there.
+    var audioSyncAdjustable: Bool {
+        vlcEngine != nil || dvDirectEngine != nil
+            || (!usingDVDirect && playerLayer?.player is KSMEPlayer)
+    }
 
     func setAudioSync(_ offset: Double) {
         audioSyncOffset = offset
         applyAudioSync()
+        // The engine on screen right now (see `applyAudioSync` for why the DV
+        // engine is applied here and at creation, never from there).
+        dvDirectEngine?.setAudioDelay(offset)
         PlaybackMemory.update(meta.id) { $0.audioSyncOffset = offset == 0 ? nil : offset }
         showToast("Audio sync \(Self.audioSyncLabel(offset))")
     }
@@ -6242,6 +6985,10 @@ final class PlayerViewModel: ObservableObject {
         currentOptions?.videoDelay = -audioSyncOffset
         // VLC's knob is audio-side directly: positive = audio delayed (µs).
         vlcEngine?.player.currentAudioPlaybackDelay = Int(audioSyncOffset * 1_000_000)
+        // NOT the DV sample engine: `load()` calls this before a new DV engine
+        // exists, while `dvDirectEngine` can still be the previous title's —
+        // and a changed offset re-anchors (seeks) the engine it is given. The
+        // DV engine takes its offset at creation and in `setAudioSync` instead.
     }
 
     /// A left/right press on the Fusion bar. A lone press nudge-seeks; holding
@@ -6383,9 +7130,12 @@ final class PlayerViewModel: ObservableObject {
 
     /// The Video tab's left column: what this stream actually IS.
     ///
-    /// Dynamic range is named PRECISELY — "Dolby Vision · Profile 8.1" rather
-    /// than a bare "DV" — because the profile decides which pipeline runs and
-    /// what the TV is actually being sent. HDR is read from the TRANSFER
+    /// Dynamic range is named PRECISELY — "Dolby Vision 8.1" rather than a
+    /// bare "DV" — because the profile decides which pipeline runs and what
+    /// the TV is actually being sent. Every value here has to FIT the column
+    /// (`InfuseRowMetrics.columnWidth` less the "Dynamic Range" label, i.e.
+    /// about 300pt, and the row is `lineLimit(1)`): a read-out that ends in an
+    /// ellipsis answers nothing. HDR is read from the TRANSFER
     /// FUNCTION rather than `formatDescription.dynamicRange`, which calls
     /// anything 10-bit "HDR10" and is wrong on 10-bit SDR encodes.
     func videoFormatRows() -> [(label: String, value: String)] {
@@ -6398,14 +7148,14 @@ final class PlayerViewModel: ObservableObject {
             let profile = engine.detectedDVProfile
             if profile > 0, !engine.forceHDR10 {
                 rows.append(("Dynamic Range", profile == 7
-                    ? "Dolby Vision · Profile 7 → 8.1"
-                    : "Dolby Vision · Profile \(profile)"))
+                    ? "Dolby Vision 7 → 8.1"
+                    : "Dolby Vision \(profile)"))
                 rows.append(("Output", "Native Dolby Vision"))
             } else if engine.forceHDR10 {
-                rows.append(("Dynamic Range", "Dolby Vision · Profile 7 (FEL)"))
+                rows.append(("Dynamic Range", "Dolby Vision 7 (FEL)"))
                 rows.append(("Output", "HDR10 base layer"))
             } else {
-                rows.append(("Dynamic Range", "HDR10 / SDR — from the bitstream"))
+                rows.append(("Dynamic Range", "HDR10 / SDR"))
             }
         } else if let track {
             let trc = track.transferFunction
@@ -6413,7 +7163,7 @@ final class PlayerViewModel: ObservableObject {
             let isHLG = trc == (kCVImageBufferTransferFunction_ITU_R_2100_HLG as String)
             if let dovi = track.dovi {
                 let profile = Int(dovi.dv_profile)
-                var name = "Dolby Vision · Profile \(profile)"
+                var name = "Dolby Vision \(profile)"
                 if profile == 8 { name += ".\(Int(dovi.dv_bl_signal_compatibility_id))" }
                 rows.append(("Dynamic Range", name))
                 // Always the base layer here: this arm is the DECODE path, and
@@ -6421,13 +7171,13 @@ final class PlayerViewModel: ObservableObject {
                 // which builds its rows above and never reaches this branch.
                 rows.append(("Output", "HDR10 base layer"))
             } else if hasHDR10Plus {
-                rows.append(("Dynamic Range", "HDR10+ · dynamic metadata"))
+                rows.append(("Dynamic Range", "HDR10+ · dynamic"))
             } else if isPQ {
                 rows.append(("Dynamic Range", "HDR10"))
             } else if isHLG {
                 rows.append(("Dynamic Range", "HLG"))
             } else {
-                rows.append(("Dynamic Range", trc == nil ? "SDR (stream carries no colour tags)" : "SDR"))
+                rows.append(("Dynamic Range", trc == nil ? "SDR · no colour tags" : "SDR"))
             }
         }
 
@@ -6452,7 +7202,7 @@ final class PlayerViewModel: ObservableObject {
                 rows.append(("Bitrate", String(format: "%.1f Mbps", Double(bitrate) / 1_000_000)))
             }
         } else if let engine = dvDirectEngine {
-            rows.append(("Codec", "HEVC"))
+            rows.append(("Codec", engine.videoCodecName))
             if engine.videoWidth > 0 {
                 rows.append(("Resolution", "\(engine.videoWidth) × \(engine.videoHeight)"))
             }
@@ -6464,6 +7214,97 @@ final class PlayerViewModel: ObservableObject {
             }
         }
         return rows
+    }
+
+    /// The Audio tab's read-only "Format" column — what the audio IS and what
+    /// this app is doing with it, rendered from the same `audioPipelineFacts`
+    /// the `[atmos]` probe block uses, so the two cannot disagree.
+    ///
+    /// The one row that matters is "Output". It names a Dolby bitstream ONLY
+    /// when compressed Dolby leaves the app; anything decoded here says PCM, in
+    /// as many words. Atmos is reported as what the FILE says about itself,
+    /// never as a claim about what the receiver is decoding.
+    func audioFormatRows() -> [(label: String, value: String)] {
+        let f = audioPipelineFacts
+        var rows: [(label: String, value: String)] = []
+        guard f.codec != "-" || f.decoder != "-" else { return rows }
+
+        rows.append(("Codec", Self.audioCodecDisplayName(f.codec)))
+        if f.channels > 0 {
+            rows.append(("Channels", Self.channelLabel(f.channels)))
+        }
+
+        // "Tagged in the file" is the honest ceiling: the container metadata
+        // says Atmos, and that is all any code on this side can know. A TrueHD
+        // track tagged Atmos is called out for what happens to it — tvOS
+        // cannot bitstream TrueHD, so the objects are lost in the PCM decode.
+        //
+        // Every value here fits `InfuseOptionRow` on ONE line at
+        // `InfuseRowMetrics.columnWidth` less its label: the row is
+        // `lineLimit(1)` and a truncated verdict reads as a bug. The long-form
+        // wording lives in the `[atmos]` probe block.
+        let lower = f.codec.lowercased()
+        let truehd = lower.contains("truehd") || lower.contains("mlp")
+        let atmos: String
+        if f.sourceSaysAtmos {
+            atmos = truehd ? "Tagged — lost in decode"
+                           : (f.dolbyBitstream ? "Tagged in file" : "Tagged — decoded to PCM")
+        } else {
+            atmos = "Not tagged"
+        }
+        rows.append(("Atmos", atmos))
+
+        // THE VERDICT, and the only row that needs reading to answer "am I
+        // actually getting Dolby?".
+        //
+        // It replaces four rows that each said a piece of the same thing —
+        // Pipeline (bitstream vs decoded), Decoder (who decoded it), Native
+        // Dolby (yes/no) and Sample Rate (48 kHz on essentially everything
+        // this plays). Anything not a Dolby bitstream leaves as LPCM, whoever
+        // decoded it, so there are exactly three outcomes worth naming.
+        let output: String
+        if f.nativeDolbyPath {
+            output = "Dolby bitstream → HDMI"
+        } else if f.routeIsMultichannel {
+            output = "Multichannel PCM → HDMI"
+        } else {
+            output = "Stereo PCM → HDMI"
+        }
+        rows.append(("Output", output))
+        rows.append(("Route", AudioOutputCapability.routeShortDescription))
+
+        // Conditionals: these appear only when something is actually wrong, so
+        // they cost nothing in the common case and are the whole point in the
+        // uncommon one.
+        if f.downmixedInApp {
+            rows.append(("Downmix", "Folded to stereo in app"))
+        }
+        // The route limit bites decoded multichannel PCM only. The cause is
+        // almost always the HDMI sink advertising stereo after a reboot or a
+        // format change — not this app — so say what actually fixes it. Two
+        // rows because one held both and truncated where the remedy started.
+        if f.pcmChannelsLostToRoute {
+            rows.append(("Route Limit", "Sink advertising stereo"))
+            rows.append(("Fix", "Power-cycle the receiver"))
+        }
+        return rows
+    }
+
+    /// The engine's raw codec name, or an already-pretty label, made readable.
+    static func audioCodecDisplayName(_ codec: String) -> String {
+        switch codec.lowercased() {
+        case "eac3": return "Dolby Digital Plus (E-AC-3)"
+        case "ac3": return "Dolby Digital (AC-3)"
+        case "truehd", "mlp": return "Dolby TrueHD"
+        case "dts": return "DTS"
+        case "flac": return "FLAC"
+        case "aac": return "AAC"
+        case "opus": return "Opus"
+        case "mp3": return "MP3"
+        case "vorbis": return "Vorbis"
+        case "-": return "Unknown"
+        default: return codec   // the KSPlayer path already hands over "Dolby Digital+ Atmos"
+        }
     }
 
     /// The Infuse Info card's one-line file summary: runtime, then size,
@@ -6485,7 +7326,7 @@ final class PlayerViewModel: ObservableObject {
         var codec: String?
         var hdr: String?
         if let engine = dvDirectEngine {
-            codec = "HEVC"
+            codec = engine.videoCodecName
             width = engine.videoWidth
             fps = Double(engine.videoFPS)
             mbps = engine.containerMbps
@@ -6762,6 +7603,12 @@ final class PlayerViewModel: ObservableObject {
 
     private func startCacheBandTicker() {
         cacheBandTask?.cancel()
+        // A different file maps bytes to time differently; never carry one
+        // session's calibration into the next.
+        cacheBandCalibration = nil
+        cacheBandSkewCandidate = nil
+        cacheBandLastPosition = -1
+        cacheBandLastTick = nil
         cacheBandTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
@@ -6774,15 +7621,96 @@ final class PlayerViewModel: ObservableObject {
                 if visible {
                     let value = self.cacheBandEnd
                     if abs(self.clock.cacheEnd - value) > 0.0005 { self.clock.cacheEnd = value }
-                    let spans = MediaCacheServer.shared.hasLiveSession
-                        ? Self.displaySpans(MediaCacheServer.shared.coveredFractions,
-                                            duration: self.clock.duration)
-                        : []
+                    var spans: [ClosedRange<Double>] = []
+                    if MediaCacheServer.shared.hasLiveSession {
+                        let snapshot = MediaCacheServer.shared.coveredFractionsAndReader
+                        self.updateCacheBandCalibration(readerByteFraction: snapshot.reader)
+                        spans = Self.displaySpans(snapshot.spans, duration: self.clock.duration,
+                                                  calibration: self.cacheBandCalibration)
+                    }
                     if spans != self.clock.cachedSpans { self.clock.cachedSpans = spans }
                 }
                 try? await Task.sleep(nanoseconds: visible ? 700_000_000 : 3_000_000_000)
             }
         }
+    }
+
+    /// Where the cache's BYTES meet the transport's TIME, as (byte fraction,
+    /// time fraction) of one point in the file. nil until measured.
+    ///
+    /// THE BAR USED TO DRAW BYTE POSITIONS ON A TIME AXIS. The cache knows
+    /// what it holds in bytes; the playhead is a timestamp; and the band was
+    /// painted at `byte / fileSize` on a track where the playhead sits at
+    /// `position / duration`. Those only agree for a constant-bitrate file.
+    /// Measured on a 4K DV remux whose opening is lighter than its average:
+    /// the resume point at 2015s (65.6% of the film) was byte 3991MB (68.1% of
+    /// the file) — so the band started 77 seconds to the right of the playhead
+    /// — and at 2190s the offset had grown to 109 seconds. That is the "cache
+    /// starts about two minutes after where I am" report. The download itself
+    /// was right the whole time; only the drawing was.
+    ///
+    /// The reader's byte offset is the one byte position whose time is known:
+    /// it is the engine's read head, `buffered`. Mapping through that point
+    /// (and the file's two ends) makes the band exact where the viewer is
+    /// looking and no worse than before anywhere else.
+    private var cacheBandCalibration: (byte: Double, time: Double)?
+    private var cacheBandSkewCandidate: Double?
+    private var cacheBandLastPosition: Double = -1
+    private var cacheBandLastTick: Date?
+
+    /// Refresh `cacheBandCalibration` from the live reader, refusing anything
+    /// that could describe a different place than the playhead. Cosmetic by
+    /// construction: on any doubt it keeps the last good calibration, or none —
+    /// which is exactly the old drawing.
+    private func updateCacheBandCalibration(readerByteFraction: Double?) {
+        let now = Date()
+        let elapsed = cacheBandLastTick.map { now.timeIntervalSince($0) } ?? 0
+        let lastPosition = cacheBandLastPosition
+        cacheBandLastTick = now
+        cacheBandLastPosition = position
+        // A seek moves the playhead immediately but the reader only when the
+        // engine next reads, so for a moment the two describe different
+        // places. Drop the candidate; keep the last good calibration.
+        if lastPosition >= 0, abs(position - lastPosition) > max(3, elapsed * 2 + 1) {
+            cacheBandSkewCandidate = nil
+            return
+        }
+        guard duration > 0, let byte = readerByteFraction else {
+            cacheBandSkewCandidate = nil
+            return
+        }
+        // The reader's byte is what the engine has READ, so the matching time
+        // is its read head, not the picture.
+        let time = min(max(buffered, position), duration) / duration
+        // Byte/time skew on a real file is a few percent; a stale reader from
+        // before a long seek is off by the length of the seek.
+        guard byte > 0.001, byte < 0.999, time > 0.001, time < 0.999,
+              abs(byte - time) <= 0.15 else {
+            cacheBandSkewCandidate = nil
+            return
+        }
+        let skew = byte - time
+        // Accept the first plausible reading of a session outright (it is
+        // better than no calibration), and after that only a reading the
+        // previous tick agrees with — VBR skew drifts by tiny amounts between
+        // ticks 0.7s apart, a stale reader does not.
+        if cacheBandCalibration == nil
+            || cacheBandSkewCandidate.map({ abs(skew - $0) < 0.01 }) == true {
+            cacheBandCalibration = (byte, time)
+        }
+        cacheBandSkewCandidate = skew
+    }
+
+    /// Map a 0…1 BYTE fraction onto the 0…1 TIME axis, piecewise-linearly
+    /// through the file's start, the calibration point and the file's end.
+    /// Monotonic and range-preserving; without a usable calibration it is the
+    /// identity, i.e. the old linear drawing.
+    nonisolated static func timeFraction(
+        ofByteFraction f: Double, calibration c: (byte: Double, time: Double)?
+    ) -> Double {
+        guard let c, c.byte > 0, c.byte < 1, c.time > 0, c.time < 1 else { return f }
+        if f <= c.byte { return f * (c.time / c.byte) }
+        return c.time + (f - c.byte) * ((1 - c.time) / (1 - c.byte))
     }
 
     /// The cache's covered runs as the BAR should draw them. Raw
@@ -6794,7 +7722,8 @@ final class PlayerViewModel: ObservableObject {
     /// seconds anyway), and slivers too narrow to read as anything are
     /// dropped rather than drawn as specks.
     nonisolated static func displaySpans(
-        _ raw: [(start: Double, end: Double)], duration: Double = 0
+        _ raw: [(start: Double, end: Double)], duration: Double = 0,
+        calibration: (byte: Double, time: Double)? = nil
     ) -> [ClosedRange<Double>] {
         // Merge gap in FRACTION of the film, derived from SECONDS. The flat
         // 1% looked reasonable on the bar but on a 2-hour film it painted a
@@ -6804,7 +7733,8 @@ final class PlayerViewModel: ObservableObject {
         // seam remains reads honestly, and the download closes it in a beat.
         let gap = duration > 1 ? min(0.01, 5.0 / duration) : 0.01
         let sorted = raw
-            .map { (max($0.start, 0), min($0.end, 1)) }
+            .map { (timeFraction(ofByteFraction: max($0.start, 0), calibration: calibration),
+                    timeFraction(ofByteFraction: min($0.end, 1), calibration: calibration)) }
             .filter { $0.1 > $0.0 }
             .sorted { $0.0 < $1.0 }
         var merged: [(Double, Double)] = []
@@ -7296,6 +8226,32 @@ final class PlayerViewModel: ObservableObject {
     /// wrong-IP case, an account out of traffic), and `viableFailoverCandidates`
     /// stops preferring it from then on.
     private var noticeClipsByAddon: [String: Int] = [:]
+
+    /// How many links from each addon have DIED mid-playback this session.
+    ///
+    /// Same reasoning as the notice-clip tally above, and it earned its place
+    /// the same way — on a real session. `debridmediamanager.com` began
+    /// answering HTTP 500 to range requests at scattered byte offsets; the
+    /// cache failed five times, the player failed over three times, and all
+    /// three hops landed on ANOTHER link from the same provider, because
+    /// `rankedCandidates` puts "same addon" first and a host being down is
+    /// invisible to a ranking built out of resolution and addon name.
+    ///
+    /// ONE failure is a bad link — a torrent that isn't really cached, one
+    /// expired URL — and says nothing about the addon's other links. TWO is the
+    /// provider: its debrid session, its account, or its origin. Demoted from
+    /// then on, never excluded, exactly as notice clips are: if nothing else
+    /// plays, a link from a struggling provider still beats the error overlay.
+    private var deadLinksByAddon: [String: Int] = [:]
+
+    /// Links already counted above, so one death is charged ONCE.
+    ///
+    /// `attemptFailoverRetry` deliberately clears `isFailingOver` and re-enters
+    /// when a candidate is consumed without ever loading, so the same dead link
+    /// can pass the counting site several times in one chain. Keyed by entry id
+    /// rather than guarded by a flag because that is the actual question being
+    /// asked — how many DISTINCT links this addon has lost.
+    private var deadLinkIDs: Set<UUID> = []
     /// True while the CURRENT source is a known notice clip, so its twenty
     /// seconds never reach Continue Watching — saved as a duration, that reads
     /// as a title watched to the end.
@@ -7439,6 +8395,28 @@ final class PlayerViewModel: ObservableObject {
             return
         }
         isFailingOver = true
+        // Charge the failure to the addon whose link just died. Here, not at
+        // the top: the direct-engine branch above returns having only changed
+        // TIER on the same source, which is not the link failing at all.
+        // Keyed by entry id because `isFailingOver` is NOT enough on its own —
+        // `attemptFailoverRetry` clears it and re-enters for the same dead
+        // link, which would charge one death two or three times over.
+        if deadLinkIDs.insert(currentEntry.id).inserted {
+            // KEYED ON `sourceAddonName`, NOT `addonName`.
+            //
+            // A debrid or P2P resolve builds a NEW entry labelled
+            // "RD · Torrentio" (StreamsView), while every candidate still
+            // waiting in `allEntries` is plain "Torrentio". Counting under the
+            // prefixed name and looking up under the bare one would never
+            // match, and the demotion below would be dead code for exactly the
+            // links that need it most — resolved debrid links are the ones that
+            // die. `sourceAddonName` strips the resolver prefix, so both sides
+            // agree.
+            let addon = currentEntry.sourceAddonName
+            deadLinksByAddon[addon, default: 0] += 1
+            PlayerProbe.event("fail", "\(addon) has now lost"
+                + " \(deadLinksByAddon[addon] ?? 0) link(s) this session")
+        }
         // The chain below re-scrapes and resolves over the network — seconds in
         // which the viewer can pick a source from the panel, change episode, or
         // exit. Anything it decides is about the stream that FAILED, so it must
@@ -7470,7 +8448,7 @@ final class PlayerViewModel: ObservableObject {
         // on the first failure, the original the user was on): prefer the same
         // addon, then the closest quality.
         if chainPreferredAddon == nil {
-            chainPreferredAddon = currentEntry.addonName
+            chainPreferredAddon = currentEntry.sourceAddonName
             chainPreferredResolution = preferResolution ?? currentEntry.resolutionLabel
         }
         failedSourceIDs.insert(currentEntry.id)
@@ -7673,7 +8651,10 @@ final class PlayerViewModel: ObservableObject {
             // next link is a notice too. Demoted, not excluded: if nothing else
             // plays, it is still better than the error overlay.
             if noticeClipsByAddon[e.addonName, default: 0] >= 2 { return 4 }
-            let sameAddon = chainPreferredAddon != nil && e.addonName == chainPreferredAddon
+            // And an addon whose links keep dying under us. Two is the
+            // provider rather than the link — see `deadLinksByAddon`.
+            if deadLinksByAddon[e.sourceAddonName, default: 0] >= 2 { return 4 }
+            let sameAddon = chainPreferredAddon != nil && e.sourceAddonName == chainPreferredAddon
             let sameRes = chainPreferredResolution != nil && e.resolutionLabel == chainPreferredResolution
             switch (sameAddon, sameRes) {
             case (true, true):   return 0
@@ -7879,7 +8860,13 @@ final class PlayerViewModel: ObservableObject {
     /// Advance to the queued Up Next episode. Honors the Still Watching gate:
     /// after `stillWatchingEpisodeThreshold` consecutive auto-advances it shows
     /// the gate instead of playing, until the user confirms.
-    private func advanceToNext(userInitiated: Bool) {
+    ///
+    /// `finishingCurrent` retires the outgoing episode's Continue Watching row
+    /// instead of saving a position in it. True for every path that reaches
+    /// here at the end of an episode — the card, the countdown — and false
+    /// only for the transport's Next Episode button pressed early, where the
+    /// viewer has not finished anything yet.
+    private func advanceToNext(userInitiated: Bool, finishingCurrent: Bool = true) {
         PlayerProbe.event("next", "ADVANCE (\(userInitiated ? "viewer" : "countdown"))")
         PlayerProbe.count("next.advance")
         countdownTask?.cancel()
@@ -7911,7 +8898,7 @@ final class PlayerViewModel: ObservableObject {
         PlayerProbe.event("next", "advance \(pickManually ? "→ SOURCE LIST (selector off)" : "auto")"
             + (pickManually ? "" : " on \(advanceAddonAllowList.joined(separator: " / "))"))
         play(episode: episode, autoAdvance: !userInitiated, presentSources: pickManually,
-             finishingCurrent: true)
+             finishingCurrent: finishingCurrent)
         advanceTarget = episode      // `play` clears the ladder's bookkeeping
         advanceAttempt = 1
         // A manual pick has no deadline — the viewer is choosing.
@@ -8010,6 +8997,36 @@ final class PlayerViewModel: ObservableObject {
     /// User pressed "Play Next Episode" on the Up Next card.
     func playUpNextNow() {
         advanceToNext(userInitiated: true)
+    }
+
+    /// Viewer pressed the transport's Next Episode button.
+    ///
+    /// Separate from `playUpNextNow()` because that one answers a card which
+    /// only exists at the end of an episode, so it can assume the episode is
+    /// over. This button is on screen for the whole episode and cannot.
+    ///
+    /// Past the point where the Up Next card would have armed on its own, this
+    /// is the same thing that card's Play Next does, so the outgoing episode is
+    /// retired exactly as it would have been. Pressed EARLY it is a viewer
+    /// skipping ahead, and `markFinished` there would delete a Continue
+    /// Watching row they are ten minutes into — and tell the account to delete
+    /// it too. Their position is saved instead, so the episode is still where
+    /// they left it.
+    ///
+    /// Everything downstream is the card's own path, so the binge-group and
+    /// auto-link rules, the source-list fallback and the retry ladder all
+    /// behave identically.
+    func playNextEpisodeFromControls() {
+        // An advance already under way is not a reason to start another: the
+        // controls go away the moment one begins, but a second press landing
+        // in the same frame would otherwise get through.
+        guard !advanceInFlight, !isSwitchingSource, !isExiting else { return }
+        guard let episode = nextEpisode else { return }
+        let finishing = crossedNextEpisodeThreshold()
+        PlayerProbe.event("next", "TRANSPORT BUTTON → \(episode.seasonEpisodeCode)"
+            + " finishingCurrent=\(finishing.probe)")
+        upNextEpisode = episode
+        advanceToNext(userInitiated: true, finishingCurrent: finishing)
     }
 
     /// Long-press "Select Source" on the Up Next card — advance to the next
@@ -8167,6 +9184,9 @@ final class PlayerViewModel: ObservableObject {
         } else {
             saveProgress()
         }
+        // The outgoing episode is settled. Nothing saves again until this
+        // episode's stream loads — see `episodeSwitchTargetID`.
+        episodeSwitchTargetID = episode.id
         engineStopForSwitch()
         let hasResolver = torrentResolver != nil
         Task {
@@ -8346,6 +9366,10 @@ final class PlayerViewModel: ObservableObject {
 
     private func saveProgressThrottled() {
         publishBufferHealth()
+        // Same two gates as `saveProgress`: mid-switch the clock and the
+        // episode disagree, and after an exit that retired the episode a tick
+        // would write it back as a periodic row.
+        guard episodeSwitchTargetID == nil, !retiredEpisodeOnExit else { return }
         // Periodic saves are TRANSIENT: persisted to disk for crash safety,
         // but never published — a publish re-renders the whole Home screen
         // behind the player, which was the periodic playback hiccup. The
@@ -8388,6 +9412,14 @@ final class PlayerViewModel: ObservableObject {
     func saveProgress() {
         guard !currentSourceIsNoticeClip else {
             PlayerProbe.event("progress", "SAVE SUPPRESSED — this source is a notice clip")
+            return
+        }
+        if let target = episodeSwitchTargetID {
+            PlayerProbe.event("progress", "SAVE SUPPRESSED — switching to episode \(target), its stream has not loaded")
+            return
+        }
+        guard !retiredEpisodeOnExit else {
+            PlayerProbe.event("progress", "SAVE SUPPRESSED — the exit retired this episode as finished")
             return
         }
         let saved = max(max(position, pendingResume ?? 0), sessionResumeFloor)
@@ -8460,12 +9492,15 @@ final class PlayerViewModel: ObservableObject {
         // save a position instead of retiring the row, so Continue Watching
         // went on offering the episode just watched. Only when a next episode
         // actually exists: on the last one of a series there is nothing to
-        // move on to, and the position is worth keeping.
+        // move on to, and the position is worth keeping. Never mid-switch: the
+        // Up Next state read here would belong to the stream being replaced,
+        // and the episode it names as current has not played at all.
         if autoAdvanceArmed, nextEpisode != nil, let leaving = currentVideo,
-           !currentSourceIsNoticeClip {
+           !currentSourceIsNoticeClip, episodeSwitchTargetID == nil {
             PlayerProbe.event("progress", "FINISHED \(leaving.seasonEpisodeCode) on exit"
                 + String(format: " at %.1f of %.1f — past the Up Next point", position, duration))
             PlayerProbe.count("progress.episode-finished")
+            retiredEpisodeOnExit = true
             progressStore.markFinished(meta: meta, video: leaving)
         } else {
             saveProgress()
@@ -9209,8 +10244,10 @@ final class PlayerViewModel: ObservableObject {
         // distinct frame under every step of the wheel, for FEWER decodes than
         // the wide pass was asking for.
         let fineTuning = wheelEngaged
-        let spacing = fineTuning ? ScrubThumbnailer.fineSecondsPerFrame
-                                 : ScrubThumbnailer.scrubSecondsPerFrame
+        let spacing = fineTuning
+            ? ScrubThumbnailer.fineSecondsPerFrame
+            : (cached ? ScrubThumbnailer.dragSecondsPerFrame
+                      : ScrubThumbnailer.scrubSecondsPerFrame)
         let wide = PerformanceProfile.isMidPower ? 180.0 : 480.0
         let half = fineTuning
             ? Self.fineTuningHalfWindow
@@ -9273,9 +10310,22 @@ final class PlayerViewModel: ObservableObject {
             let need = await MainActor.run { (self?.previewBufferGate ?? 8) * 0.75 }
             var proceed: (@Sendable () -> Bool)?
             if let health { proceed = { health.wrappedValue >= need } }
+            // SWEEP FOR THE FRAMES BETWEEN THE KEYFRAMES, off the local cache
+            // only. A slot pass seeks, and a seek lands on a keyframe — five
+            // or ten seconds apart on a remux — so fine-tuning showed the same
+            // still through most of a turn of a wheel that moves 24 seconds per
+            // revolution. The sweep decodes straight through the window
+            // instead and keeps one frame a second. It reads every byte of
+            // what it sweeps, which is why it is never asked for over the
+            // network, and it stands itself down on hardware that can't hold
+            // the pace (`sweepFloorFPS`), leaving the slot pass to fill the
+            // window at the old density.
             let fine = ScrubThumbnailer(url: url, count: count,
                                         budgetSeconds: cached ? 60 : 30,
                                         headers: headers, range: lower...upper,
+                                        denseSpacing: fineTuning && cached
+                                            ? ScrubThumbnailer.fineSweepSeconds : nil,
+                                        denseCenter: target,
                                         shouldProceed: proceed)
             await MainActor.run { self?.fineThumbnailer = fine }
             let thumbs = await fine.generate { partial in
@@ -9332,9 +10382,14 @@ final class PlayerViewModel: ObservableObject {
     }
 
     /// Half-width of the fine-tuning window: the wheel is for small
-    /// adjustments, so a narrow window at `fineSecondsPerFrame` (2s) puts a
-    /// distinct frame under every couple of steps for a handful of decodes.
-    private static let fineTuningHalfWindow: Double = 30
+    /// adjustments, so a narrow window puts a distinct frame under every
+    /// couple of steps for a handful of decodes.
+    ///
+    /// Twenty seconds, not thirty, since the sweep arrived: the sweep DECODES
+    /// the window rather than sampling it, so its width is what it costs, and
+    /// ±20s is still most of a turn of the wheel (24s per revolution) either
+    /// way. Everything past it is the coarse set's job.
+    private static let fineTuningHalfWindow: Double = 20
 
     /// How far a frame from the dense set may be from the asked-for time and
     /// still be the right picture: the spacing the set was BUILT at (2s when
@@ -9516,7 +10571,9 @@ final class PlayerViewModel: ObservableObject {
     /// stripped-down record (a Continue Watching card carries only name +
     /// artwork), so the panel would show just "Movie". Re-fetched from the
     /// meta addon (cached, same call the Detail screen makes).
-    @Published private(set) var enrichedMeta: MetaItem?
+    @Published private(set) var enrichedMeta: MetaItem? {
+        didSet { refreshNextEpisodeAvailability() }
+    }
     /// Best available metadata: the enriched fetch when it lands, else
     /// whatever the player was launched with.
     var displayMeta: MetaItem { enrichedMeta ?? meta }
@@ -9667,7 +10724,7 @@ final class PlayerViewModel: ObservableObject {
             let profile = engine.detectedDVProfile
             video.append(.init(label: "Codec",
                                value: profile > 0 && !engine.forceHDR10
-                                   ? "HEVC · Dolby Vision P\(profile)" : "HEVC"))
+                                   ? "HEVC · Dolby Vision P\(profile)" : engine.videoCodecName))
             if engine.videoWidth > 0 {
                 video.append(.init(label: "Resolution", value: "\(engine.videoWidth) × \(engine.videoHeight)"))
             }

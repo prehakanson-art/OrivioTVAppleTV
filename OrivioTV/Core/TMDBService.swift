@@ -335,7 +335,24 @@ enum TMDBService {
         set { languageLock.lock(); defer { languageLock.unlock() }; preferredLanguageStorage = newValue }
     }
 
+    /// Same timing shell as `StremioAPI.get`, and for the same reason: every
+    /// TMDB call in the app comes through here, so one wrapper answers which
+    /// enrichment was slow or missing without a probe per endpoint. `path`
+    /// alone is logged — the query carries the API key.
     private static func get<T: Decodable>(_ path: String, query: [String: String] = [:]) async throws -> T {
+        let done = AppProbe.begin("data", "tmdb " + path)
+        do {
+            let value: T = try await fetch(path, query: query)
+            done("ok")
+            return value
+        } catch {
+            done("FAILED")
+            AppProbe.warn("tmdb", "\(path) — \(error)")
+            throw error
+        }
+    }
+
+    private static func fetch<T: Decodable>(_ path: String, query: [String: String] = [:]) async throws -> T {
         // No key, no request. Every TMDB v3 endpoint needs one, and firing
         // them anyway would just spend the network on guaranteed 401s.
         let key = apiKey
@@ -1341,41 +1358,51 @@ enum TMDBService {
         return map
     }
 
-    /// Best YouTube trailer key for a title — the hero's billboard preview.
+    /// The YouTube trailer keys for a title — the hero's billboard preview.
     ///
     /// The dedicated /videos endpoint rather than `detail`: a hero rest
     /// shouldn't pay for credits, recommendations and release dates it will
     /// never show. Same ranking as `detail` — YouTube only, Trailer/Teaser
     /// only, official first, Trailer before Teaser.
     ///
-    /// Cached including MISSES (`.some(nil)`): browsing wanders across the
-    /// same handful of titles all evening, and a title with no trailer would
-    /// otherwise re-ask on every visit.
+    /// The whole ranked list is kept, not just the winner: an empty array is a
+    /// cached MISS, a missing entry means "not looked up yet". Misses are
+    /// cached because browsing wanders across the same handful of titles all
+    /// evening, and a title with no trailer would otherwise re-ask on every
+    /// visit.
     /// Guarded by `cacheLock`, like every other cache in this file — this one
-    /// was the exception. `firstTrailerKey` is a nonisolated async static, so
+    /// was the exception. `trailerKeys` is a nonisolated async static, so
     /// the hero-trailer layer calls it OFF the main actor, and stepping across
     /// a poster row starts the next lookup without awaiting the previous one:
     /// two concurrent tasks mutating a plain Dictionary is a corrupted hash
     /// table or EXC_BAD_ACCESS, exactly what the note at the top of this file
     /// warns about.
-    private static var trailerKeyCache: [String: String?] = [:]
+    private static var trailerKeyCache: [String: [String]] = [:]
 
-    private static func cachedTrailerKey(_ key: String) -> String?? {
+    private static func cachedTrailerKeys(_ key: String) -> [String]? {
         cacheLock.lock(); defer { cacheLock.unlock() }
         return trailerKeyCache[key]
     }
 
-    private static func storeTrailerKey(_ value: String?, for key: String) {
+    private static func storeTrailerKeys(_ value: [String], for key: String) {
         cacheLock.lock(); defer { cacheLock.unlock() }
         trailerKeyCache[key] = value
     }
 
-    static func firstTrailerKey(id: String, type: String) async -> String? {
+    /// Every YouTube trailer/teaser TMDB lists for a title, best first.
+    ///
+    /// The callers used to take the top-ranked key and stop there, which made
+    /// one geo-restricted video enough to leave a title with no preview at
+    /// all — the everyday case when the box leaves the house through a VPN
+    /// exit in another country, since YouTube restricts trailers by region
+    /// like any other upload. TMDB usually lists several, and the ones behind
+    /// the first are often not restricted at all.
+    static func trailerKeys(id: String, type: String) async -> [String] {
         let cacheKey = "\(type):\(id)"
-        if let hit = cachedTrailerKey(cacheKey) { return hit }
+        if let hit = cachedTrailerKeys(cacheKey) { return hit }
         guard let (tmdbID, isMovie) = await resolveTMDBID(from: id, type: type) else {
-            storeTrailerKey(nil, for: cacheKey)
-            return nil
+            storeTrailerKeys([], for: cacheKey)
+            return []
         }
         struct VideosResponse: Decodable {
             struct Video: Decodable {
@@ -1397,11 +1424,11 @@ enum TMDBService {
                 if (a.official ?? false) != (b.official ?? false) { return (a.official ?? false) }
                 return (a.type == "Trailer" ? 0 : 1) < (b.type == "Trailer" ? 0 : 1)
             }
-        let key = ranked.first?.key
+        let keys = ranked.compactMap { $0.key }
         // A failed REQUEST is not a miss — leave it uncached so a flaky
         // network doesn't brand the title trailer-less for the session.
-        if body != nil { storeTrailerKey(key, for: cacheKey) }
-        return key
+        if body != nil { storeTrailerKeys(keys, for: cacheKey) }
+        return keys
     }
 
     /// The whole episode list for a series, as `MetaVideo`s the detail page

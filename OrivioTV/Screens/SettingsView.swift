@@ -497,7 +497,7 @@ struct AppearanceDetail: View {
 
                 SettingsToggleCard(
                     title: "Black Background",
-                    subtitle: "Pure black stage that keeps your accent glow",
+                    subtitle: "Flat black stage with no wash or accent glow",
                     isOn: Binding(get: { theme.amoled }, set: { theme.amoled = $0 })
                 )
             }

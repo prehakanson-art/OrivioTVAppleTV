@@ -263,6 +263,7 @@
 		9845B0EA1C787B090833EDC4 /* LiveTVSettingsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveTVSettingsStore.swift; sourceTree = "<group>"; };
 		9880B14903A7091693C0A31A /* BoundedConcurrency.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BoundedConcurrency.swift; sourceTree = "<group>"; };
 		9BBE97BCD49F9A7D427F1055 /* TraktSyncManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TraktSyncManager.swift; sourceTree = "<group>"; };
+		9CA01E5B5F2B455310635A9A /* YouTubeKit */ = {isa = PBXFileReference; lastKnownFileType = folder; name = YouTubeKit; path = Vendor/YouTubeKit; sourceTree = SOURCE_ROOT; };
 		9CA2E1DC6623EFAE372FDE28 /* OrivioTopShelf-Debug.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "OrivioTopShelf-Debug.entitlements"; sourceTree = "<group>"; };
 		9D08955441C9D04BF1287261 /* KeyHandoffServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyHandoffServer.swift; sourceTree = "<group>"; };
 		9D1CE0249C1AE5940C106667 /* M3UService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = M3UService.swift; sourceTree = "<group>"; };
@@ -410,6 +411,7 @@
 			isa = PBXGroup;
 			children = (
 				CFA2037D6C200F8E219BD175 /* KSPlayer */,
+				9CA01E5B5F2B455310635A9A /* YouTubeKit */,
 			);
 			name = Packages;
 			sourceTree = "<group>";
@@ -702,8 +704,8 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				F827329C72CFCE56C74FC7FB /* XCRemoteSwiftPackageReference "vlckit-spm" */,
-				7BA735461690CD6170FDB6C0 /* XCRemoteSwiftPackageReference "YouTubeKit" */,
 				DD7B508344E6068A42E32630 /* XCLocalSwiftPackageReference "Vendor/KSPlayer" */,
+				4F81B6EDEB289261CCECC51B /* XCLocalSwiftPackageReference "Vendor/YouTubeKit" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 2A5DF0DB0B55F03ACA9A367B /* Products */;
@@ -971,8 +973,8 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 7;
-				PRODUCT_BUNDLE_IDENTIFIER = com.orivio.tv.appletv.devbuild.topshelf;
+				MARKETING_VERSION = 8;
+				PRODUCT_BUNDLE_IDENTIFIER = com.orivio.tv.appletv.dev.topshelf;
 				SDKROOT = appletvos;
 				SWIFT_VERSION = 5.9;
 				TARGETED_DEVICE_FAMILY = 3;
@@ -1129,7 +1131,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 7;
+				MARKETING_VERSION = 8;
 				PRODUCT_BUNDLE_IDENTIFIER = com.orivio.tv.appletv.dev.topshelf;
 				SDKROOT = appletvos;
 				SWIFT_VERSION = 5.9;
@@ -1156,7 +1158,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 7;
+				MARKETING_VERSION = 8;
 				PRODUCT_BUNDLE_IDENTIFIER = com.orivio.tv.appletv.dev;
 				SDKROOT = appletvos;
 				SWIFT_VERSION = 5.9;
@@ -1183,8 +1185,8 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 7;
-				PRODUCT_BUNDLE_IDENTIFIER = com.orivio.tv.appletv.devbuild;
+				MARKETING_VERSION = 8;
+				PRODUCT_BUNDLE_IDENTIFIER = com.orivio.tv.appletv.dev;
 				SDKROOT = appletvos;
 				SWIFT_VERSION = 5.9;
 				TARGETED_DEVICE_FAMILY = 3;
@@ -1233,6 +1235,10 @@
 /* End XCConfigurationList section */
 
 /* Begin XCLocalSwiftPackageReference section */
+		4F81B6EDEB289261CCECC51B /* XCLocalSwiftPackageReference "Vendor/YouTubeKit" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = Vendor/YouTubeKit;
+		};
 		DD7B508344E6068A42E32630 /* XCLocalSwiftPackageReference "Vendor/KSPlayer" */ = {
 			isa = XCLocalSwiftPackageReference;
 			relativePath = Vendor/KSPlayer;
@@ -1240,14 +1246,6 @@
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCRemoteSwiftPackageReference section */
-		7BA735461690CD6170FDB6C0 /* XCRemoteSwiftPackageReference "YouTubeKit" */ = {
-			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/alexeichhorn/YouTubeKit";
-			requirement = {
-				kind = exactVersion;
-				version = 0.4.9;
-			};
-		};
 		F827329C72CFCE56C74FC7FB /* XCRemoteSwiftPackageReference "vlckit-spm" */ = {
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/tylerjonesio/vlckit-spm";
@@ -1270,7 +1268,6 @@
 		};
 		AF80AB66BCDB4575470C9126 /* YouTubeKit */ = {
 			isa = XCSwiftPackageProductDependency;
-			package = 7BA735461690CD6170FDB6C0 /* XCRemoteSwiftPackageReference "YouTubeKit" */;
 			productName = YouTubeKit;
 		};
 /* End XCSwiftPackageProductDependency section */

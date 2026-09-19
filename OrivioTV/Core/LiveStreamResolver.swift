@@ -38,9 +38,13 @@ enum LiveStreamResolver {
         if let cached, Date().timeIntervalSince(cached.at) < ttl { return cached.resolved }
 
         // `.local` parses YouTube's own page and `.remote` uses the extraction
-        // service. Passing both in one call does not reliably fall through —
-        // a local parse that throws takes the whole call with it — so the
-        // remote extractor gets its own attempt, exactly as TrailerResolver does.
+        // service, which needs no page at all — so the remote extractor gets
+        // its own attempt, exactly as TrailerResolver does. (Reaching it needs
+        // the ORIVIO PATCH in the vendored YouTubeKit: its availability
+        // pre-check parses the watch page before it walks the method list, and
+        // used to abort everything when that page came back unreadable — a
+        // consent wall or bot check, which is what an address YouTube
+        // distrusts gets served.)
         // A LIVE broadcast exposes an HLS manifest and NO usable progressive
         // stream, so it is tried first — `streams` on a live video either
         // throws or returns a frozen snapshot of the broadcast so far.

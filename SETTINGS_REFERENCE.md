@@ -93,7 +93,7 @@ back on finds each profile's own state where it was.
 | Control | Type | What it does | Works? |
 | --- | --- | --- | --- |
 | Accent Color | Swatch row | Highlight color across the app. One swatch per palette in `OrivioThemes.all` | Wired |
-| Black Background | Switch | Pure black stage that keeps the accent glow (AMOLED) | Wired |
+| Black Background | Switch | Flat black stage (AMOLED) — drops both the grey depth wash and the accent bloom, and the Detail hero scrim fades to the same black | Wired |
 | Font | Chips | Typeface across the app (`AppFont.allCases`) | Wired |
 | Experience Mode | Chips | **Essential** / **Advanced**. Essential hides the Plugins section and the advanced Playback cards (auto-play source, player engine, on-screen display, audio) | Wired |
 | Settings Style | Chips | **Classic** rounded / **Zen** pill / **Horizon** squared — reshapes settings cards and rows | Wired |
@@ -109,9 +109,11 @@ back on finds each profile's own state where it was.
 | *(layout picker)* | Cards | Chooses the Home layout | Wired |
 | Landscape Posters | Switch | Portrait vs landscape cards for Modern view | Wired |
 | Featured section | Switch | The rotating Featured banner between Continue Watching and the catalog rows | Wired |
-| Pin hero to the top | Switch | Keeps the hero fixed above the rows showing whatever is highlighted, instead of a banner that scrolls away and cycles the top ten | Wired |
+| Hero layout | Dropdown | How the Home hero behaves. **Rolling Hero** — a banner that cycles the top ten on a timer; browsing never changes it. **Pinned Focus** — a fixed header above the rows showing whichever card holds focus; never cycles. **Hybrid** — cycles at the top of the page; move down into the rows and it becomes a Pinned Focus hero fixed to the top of the *screen*, following whichever card you're on. Press UP out of the first row to hand it back to the roll. **Hybrid is the default.** Replaces the old "Pin hero to the top" switch: on → Pinned Focus (an explicit choice, kept), off → Hybrid (never a choice, takes the default) | Wired |
+| Hero source | Dropdown | Which catalog feeds the hero. **Automatic (first row)** is the default and the long-standing behaviour — whichever catalog sits first in your Home order. Pick any catalog an add-on declares to pin the hero to it instead. A chosen catalog that isn't on screen (switched off in the row list below, ranked past Home's row cap, or from an add-on since removed) falls back to the first row. The Featured bar always takes the first catalog that *isn't* the hero's, so the two never show the same row | Wired |
+| Navigation Position | Dropdown | Where the primary navigation sits. **Left / Vertical** is the default and the shipped layout — a glass rail hugging the left edge that expands to labels on focus. **Top / Horizontal** turns the same component on its side: one bar across the top, always showing every tab's label and the profile chip. Same items, icons, focus bindings and glass either way. The bar floats OVER Home (the hero is never pushed down, exactly as the left pill floats beside it); the other tabs reserve clearance for it. Reach the navigation with Left (vertical) or Up (horizontal); step along it with Up/Down or Left/Right; leave it with Right or Down. Back behaves identically in both | Wired |
 | Hide the sidebar | Switch | Gives rows the full screen width. LEFT from the page edge (or Menu) brings the sidebar back | Wired |
-| Hero trailers | Switch | With the hero pinned, plays the highlighted title's trailer behind the name and details | Wired |
+| Hero trailers | Switch | With the hero pinned, plays the highlighted title's trailer behind the name and details. **Pinned Focus only** — the rolling banner (Rolling / Hybrid) has never played trailers | Wired |
 | Hero trailer sound | Switch | Plays the hero trailer with sound instead of muted | Wired |
 | Full stream names | Switch | Source list shows each link's complete release name, wrapped rather than truncated | Wired |
 
@@ -120,6 +122,7 @@ back on finds each profile's own state where it was.
 | Control | Type | What it does | Works? |
 | --- | --- | --- | --- |
 | Poster labels | Switch | Title beneath poster cards | Wired |
+| Poster banners | Switch | Shows the tags some add-ons print into their poster artwork ("In Cinema", "#2 Today", "New Movie"). Off uses the plain poster the add-on sends alongside (`posterFallback`) wherever it sends one, swapped in as catalogs and details are fetched: Home reloads on the switch, other screens pick it up the next time they load. Continue Watching and Library keep the artwork each title was saved with | Wired |
 | Corner radius | Dropdown | Roundness of poster card corners | Wired |
 | Hide unreleased content | Switch | Keeps unaired titles out of catalog rows | Wired |
 
@@ -131,6 +134,20 @@ back on finds each profile's own state where it was.
 | Type suffix in row titles | Switch | Appends "- Movie" / "- Series" to row headers | Wired |
 | Full release date | Switch | Full date on the details page instead of just the year | Wired |
 | Trailer button | Switch | Shows the Trailer button on the details page | Wired |
+
+### Layout → Details Page
+
+Which optional sections appear below a title's artwork. All default ON, so a viewer who never opens these sees the page exactly as it always was. These are DISPLAY switches and are independent of the per-section TMDB enrichment switches under Integrations → TMDB, which decide whether the data is fetched at all — a section with no data stays hidden either way.
+
+| Setting | Type | What it does | Status |
+| --- | --- | --- | --- |
+| Creator and Cast | Switch | The row of directors, writers and cast members | Wired |
+| Collection | Switch | The "part of…" row for a title in a series of films, listing the others | Wired |
+| More Like This | Switch | Recommended titles based on the one being viewed | Wired |
+| Production | Switch | The studios and production companies behind the title | Wired |
+| Comments | Switch | Viewer comments from Trakt | Wired |
+
+The episode browser on a series is deliberately NOT toggleable — it is how an episode is chosen, so hiding it would leave a series unplayable.
 
 ### Continue Watching
 

@@ -58,9 +58,47 @@ final class OrivioSyncManager: ObservableObject {
     private var pushPluginsTask: Task<Void, Never>?
     private var avatarCatalogCache: [AvatarCatalogItem] = []
     private var wasSignedIn = false
-    /// The in-flight full sync (sign-in or profile switch); new full syncs chain
-    /// behind it so two cycles never interleave across profiles.
+    /// The in-flight full sync (sign-in, launch or profile switch); new full
+    /// syncs chain behind it so two cycles never interleave across profiles.
     private var fullSyncTask: Task<Void, Never>?
+
+    /// The sync armed by the app being opened — a launch with a session
+    /// already restored, or a return to the foreground. See `syncOnAppOpen`.
+    private var openSyncTask: Task<Void, Never>?
+
+    /// True from the moment an app-open sync is armed until it has started (or
+    /// decided not to). Set SYNCHRONOUSLY, because the whole point is that the
+    /// other launch-time pulls can see it before it begins: `isSyncing` only
+    /// goes up once the task body reaches `syncNow`, and the foreground
+    /// `refreshContinueWatching` fires in that gap — two full-snapshot pulls of
+    /// progress and library, overlapping in `mergeRemote`.
+    private(set) var openSyncPending = false
+
+    /// When the last full sync finished (success or failure), and when the
+    /// last app-open sync did. An app-open sync inside `openSyncFloor` of it is
+    /// skipped: the picture is already current, and a quick inactive→active
+    /// flip (a system overlay, the top shelf) shouldn't cost a full cycle.
+    private var lastFullSyncEnded = Date.distantPast
+    private static let openSyncFloor: TimeInterval = 15
+
+    /// How long the app-open sync waits before starting.
+    ///
+    /// Not zero, and this is the reason a restored session used to have no
+    /// launch sync at all: a full cycle is a few dozen round trips whose
+    /// responses are decoded and merged ON THE MAIN ACTOR, and running that
+    /// on top of app construction is what made launch unresponsive on a large
+    /// library. The wait lets the first screen render and its catalogs get
+    /// their requests out; after it the sync is just another background
+    /// consumer. It is a settle delay, not a poll — nothing the user does
+    /// shortens or triggers it, and it is orders of magnitude shorter than the
+    /// 30/90s tick this replaces.
+    ///
+    /// The A8/A10X tier gets the same 3s the launch collection migration uses:
+    /// those boxes are still decoding the first screen's posters at that point,
+    /// and the pulls merge their snapshots on the main actor.
+    private static var openSyncDelay: TimeInterval {
+        (PerformanceProfile.isLowPower || PerformanceProfile.isMidPower) ? 3.0 : 1.5
+    }
     /// Profiles whose library pull succeeded this session, gating empty
     /// (cleared) library pushes so a cold start — or a profile whose pull
     /// failed — can't wipe that profile's account library. See pushLibrary.
@@ -717,20 +755,21 @@ final class OrivioSyncManager: ObservableObject {
             if autoSyncTask == nil { startAutoSync() }
             guard !wasSignedIn else { return }
             wasSignedIn = true
-            // A session RESTORED at launch stays deferred: a heavyweight full
-            // sync during app construction is what made launch unresponsive on a
-            // large library, and the 30s loop picks it up shortly anyway.
+            // A session RESTORED at launch syncs too, just not from inside app
+            // construction. It used to wait for the periodic loop — up to 30s,
+            // 90s on the A8/A10X — so opening the app showed the previous
+            // session's Continue Watching, library and settings until a timer
+            // the user couldn't see happened to fire. `syncOnAppOpen` starts it
+            // after a short settle instead (see `openSyncDelay`), which keeps
+            // the launch itself responsive.
             //
             // Someone actually SIGNING IN is the opposite case. They are sitting
             // in front of the TV having just authenticated, and everything they
             // own — library, watch progress, add-ons, collections — is on the
-            // account rather than the device. Waiting up to thirty seconds to
-            // see any of it reads as a broken sign-in, so pull it now.
+            // account rather than the device. Waiting even a second to see any
+            // of it reads as a broken sign-in, so pull it now.
             guard account.didSignInInteractively else {
-                OrivioSyncDiagnostics.record(
-                    .info, area: "Orivio",
-                    "Restored session; the account syncs on the next tick."
-                )
+                syncOnAppOpen(reason: "launch, restored session")
                 return
             }
             OrivioSyncDiagnostics.record(
@@ -747,6 +786,12 @@ final class OrivioSyncManager: ObservableObject {
             wasSignedIn = false
             profileStore.accountAvailable = false
             stopAutoSync()
+            // An app-open sync still sitting in its settle delay belongs to the
+            // account being left. Its own token guard would catch it, but only
+            // after it had waited; disarm it here so the flag can't stay set.
+            openSyncTask?.cancel()
+            openSyncTask = nil
+            openSyncPending = false
             // Nothing queued for the account we just left may be allowed to run
             // against whichever account signs in next: the pending delete queues
             // would delete THAT user's rows, and the seeded flags would put its
@@ -758,6 +803,111 @@ final class OrivioSyncManager: ObservableObject {
     }
 
     // MARK: - Full sync
+
+    // MARK: - App-open sync
+
+    /// Bring the account down (and this device's changes up) because the app
+    /// was just opened: a cold launch with a session already restored, or a
+    /// return to the foreground after being away.
+    ///
+    /// Safe to call from every open-shaped lifecycle event, and meant to be —
+    /// the launch auth-change and the `scenePhase` change both fire on a cold
+    /// launch, and on tvOS `scenePhase` can flip more than once. Four things
+    /// keep that from turning into several syncs:
+    ///
+    /// * An armed-but-not-yet-started open sync swallows further requests
+    ///   (`openSyncPending`).
+    /// * A full sync already running is REUSED, not queued behind — unlike
+    ///   `syncNow`'s `rerunRequested`, which exists to carry a local change the
+    ///   running cycle may have missed. Opening the app carries no such change,
+    ///   so a second cycle would be pure duplicate work.
+    /// * A full sync that ended in the last `openSyncFloor` seconds means the
+    ///   picture is already current.
+    /// * The task chains behind `fullSyncTask`, so it can never interleave with
+    ///   a sign-in or profile-switch cycle.
+    ///
+    /// Nothing here blocks the UI: the stores already hold the last synced
+    /// snapshot from disk and the screens are rendering it before this runs;
+    /// the pulls publish into those same stores, so fresh data appears where
+    /// the user already is.
+    func syncOnAppOpen(reason: String) {
+        guard !openSyncPending else {
+            NSLog("[OrivioSync] app-open sync already armed — ignoring '%@'", reason)
+            AppProbe.sync("app-open sync already armed — ignoring '\(reason)'")
+            return
+        }
+        // Token only. `currentUserID` reads `authState`, and this is called
+        // from that property's `willSet` subscriber — where it can still hold
+        // the previous value (see `handleAuthChange`). `syncNow` re-checks it
+        // for real, with the diagnostic, once the session has settled.
+        guard account.accessToken != nil else { return }
+        guard !isRetiringAccountState else { return }
+        guard !isSyncing else {
+            NSLog("[OrivioSync] app-open sync reusing the running sync (%@)", reason)
+            AppProbe.sync("app-open sync reusing the running cycle (\(reason))")
+            return
+        }
+        guard Date().timeIntervalSince(lastFullSyncEnded) >= Self.openSyncFloor else {
+            NSLog("[OrivioSync] app-open sync skipped — one finished %.0fs ago (%@)",
+                  Date().timeIntervalSince(lastFullSyncEnded), reason)
+            return
+        }
+        openSyncPending = true
+        NSLog("[OrivioSync] app-open sync armed — %@", reason)
+        AppProbe.sync(String(format: "app-open sync armed — %@ (fires in %.1fs)",
+                             reason, Self.openSyncDelay))
+        let previous = fullSyncTask
+        // The profile this sync was armed for. Picking someone else at the
+        // launch gate runs `handleProfileSwitch`, which queues a full sync for
+        // the profile chosen — so this one would be a second, identical cycle.
+        let armedProfile = pid
+        let task = Task { [weak self] in
+            await previous?.value
+            // Cancellation lands here as a thrown sleep; the code below still
+            // has to run so `openSyncPending` can't stay armed forever.
+            try? await Task.sleep(nanoseconds: UInt64(Self.openSyncDelay * 1_000_000_000))
+            guard let self else { return }
+            self.openSyncPending = false
+            guard !Task.isCancelled else { return }
+            guard self.pid == armedProfile else {
+                NSLog("[OrivioSync] app-open sync stood down — profile changed %d -> %d; its switch syncs it",
+                      armedProfile, self.pid)
+                return
+            }
+            // Re-check both gates: waiting on `previous` and the settle delay
+            // between them are plenty of time for a sign-in, a profile switch
+            // or a tick to have started (or just finished) a cycle of its own.
+            guard !self.isSyncing,
+                  Date().timeIntervalSince(self.lastFullSyncEnded) >= Self.openSyncFloor
+            else {
+                NSLog("[OrivioSync] app-open sync stood down — another cycle covered it")
+                AppProbe.sync("app-open sync stood down — another cycle covered it")
+                return
+            }
+            OrivioSyncDiagnostics.record(
+                .info, area: "Orivio", "Syncing this account because the app was opened."
+            )
+            // Same split the periodic tick and the local-change coordinator
+            // make. A stream can be playing when this fires — tvOS drops the
+            // app to `.inactive` for a system overlay without stopping
+            // playback, and coming back is an app-open — and the full cycle's
+            // metadata enrichment and twenty-odd preference round trips are
+            // exactly what must not contend with a decode. The light pass
+            // still brings down Continue Watching, the library and watched
+            // history, which is what changed on the other device.
+            if Self.playbackActive {
+                await self.syncLight(reason: "app opened during playback")
+                // `syncNow`'s defer stamps this for the full path; the light
+                // pass has to stamp it itself or a run of foreground flips
+                // during one film would each get their own pass.
+                self.lastFullSyncEnded = Date()
+            } else {
+                await self.syncNow()
+            }
+        }
+        openSyncTask = task
+        fullSyncTask = task
+    }
 
     // MARK: - Periodic auto-sync
 
@@ -897,6 +1047,7 @@ final class OrivioSyncManager: ObservableObject {
         let started = Date()
         defer {
             isSyncing = false
+            lastFullSyncEnded = Date()
             if rerunRequested {
                 rerunRequested = false
                 Task { [weak self] in await self?.syncNow() }
@@ -1099,7 +1250,25 @@ final class OrivioSyncManager: ObservableObject {
     /// NOT abort the rest.
     private func syncPreferencesChain(profile: Int) async throws {
         try ensureProfile(profile)
-        if collectionsDirty { try? await pushCollections(profile: profile) }
+        if collectionsDirty {
+            do {
+                try await pushCollections(profile: profile)
+            } catch {
+                // Swallowed by `try?` before, which hid the worst part: the
+                // dirty flag only clears on SUCCESS, and `pullCollections`
+                // refuses to apply anything while it is set. A push that keeps
+                // failing therefore leaves this device permanently blind to
+                // collection changes made anywhere else — folders reordered on
+                // the phone simply never arrive — with nothing anywhere saying
+                // so. Still best-effort (the rest of the chain must run), but
+                // no longer silent.
+                OrivioSyncDiagnostics.record(
+                    .failure, area: "Orivio",
+                    "Couldn't upload this device's collections: \(error.localizedDescription). "
+                        + "Until it succeeds, collection changes made on other devices are NOT applied here."
+                )
+            }
+        }
         try? await pullCollections(profile: profile)
         if homeCatalogDirty { try? await pushHomeCatalogSettings(profile: profile) }
         try await pullHomeCatalogSettings(profile: profile)
@@ -1361,7 +1530,15 @@ final class OrivioSyncManager: ObservableObject {
             // the account was being pulled roughly twice per window, with the
             // two runs overlapping in `libraryStore.mergeRemote`. Every other
             // entry point has this guard; this one didn't.
-            guard !self.isSyncing, !self.isRetiringAccountState else { return }
+            //
+            // `openSyncPending` counts as well. This method is called from the
+            // same `scenePhase` change that arms the app-open sync, and that
+            // sync's settle delay means `isSyncing` is still false when this
+            // runs — so both would pull progress and library at once, which is
+            // exactly the overlap the guard exists to stop. Standing down loses
+            // nothing: the full sync about to run is a superset of this.
+            guard !self.isSyncing, !self.openSyncPending, !self.isRetiringAccountState
+            else { return }
             // Pinned exactly like syncNow: this is a miniature sync, and the
             // profile can change between any two of these awaits.
             let profile = self.pid
@@ -1463,9 +1640,27 @@ final class OrivioSyncManager: ObservableObject {
     /// out. Must run before every progress pull.
     private func reconcileProgressDeletesBeforePull(profile: Int) async {
         guard pid == profile else { return }
+        dropPendingDeletesHeldLocally(profile: profile)
         let pending = loadPendingDeletes(profile: profile)
         if !pending.isEmpty { progressStore.tombstone(Array(pending)) }
         await drainPendingDeletes(profile: profile)
+    }
+
+    /// A queued delete for an episode this device HAS again — finished, then
+    /// played again before the delete went out (it waits for the network) — is
+    /// void. Now that deletes name the account's row, sending it removed the
+    /// fresh row from the account, and the tombstone reasserted before the pull
+    /// dropped the local one too. Active profile only: the store holds no other.
+    private func dropPendingDeletesHeldLocally(profile: Int) {
+        guard pid == profile else { return }
+        let pending = loadPendingDeletes(profile: profile)
+        guard !pending.isEmpty else { return }
+        let held = pending.intersection(progressStore.accountKeysHeld())
+        guard !held.isEmpty else { return }
+        savePendingDeletes(pending.subtracting(held), profile: profile)
+        var attempts = loadPendingDeleteAttempts(profile: profile)
+        for key in held { attempts[key] = nil }
+        savePendingDeleteAttempts(attempts, profile: profile)
     }
 
     /// Send every queued removal to the account, clearing only what the server
@@ -1477,6 +1672,7 @@ final class OrivioSyncManager: ObservableObject {
     ///   after the response meant a switch mid-request cleared the NEW
     ///   profile's queue on the strength of the old profile's delete.
     private func drainPendingDeletes(profile: Int) async {
+        dropPendingDeletesHeldLocally(profile: profile)
         let pending = loadPendingDeletes(profile: profile)
         guard !pending.isEmpty, account.accessToken != nil else { return }
         let body: [String: Any] = [
@@ -1628,7 +1824,19 @@ final class OrivioSyncManager: ObservableObject {
     private nonisolated static func encodeWatchProgressBody(
         _ items: [WatchProgress], pid: Int, clientID: String
     ) -> Data? {
-        let entries: [[String: Any]] = items.compactMap { wp in
+        // ONE entry per account row, keyed the way the account keys it (see
+        // `ProgressStore.accountProgressKey`). Two rows here can be the same
+        // episode under different keys until a pull folds them together, and
+        // sent side by side the server applied whichever it met last — the
+        // older position as often as not. The newest row per episode goes up.
+        var newestByAccountKey: [String: WatchProgress] = [:]
+        for wp in items {
+            let key = ProgressStore.accountProgressKey(for: wp)
+            if let held = newestByAccountKey[key],
+               (held.updatedAt, held.id) >= (wp.updatedAt, wp.id) { continue }
+            newestByAccountKey[key] = wp
+        }
+        let entries: [[String: Any]] = newestByAccountKey.compactMap { accountKey, wp in
             guard wp.durationSeconds > 0,
                   let position = milliseconds(wp.positionSeconds),
                   let duration = milliseconds(wp.durationSeconds),
@@ -1640,7 +1848,7 @@ final class OrivioSyncManager: ObservableObject {
                 "position": position,
                 "duration": duration,
                 "last_watched": lastWatched,
-                "progress_key": wp.id
+                "progress_key": accountKey
             ]
             if let season = wp.season { obj["season"] = season }
             if let episode = wp.episode { obj["episode"] = episode }
@@ -1653,6 +1861,66 @@ final class OrivioSyncManager: ObservableObject {
             "p_origin_client_id": clientID
         ]
         return try? JSONSerialization.data(withJSONObject: body)
+    }
+
+    /// The key an account row is stored under on this device.
+    ///
+    /// The account names an episode `<content_id>_s<S>e<E>`; everything local
+    /// — the player's saves, the details page, the Trakt and SIMKL merges —
+    /// names it by its add-on video id. Kept under the account's key, a pulled
+    /// episode was invisible to all of them: the player saved beside it under
+    /// `tt…:2:2`, the next pull dropped that save as absent from the server,
+    /// and a resume from the details page started from zero.
+    ///
+    /// An IMDb show's episodes are `tt…:season:episode` in every add-on (the
+    /// same form `canonicalResumeIdentity` rebuilds). Another scheme's are
+    /// whatever video id the writer sent, when it is an episode of this title;
+    /// failing that, the account's key as before. Movies are unchanged.
+    private nonisolated static func localProgressKey(for row: SupabaseWatchProgress) -> String {
+        guard let season = row.season, let episode = row.episode else { return row.progressKey }
+        if row.contentID.hasPrefix("tt") { return "\(row.contentID):\(season):\(episode)" }
+        if row.videoID != row.progressKey, row.videoID.hasPrefix(row.contentID + ":") {
+            return row.videoID
+        }
+        return row.progressKey
+    }
+
+    /// Account rows as store rows, under their local keys (`localProgressKey`),
+    /// with each local key's account key beside it for the deletes a pull
+    /// queues. The account stores ids and positions only, so the rows are bare.
+    private nonisolated static func progressRows(
+        fromAccount rows: [SupabaseWatchProgress]
+    ) -> (rows: [WatchProgress], accountKeyByLocalID: [String: String]) {
+        var accountKeyByLocalID: [String: String] = [:]
+        var newestByLocalID: [String: SupabaseWatchProgress] = [:]
+        for row in rows {
+            let localID = localProgressKey(for: row)
+            // Two account rows can land on one local key (a row another client
+            // wrote under its own key). Keep the newest, never whichever came last.
+            if let held = newestByLocalID[localID], held.lastWatched >= row.lastWatched { continue }
+            newestByLocalID[localID] = row
+            accountKeyByLocalID[localID] = row.progressKey
+        }
+        let progress = newestByLocalID.map { localID, row in
+            WatchProgress(
+                id: localID,
+                metaID: row.contentID,
+                type: row.contentType,
+                name: "",
+                poster: nil,
+                background: nil,
+                logo: nil,
+                season: row.season,
+                episode: row.episode,
+                episodeTitle: nil,
+                positionSeconds: Double(row.position) / 1000.0,
+                durationSeconds: Double(row.duration) / 1000.0,
+                streamURL: nil,
+                updatedAt: Date(timeIntervalSince1970: Double(row.lastWatched) / 1000.0),
+                syncSource: "nuvio"
+            )
+        }
+        return (progress, accountKeyByLocalID)
     }
 
     private var loggedWatchProgressColumns = false
@@ -1694,25 +1962,9 @@ final class OrivioSyncManager: ObservableObject {
         // full snapshot and must reconcile deletions, e.g. when the last item
         // was removed elsewhere.
 
-        var pulled: [WatchProgress] = rows.map { row in
-            WatchProgress(
-                id: row.progressKey,
-                metaID: row.contentID,
-                type: row.contentType,
-                name: "",
-                poster: nil,
-                background: nil,
-                logo: nil,
-                season: row.season,
-                episode: row.episode,
-                episodeTitle: nil,
-                positionSeconds: Double(row.position) / 1000.0,
-                durationSeconds: Double(row.duration) / 1000.0,
-                streamURL: nil,
-                updatedAt: Date(timeIntervalSince1970: Double(row.lastWatched) / 1000.0),
-                syncSource: "nuvio"
-            )
-        }
+        let converted = Self.progressRows(fromAccount: rows)
+        var pulled = converted.rows
+        let accountKeyByLocalID = converted.accountKeyByLocalID
         // NOTE: no clear-horizon filter here, deliberately. An earlier version
         // dropped every account row older than the watch-history clear AND
         // queued its deletion, to converge the account after a Trakt flood.
@@ -1735,7 +1987,8 @@ final class OrivioSyncManager: ObservableObject {
             pulled.removeAll { blocked.contains($0.id) }
             NSLog("[OrivioCWSync] pullWatchProgress: %d row(s) belong to removed shows — queued for deletion",
                   blocked.count)
-            deleteWatchProgress(keys: Array(blocked), profile: profile)
+            // By the account's key: the local one names nothing there.
+            deleteWatchProgress(keys: blocked.map { accountKeyByLocalID[$0] ?? $0 }, profile: profile)
         }
         // Metadata enrichment is a run of network calls; the store write after
         // it must still be going to the profile these rows came from.
@@ -2737,7 +2990,14 @@ final class OrivioSyncManager: ObservableObject {
         // debounced push has not landed (or failed — the RPC is best-effort
         // and absent on the shared backend) must not be replaced by the
         // account's older copy, which the ID-keyed merge would let win.
-        guard !collectionsDirty else { return }
+        guard !collectionsDirty else {
+            OrivioSyncDiagnostics.record(
+                .warning, area: "Orivio",
+                "Skipped applying \(decoded.count) collection(s) from the account — this device has a "
+                    + "collection edit that hasn't uploaded yet, and applying now would overwrite it."
+            )
+            return
+        }
         if collectionsStore.mergeIntoLibrary(decoded) { libraryGrewDuringSync = true }
     }
 
@@ -2818,6 +3078,75 @@ final class OrivioSyncManager: ObservableObject {
         // `profile`'s store may receive it.
         try ensureProfile(profile)
         homeCatalogSettings.applyRemote(payload)
+        recordHomeCatalogReach(payload)
+    }
+
+    /// Say — in the log the viewer can actually read (Settings → Account) —
+    /// how much of the pulled layout this device can act on.
+    ///
+    /// Two different things quietly swallow a phone's Home order, and neither
+    /// used to leave any trace, so "my layout didn't come across" had no way
+    /// of being told apart:
+    ///
+    /// * a key naming a catalog no add-on installed HERE declares — it is
+    ///   dropped by `mergedOrder`, because there is no row to order;
+    /// * Home's hard row cap (`maxHomeRows`) — rows past it keep their place
+    ///   in the order and are simply never built, which on an account with
+    ///   more catalogs than the cap is most of them.
+    ///
+    /// An account carrying well over a hundred catalogs hits the second every
+    /// time, and that is expected rather than broken. Saying so — with the
+    /// numbers — is the difference between a settled question and a bug report
+    /// nobody can act on.
+    private func recordHomeCatalogReach(_ payload: SyncHomeCatalogPayload) {
+        let catalogKeys = payload.orderKeys.filter { !$0.hasPrefix("collection_") }
+        guard !catalogKeys.isEmpty else { return }
+        var available = Set<String>()
+        for addon in addonManager.catalogAddons {
+            for catalog in (addon.manifest.catalogs ?? []) where !catalog.requiresExtra {
+                available.insert(HomeCatalogSettingsStore.catalogKey(
+                    addonID: addon.manifest.id, type: catalog.type, catalogID: catalog.id))
+            }
+        }
+        let disabled = Set(payload.disabledKeys)
+        let matched = catalogKeys.filter { available.contains($0) }
+        let renderable = matched.filter { !disabled.contains($0) }
+        let cap = AddonSweepLimits.maxHomeRows
+
+        var message = "Home layout pulled: \(catalogKeys.count) catalog row(s) in the account's order; "
+            + "\(matched.count) come from add-ons installed on this device"
+        if matched.count < catalogKeys.count {
+            message += ", \(catalogKeys.count - matched.count) name a catalog no add-on here declares"
+        }
+        message += "."
+        // Collections are ordered by their own `collection_<id>` keys in the
+        // same list. Counted separately because they are the part most likely
+        // to be missing: a client that orders collections by the order of its
+        // own collections array, rather than by writing keys here, leaves this
+        // at zero — and then nothing about where they sit can cross over.
+        let collectionOrderKeys = payload.orderKeys.filter { $0.hasPrefix("collection_") }
+        let knownCollections = Set(collectionsStore.library.map {
+            HomeCatalogSettingsStore.collectionKey($0.id)
+        })
+        if knownCollections.isEmpty {
+            message += " No collections on this device."
+        } else if collectionOrderKeys.isEmpty {
+            message += " The layout carries NO collection positions"
+                + " (\(knownCollections.count) collection(s) exist here), so they fall to the end of Home"
+                + " in whatever order they loaded."
+        } else {
+            let placed = collectionOrderKeys.filter { knownCollections.contains($0) }.count
+            message += " \(collectionOrderKeys.count) collection position(s) in the layout,"
+                + " \(placed) matching a collection on this device."
+        }
+        if renderable.count > cap {
+            message += " Home builds the first \(cap) of them — the rest keep their place in the order"
+                + " but are not rendered, and stay reachable from Discover."
+        }
+        // A wholesale miss is the shape of a key-format mismatch rather than a
+        // device simply having fewer add-ons, so it is worth flagging louder.
+        let level: OrivioSyncLogEntry.Level = matched.isEmpty ? .warning : .info
+        OrivioSyncDiagnostics.record(level, area: "Orivio", message)
     }
 
     private func fetchHomeCatalogBlob(platform: String, profile: Int) async throws -> SupabaseHomeCatalogSettingsBlob? {

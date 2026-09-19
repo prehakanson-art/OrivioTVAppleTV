@@ -12,8 +12,15 @@ struct StreamProbeResult {
     /// Dolby Vision profile from the container's dvcC/dvvC record (nil when
     /// the stream carries none). Read from the header — no packet scan.
     var dvProfile: Int?
-    /// An HEVC video track exists (the direct engine's requirement).
+    /// An HEVC video track exists (the direct engine's original requirement).
     var hasHEVC = false
+    /// An H.264 video track exists. The direct engine takes H.264 too now —
+    /// but only alongside a bitstreamable Dolby track, so this is only read
+    /// together with `hasBitstreamableDolby`. `isPQ` and `dvProfile` stay
+    /// HEVC-only on purpose: H.264 carries no Dolby Vision here, and leaving
+    /// them unset is what keeps every DV/HDR display request unreachable for
+    /// an H.264 file by construction.
+    var hasAVC = false
     /// The video is PQ-transfer HDR (HDR10 family) — drives the display-mode
     /// request when there's no DV.
     var isPQ = false
@@ -25,6 +32,20 @@ struct StreamProbeResult {
     /// E-AC3/AC3/AAC for the remux path; the direct sample engine decodes
     /// everything else to LPCM, so ANY audio is now eligible.)
     var hasEligibleAudio = false
+    /// The file carries an audio track tvOS can take as a BITSTREAM — E-AC-3
+    /// (Dolby Digital Plus, Atmos/JOC included) or AC-3. This is the whole
+    /// reason the sample-feed engine is worth opening for audio: it hands
+    /// these to `AVSampleBufferAudioRenderer` untouched, where every other
+    /// engine in the app decodes them to LPCM.
+    ///
+    /// TrueHD and DTS-HD deliberately do NOT count. Apple's platforms cannot
+    /// bitstream them (Infuse documents the same limitation), so they decode
+    /// to PCM whichever engine plays them and there is nothing to gain by
+    /// switching — but a file that has TrueHD usually ALSO has an E-AC-3
+    /// compatibility track, and that is what sets this flag.
+    var hasBitstreamableDolby = false
+    /// Best channel count seen on a bitstreamable track (0 when none).
+    var bitstreamDolbyChannels = 0
 }
 
 /// Cheap "what is actually in this stream?" check, run once per title.
@@ -113,6 +134,9 @@ enum StreamProbe {
                 }
             case AVMEDIA_TYPE_VIDEO:
                 let isAttachedPic = (stream.pointee.disposition & AV_DISPOSITION_ATTACHED_PIC) != 0
+                if !isAttachedPic, par.pointee.codec_id == AV_CODEC_ID_H264 {
+                    result.hasAVC = true
+                }
                 if !isAttachedPic, videoIndex < 0, par.pointee.codec_id == AV_CODEC_ID_HEVC {
                     videoIndex = Int32(i)
                     isPQ = par.pointee.color_trc == AVCOL_TRC_SMPTE2084
@@ -134,6 +158,13 @@ enum StreamProbe {
                 }
             case AVMEDIA_TYPE_AUDIO:
                 result.hasEligibleAudio = true
+                let audioID = par.pointee.codec_id
+                if audioID == AV_CODEC_ID_EAC3 || audioID == AV_CODEC_ID_AC3 {
+                    result.hasBitstreamableDolby = true
+                    result.bitstreamDolbyChannels = max(
+                        result.bitstreamDolbyChannels, Int(par.pointee.ch_layout.nb_channels)
+                    )
+                }
             default: break
             }
         }

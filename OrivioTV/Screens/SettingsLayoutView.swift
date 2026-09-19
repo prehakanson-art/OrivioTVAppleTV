@@ -17,6 +17,36 @@ private struct LayoutRowInfo: Identifiable {
 struct LayoutSettingsDetail: View {
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var settings: HomeCatalogSettingsStore
+    @EnvironmentObject private var addonManager: AddonManager
+
+    /// Every catalog that can feed the hero, plus an Automatic entry.
+    ///
+    /// The same enumeration the row list further down this pane uses, so the
+    /// two agree about what a "catalog" is — every catalog an addon declares
+    /// that doesn't need extra parameters. Labelled "Catalog · Add-on" because
+    /// names like "Trending" repeat across add-ons and would otherwise be
+    /// indistinguishable in the picker.
+    private var heroSourceOptions: [OrivioDropdownOption] {
+        var options = [OrivioDropdownOption("", "Automatic (first row)")]
+        var seen = Set<String>()
+        for addon in addonManager.catalogAddons {
+            for catalog in (addon.manifest.catalogs ?? []) where !catalog.requiresExtra {
+                let key = HomeCatalogSettingsStore.catalogKey(
+                    addonID: addon.manifest.id, type: catalog.type, catalogID: catalog.id)
+                guard seen.insert(key).inserted else { continue }
+                options.append(OrivioDropdownOption(
+                    key, "\(catalog.displayName) · \(addon.manifest.name)"))
+            }
+        }
+        // A key saved earlier whose add-on has since been removed would other-
+        // wise not be in the list at all, and the dropdown would show the raw
+        // key as its value. Name it for what it is; picking anything else
+        // clears it.
+        if !settings.heroCatalogKey.isEmpty, !seen.contains(settings.heroCatalogKey) {
+            options.append(OrivioDropdownOption(settings.heroCatalogKey, "Unavailable catalog"))
+        }
+        return options
+    }
 
     var body: some View {
         DetailScaffold(title: SettingsCategory.layout.title, subtitle: SettingsCategory.layout.subtitle) {
@@ -44,11 +74,33 @@ struct LayoutSettingsDetail: View {
                     isOn: $settings.showFeaturedBar
                 )
 
-                SettingsToggleCard(
-                    title: "Pin hero to the top",
-                    subtitle: "Keep the hero fixed above the rows and show whatever title is highlighted, instead of a banner that scrolls away and cycles the top ten on its own.",
-                    isOn: $settings.pinnedHero
-                )
+                OrivioDropdown(
+                    title: "Hero layout",
+                    subtitle: settings.heroLayout.summary,
+                    icon: "rectangle.topthird.inset.filled",
+                    selection: settings.heroLayout.rawValue,
+                    options: HeroLayout.allCases.map {
+                        OrivioDropdownOption($0.rawValue, $0.displayName)
+                    }
+                ) { settings.heroLayout = HeroLayout(rawValue: $0) ?? .hybrid }
+
+                OrivioDropdown(
+                    title: "Hero source",
+                    subtitle: "Which catalog the hero shows. Automatic uses whichever row sits first in your Home order. A catalog you've switched off below — or one ranked too far down to be built — falls back to that first row.",
+                    icon: "square.stack.3d.down.right.fill",
+                    selection: settings.heroCatalogKey,
+                    options: heroSourceOptions
+                ) { settings.heroCatalogKey = $0 }
+
+                OrivioDropdown(
+                    title: "Navigation Position",
+                    subtitle: settings.navigationPosition.summary,
+                    icon: "sidebar.leading",
+                    selection: settings.navigationPosition.rawValue,
+                    options: NavigationPosition.allCases.map {
+                        OrivioDropdownOption($0.rawValue, $0.displayName)
+                    }
+                ) { settings.navigationPosition = NavigationPosition(rawValue: $0) ?? .left }
 
                 SettingsToggleCard(
                     title: "Hide the sidebar",
@@ -91,6 +143,12 @@ struct LayoutSettingsDetail: View {
                     isOn: $settings.showPosterLabels
                 )
 
+                SettingsToggleCard(
+                    title: "Poster banners",
+                    subtitle: "Show the tags some add-ons print across their poster artwork, like \"In Cinema\", \"#2 Today\" or \"New Movie\". Off swaps in the plain poster the add-on sends alongside, wherever it sends one; posters without a plain version stay as they are. Titles already in Continue Watching or your Library keep the artwork they were saved with.",
+                    isOn: $settings.showPosterBanners
+                )
+
                 OrivioDropdown(
                     title: "Corner radius",
                     subtitle: "Roundness of poster card corners",
@@ -128,6 +186,35 @@ struct LayoutSettingsDetail: View {
                     title: "Trailer button",
                     subtitle: "Show the Trailer button on the details page",
                     isOn: $settings.detailPageTrailerButtonEnabled
+                )
+            }
+
+            SettingsGroupCard(title: "Details Page",
+                              subtitle: "Which sections appear below a title's artwork") {
+                SettingsToggleCard(
+                    title: "Creator and Cast",
+                    subtitle: "The row of directors, writers and cast members.",
+                    isOn: $settings.detailShowCast
+                )
+                SettingsToggleCard(
+                    title: "Collection",
+                    subtitle: "The “part of…” row for a title that belongs to a series of films, listing the others in it.",
+                    isOn: $settings.detailShowCollection
+                )
+                SettingsToggleCard(
+                    title: "More Like This",
+                    subtitle: "Recommended titles based on the one you're looking at.",
+                    isOn: $settings.detailShowMoreLikeThis
+                )
+                SettingsToggleCard(
+                    title: "Production",
+                    subtitle: "The studios and production companies behind the title.",
+                    isOn: $settings.detailShowProduction
+                )
+                SettingsToggleCard(
+                    title: "Comments",
+                    subtitle: "Viewer comments from Trakt.",
+                    isOn: $settings.detailShowComments
                 )
             }
 
@@ -229,6 +316,32 @@ struct CatalogOrderSection: View {
     @State private var renamingRow: LayoutRowInfo?
     @State private var renameText = ""
 
+    /// Says how many of these rows Home will actually build, but only when
+    /// that is fewer than there are.
+    ///
+    /// Home caps the rows it renders (`maxHomeRows` — they are built eagerly,
+    /// so hundreds of them would take the focus engine down with them). The cap
+    /// cuts in THIS list's order, so the rows a viewer ranked highest are the
+    /// ones that survive — but nothing said so anywhere, and an account with a
+    /// hundred-plus catalogs (an order set up on the phone, say) just looked
+    /// like the order had been ignored.
+    /// Takes the rows the body already built. `rows` rebuilds the whole
+    /// display list — every add-on's catalogs, then a merged order over them —
+    /// and the body caches it in a local for exactly that reason; reading
+    /// `self.rows` again here would do all of it twice on every body pass, on
+    /// the screen whose whole job is a list that can be hundreds long.
+    private func rowsSubtitle(_ rows: [LayoutRowInfo]) -> String {
+        let enabled = rows.filter { row in
+            row.key == HomeCatalogSettingsStore.collectionsUnit
+                ? collectionsEnabled : settings.isEnabled(key: row.key)
+        }.count
+        let cap = AddonSweepLimits.maxHomeRows
+        guard enabled > cap else { return "Reorder, rename and hide your catalog rows" }
+        return "Reorder, rename and hide your catalog rows. Home builds the first \(cap) "
+            + "of your \(enabled) shown rows — the rest keep their place here and stay "
+            + "reachable from Discover."
+    }
+
     /// Keep a just-moved row in view (runs after the reorder re-lays-out).
     private func follow(_ proxy: ScrollViewProxy, _ key: String) {
         DispatchQueue.main.async {
@@ -301,7 +414,7 @@ struct CatalogOrderSection: View {
         // move we scroll the row back into view — otherwise moving up pushed
         // the row off the top of the screen.
         ScrollViewReader { proxy in
-            SettingsGroupCard(title: "Home Rows", subtitle: "Reorder, rename and hide your catalog rows") {
+            SettingsGroupCard(title: "Home Rows", subtitle: rowsSubtitle(rows)) {
                 ForEach(rows) { row in
                     let isCollectionsUnit = row.key == HomeCatalogSettingsStore.collectionsUnit
                     LayoutRowView(
@@ -978,9 +1091,18 @@ struct CollectionEditorView: View {
     private func folderSubtitle(_ folder: OrivioCollectionFolder) -> String {
         let liveCount = folder.effectiveSources.count - folder.addonSources.count
         guard liveCount > 0 else {
-            // Nothing this folder holds can resolve — say so here rather than
-            // letting it read as configured and open empty.
-            return folder.addonSources.isEmpty ? "No sources" : "No TMDB/Trakt sources"
+            guard !folder.addonSources.isEmpty else { return "No sources" }
+            // An add-on-only folder — which is every folder of an imported
+            // pack — fills itself from its add-on's catalogs, so say which,
+            // by the SAME rule the browse screen resolves by. "No TMDB/Trakt
+            // sources" was true to the letter and wrong in effect: it read as
+            // "this can't load" under folders that load fine, which is the
+            // report that had them adding TMDB sources to fix nothing.
+            let live = folder.addonSources.filter {
+                CollectionResolver.addonCatalog(for: $0, addons: addonManager.addons) != nil
+            }.count
+            guard live > 0 else { return "Add-on not installed on this profile" }
+            return "\(live) add-on catalog\(live == 1 ? "" : "s")"
         }
         return "\(liveCount) TMDB/Trakt source\(liveCount == 1 ? "" : "s")"
     }

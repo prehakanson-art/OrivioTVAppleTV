@@ -6,16 +6,26 @@ import Foundation
 /// fire hundreds of TMDB requests per folder on every load).
 ///
 /// Categories are a TMDB/Trakt feature. Add-on catalog sources are NOT resolved
-/// here: a folder pointing at an installed add-on's catalog used to fill itself
-/// with no TMDB key at all, which made "categories" look like they worked while
-/// every TMDB-backed folder sat empty. Existing addon rows are left in storage
-/// untouched (so a folder authored on the phone round-trips unchanged) — they
-/// simply resolve to nothing, and `blocker(for:providers:)` says so.
+/// in a folder that has any TMDB or Trakt source: a folder pointing at an
+/// installed add-on's catalog used to fill itself with no TMDB key at all,
+/// which made "categories" look like they worked while every TMDB-backed folder
+/// sat empty. Those folders' addon rows are left in storage untouched (so a
+/// folder authored on the phone round-trips unchanged) and resolve to nothing.
+///
+/// The one exception is a folder with NO TMDB or Trakt source at all, which
+/// resolves its add-on catalogs through the installed add-on that serves them.
+/// A pack built elsewhere out of an add-on's own catalogs is made entirely of
+/// such folders — an Xperience export, for one, is nothing but
+/// `catalogSources` naming the Xperience add-on — and every one of them opened
+/// on "add TMDB or Trakt sources" however TMDB was set up. There is no TMDB
+/// source in them for an add-on catalog to hide, and
+/// `blocker(for:providers:addons:)` still says when the add-on is missing.
 /// The services a collection can draw on right now.
 ///
-/// Collections are built entirely out of TMDB and Trakt sources, so with
-/// neither connected there is nothing for one to resolve — every folder would
-/// open empty. `any` is the switch the whole feature hangs off.
+/// Apart from those add-on-only folders, collections are built out of TMDB and
+/// Trakt sources, so with neither connected there is nothing for one to
+/// resolve — every folder would open empty. `any` is the switch the whole
+/// feature hangs off.
 struct CollectionProviders: Equatable {
     /// TMDB has the viewer's API key and is switched on.
     let tmdb: Bool
@@ -53,14 +63,18 @@ enum CollectionResolver {
         case needsTrakt
         /// Has both kinds, and neither service is connected.
         case needsEither
-        /// Add-on catalogs only — collections are TMDB/Trakt now.
+        /// Add-on catalogs only, and no installed, switched-on add-on on this
+        /// profile serves any of them.
+        case needsAddon
+        /// No TMDB, Trakt or add-on source this app can resolve.
         case unsupportedSources
         /// The folder has no sources at all.
         case empty
     }
 
     static func blocker(for folder: OrivioCollectionFolder,
-                        providers: CollectionProviders) -> FolderBlocker {
+                        providers: CollectionProviders,
+                        addons: [InstalledAddon]) -> FolderBlocker {
         let sources = folder.effectiveSources
         guard !sources.isEmpty else { return .empty }
         let tmdb = sources.contains(where: \.isTMDBSource)
@@ -70,14 +84,51 @@ enum CollectionResolver {
         if tmdb && trakt { return .needsEither }
         if tmdb { return .needsTMDB }
         if trakt { return .needsTrakt }
+        // No TMDB or Trakt source at all: an add-on-only folder, which fills
+        // itself from whichever of its catalogs an installed add-on serves.
+        if folder.addonSources.contains(where: { addonCatalog(for: $0, addons: addons) != nil }) {
+            return .none
+        }
+        if !folder.addonSources.isEmpty { return .needsAddon }
         return .unsupportedSources
     }
 
-    /// Resolve ONE folder's items, de-duplicated by id (addon order, then TMDB,
-    /// then Trakt). Returns empty when the folder has nothing resolvable.
+    /// One add-on catalog a folder can fetch: the add-on that serves it, that
+    /// add-on's manifest entry for it, and the source's genre filter.
+    struct AddonCatalog {
+        let addon: InstalledAddon
+        let catalog: ManifestCatalog
+        let genre: String?
+    }
+
+    /// The catalog an add-on source names, if an installed, switched-on add-on
+    /// on this profile serves it — the add-on matched by manifest id, the
+    /// catalog by type and id within that manifest.
+    ///
+    /// Deliberately NOT filtered on `requiresExtra`, which only decides what
+    /// can stand as a plain Home row: Xperience marks every one of its catalogs'
+    /// genre as required (which keeps them off Stremio boards) and still
+    /// answers the bare catalog URL with the full list.
+    static func addonCatalog(for source: CollectionSourceDTO,
+                             addons: [InstalledAddon]) -> AddonCatalog? {
+        guard source.isAddonSource,
+              let addonID = source.addonId,
+              let type = source.type,
+              let catalogID = source.catalogId,
+              let addon = addons.first(where: { $0.enabled && $0.manifest.id == addonID }),
+              let catalog = (addon.manifest.catalogs ?? [])
+                .first(where: { $0.type == type && $0.id == catalogID })
+        else { return nil }
+        return AddonCatalog(addon: addon, catalog: catalog, genre: source.genre)
+    }
+
+    /// Resolve ONE folder's items, de-duplicated by id (TMDB, then Trakt, then
+    /// add-on catalogs). Returns empty when the folder has nothing resolvable.
     static func resolveFolder(
         _ folder: OrivioCollectionFolder,
         addonManager: AddonManager,
+        /// The installed add-ons an add-on-only folder resolves through.
+        addons: [InstalledAddon],
         providers: CollectionProviders,
         tmdbLanguage: String,
         maxTmdbPages: Int = Int.max,
@@ -97,7 +148,14 @@ enum CollectionResolver {
         let resolvableTmdb = providers.tmdb ? folder.effectiveSources.filter(\.isTMDBSource) : []
         let traktSources = (providers.trakt && resolvableTmdb.isEmpty)
             ? folder.effectiveSources.filter(\.isUsableTraktSource) : []
-        guard !resolvableTmdb.isEmpty || !traktSources.isEmpty else { return [] }
+        // Add-on catalogs only ever fill a folder with no TMDB or Trakt source
+        // at all (see the note at the top of this file), so every folder TMDB
+        // or Trakt could resolve before resolves exactly as it did.
+        let isAddonOnly = !folder.effectiveSources.contains(where: \.isTMDBSource)
+            && !folder.effectiveSources.contains(where: \.isUsableTraktSource)
+        let addonCatalogs = isAddonOnly
+            ? folder.addonSources.compactMap { addonCatalog(for: $0, addons: addons) } : []
+        guard !resolvableTmdb.isEmpty || !traktSources.isEmpty || !addonCatalogs.isEmpty else { return [] }
 
         let isContinuation = tmdbStartPage > 1
 
@@ -108,7 +166,7 @@ enum CollectionResolver {
         // others. Folders were already parallel; the wait was inside each one.
         //
         // Order is preserved by INDEX, not by arrival: the merge below still
-        // goes TMDB → Trakt, in each group's own source order, so the
+        // goes TMDB → Trakt → add-on, in each group's own source order, so the
         // de-duplication keeps giving the same winner it always did (first
         // source to claim an id owns it). Concurrency changes when things
         // arrive, never what the folder resolves to.
@@ -130,10 +188,15 @@ enum CollectionResolver {
         async let traktResults: [[MetaItem]] = isContinuation ? [] : gather(traktSources.count) { i in
             await resolveTrakt(source: traktSources[i], addonManager: addonManager)
         }
+        async let addonResults: [[MetaItem]] = isContinuation ? [] : gather(addonCatalogs.count) { i in
+            let source = addonCatalogs[i]
+            return (try? await StremioAPI.catalog(addon: source.addon, catalog: source.catalog,
+                                                  genre: source.genre)) ?? []
+        }
 
         var items: [MetaItem] = []
         var seen = Set<String>()
-        for batch in await tmdbResults + traktResults {
+        for batch in await tmdbResults + traktResults + addonResults {
             for item in batch where seen.insert(item.id).inserted { items.append(item) }
         }
         return hideUnreleased ? items.filter { !$0.isUnreleased } : items

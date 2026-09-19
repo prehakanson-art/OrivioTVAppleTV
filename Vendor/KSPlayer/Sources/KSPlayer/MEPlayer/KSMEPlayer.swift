@@ -179,10 +179,26 @@ private extension KSMEPlayer {
         guard let reason = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt else {
             return
         }
-//        let routeChangeReason = AVAudioSession.RouteChangeReason(rawValue: reason)
-//        guard [AVAudioSession.RouteChangeReason.newDeviceAvailable, .oldDeviceUnavailable, .routeConfigurationChange].contains(routeChangeReason) else {
-//            return
-//        }
+        // ORIVIO PATCH (side-button desync): this guard was commented out, so
+        // `reason` was decoded and then thrown away and EVERY route
+        // notification ran the body — including the `.categoryChange` and
+        // `.override` that a volume press, a Siri panel or any other system
+        // HUD produces just by perturbing the audio session. The body is not
+        // cheap: it re-derives the output format for every audio track and
+        // then FLUSHES the audio output, which drops the queued audio while
+        // the master clock carries on. Video is slaved to that clock, so the
+        // picture kept its timing while the sound restarted a beat later, and
+        // KSPlayer's drift correction is rate-limited (a drop every 2nd sync
+        // decision, a flush every 10th) — so it took seconds to converge
+        // again. That is the "press a side button and the audio goes out of
+        // sync for a couple of seconds" report.
+        //
+        // Only a real change of output device or configuration should reach
+        // it. This is stock KSPlayer's own filter, restored.
+        let routeChangeReason = AVAudioSession.RouteChangeReason(rawValue: reason)
+        guard [AVAudioSession.RouteChangeReason.newDeviceAvailable, .oldDeviceUnavailable, .routeConfigurationChange].contains(routeChangeReason) else {
+            return
+        }
         for track in tracks(mediaType: .audio) {
             (track as? FFmpegAssetTrack)?.audioDescriptor?.updateAudioFormat()
         }

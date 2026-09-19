@@ -1,5 +1,8 @@
 import Foundation
 import Network
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// The hybrid disk cache: a localhost HTTP proxy between the player engines
 /// and a direct-file stream, Infuse-style.
@@ -72,6 +75,19 @@ final class MediaCacheServer {
     /// Terminal failure → answer everything with a redirect to the origin.
     private var redirectAll = false
     private var listener: NWListener?
+    /// Listeners retired or failed since one last reached `.ready`. See
+    /// `startListenerLocked` — two in a row means rebuilding is not working,
+    /// and the session declines for `listenerRetryDelay` so playback goes
+    /// straight to the origin instead of looping on a port nobody answers.
+    private var listenerFailures = 0
+    private var listenerRetryAfter = Date.distantPast
+    private static let listenerRetryDelay: TimeInterval = 30
+    /// When the app last came back from the background, and when the current
+    /// listener was built. A listener older than the last suspension is never
+    /// trusted, whatever state it reports — see `startListenerLocked`.
+    private var lastResumeAt = Date.distantPast
+    private var listenerBuiltAt = Date.distantPast
+    private var lifecycleObserved = false
     private var connections: [ObjectIdentifier: NWConnection] = [:]
     /// The download POOL. One connection is throttled by the provider, not by
     /// the link — several pulling different chunks is how a 22 GB remux keeps
@@ -206,6 +222,29 @@ final class MediaCacheServer {
     /// I jump somewhere else": the playhead was down to a single connection
     /// while the pool looked busy.
     private static let archiveWorkerCap = 2
+
+    /// The cap ACTUALLY in force, scaled to the pool the origin is allowing.
+    ///
+    /// `archiveWorkerCap` is an absolute 2, written against a pool of six to
+    /// eight — where two really does leave "most of the pool free". It says
+    /// nothing about the case the throttle creates: a provider that answers
+    /// 429 drops `parallelLimit` to ONE, and `workersOnArchive < 2` then still
+    /// admits an archive worker, which is 100% of the connections. The comment
+    /// above `nextArchiveGap` promises the archive "can never take a connection
+    /// from the viewer"; on a throttled origin it took the only one there was.
+    ///
+    /// Caught on device: both buffering holds of one session had `pool=1/1`,
+    /// `archiveWorkers=1/2`, archive `filling`, BOTH demux queues empty — and
+    /// 614 seconds of film already on disk. The bytes were there; the one
+    /// connection that could have fetched the next ones was archiving a part of
+    /// the film nobody was watching.
+    ///
+    /// One below the pool, so the playhead always keeps a connection: at a
+    /// limit of 1 the archive stands down entirely, at 2 it may take one, and
+    /// from 3 up the original cap of 2 governs as before.
+    private var archiveWorkerLimit: Int {
+        min(Self.archiveWorkerCap, max(0, parallelLimit - 1))
+    }
 
     /// Road the viewer must have in front of them before any of the pool is
     /// spent on film they are not watching. After a seek this is zero, so the
@@ -394,6 +433,8 @@ final class MediaCacheServer {
     /// Why the session failed, when it has — published so the UI can stop
     /// pretending a cache is live and fall back to the engine's buffer band.
     private var snapshotFailure: String?
+    /// Last listener state, for the probe ("no session" included).
+    private var snapshotListenerState = "none"
     /// Queue-confined master copy of the failure reason.
     private var failureReason: String?
 
@@ -435,6 +476,7 @@ final class MediaCacheServer {
     private var snapshotArchiveCeiling: Int64 = 0
     private var snapshotVisited: [Int64] = []
     private var snapshotArchiveWorkers = 0
+    private var snapshotArchiveWorkerLimit = 0
     private var snapshotOldest: Int64?
     /// Mirror of the live session's origin, for beginSession's same-origin
     /// check (it runs on the main actor, before parking on `q`).
@@ -495,6 +537,7 @@ final class MediaCacheServer {
         snapshotArchiveCeiling = windowed ? archiveCeiling : 0
         snapshotVisited = visitedAnchors
         snapshotArchiveWorkers = workersOnArchive
+        snapshotArchiveWorkerLimit = archiveWorkerLimit
         snapshotOldest = ranges.min(by: { $0.born < $1.born })?.start
         snapshotWorkerCount = workers.count
         snapshotRampInterval = rampInterval
@@ -638,7 +681,9 @@ final class MediaCacheServer {
     var probeLines: [String] {
         snapshotLock.lock()
         defer { snapshotLock.unlock() }
-        guard snapshotTotal > 0 || snapshotFailure != nil else { return ["no session"] }
+        guard snapshotTotal > 0 || snapshotFailure != nil else {
+            return ["no session (listener \(snapshotListenerState))"]
+        }
         func mb(_ bytes: Int64) -> String { String(format: "%.0fMB", Double(bytes) / 1_048_576) }
         let onDisk = snapshotRanges.reduce(Int64(0)) { $0 + ($1.end - $1.start) }
         var lines = [
@@ -660,7 +705,7 @@ final class MediaCacheServer {
             "oldestCached=\(snapshotOldest.map { mb($0) } ?? "-")"
                 + " (next to go)",
             "visited=\(snapshotVisited.map { mb($0) }.joined(separator: ","))"
-                + " archiveWorkers=\(snapshotArchiveWorkers)/\(Self.archiveWorkerCap)",
+                + " archiveWorkers=\(snapshotArchiveWorkers)/\(snapshotArchiveWorkerLimit)",
             snapshotWindowed
                 ? "archive=\(mb(snapshotArchiveUsed))/\(mb(snapshotArchiveCeiling))"
                     + " (\(snapshotArchiveUsed < snapshotArchiveCeiling ? "filling" : "full"))"
@@ -729,6 +774,29 @@ final class MediaCacheServer {
         return snapshotRanges.map { (Double($0.start) / total, Double($0.end) / total) }
     }
 
+    /// `coveredFractions` together with the live reader's position, as a 0…1
+    /// fraction of the file, read under ONE lock hold so the band and the
+    /// point it is calibrated against come from the same snapshot.
+    ///
+    /// Everything here is in BYTES. The transport bar is in TIME, and on a
+    /// variable-bitrate file those disagree by minutes — a film whose opening
+    /// is lighter than its average puts every later byte position well to the
+    /// right of the matching timestamp. The reader's offset is the one byte
+    /// position whose playback time the player actually knows (its engine's
+    /// read head), which is what lets the bar convert the rest. `reader` is nil
+    /// when there is no live reader or no known length.
+    var coveredFractionsAndReader: (spans: [(start: Double, end: Double)], reader: Double?) {
+        snapshotLock.lock()
+        defer { snapshotLock.unlock() }
+        guard snapshotTotal > 0 else { return ([], nil) }
+        let total = Double(snapshotTotal)
+        let spans = snapshotRanges.map { (Double($0.start) / total, Double($0.end) / total) }
+        let reader: Double? = !snapshotReaders.isEmpty
+            && snapshotAnchor > 0 && snapshotAnchor < snapshotTotal
+            ? Double(snapshotAnchor) / total : nil
+        return (spans, reader)
+    }
+
     /// The cache-only twin of the playback URL for the live session. Reads on
     /// this lane are served solely from bytes already on disk: they never
     /// reposition the downloader, never wait for the network (an uncovered
@@ -784,8 +852,12 @@ final class MediaCacheServer {
             //    a self-sustaining reload loop in which nothing ever played.
             // 2. Even without that, throwing away a partly-downloaded film on
             //    an engine swap or a failover is pure waste.
-            if self.origin == origin, !token.isEmpty, listener != nil,
+            // The session is kept, but its URL is only worth handing out if
+            // something is actually listening on it — rebuilt in place if not
+            // (the token is session state, so the same URL keeps working).
+            if self.origin == origin, !token.isEmpty,
                writeHandle != nil, failureReason == nil {
+                guard startListenerLocked() else { return nil }
                 return proxyURL(for: origin)
             }
             teardownSessionLocked()
@@ -864,6 +936,27 @@ final class MediaCacheServer {
     /// megabyte write and whatever eviction that write triggers. Nothing reads
     /// a result, and the queue is serial, so a `beginSession` starting the next
     /// film still runs after this teardown.
+    /// The app has just come back from being SUSPENDED.
+    ///
+    /// Every stall clock in here is wall-clock — `lastWriteAt`, the reader
+    /// touch stamps — and tvOS freezes this process while the TV sleeps. So
+    /// after a long sleep the first read finds "nothing written for 25s",
+    /// fails the whole session and starts 307-redirecting the player at the
+    /// origin (usually a debrid link, which then has to be re-resolved and
+    /// surfaces as a source failure). The download really did stop, but the
+    /// session is fine: reclaim the segments whose sockets the suspension
+    /// killed, then restart the heartbeat the way a fresh session does.
+    func noteAppResumed() {
+        q.async { [weak self] in
+            guard let self, self.writeHandle != nil, !self.redirectAll else { return }
+            // Reaped FIRST, while the stamp is still old — that is the path
+            // that cancels stuck segments and kicks the pool.
+            self.reapStalledWorkers()
+            self.lastWriteAt = Date()
+            self.readTouchedAt = [:]
+        }
+    }
+
     func endSession() {
         q.async { [weak self] in self?.teardownSessionLocked() }
     }
@@ -984,8 +1077,131 @@ final class MediaCacheServer {
 
     // MARK: - Listener (on q)
 
+    /// Whether the listener is accepting (or has only just been started and is
+    /// about to be). Queue-confined, like `listener`.
+    private var listenerIsLive: Bool {
+        guard let listener else { return false }
+        switch listener.state {
+        case .ready, .setup: return true
+        default: return false
+        }
+    }
+
+    #if DEBUG
+    /// Dev probe hook (`/cachecheck` on :8123): run the SAME listener check a
+    /// new session runs, then report what the listener became. Verifies the
+    /// post-suspension rebuild on device without having to start a playback.
+    func debugCheckListener(_ done: @escaping (String) -> Void) {
+        q.async { [weak self] in
+            guard let self, let port = NWEndpoint.Port(rawValue: Self.port) else { return }
+            let started = self.startListenerLocked()
+            // State alone proved worthless after a suspension, so actually
+            // connect: a refused or stalled connect is the ground truth.
+            let probe = NWConnection(host: "127.0.0.1", port: port, using: .tcp)
+            var reported = false
+            let finish: (String) -> Void = { accepts in
+                guard !reported else { return }
+                reported = true
+                probe.cancel()
+                self.snapshotLock.lock()
+                let state = self.snapshotListenerState
+                self.snapshotLock.unlock()
+                done("startListener=\(started) live=\(self.listenerIsLive) accepts=\(accepts)"
+                     + " state=\(state) failures=\(self.listenerFailures)")
+            }
+            probe.stateUpdateHandler = { state in
+                switch state {
+                case .ready: self.q.async { finish("yes") }
+                case .failed(let error): self.q.async { finish("NO (\(error))") }
+                case .waiting(let error): self.q.async { finish("NO (waiting: \(error))") }
+                default: break
+                }
+            }
+            probe.start(queue: self.q)
+            self.q.asyncAfter(deadline: .now() + 2) { finish("NO (no answer in 2s)") }
+        }
+    }
+    #endif
+
+    /// Rebuild the listener as the app comes back from the background, BEFORE
+    /// anything needs it — a resumed session reconnects within moments of the
+    /// return, and a listener that lived through the suspension would refuse it
+    /// (see `startListenerLocked`). Installed with the first listener.
+    private func installLifecycleObserverIfNeeded() {
+        guard !lifecycleObserved else { return }
+        lifecycleObserved = true
+        #if canImport(UIKit)
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification, object: nil, queue: nil
+        ) { [weak self] _ in
+            self?.q.async { self?.rebuildListenerAfterSuspensionLocked() }
+        }
+        #endif
+    }
+
+    private func rebuildListenerAfterSuspensionLocked() {
+        lastResumeAt = Date()
+        // Nothing built yet: the next session builds a fresh one anyway.
+        guard listener != nil else { return }
+        _ = startListenerLocked()
+    }
+
+    private func noteListenerState(_ state: String) {
+        snapshotLock.lock()
+        snapshotListenerState = state
+        snapshotLock.unlock()
+        PlayerProbe.event("cache", "listener \(state)")
+    }
+
     private func startListenerLocked() -> Bool {
-        if listener != nil { return true }
+        // A listener that EXISTS is not necessarily one that is LISTENING.
+        //
+        // This used to be `if listener != nil { return true }`, and every
+        // session — plus the same-origin re-entry in `beginSession` — trusted
+        // it. Backgrounding the app can leave this loopback listener `.waiting`
+        // or `.failed` with the handle still set, and from then on each load
+        // was handed a proxy URL with nothing behind it: "Could not connect to
+        // the server" on every title, a failover onto the next link, the same
+        // again, forever — "Comet isn't working in any movie" until the app
+        // was relaunched. Measured on device: S2E1 played through the cache at
+        // 187s, the app backgrounded at 259s, and every load after it failed
+        // with no proxy request ever arriving.
+        installLifecycleObserverIfNeeded()
+        if let existing = listener {
+            // SURVIVING A SUSPENSION IS DISQUALIFYING, WHATEVER IT REPORTS.
+            // Measured on device (2026-09-16): after 75s in the background the
+            // listener still read `.ready` — no state callback fired at all —
+            // yet every connection to it was refused. The resumed Dolby Vision
+            // session could not reconnect (black screen, 20s stall watchdog),
+            // and every link the failover then tried died with "Could not
+            // connect to the server", while the cache's own download workers
+            // reached the origin fine. State cannot detect that, so age does.
+            let predatesSuspension = listenerBuiltAt < lastResumeAt
+            if listenerIsLive, !predatesSuspension { return true }
+            // Retire it properly: `cancel()` releases the port so the rebuild
+            // can bind it, and the handlers go first so its own `.cancelled`
+            // callback can't touch the replacement. Connections it already
+            // accepted are separate objects and carry on unaffected.
+            existing.stateUpdateHandler = nil
+            existing.newConnectionHandler = nil
+            existing.cancel()
+            listener = nil
+            if predatesSuspension {
+                // Routine, not a failure: must not push toward the back-off.
+                noteListenerState("rebuilding after a suspension")
+            } else {
+                listenerFailures += 1
+                noteListenerState("retired a dead listener (\(existing.state)) — rebuilding")
+            }
+        }
+        // Rebuilding keeps failing: stop handing out URLs nothing will answer.
+        // The caller declines the cache and the player goes straight to the
+        // origin, which plays — just without the disk cache — until the delay
+        // passes and a rebuild is tried again.
+        if listenerFailures >= 2, Date() < listenerRetryAfter {
+            noteListenerState("unavailable — playing without the cache for now")
+            return false
+        }
         do {
             let params = NWParameters.tcp
             params.allowLocalEndpointReuse = true
@@ -997,11 +1213,52 @@ final class MediaCacheServer {
             listener.newConnectionHandler = { [weak self] connection in
                 self?.q.async { self?.accept(connection) }
             }
+            // `.failed`/`.cancelled` mean the socket is gone underneath us (a
+            // long suspension can do it). Guarded by IDENTITY: an unguarded
+            // handler could nil the listener that REPLACED this one, when this
+            // one's late callback finally arrived — dropping a healthy listener
+            // for no reason. And cancelled, not just dropped, so the port is
+            // released for the rebuild.
+            listener.stateUpdateHandler = { [weak self, weak listener] state in
+                self?.q.async {
+                    guard let self, let listener, self.listener === listener else { return }
+                    switch state {
+                    case .ready:
+                        self.listenerFailures = 0
+                        self.listenerRetryAfter = .distantPast
+                        self.noteListenerState("ready")
+                    case .failed, .cancelled:
+                        NSLog("[OrivioCache] listener %@ — will rebuild on the next session", "\(state)")
+                        listener.stateUpdateHandler = nil
+                        listener.newConnectionHandler = nil
+                        listener.cancel()
+                        self.listener = nil
+                        self.listenerFailures += 1
+                        if self.listenerFailures >= 2 {
+                            self.listenerRetryAfter = Date().addingTimeInterval(Self.listenerRetryDelay)
+                        }
+                        self.noteListenerState("\(state) — will rebuild")
+                    case .waiting(let error):
+                        // Not acted on here: it may recover by itself. The next
+                        // session finds it not live and rebuilds it.
+                        self.noteListenerState("waiting (\(error))")
+                    default:
+                        break
+                    }
+                }
+            }
             listener.start(queue: q)
             self.listener = listener
+            listenerBuiltAt = Date()
+            if listenerFailures >= 2 {
+                // A rebuild while failures stand: if this one dies too, back off.
+                listenerRetryAfter = Date().addingTimeInterval(Self.listenerRetryDelay)
+            }
             return true
         } catch {
             NSLog("[OrivioCache] listener failed: %@", "\(error)")
+            listenerFailures += 1
+            noteListenerState("could not be created (\(error))")
             return false
         }
     }
@@ -2166,7 +2423,7 @@ final class MediaCacheServer {
         // then, so a seek always finds most of the pool free to follow it.
         if !bursting, windowed, usedBytes() < archiveCeiling,
            downloadHead - liveReadAnchor() > Self.archiveMinLeadBytes,
-           workersOnArchive < Self.archiveWorkerCap {
+           workersOnArchive < archiveWorkerLimit {
             // FIRST, the places the viewer has actually been — a bounded
             // neighbourhood around each, oldest first, so a session that jumped
             // to four scenes ends up with all four on disk rather than one of

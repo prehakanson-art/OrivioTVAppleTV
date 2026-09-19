@@ -350,8 +350,9 @@ struct InfuseInfoPanel: View {
     /// ZOOMED the film behind it, and the Status column was being clipped off
     /// the right edge at the same time.
     ///
-    /// 580 + 530 + 450 + (40 × 2 spacing) + (40 × 2 padding) = 1720, i.e.
-    /// 28pt of slack. Keep the sum under 1748 when touching any of these.
+    /// Every column is `InfuseRowMetrics.columnWidth` (520), on this tab and on
+    /// Audio: 520 × 3 + (40 × 2 spacing) + (40 × 2 padding) = 1720, i.e. 28pt
+    /// of slack. Keep the sum under 1748 when touching any of these.
     private var videoTab: some View {
         HStack(alignment: .top, spacing: 40) {
             formatColumn
@@ -407,7 +408,7 @@ struct InfuseInfoPanel: View {
                                 interactive: false)
             }
         }
-        .frame(width: 450, alignment: .leading)   // see videoTab's width budget
+        .frame(width: InfuseRowMetrics.columnWidth, alignment: .leading)
         .allowsHitTesting(false)
     }
 
@@ -439,7 +440,7 @@ struct InfuseInfoPanel: View {
                 }
             }
         }
-        .frame(width: 580, alignment: .leading)   // see videoTab's width budget
+        .frame(width: InfuseRowMetrics.columnWidth, alignment: .leading)
         .allowsHitTesting(false)
     }
 
@@ -506,7 +507,7 @@ struct InfuseInfoPanel: View {
                 InfuseOptionRow(label: "Dolby Vision", value: dolby, interactive: false)
             }
         }
-        .frame(width: 530, alignment: .leading)   // see videoTab's width budget
+        .frame(width: InfuseRowMetrics.columnWidth, alignment: .leading)
     }
 
     private static let speeds: [Float] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
@@ -525,18 +526,59 @@ struct InfuseInfoPanel: View {
 
     // MARK: Audio tab
 
+    /// Tracks, then the controls, then — far right — what the audio IS and
+    /// what the app is doing with it. Three columns of
+    /// `InfuseRowMetrics.columnWidth`, the same as the Video tab's, so the
+    /// headers sit at one pitch and the right-hand column does not move when
+    /// you switch tabs — see the width-budget note above `videoTab` for why
+    /// the sum must stay under 1748: exceeding it once made the hosting stack
+    /// wider than the screen and visibly zoomed the film behind the sheet.
+    /// Tracks stay first so the default focus target (`audio.track.*`) is
+    /// unchanged.
     private var audioTab: some View {
-        twoColumns {
+        HStack(alignment: .top, spacing: 40) {
             tracksColumn(prefix: "audio", options: viewModel.audioOptions,
                          selectedID: viewModel.selectedAudioID) { option in
                 viewModel.selectAudio(option)
             }
-        } trailing: {
-            optionsColumn(header: "Options") {
+            .frame(width: InfuseRowMetrics.columnWidth, alignment: .leading)
+            audioOptionsColumn
+            audioFormatColumn
+        }
+        .padding(.vertical, 22)
+        .padding(.horizontal, 40)
+    }
+
+    /// Read-only and non-focusable, like the Video tab's `formatColumn`: it
+    /// answers "is this really Atmos, or multichannel PCM?" without leaving
+    /// the player. Re-read on every route change so plugging in a receiver
+    /// mid-film updates the Output and Route rows.
+    private var audioFormatColumn: some View {
+        let rows = viewModel.audioFormatRows()
+        return VStack(alignment: .leading, spacing: 0) {
+            InfuseColumnHeader(text: "Format")
+            if rows.isEmpty {
+                InfuseOptionRow(label: "Still identifying the audio…", value: nil, interactive: false)
+            } else {
+                ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                    InfuseOptionRow(label: row.label, value: row.value, interactive: false)
+                }
+            }
+        }
+        .frame(width: InfuseRowMetrics.columnWidth, alignment: .leading)
+        .allowsHitTesting(false)
+        // `speakerName` is already refreshed on route change below; naming it
+        // here makes this column re-evaluate on the same notification.
+        .id(speakerName)
+    }
+
+    private var audioOptionsColumn: some View {
+        optionsColumn(header: "Options") {
                 // Lip-sync offset ("voices don't line up with the mouths") —
-                // per-title, remembered like speed. FFmpeg + VLC engines only;
-                // the native/DV paths have no adjustable clock, so the row
-                // stays out of the way there rather than lying.
+                // per-title, remembered like speed. FFmpeg, VLC and DV sample
+                // engines; the native AVPlayer path has no knob to turn, so the
+                // row stays out of the way there rather than lying. "Off" is the
+                // engine's own timing — every value is added on top of it.
                 if viewModel.audioSyncAdjustable {
                     optionRow("audio.sync", label: "Audio Sync",
                               value: PlayerViewModel.audioSyncLabel(viewModel.audioSyncOffset)) {
@@ -557,6 +599,7 @@ struct InfuseInfoPanel: View {
                     routePickerToken += 1
                 }
             }
+            .frame(width: InfuseRowMetrics.columnWidth, alignment: .leading)
             .background {
                 // Invisible AVRoutePickerView; the row pokes it to present
                 // the system AirPlay / output sheet.
@@ -568,7 +611,6 @@ struct InfuseInfoPanel: View {
             .onReceive(NotificationCenter.default.publisher(for: AVAudioSession.routeChangeNotification)) { _ in
                 speakerName = Self.currentSpeakerName()
             }
-        }
     }
 
     /// The current audio output route, as the TV names it.
@@ -835,6 +877,15 @@ struct AirPlayRoutePickerHost: UIViewRepresentable {
 enum InfuseRowMetrics {
     static let height: CGFloat = 52
     static let font: CGFloat = 29
+
+    /// Every column on every tab, so the three headers sit at the same pitch
+    /// and the third one lands in the SAME place whichever tab you are on.
+    /// They used to be 580 / 530 / 450, which stepped unevenly across the card
+    /// and made the right-hand header jump when you switched between Video and
+    /// Audio. See the width-budget note above `videoTab` before changing it:
+    /// 3 × 520 + (40 × 2 spacing) + (40 × 2 padding) = 1720 — the same total
+    /// the old split came to, so the 28pt of slack under the card is unchanged.
+    static let columnWidth: CGFloat = 520
 }
 
 private struct InfuseTabLabel: View {

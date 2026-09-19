@@ -356,7 +356,12 @@ struct DetailView: View {
     /// Loop observer for the backdrop trailer, removed on teardown — otherwise
     /// every Detail visit leaves a dead block registered with the notification
     /// center forever.
-    @State private var backdropLoopToken: NSObjectProtocol?
+    /// Fires when the backdrop trailer reaches its end — see
+    /// `restoreBackdropArtwork()`.
+    @State private var backdropEndToken: NSObjectProtocol?
+    /// Holds the teardown until the fade has finished. Cancellable, because a
+    /// page leaving (or a new trailer arming) must win over a fade in flight.
+    @State private var backdropFadeTask: Task<Void, Never>?
     /// Netflix-style: once the muted backdrop trailer has been playing and the
     /// user stays idle a beat longer, the page chrome fades away and the
     /// trailer takes the full screen (with sound). Any press/move restores.
@@ -384,6 +389,8 @@ struct DetailView: View {
     /// over the static backdrop, then eat the next press to come back.
     @State private var backdropTrailerPlaying = false
     @State private var backdropStatusObserver: NSKeyValueObservation?
+    /// Watches the ITEM, not the player — see `startBackdropTrailerIfEnabled`.
+    @State private var backdropItemObserver: NSKeyValueObservation?
     @FocusState private var fullscreenTrailerFocus: Bool
 
     init(
@@ -580,7 +587,11 @@ struct DetailView: View {
             if newValue != nil { backdropPlayer?.pause() }
         }
         .fullScreenCover(item: $activeTrailer) { trailer in
-            TrailerPlayerView(trailer: trailer)
+            // The alternates come along so a first pick that this connection
+            // can't reach falls through to the next one instead of landing on
+            // "Trailer unavailable".
+            TrailerPlayerView(trailer: trailer,
+                              alternates: viewModel.trailers.map(\.youtubeKey))
                 .environmentObject(theme)
         }
         .fullScreenCover(isPresented: $showRatingPicker) {
@@ -640,40 +651,63 @@ struct DetailView: View {
         // to full screen a few seconds later — a large positional transition
         // the viewer never asked for and the setting's copy never mentions.
         guard !perf.reduceMotion else { return }
-        guard delay > 0, let trailer = viewModel.trailers.first else { return }
+        guard delay > 0, !viewModel.trailers.isEmpty else { return }
+        // EVERY trailer the title has, best first — not just the top one. A
+        // geo-restricted first pick (routine when the connection leaves the
+        // house through a VPN exit in another country) used to be the end of
+        // it; `backdropItem` now falls through to the next candidate.
+        let candidates = viewModel.trailers.map(\.youtubeKey)
         // Resolve WHILE the idle delay runs, not after it — extraction (and
         // the remote fallback especially) can take several seconds, and
         // serializing it behind the delay made the trailer feel like forever.
-        async let resolved = TrailerResolver.backdropItem(youtubeKey: trailer.youtubeKey)
+        async let resolved = TrailerResolver.backdropItem(candidates: candidates)
         try? await Task.sleep(for: .seconds(delay))
         guard !Task.isCancelled else { return }
         // The title is playing in the Picture in Picture window (the player
         // dismissed onto this page): a second decoder and a full-screen
         // trailer that grabs and then drops the audio session would stall it.
         guard !PiPHandoff.shared.isActive else { return }
-        guard let item = await resolved else {
-            NSLog("[OrivioTrailer] backdrop resolve failed for %@", trailer.youtubeKey)
+        guard let resolvedTrailer = await resolved else {
+            NSLog("[OrivioTrailer] backdrop resolve failed for %@", candidates.joined(separator: ","))
             return
         }
+        let item = resolvedTrailer.item
         guard !Task.isCancelled else { return }
         let player = AVPlayer(playerItem: item)
         // Silent hero preview (Netflix-style). Muting also means we don't need
         // an active audio session, which on tvOS can otherwise stall a raw
         // AVPlayer's playback entirely.
         player.isMuted = true
-        // Loop so the preview keeps running while browsing the page.
+        // Play ONCE and give the backdrop art back, rather than restarting
+        // forever. `.none` rather than `.pause` so the player holds its last
+        // frame at the end instead of resetting — that held frame is what
+        // dissolves back into the artwork.
         player.actionAtItemEnd = .none
         // The task can re-run within one visit (autoTrailerKey change) —
-        // release the previous loop observer before installing a new one.
-        if let token = backdropLoopToken { NotificationCenter.default.removeObserver(token) }
-        backdropLoopToken = NotificationCenter.default.addObserver(
+        // release the previous observer before installing a new one.
+        if let token = backdropEndToken { NotificationCenter.default.removeObserver(token) }
+        backdropEndToken = NotificationCenter.default.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime,
-            object: player.currentItem, queue: .main
-        ) { [weak player] _ in
-            player?.seek(to: .zero)
-            player?.play()
+            object: item, queue: .main
+        ) { _ in
+            Task { @MainActor in restoreBackdropArtwork() }
         }
         backdropPlayer = player
+        // A URL minted for a network path the box has since left (a VPN going
+        // up or down mid-session) answers 403 rather than video, and the item
+        // fails instead of ever playing. Forget it, so the next visit to this
+        // title extracts again rather than replaying the same dead link for
+        // the rest of the cache window.
+        backdropItemObserver?.invalidate()
+        // Capture the KEY, not the resolved pair — the observation outlives
+        // this scope and shouldn't be the reason the item stays alive.
+        let resolvedKey = resolvedTrailer.youtubeKey
+        backdropItemObserver = item.observe(\.status, options: [.new]) { observed, _ in
+            guard observed.status == .failed else { return }
+            NSLog("[OrivioTrailer] backdrop %@ failed to load: %@", resolvedKey,
+                  String(describing: observed.error))
+            TrailerResolver.invalidate(youtubeKey: resolvedKey)
+        }
         backdropStatusObserver?.invalidate()
         backdropStatusObserver = player.observe(\.timeControlStatus, options: [.initial, .new]) { player, _ in
             let playing = player.timeControlStatus == .playing
@@ -681,6 +715,47 @@ struct DetailView: View {
         }
         player.play()
         withAnimation(.easeInOut(duration: 0.6)) { showBackdropTrailer = true }
+    }
+
+    /// How long the backdrop trailer takes to dissolve back into the still
+    /// art. Matches the Home hero's, so the two read as one behaviour.
+    private static let backdropFadeSeconds: TimeInterval = 0.7
+
+    /// The backdrop trailer finished. Dissolve it back into the still artwork,
+    /// and only then take the player down.
+    ///
+    /// The order matters: `teardownBackdropTrailer` clears the layer's player,
+    /// which empties it to black at once — doing that first and animating
+    /// afterwards would fade out a black rectangle over the artwork instead of
+    /// the trailer's last frame.
+    ///
+    /// A trailer that ends while the viewer has escalated it to FULL SCREEN is
+    /// put back on the page first, through the same `exitTrailerFullscreen`
+    /// that a Menu press uses — so the audio session, the idle timer, the
+    /// cooldown and the focus hand-back to Play all happen exactly as they
+    /// already do, rather than being re-implemented here. The dissolve follows
+    /// once the page is back.
+    @MainActor
+    private func restoreBackdropArtwork() {
+        guard backdropPlayer != nil else { return }
+        guard showBackdropTrailer else { teardownBackdropTrailer(); return }
+        let wasFullscreen = trailerFullscreen
+        if wasFullscreen { exitTrailerFullscreen() }
+        backdropFadeTask?.cancel()
+        backdropFadeTask = Task { @MainActor in
+            if wasFullscreen {
+                // Let the page settle back before dissolving, so the two
+                // animations read as one move rather than fighting.
+                try? await Task.sleep(for: .milliseconds(350))
+                guard !Task.isCancelled, backdropPlayer != nil else { return }
+            }
+            withAnimation(.easeInOut(duration: Self.backdropFadeSeconds)) {
+                showBackdropTrailer = false
+            }
+            try? await Task.sleep(for: .seconds(Self.backdropFadeSeconds))
+            guard !Task.isCancelled else { return }
+            teardownBackdropTrailer()
+        }
     }
 
     /// Restore the detail page from full-screen trailer mode and put focus
@@ -719,6 +794,11 @@ struct DetailView: View {
     }
 
     private func teardownBackdropTrailer() {
+        // A fade still in flight is answered by whatever called this — the page
+        // leaving, a new trailer arming, PiP taking over — so drop it rather
+        // than letting it tear down a preview that has already been replaced.
+        backdropFadeTask?.cancel()
+        backdropFadeTask = nil
         if trailerFullscreen {
             UIApplication.shared.isIdleTimerDisabled = false
             if !PiPHandoff.shared.isActive {
@@ -728,6 +808,8 @@ struct DetailView: View {
         trailerFullscreen = false
         backdropStatusObserver?.invalidate()
         backdropStatusObserver = nil
+        backdropItemObserver?.invalidate()
+        backdropItemObserver = nil
         backdropTrailerPlaying = false
         // Clear the item too, not just pause — otherwise the muted backdrop
         // player stays the system "Now Playing" item and the tvOS transport
@@ -735,9 +817,9 @@ struct DetailView: View {
         backdropPlayer?.pause()
         backdropPlayer?.replaceCurrentItem(with: nil)
         backdropPlayer = nil
-        if let token = backdropLoopToken {
+        if let token = backdropEndToken {
             NotificationCenter.default.removeObserver(token)
-            backdropLoopToken = nil
+            backdropEndToken = nil
         }
         showBackdropTrailer = false
     }
@@ -1044,10 +1126,28 @@ struct DetailView: View {
     private var seriesPlayTarget: MetaVideo? {
         let all = viewModel.allEpisodesInPlayOrder
         guard !all.isEmpty else { return nil }
-        if let inProgress = all.first(where: { ep in
-            if let p = progressStore.progress(for: ep.id) { return p.fraction > 0.02 && p.fraction < 0.95 }
-            return false
-        }) { return inProgress }
+        // The in-progress episode touched MOST RECENTLY — the one Continue
+        // Watching resumes — not the first in play order, and not one the
+        // viewer has moved past: when an episode at or after it has been
+        // watched since, Play goes on to the next-up episode below, as Home's
+        // row does (`supersededContinueRows`). First in play order would offer
+        // "Resume S1:E3" to someone who left S1E3 half-watched a month ago and
+        // has finished every episode through S2E2 since.
+        var latest: (index: Int, progress: WatchProgress)?
+        for (index, ep) in all.enumerated() {
+            guard let p = progressStore.progress(for: ep.id), p.fraction > 0.02, p.fraction < 0.95 else { continue }
+            if let current = latest, (current.progress.updatedAt, current.progress.id) >= (p.updatedAt, p.id) { continue }
+            latest = (index, p)
+        }
+        if let latest {
+            let movedPast = all[latest.index...].contains { ep in
+                guard let mark = watched.items[WatchedItem.key(contentID: viewModel.meta.id,
+                                                               season: ep.season ?? 0,
+                                                               episode: ep.episode)] else { return false }
+                return mark.watchedAt > latest.progress.updatedAt
+            }
+            if !movedPast { return all[latest.index] }
+        }
 
         func isWatched(_ ep: MetaVideo) -> Bool {
             watched.isWatched(contentID: viewModel.meta.id, season: ep.season ?? 0, episode: ep.episode)
@@ -1229,7 +1329,7 @@ struct DetailView: View {
     @ViewBuilder
     private var castSection: some View {
         let people = viewModel.crew + viewModel.cast
-        if !people.isEmpty {
+        if layout.detailShowCast, !people.isEmpty {
             VStack(alignment: .leading, spacing: OrivioSpacing.md) {
                 // The trailer lives only in the action row above; the cast
                 // header is just a title (removed the duplicate trailer tab).
@@ -1259,7 +1359,8 @@ struct DetailView: View {
 
     @ViewBuilder
     private var collectionSection: some View {
-        if let collection = viewModel.collection, !viewModel.collectionParts.isEmpty {
+        if layout.detailShowCollection, let collection = viewModel.collection,
+           !viewModel.collectionParts.isEmpty {
             VStack(alignment: .leading, spacing: OrivioSpacing.md) {
                 RowHeader(title: collection.name)
                 ScrollView(.horizontal) {
@@ -1287,7 +1388,7 @@ struct DetailView: View {
 
     @ViewBuilder
     private var moreLikeThisSection: some View {
-        if !viewModel.moreLikeThis.isEmpty {
+        if layout.detailShowMoreLikeThis, !viewModel.moreLikeThis.isEmpty {
             VStack(alignment: .leading, spacing: OrivioSpacing.md) {
                 RowHeader(title: "More Like This")
                 ScrollView(.horizontal) {
@@ -1315,7 +1416,7 @@ struct DetailView: View {
 
     @ViewBuilder
     private var companiesSection: some View {
-        if !viewModel.companies.isEmpty {
+        if layout.detailShowProduction, !viewModel.companies.isEmpty {
             VStack(alignment: .leading, spacing: OrivioSpacing.md) {
                 RowHeader(title: "Production")
                 ScrollView(.horizontal) {
@@ -1342,7 +1443,7 @@ struct DetailView: View {
 
     @ViewBuilder
     private var commentsSection: some View {
-        if !viewModel.comments.isEmpty {
+        if layout.detailShowComments, !viewModel.comments.isEmpty {
             VStack(alignment: .leading, spacing: OrivioSpacing.md) {
                 RowHeader(title: "Comments")
                 ScrollView(.horizontal) {
@@ -1681,10 +1782,15 @@ struct DetailPillButtonStyle: ButtonStyle {
 
         var body: some View {
             configuration.label
-                .foregroundStyle(isFocused ? .white : .black)
+                // The palette's own text colour for its fill — White, Lavender
+                // and Mint are light fills, and white text vanished into them.
+                .foregroundStyle(isFocused ? theme.palette.onSecondary
+                                 : (restsOnGlass ? theme.palette.textPrimary : .black))
                 .padding(.horizontal, 36)
                 .padding(.vertical, 16)
-                .background(Capsule().fill(isFocused ? theme.palette.secondary : Color.white.opacity(0.9)))
+                .background(Capsule().fill(isFocused ? theme.palette.secondary
+                                           : (restsOnGlass ? Color.clear : Color.white.opacity(0.9))))
+                .liquidGlassIf(restsOnGlass && !isFocused, in: Capsule())
                 .overlay(
                     Capsule().strokeBorder(isFocused ? Color.white.opacity(0.95) : .clear, lineWidth: 4)
                 )
@@ -1693,6 +1799,11 @@ struct DetailPillButtonStyle: ButtonStyle {
                 .focusLift(OrivioFocus.card, isFocused)
                 .cardPressDip(configuration.isPressed)
         }
+
+        /// White's accent fill is the same white this pill rests on, so on White
+        /// focus changed nothing and the resting pill looked focused beside the
+        /// icon circles. There it rests on glass, the way the circles do.
+        private var restsOnGlass: Bool { theme.palette.id == OrivioThemes.white.id }
     }
 }
 

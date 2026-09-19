@@ -669,12 +669,10 @@ struct PlayerScreen: View {
     }
 
     /// The transport is on screen: controls, paused, or a track popover.
-    private var controlsVisible: Bool {
-        switch viewModel.overlay {
-        case .controls, .pauseInfo, .audio, .subtitles: return true
-        default: return false
-        }
-    }
+    /// See `PlayerOverlay.showsTransport` — shared with `controlsSession`, so
+    /// "the transport is on screen" and "the transport was just raised" can
+    /// never disagree about which states count.
+    private var controlsVisible: Bool { viewModel.overlay.showsTransport }
 
     private var bottomBlockVisible: Bool {
         if controlsVisible { return true }

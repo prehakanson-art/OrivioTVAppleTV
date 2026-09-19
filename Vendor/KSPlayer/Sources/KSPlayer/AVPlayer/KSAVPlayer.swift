@@ -419,6 +419,15 @@ extension KSAVPlayer: MediaPlayerProtocol {
             guard let self else { return }
             self.bufferingProgress = 0
             let playerItem = AVPlayerItem(asset: self.urlAsset)
+            // Orivio: the native path's Atmos gate. `allowedAudioSpatializationFormats`
+            // defaults to `.monoAndStereo`, so an MP4/HLS item carrying E-AC-3
+            // JOC was told multichannel was unwanted before it ever reached the
+            // HDMI route. Nothing else here decodes audio — AVPlayer bitstreams
+            // Dolby itself — so this one line is the difference between Atmos
+            // and a stereo fold on every native session.
+            if #available(tvOS 15.0, iOS 15.0, macOS 12.0, *) {
+                playerItem.allowedAudioSpatializationFormats = .monoStereoAndMultichannel
+            }
             self.options.openTime = CACurrentMediaTime()
             self.replaceCurrentItem(playerItem: playerItem)
             self.player.actionAtItemEnd = .pause

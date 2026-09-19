@@ -190,10 +190,29 @@ open class KSPlayerLayer: NSObject {
             // 一个兜底保护，正常不能走到这里
             self.state = .bufferFinished
         }
-        if self.player.isPlaying {
+        // ORIVIO PATCH (stutter): this used to run on every 0.1s tick. The
+        // subscript is a read-modify-write of the WHOLE now-playing dictionary
+        // — which, on this layer, holds the artwork and the
+        // MPNowPlayingInfoLanguageOptionGroup arrays built at `.readyToPlay` —
+        // and each write is an XPC round trip to mediaserverd. Ten a second, on
+        // the main thread, for the length of the film.
+        //
+        // That thread is not a bystander here: the FFmpeg engine's display link
+        // runs on the main run loop and IS the frame pump (frames are enqueued
+        // `DisplayImmediately`, so a picture appears exactly when the callback
+        // runs), and the master audio clock is stamped on main too. Anything
+        // that blocks main both delays the frame and staled the clock the drop
+        // decision is then made against — one hitch, counted twice.
+        //
+        // Once a second is as much resolution as the system's own UI shows.
+        nowPlayingTick &+= 1
+        if self.player.isPlaying, nowPlayingTick % 10 == 0 {
             MPNowPlayingInfoCenter.default().nowPlayingInfo?[MPNowPlayingInfoPropertyElapsedPlaybackTime] = self.player.currentPlaybackTime
         }
     }
+
+    /// Counts the 0.1s ticks above so the now-playing write can run at 1Hz.
+    private var nowPlayingTick = 0
 
     private var urls = [URL]()
     private var isAutoPlay: Bool

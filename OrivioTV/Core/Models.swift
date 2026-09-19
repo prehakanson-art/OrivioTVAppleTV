@@ -277,7 +277,8 @@ struct MetaItem: Codable, Identifiable, Hashable {
     let id: String
     let type: String
     let name: String
-    let poster: String?
+    /// `var` only so `withPlainPoster()` can swap it on a copy.
+    var poster: String?
     let background: String?
     let logo: String?
     let description: String?
@@ -287,10 +288,14 @@ struct MetaItem: Codable, Identifiable, Hashable {
     let genres: [String]?
     let cast: [String]?
     let videos: [MetaVideo]?
+    /// An undecorated poster some add-ons send beside `poster` — see
+    /// `withPlainPoster()`.
+    let posterFallback: String?
 
     private enum CodingKeys: String, CodingKey {
         case id, type, name, poster, background, logo, description
         case releaseInfo, imdbRating, runtime, genres, cast, videos, year
+        case posterFallback
     }
 
     init(from decoder: Decoder) throws {
@@ -324,6 +329,7 @@ struct MetaItem: Codable, Identifiable, Hashable {
         // Element-wise: one episode with a numeric/missing id used to nil the
         // WHOLE list, so the Detail page showed no episodes for that show.
         videos = c.lossyArrayHelper(MetaVideo.self, forKey: .videos)
+        posterFallback = try? c.decode(String.self, forKey: .posterFallback)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -341,6 +347,7 @@ struct MetaItem: Codable, Identifiable, Hashable {
         try c.encodeIfPresent(genres, forKey: .genres)
         try c.encodeIfPresent(cast, forKey: .cast)
         try c.encodeIfPresent(videos, forKey: .videos)
+        try c.encodeIfPresent(posterFallback, forKey: .posterFallback)
     }
 
     init(
@@ -348,7 +355,7 @@ struct MetaItem: Codable, Identifiable, Hashable {
         poster: String? = nil, background: String? = nil, logo: String? = nil,
         description: String? = nil, releaseInfo: String? = nil, imdbRating: String? = nil,
         runtime: String? = nil, genres: [String]? = nil, cast: [String]? = nil,
-        videos: [MetaVideo]? = nil
+        videos: [MetaVideo]? = nil, posterFallback: String? = nil
     ) {
         self.id = id
         self.type = type
@@ -363,6 +370,19 @@ struct MetaItem: Codable, Identifiable, Hashable {
         self.genres = genres
         self.cast = cast
         self.videos = videos
+        self.posterFallback = posterFallback
+    }
+
+    /// This title with the add-on's plain poster in place of its decorated one
+    /// (Settings → Layout → Posters → "Poster banners" off). Some add-ons print
+    /// tags such as "In Cinema" or "#2 Today" into the poster image itself —
+    /// Xperience's poster providers do — and send the undecorated art alongside
+    /// as `posterFallback`. Returns `self` when there is no such fallback.
+    func withPlainPoster() -> MetaItem {
+        guard let posterFallback, !posterFallback.isEmpty, posterFallback != poster else { return self }
+        var copy = self
+        copy.poster = posterFallback
+        return copy
     }
 
     var year: String? {
@@ -1121,6 +1141,19 @@ struct StreamEntry: Identifiable, Hashable {
     let id = UUID()
     let addonName: String
     let stream: Stream
+
+    /// The add-on this link came from, with any resolver prefix removed.
+    ///
+    /// A debrid or P2P resolve re-labels the entry it hands to the player
+    /// ("RD · Torrentio", "P2P · Torrentio") so the row says who resolved it,
+    /// while every other copy of that link in the pool keeps the plain name.
+    /// Comparing the labels directly therefore never matched for anyone using
+    /// debrid — which is what sent a failover to a DIFFERENT add-on instead of
+    /// the next link from the one the viewer was on. Compare THIS.
+    var sourceAddonName: String {
+        guard let separator = addonName.range(of: " · ", options: .backwards) else { return addonName }
+        return String(addonName[separator.upperBound...])
+    }
 
     /// Identity that survives between sessions, for remembering a link the
     /// viewer walked out on. NOT the URL: a debrid link is freshly signed on

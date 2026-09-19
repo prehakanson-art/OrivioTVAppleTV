@@ -83,16 +83,31 @@ struct FusionPlayerControlsOverlay: View {
         case bar
         case subtitlesGlyph
         case audioGlyph
+        case nextEpisodeGlyph
         case popoverRow(String)
     }
 
     /// Glyphs on screen, left→right.
+    ///
+    /// Next Episode goes on the FAR RIGHT, deliberately. Up from the bar lands
+    /// on `first`, so putting it anywhere else would both move where a single
+    /// Up press arrives and make the episode-advancing button the thing that
+    /// press lands on. From the end of the row it takes a deliberate walk to
+    /// reach, which is right for the only control here that ends the episode
+    /// you are watching.
     private var glyphOrder: [Control] {
         var order: [Control] = []
         if !viewModel.subtitleOptions.isEmpty { order.append(.subtitlesGlyph) }
         if !viewModel.audioOptions.isEmpty { order.append(.audioGlyph) }
+        if showsNextEpisodeGlyph { order.append(.nextEpisodeGlyph) }
         return order
     }
+
+    /// Shown whenever there IS a next episode — there is no longer a setting
+    /// for it. `nextEpisodeAvailable` is the view model's cached answer;
+    /// reading `nextEpisode` here would sort the whole episode list on every
+    /// tick.
+    private var showsNextEpisodeGlyph: Bool { viewModel.nextEpisodeAvailable }
 
     private var popoverGlyph: Control? {
         switch viewModel.overlay {
@@ -151,6 +166,19 @@ struct FusionPlayerControlsOverlay: View {
             focusedControl = .bar
             if !viewModel.controlsFocusOnBar { viewModel.controlsFocusOnBar = true }
         }
+        // Raising the transport always starts on the bar. `onAppear` alone was
+        // not enough: bring the transport back inside its own dismiss
+        // transition and SwiftUI keeps the outgoing copy on screen, still
+        // focused on whichever glyph it held, so the press that followed opened
+        // Subtitles instead of scrubbing. `controlsSession` changes on every
+        // raise whether or not this view is rebuilt.
+        //
+        // Deliberately NOT bumped for controls ↔ pauseInfo or for opening and
+        // closing a track popover, so none of those move focus.
+        .onChange(of: viewModel.controlsSession) { _, _ in
+            focusedControl = .bar
+            if !viewModel.controlsFocusOnBar { viewModel.controlsFocusOnBar = true }
+        }
         .onChange(of: focusedControl) { old, new in
             // Every hop, in order — which is how a single Up press showing as
             // two moves (bar → subtitles → audio) is readable at all.
@@ -182,30 +210,66 @@ struct FusionPlayerControlsOverlay: View {
             if new == .controls, old == .audio { focusedControl = .audioGlyph }
             if new == .controls, old == .subtitles { focusedControl = .subtitlesGlyph }
         }
+        .onChange(of: glyphOrder) { _, order in
+            // A glyph that goes away must not take the focus with it. Nothing
+            // else in this overlay is focusable except the bar and an open
+            // popover's rows, so an overlay left holding focus on a view that
+            // no longer exists is a dead remote. The row can change under the
+            // viewer — audio and subtitle tracks appear as the stream's
+            // headers parse, and the Next Episode glyph follows an episode
+            // list that arrives from the enrichment fetch.
+            guard let focused = focusedControl else { return }
+            switch focused {
+            case .bar, .popoverRow: return
+            default: if !order.contains(focused) { focusedControl = .bar }
+            }
+        }
         .animation(FusionMotion.controlsAppear, value: popoverGlyph)
     }
 
     // MARK: Glyphs
 
-    /// Subtitles, then audio — the quiet icon pair at the right end of the
-    /// title line. Each opens its track popover; pressing again closes it.
+    /// Subtitles, audio, then Next Episode — the quiet icon row at the right
+    /// end of the title line. The track glyphs open their popover (pressing
+    /// again closes it); Next Episode acts at once.
+    ///
+    /// Built FROM `glyphOrder` rather than repeating its conditions, so what
+    /// is drawn and what Left/Right walks can never disagree: `popoverTrailing`
+    /// positions each popover by that same order, and a list that had drifted
+    /// from the row would anchor a panel over the wrong glyph.
     private var glyphCluster: some View {
         HStack(spacing: FusionMetrics.glyphSpacing) {
-            if !viewModel.subtitleOptions.isEmpty {
-                glyphButton(control: .subtitlesGlyph, label: "Subtitles") {
-                    Image(systemName: "captions.bubble")
-                        .font(.system(size: 28, weight: .regular))
-                } action: {
-                    viewModel.overlay = viewModel.overlay == .subtitles ? .controls : .subtitles
-                }
+            ForEach(glyphOrder, id: \.self) { control in
+                glyph(for: control)
             }
-            if !viewModel.audioOptions.isEmpty {
-                glyphButton(control: .audioGlyph, label: "Audio") {
-                    InfuseAudioGlyph()
-                } action: {
-                    viewModel.overlay = viewModel.overlay == .audio ? .controls : .audio
-                }
+        }
+    }
+
+    @ViewBuilder
+    private func glyph(for control: Control) -> some View {
+        switch control {
+        case .subtitlesGlyph:
+            glyphButton(control: .subtitlesGlyph, label: "Subtitles") {
+                Image(systemName: "captions.bubble")
+                    .font(.system(size: 28, weight: .regular))
+            } action: {
+                viewModel.overlay = viewModel.overlay == .subtitles ? .controls : .subtitles
             }
+        case .audioGlyph:
+            glyphButton(control: .audioGlyph, label: "Audio") {
+                InfuseAudioGlyph()
+            } action: {
+                viewModel.overlay = viewModel.overlay == .audio ? .controls : .audio
+            }
+        case .nextEpisodeGlyph:
+            glyphButton(control: .nextEpisodeGlyph, label: "Next Episode") {
+                Image(systemName: "forward.end.fill")
+                    .font(.system(size: 26, weight: .regular))
+            } action: {
+                viewModel.playNextEpisodeFromControls()
+            }
+        case .bar, .popoverRow:
+            EmptyView()
         }
     }
 

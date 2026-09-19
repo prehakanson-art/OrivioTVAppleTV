@@ -20,6 +20,10 @@ struct OrivioTVApp: App {
         // cannot answer: a suspended app, a wedged one, or a box that panics.
         // See FlightRecorder for what it records and why each field is there.
         FlightRecorder.start()
+        // The browse half of the same probe. Armed HERE, not on a screen's
+        // appear, so the tail covers launch itself — a cold start that hangs
+        // before any view exists is exactly the session with no other witness.
+        AppProbe.installLevels()
     }
 
     @StateObject private var theme = ThemeManager()
@@ -73,6 +77,47 @@ struct OrivioTVApp: App {
                 // honors its Appearance setting — light, dark, or nil to
                 // follow the TV's own system appearance.
                 .preferredColorScheme(theme.preferredColorScheme)
+        }
+    }
+}
+
+/// Human names for the probe's `[app]` block and its nav events. Kept beside
+/// the enum so a new case is obvious here too — an unnamed route reads as
+/// "route" in the tail and tells the reader nothing.
+extension Route {
+    var probeName: String {
+        switch self {
+        case .detail: return "Detail"
+        case .collection: return "Collection"
+        case .person: return "Cast"
+        case .tmdbCompany: return "Studio"
+        case .catalogSeeAll: return "See All"
+        case .discover: return "Discover"
+        case .cloudLibrary: return "Cloud Library"
+        case .mediaServerShow: return "Media Server Show"
+        case .streams: return "Sources"
+        case .streamsInfuse: return "Sources (Infuse)"
+        case .streamsManual: return "Sources (manual)"
+        case .streamsFromStart: return "Sources (from start)"
+        case .streamsResume: return "Sources (resume)"
+        }
+    }
+
+    var probeDetail: String {
+        switch self {
+        case .detail(let item): return "\(item.name) [\(item.type) \(item.id)]"
+        case .collection(let c): return c.title
+        case .person(_, let name): return name
+        case .tmdbCompany(_, let name): return name
+        case .catalogSeeAll(_, _, let title): return title
+        case .mediaServerShow(let show): return show.title
+        case .streams(let meta, let video),
+             .streamsInfuse(let meta, let video),
+             .streamsManual(let meta, let video),
+             .streamsFromStart(let meta, let video),
+             .streamsResume(let meta, let video, _):
+            return meta.name + (video.map { " S\($0.season ?? 0)E\($0.episode ?? 0)" } ?? "")
+        default: return ""
         }
     }
 }
@@ -256,6 +301,17 @@ struct RootView: View {
                             ProgressStore.key(metaID: meta.id, video: video)
                         )
                     }
+                    // A synced row for an episode finished AFTER that row was
+                    // written is a stale copy; no merge may restore it (see
+                    // `ProgressStore.episodeWatchedAfter`).
+                    progressStore.episodeWatchedAfter = { [weak watched] row in
+                        guard let watched, let season = row.season, let episode = row.episode,
+                              let mark = watched.items[WatchedItem.key(contentID: row.metaID,
+                                                                       season: season,
+                                                                       episode: episode)]
+                        else { return false }
+                        return mark.watchedAt > row.updatedAt
+                    }
                     let orivioSync = OrivioSyncManager(
                         account: account,
                         addonManager: addonManager,
@@ -436,6 +492,14 @@ struct RootView: View {
                     // locked. With only the count test, a device with a single
                     // PIN-locked profile booted straight into it and the lock
                     // the user had enabled protected nothing.
+                    // Everything the browse probe needs that lives in a store
+                    // rather than in this view. Weak, so a block registered
+                    // here can never be what keeps a store alive, and
+                    // re-registered harmlessly if the root ever reappears
+                    // (`register` replaces by name).
+                    installStoreProbe()
+                    AppProbe.tab = Self.tabName(selectedTab)
+                    AppProbe.life("root appeared — tab=\(Self.tabName(selectedTab))")
                     // Skipped in the demo modes so the screen isn't covered.
                     let args = ProcessInfo.processInfo.arguments
                     let demoArgs = ["-detailDemo", "-detailDemoSeries", "-homeDemo", "-settingsDemo", "-liveTVDemo", "-searchDemo", "-libraryDemo", "-discoverDemo", "-traktQRDemo", "-simklQRDemo", "-accountDemo", "-settingsTabDemo"]
@@ -687,10 +751,34 @@ struct RootView: View {
             // made on another device show up without a relaunch (local edits
             // already push immediately on every change).
             .onChange(of: scenePhase) { _, phase in
+                AppProbe.scene = "\(phase)"
+                AppProbe.life("scene → \(phase)")
                 if phase == .active {
+                    // Opening the app syncs the whole account, not just
+                    // Continue Watching — add-ons, collections, the layout and
+                    // the player/theme settings all change on other devices
+                    // too, and waiting for the periodic tick (30s, 90s on the
+                    // A8/A10X) meant the app opened showing yesterday's copy.
+                    // Self-coalescing and self-throttled: a cold launch arms
+                    // this from the auth change as well, a quick
+                    // inactive→active flip is ignored, and a cycle already
+                    // running is reused rather than duplicated.
+                    sync?.syncOnAppOpen(reason: "app opened")
+                    // Stands down on its own while that sync is armed, so the
+                    // two can't pull progress and library at the same time.
                     sync?.refreshContinueWatching()
                     traktSync?.syncNow()
                     stremioSync?.syncNow(reason: "Foreground Stremio sync")
+                    // An add-on left as a stub — its manifest fetch answered
+                    // during a wake, before the network was really back — has
+                    // no catalogs and serves no streams, and NOTHING else
+                    // re-fetches manifests until the next launch. That is why a
+                    // missing add-on came back only after closing the app.
+                    // Same repair the Sources screen already runs, and it does
+                    // nothing when there is no stub to fix.
+                    if addonManager.addons.contains(where: { $0.enabled && $0.manifest.isPlaceholder }) {
+                        Task { _ = await addonManager.resolvePlaceholders() }
+                    }
                 }
             }
             // Keep Continue Watching live while browsing Home (tab 0), app
@@ -924,6 +1012,11 @@ struct RootView: View {
     /// at the left edge of the content (or Menu) calls it back. Settings keeps
     /// its rail regardless — that pane is navigated THROUGH the rail, and
     /// hiding it there leaves no way back out of a settings detail.
+    /// Where the rail lives. Read once here so every axis-dependent site below
+    /// agrees, and so the whole feature is one value to follow.
+    private var navPosition: NavigationPosition { homeCatalogSettings.navigationPosition }
+    private var navIsTop: Bool { navPosition.isHorizontal }
+
     private var sidebarAutoHides: Bool {
         homeCatalogSettings.autoHideSidebar && selectedTab != 3
     }
@@ -931,6 +1024,18 @@ struct RootView: View {
     /// Set when the auto-hiding rail has been summoned; cleared when it
     /// collapses again.
     @State private var sidebarRevealed = false
+
+    /// When the rail was last ASKED for — a summon, or focus actually landing
+    /// in it. Read only by the rail's exit-move handler; see the note there.
+    @State private var sidebarEngagedAt = Date.distantPast
+
+    /// How long after engaging the rail an exit move is treated as an echo of
+    /// the gesture that opened it rather than a fresh instruction to leave.
+    ///
+    /// Short enough that a deliberate press pair is never swallowed (two
+    /// separate presses on the clickpad are far slower than this), long enough
+    /// to cover the tail of ONE swipe on the old remote's touch surface.
+    private static let sidebarExitEchoWindow: TimeInterval = 0.3
 
     private var showSidebar: Bool {
         guard atTabRoot else { return false }
@@ -942,14 +1047,25 @@ struct RootView: View {
     /// `showSidebar` turns true, and `@FocusState` on a view that doesn't
     /// exist yet is dropped on the floor.
     private func revealSidebar() {
-        guard sidebarAutoHides, !sidebarRevealed else { return }
+        guard sidebarAutoHides, !sidebarRevealed else {
+            AppProbe.focus("reveal rail refused — autoHides=\(sidebarAutoHides.probe)"
+                           + " alreadyRevealed=\(sidebarRevealed.probe)")
+            return
+        }
         // The failed-move notification is app-wide: a left press with no
         // target inside the player, a pushed Detail page, or either fullscreen
         // gate reaches here too, and revealing there would flip state for a
         // rail that isn't even on screen — it then greets the viewer already
         // open when they come back to the root.
-        guard atTabRoot, playback == nil, !showProfileGate, !showWelcome else { return }
+        guard atTabRoot, playback == nil, !showProfileGate, !showWelcome else {
+            AppProbe.focus("reveal rail refused — atRoot=\(atTabRoot.probe)"
+                           + " player=\((playback != nil).probe) gate=\(showProfileGate.probe)"
+                           + " welcome=\(showWelcome.probe)")
+            return
+        }
+        AppProbe.focus("reveal rail")
         sidebarRevealed = true
+        sidebarEngagedAt = Date()
         setSidebarEnabled(true)
         DispatchQueue.main.async { sidebarFocus = selectedTab }
     }
@@ -959,7 +1075,7 @@ struct RootView: View {
     /// so the expanding panel just draws over the content — the content
     /// column never re-lays-out during the spring.
     private var tabLayout: some View {
-        ZStack(alignment: .leading) {
+        ZStack(alignment: navIsTop ? .top : .leading) {
             selectedContent
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 // Tab changes CUT. No fade, in either direction.
@@ -990,8 +1106,21 @@ struct RootView: View {
                 .transition(.identity)
                 .animation(nil, value: selectedTab)
                 // Home runs full-bleed (hero art sweeps under the floating
-                // pill); other tabs clear the rail.
-                .padding(.leading, showSidebar && selectedTab != 0 ? GlassSidebar.collapsedWidth : 0)
+                // pill); other tabs clear the rail. The top bar reserves
+                // height where the left rail reserves width — and Home is NOT
+                // exempt there: the left rail floats beside the hero's art,
+                // but a top bar sits across the hero's own title block, which
+                // is text rather than bleed.
+                .padding(.leading, !navIsTop && showSidebar && selectedTab != 0
+                         ? GlassSidebar.collapsedWidth : 0)
+                // Same rule on the other axis, Home included: the bar FLOATS
+                // over Home the way the pill floats beside it, so the hero is
+                // never pushed down. The other tabs get a SAFE-AREA inset
+                // rather than a plain one — see `topBarClearance`: plain
+                // padding cut the page off under the bar, so scrolled rows hit
+                // a black band instead of sliding under the glass.
+                .safeAreaPadding(.top, navIsTop && showSidebar && selectedTab != 0
+                                 ? GlassSidebar.topBarClearance : 0)
                 // The expanded panel draws OVER the page and the page does
                 // not move. There was an `.offset` here (plus an animation
                 // keyed to the rail opening) that slid the content sideways to
@@ -1015,18 +1144,60 @@ struct RootView: View {
                 .onReceive(NotificationCenter.default.publisher(
                     for: UIFocusSystem.movementDidFailNotification)) { note in
                     guard let ctx = note.userInfo?[UIFocusSystem.focusUpdateContextUserInfoKey]
-                            as? UIFocusUpdateContext,
-                          ctx.focusHeading.contains(.left) else { return }
-                    revealSidebar()
+                            as? UIFocusUpdateContext else { return }
+                    // The press that reaches for the rail is whichever one
+                    // points AT it: Left for the edge rail, Up for the bar.
+                    // Everything downstream is identical.
+                    guard ctx.focusHeading.contains(navIsTop ? .up : .left) else { return }
+                    // Search root with the rail ON SCREEN but inside one of its
+                    // short `.disabled` windows (the moments after a tab switch
+                    // or a rail exit, kept so the engine seeds focus into the
+                    // content). A disabled rail can't take focus, so this Left
+                    // failed and was swallowed: the search bar read as a trap
+                    // while Back, which force-enables the rail, still worked.
+                    // A deliberate Left now takes Back's path. Search only.
+                    if selectedTab == 1, showSidebar, !sidebarEnabled, sidebarFocus == nil,
+                       playback == nil, !showProfileGate, !showWelcome {
+                        focusSidebar(selectedTab)
+                    } else if navIsTop, showSidebar, sidebarFocus == nil, atTabRoot,
+                              playback == nil, !showProfileGate, !showWelcome {
+                        // TOP BAR, already on screen, and Up found nothing: put
+                        // focus in it.
+                        //
+                        // The left rail never needs this — it sits BESIDE the
+                        // content (which is inset by its width), so the engine
+                        // finds it by geometry. The bar sits OVER content that
+                        // spans the full height, and from a page whose own
+                        // topmost row is close under it the engine answers "no
+                        // candidate" instead of stepping up into it. The press
+                        // then did nothing at all: Library's filter chips were
+                        // a dead end upward, and with "Hide the sidebar" on
+                        // there was no way to call the bar back either, because
+                        // the branch below only reveals a bar that is OFF
+                        // screen. Same remedy the Search case above uses, which
+                        // is the same problem on the other axis.
+                        focusSidebar(selectedTab)
+                    } else {
+                        revealSidebar()
+                    }
                 }
                 // Lets the content tell whether a LEFT press should be its own
                 // (step the hero spotlight) or the rail's (come back).
-                .environment(\.railIsHidden, sidebarAutoHides && !sidebarRevealed)
+                // "A LEFT press has to escape to the rail." False with the bar
+                // on top, where Left is never the rail's press — so the hero's
+                // spotlight sentinels stay in place there, which is what they
+                // are for.
+                .environment(\.railIsHidden,
+                             !navIsTop && sidebarAutoHides && !sidebarRevealed)
+                // Layout, not input: Home's own leading inset exists to clear a
+                // rail at the LEFT edge, and there isn't one in the top layout.
+                .environment(\.navigationIsTop, navIsTop)
 
             if showSidebar {
                 GlassSidebar(selected: $selectedTab, focusBinding: $sidebarFocus,
                              onProfileTap: { profileGateCancellable = true; showProfileGate = true },
-                             onTabSelected: { newTab in selectTab(newTab) })
+                             onTabSelected: { newTab in selectTab(newTab) },
+                             position: navPosition)
                     .focusSection()
                     .disabled(!sidebarEnabled)
                     // Back while IN the rail collapses it into content instead
@@ -1037,7 +1208,29 @@ struct RootView: View {
                     // so the engine sees no candidate to the right — catch it
                     // and run the same collapse Back uses.
                     .onMoveCommand { direction in
-                        guard direction == .right else { return }
+                        // Out of the rail and into the content: Right off the
+                        // edge rail, Down off the top bar.
+                        guard direction == (navIsTop ? .down : .right) else { return }
+                        // …unless this is the tail of the swipe that just
+                        // OPENED the rail.
+                        //
+                        // The old Siri Remote's touch surface reports a swipe
+                        // as a stream of move commands, and the settling end of
+                        // one carries a move back the other way; the clickpad
+                        // on the current remote emits a single discrete press
+                        // and never does this. So a swipe left landed focus in
+                        // the rail and the same gesture's tail immediately
+                        // exited it — the panel opened and bounced straight
+                        // back, only ever on the old remote. The race below
+                        // makes it worse: this block is async, so a tail that
+                        // arrives before focus has settled sees `sidebarFocus`
+                        // still nil and disables the rail exactly as focus is
+                        // arriving, which pushes it back to the content too.
+                        //
+                        // A leaving move is only real once the opening one has
+                        // had time to finish.
+                        guard Date().timeIntervalSince(sidebarEngagedAt)
+                                > Self.sidebarExitEchoWindow else { return }
                         // The engine acts on this press too: on tabs whose
                         // content clears only the COLLAPSED rail, cards past
                         // the panel's edge are real right candidates, so focus
@@ -1053,7 +1246,7 @@ struct RootView: View {
                             }
                         }
                     }
-                    .transition(.move(edge: .leading).combined(with: .opacity))
+                    .transition(.move(edge: navIsTop ? .top : .leading).combined(with: .opacity))
                     // Stays non-focusable until Home has content to hold
                     // initial focus (onContentReady); timer is the fallback.
                     .task {
@@ -1072,6 +1265,14 @@ struct RootView: View {
                    ? .spring(response: 0.34, dampingFraction: 0.86) : nil, value: showSidebar)
         .animation(perf.sidebarAnimationEffective
                    ? .spring(response: 0.34, dampingFraction: 0.86) : nil, value: sidebarFocus != nil)
+        // Focus ARRIVING in the rail counts as engaging it, however it got
+        // there. `focusSidebar` and `revealSidebar` stamp their own way in, but
+        // the common case — an always-visible rail that the focus engine simply
+        // moves into from the first card of a row — goes through neither, and
+        // that is exactly the case a swipe hits.
+        .onChange(of: sidebarFocus) { old, new in
+            if old == nil, new != nil { sidebarEngagedAt = Date() }
+        }
         .background(ATVBackground())
     }
 
@@ -1098,6 +1299,7 @@ struct RootView: View {
             NavigationStack {
                 ATVSettingsView(onOpenProfiles: { profileGateCancellable = true; showProfileGate = true })
                     .onExitCommand { focusSidebar(3) }
+                    .probeScreen("Settings")
             }
         case 4:
             NavigationStack(path: $liveTVPath) {
@@ -1129,10 +1331,59 @@ struct RootView: View {
         }
     }
 
+    /// Rail tabs by name, for the probe. Numbers in a log are a second thing
+    /// to decode while reading a focus bug.
+    static func tabName(_ tab: Int) -> String {
+        switch tab {
+        case 1: return "Search"
+        case 2: return "Library"
+        case 3: return "Settings"
+        case 4: return "Live TV"
+        default: return "Home"
+        }
+    }
+
+    /// The `[stores]` probe block: what the app is holding right now, which is
+    /// the other half of "why is this row empty" — the first half being the
+    /// `data` events that tried to fill it.
+    private func installStoreProbe() {
+        PlayerProbe.register("stores") { [weak addonManager, weak collections,
+                                          weak library, weak progressStore,
+                                          weak profiles, weak account] in
+            var out: [String] = []
+            if let addonManager {
+                let enabled = addonManager.addons.filter(\.enabled)
+                let stubs = enabled.filter { $0.manifest.isPlaceholder }
+                out.append("addons \(enabled.count)/\(addonManager.addons.count) enabled"
+                           + (stubs.isEmpty ? "" : "  STUBS: " + stubs.map(\.manifest.name).joined(separator: ", ")))
+            }
+            if let collections {
+                out.append("collections \(collections.library.count)")
+            }
+            if let library {
+                out.append("library \(library.items.count)")
+            }
+            if let progressStore {
+                out.append("continue watching \(progressStore.items.count)")
+            }
+            if let profiles {
+                out.append("profile \(profiles.active.name) [\(profiles.active.id)]"
+                           + "  of \(profiles.profiles.count)")
+            }
+            if let account {
+                out.append("account \(account.authState.isSignedIn ? "signed in" : "signed out")")
+            }
+            return out
+        }
+    }
+
     /// Handles tapping a rail tab: collapse the panel and force focus into the
     /// fresh tab's content by making the rail momentarily unfocusable.
     private func selectTab(_ newTab: Int) {
         let enteringHomeFresh = selectedTab != 0 && newTab == 0
+        AppProbe.nav("tab \(Self.tabName(selectedTab)) → \(Self.tabName(newTab))"
+                     + (enteringHomeFresh ? "  (Home rebuilds; rail waits on content)" : ""))
+        AppProbe.tab = Self.tabName(newTab)
         selectedTab = newTab
         if homeCatalogSettings.autoHideSidebar { sidebarRevealed = false }
         sidebarFocus = nil
@@ -1156,8 +1407,11 @@ struct RootView: View {
     /// dropped — a Menu press in one of those windows did nothing. A deliberate
     /// Back always wins: enable now, focus on the next tick.
     private func focusSidebar(_ tab: Int) {
+        AppProbe.focus("focusSidebar(\(Self.tabName(tab)))"
+                       + "  revealed=\(sidebarRevealed.probe) enabled=\(sidebarEnabled.probe)")
         // Menu at a tab root is the other way back to a hidden rail.
         if sidebarAutoHides { sidebarRevealed = true }
+        sidebarEngagedAt = Date()
         setSidebarEnabled(true)
         DispatchQueue.main.async { sidebarFocus = tab }
     }
@@ -1193,6 +1447,12 @@ struct RootView: View {
     @State private var sidebarReenableTask: Task<Void, Never>?
 
     private func setSidebarEnabled(_ enabled: Bool, reenableAfter delay: Double? = nil) {
+        // The rail's `.disabled` windows swallow directional presses, which is
+        // the shape of half the focus bugs this app has had — so every open and
+        // close of one is on the record, with how long it is meant to last.
+        AppProbe.focus("rail " + (enabled ? "enabled" : "disabled")
+                       + (delay.map { String(format: " for %.2fs", $0) } ?? ""))
+        AppProbe.rail = enabled ? "enabled" : "disabled"
         if enabled { sidebarAwaitingContent = false }
         sidebarReenableTask?.cancel()
         sidebarReenableTask = nil
@@ -1215,6 +1475,8 @@ struct RootView: View {
         sidebarReenableTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             guard !Task.isCancelled else { return }
+            AppProbe.focus("rail re-enabled by timer")
+            AppProbe.rail = "enabled"
             sidebarEnabled = true
             sidebarReenableTask = nil
         }
@@ -1262,6 +1524,7 @@ struct RootView: View {
                 focusSidebar(0)
             }
         )
+        .probeScreen("Home")
     }
 
     private var searchRoot: some View {
@@ -1270,6 +1533,7 @@ struct RootView: View {
             onSelect: { searchPath.append(Route.detail($0)) },
             onOpenDiscover: { searchPath.append(Route.discover) }
         )
+        .probeScreen("Search")
     }
 
     private var libraryRoot: some View {
@@ -1280,6 +1544,7 @@ struct RootView: View {
             onOpenMediaServerShow: { libraryPath.append(Route.mediaServerShow($0)) },
             onBackAtRoot: { focusSidebar(2) }
         )
+        .probeScreen("Library")
     }
 
     private var liveTVRoot: some View {
@@ -1287,12 +1552,21 @@ struct RootView: View {
             onSelectChannel: { channel in liveTVPath.append(Route.streams(channel, nil)) },
             onPlayDirect: { channel in playLiveChannel(channel) }
         )
+        .probeScreen("Live TV")
     }
 
     /// Shared navigation destinations. `path` is the binding for whichever
     /// tab's stack is presenting, so nested pushes stay within that tab.
-    @ViewBuilder
+    /// Every pushed screen goes through here, so ONE marker covers all of
+    /// them — and a route added later is instrumented the moment it is
+    /// reachable, with no second place to remember.
     private func destination(for route: Route, path: Binding<NavigationPath>) -> some View {
+        destinationBody(for: route, path: path)
+            .probeScreen(route.probeName) { route.probeDetail }
+    }
+
+    @ViewBuilder
+    private func destinationBody(for route: Route, path: Binding<NavigationPath>) -> some View {
         switch route {
         case .detail(let item):
             DetailView(

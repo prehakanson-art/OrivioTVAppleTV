@@ -204,6 +204,18 @@ final class ProgressStore: ObservableObject {
     /// carries rows that still exist locally — so without this a removal was
     /// invisible to Stremio and the card simply came back on the next pull.
     var onStremioClearProgress: ((String) -> Void)?
+    /// Whether a row's episode was marked watched AFTER the row was last
+    /// written (installed by the app from `WatchedStore`). Such a row is a
+    /// stale copy of an episode the viewer has since finished, and no merge
+    /// may put it back.
+    ///
+    /// Finishing retires the row here, but copies elsewhere outlive it: the
+    /// account row the periodic pushes wrote, a Trakt playback row, Stremio's
+    /// resume state. Each handed the episode back once the three-minute
+    /// tombstone lapsed, at the position it had reached before the credits,
+    /// and Continue Watching went back to an episode already watched. The
+    /// watched mark is the record that outlives them all.
+    var episodeWatchedAfter: ((WatchProgress) -> Bool)?
     private var suppressChange = false
 
     /// Recently-removed progress keys → removal time. A pull's server snapshot
@@ -457,6 +469,77 @@ final class ProgressStore: ObservableObject {
     /// All entries, for a full push to the account backend.
     func allForSync() -> [WatchProgress] { Array(items.values) }
 
+    /// The key the ACCOUNT stores a row under.
+    ///
+    /// Nuvio Sync names an episode `<metaID>_s<season>e<episode>` — the phone
+    /// app, the Android TV app and the reference tvOS client all key it that
+    /// way — while this store keys a row by the add-on's video id
+    /// (`tt123:2:2`), which is what the player, the details page and the
+    /// tracker merges look rows up by. Pushed, deleted and pulled under the
+    /// local key, the two never met: a pull never returned the `:2:2` row, so
+    /// the reconcile dropped what the player had just saved and kept the
+    /// account's older `_s2e2` copy, and a delete sent as `:2:2` deleted
+    /// nothing, so a finished episode came straight back. A movie (or any row
+    /// without a season and episode) has the same key on both sides.
+    nonisolated static func accountProgressKey(for row: WatchProgress) -> String {
+        guard let season = row.season, let episode = row.episode else { return row.id }
+        return "\(row.metaID)_s\(season)e\(episode)"
+    }
+
+    /// Every key, local and account form, that a row still in the store
+    /// answers to — published rows and periodic in-playback ones alike.
+    func accountKeysHeld() -> Set<String> {
+        var held = Set<String>()
+        for row in items.values {
+            held.insert(row.id)
+            held.insert(Self.accountProgressKey(for: row))
+        }
+        for row in transientOverrides.values {
+            held.insert(row.id)
+            held.insert(Self.accountProgressKey(for: row))
+        }
+        return held
+    }
+
+    /// What to delete on the ACCOUNT for rows that have just left this store:
+    /// each row's own key and the account's name for it.
+    ///
+    /// Nothing is sent for an episode that a row still in the store stands
+    /// for — a duplicate collapsed onto its survivor, a key migrated in place.
+    /// The account holds one row per episode, so deleting the retired key's
+    /// account name deleted the SURVIVOR's row: resuming a synced episode from
+    /// Continue Watching did exactly that, and when the viewer left before the
+    /// player saved again, the episode vanished and the card fell back to an
+    /// earlier one. Call after the rows are gone from `items`.
+    private func accountDeleteKeys(for removed: [WatchProgress]) -> [String] {
+        let held = accountKeysHeld()
+        var keys: [String] = []
+        for row in removed {
+            let accountKey = Self.accountProgressKey(for: row)
+            guard !held.contains(accountKey) else { continue }
+            for key in [row.id, accountKey] where !keys.contains(key) {
+                keys.append(key)
+            }
+        }
+        return keys
+    }
+
+    /// The same row under another key. `WatchProgress.id` is a `let`, so a
+    /// key change means rebuilding it, every field carried.
+    private static func rekeyed(_ row: WatchProgress, to id: String) -> WatchProgress {
+        WatchProgress(
+            id: id, metaID: row.metaID, type: row.type, name: row.name,
+            poster: row.poster, background: row.background, logo: row.logo,
+            season: row.season, episode: row.episode, episodeTitle: row.episodeTitle,
+            episodeThumbnail: row.episodeThumbnail,
+            positionSeconds: row.positionSeconds, durationSeconds: row.durationSeconds,
+            streamURL: row.streamURL, streamSignature: row.streamSignature,
+            updatedAt: row.updatedAt,
+            syncSource: row.syncSource,
+            newEpisodeCount: row.newEpisodeCount
+        )
+    }
+
     /// Sources whose rows are real, syncable Continue Watching — as opposed to
     /// a device-local scratch row. A row whose source is NOT in this set is
     /// dropped by `removeLocalOnlyProgress`, never uploaded to the account,
@@ -691,6 +774,24 @@ final class ProgressStore: ObservableObject {
         awaitingServerAck.subtract(remoteIDs)
         pruneTombstones()
 
+        // A local row for the same EPISODE under another key is the same row,
+        // not a second one. Rows pulled before the account keys were translated
+        // sit here under the account's `_sXeY` form, and a tracker or another
+        // client can key an episode its own way. Matched by key alone, the
+        // pulled row landed beside them without their title, still or stream
+        // signature, and the leftover was dropped as absent from the server.
+        // Newest row per episode, ties broken on the key.
+        var localByEpisode: [String: WatchProgress] = [:]
+        for row in items.values where row.season != nil && row.episode != nil {
+            let identity = Self.identity(of: row)
+            if let held = localByEpisode[identity],
+               (held.updatedAt, held.id) >= (row.updatedAt, row.id) { continue }
+            localByEpisode[identity] = row
+        }
+        // Local rows folded into a pulled row under another key. They must not
+        // also survive beside it through the keep rules below.
+        var mergedLocalIDs = Set<String>()
+
         var next: [String: WatchProgress] = [:]
         for entry in sanitizedRemote {
             // A show the user removed stays removed until it is watched again
@@ -709,28 +810,47 @@ final class ProgressStore: ObservableObject {
                     continue
                 }
             }
-            guard let local = items[entry.id] else {
-                next[entry.id] = entry
+            // The row CURRENTLY PLAYING: its live position rides
+            // `transientOverrides`, and the pulled row is the echo of what this
+            // device pushed moments ago. Adopting it republished Home behind the
+            // player at every pull — the rule `mergeRemote` already follows.
+            // Only for a row `items` already holds: one it lacks is adopted as
+            // before, or a session that ended without publishing (an exit in
+            // the middle of a source switch) stayed off the row until relaunch.
+            if let local = items[entry.id], let transient = transientOverrides[entry.id],
+               transient.updatedAt >= entry.updatedAt {
+                next[entry.id] = local
                 continue
             }
-            // Newest side wins, same comparison `mergeRemote` uses. This path
-            // was remote-always-wins: it adopted the server's position AND its
-            // timestamp unconditionally, so with any clock skew (or a snapshot
-            // captured before our push landed) an OLDER remote row overwrote a
-            // newer local resume point and playback jumped backwards.
-            if local.updatedAt >= entry.updatedAt {
-                next[entry.id] = local
-            } else {
-                next[entry.id] = coalesced(remote: entry, local: local)
+            let local = items[entry.id]
+                ?? (entry.season != nil && entry.episode != nil
+                    ? localByEpisode[Self.identity(of: entry)] : nil)
+            var merged = entry
+            if let local {
+                if local.id != entry.id { mergedLocalIDs.insert(local.id) }
+                // Newest side wins, same comparison `mergeRemote` uses. This path
+                // was remote-always-wins: it adopted the server's position AND its
+                // timestamp unconditionally, so with any clock skew (or a snapshot
+                // captured before our push landed) an OLDER remote row overwrote a
+                // newer local resume point and playback jumped backwards.
+                if local.updatedAt >= entry.updatedAt {
+                    merged = local.id == entry.id ? local : Self.rekeyed(local, to: entry.id)
+                } else {
+                    merged = coalesced(remote: entry, local: local)
+                }
             }
+            // The episode was finished after this row was last written: a stale
+            // copy the account still holds (see `episodeWatchedAfter`).
+            if episodeWatchedAfter?(merged) == true { continue }
+            next[entry.id] = merged
         }
-        for id in awaitingServerAck {
+        for id in awaitingServerAck where !mergedLocalIDs.contains(id) {
             if let local = items[id], Self.sanitized(local) != nil {
                 next[id] = local
             }
         }
         if preserveLocalAdditions {
-            for (id, local) in items where next[id] == nil {
+            for (id, local) in items where next[id] == nil && !mergedLocalIDs.contains(id) {
                 guard Self.sanitized(local) != nil,
                       let source = local.syncSource,
                       Self.serviceSyncSources.contains(source) else { continue }
@@ -743,7 +863,7 @@ final class ProgressStore: ObservableObject {
         // title just watched from Continue Watching until the tombstone
         // expired, three minutes later.
         let graceCutoff = Date().addingTimeInterval(-Self.deletionGrace)
-        for (id, local) in items where next[id] == nil {
+        for (id, local) in items where next[id] == nil && !mergedLocalIDs.contains(id) {
             guard local.updatedAt >= graceCutoff, Self.sanitized(local) != nil else { continue }
             next[id] = local
         }
@@ -863,8 +983,9 @@ final class ProgressStore: ObservableObject {
         }
         guard !losers.isEmpty else { return [] }
         let now = Date()
+        var loserRows: [WatchProgress] = []
         for key in losers {
-            items.removeValue(forKey: key)
+            if let row = items.removeValue(forKey: key) { loserRows.append(row) }
             // The losing key may be the one currently playing, whose periodic
             // row lives only in `transientOverrides`. Left behind, `save()`
             // folds it straight back onto disk and the push re-uploads it right
@@ -876,8 +997,12 @@ final class ProgressStore: ObservableObject {
         save()
         if !suppressChange {
             // Delete the dropped keys from the account as well, or the next
-            // pull hands the duplicate straight back.
-            onRemove?(losers)
+            // pull hands the duplicate straight back — except where the account
+            // row IS the survivor's, which is every same-episode pair: the
+            // account holds one row per episode, and deleting it there took the
+            // episode off the account until the next push restored it.
+            let accountKeys = accountDeleteKeys(for: loserRows)
+            if !accountKeys.isEmpty { onRemove?(accountKeys) }
             onLocalUpdate?()
         }
         return losers
@@ -893,6 +1018,10 @@ final class ProgressStore: ObservableObject {
             // removed show straight back; the removal record is what makes
             // "Remove from Continue Watching" stick against them.
             if isBlockedByRemoval(entry) { continue }
+            // A playback row or resume state written before the episode was
+            // finished: Trakt keeps the row when the stop scrobble never
+            // reached it, Stremio keeps its state until something replaces it.
+            if episodeWatchedAfter?(entry) == true { continue }
             let key = mergeKey(for: entry, index: index)
             if let local = items[key] {
                 // Only advance position if external is further and MEANINGFULLY
@@ -1016,15 +1145,41 @@ final class ProgressStore: ObservableObject {
         // straight through left the dismissal in place for good and Next Up
         // never offered that show again.
         clearNextUpDismissal(metaID: meta.id)
-        let removed = items.removeValue(forKey: key) != nil
-        // Retire the periodic row too. Without this, `save()` folds it back
-        // into the snapshot and the finished title returns to Continue
-        // Watching on the next launch — and `serviceBackedForSync()` pushes it
-        // back to the account right after `onRemove` asked for a delete.
-        transientOverrides.removeValue(forKey: key)
-        if removed { tombstones[key] = Date() }
+        // Every row that IS this episode, not only the one under the player's
+        // key: a copy under another key (the account's `_sXeY`, a tracker's)
+        // kept the finished episode on the row at its old position.
+        //
+        // And a row that exists only as a periodic save counts as removed. An
+        // episode played straight through to the Up Next card is never
+        // published to `items`, so this used to find nothing to remove — no
+        // tombstone, no account delete — while the periodic pushes had already
+        // put its credits-time position on the account, and the next pull
+        // brought the finished episode back.
+        var finished: [String: WatchProgress] = [:]
+        if let row = items[key] ?? transientOverrides[key] { finished[key] = row }
+        if let season = video?.season, let episode = video?.episode {
+            for (rowKey, row) in items
+            where row.metaID == meta.id && row.season == season && row.episode == episode {
+                finished[rowKey] = row
+            }
+            for (rowKey, row) in transientOverrides
+            where finished[rowKey] == nil
+                && row.metaID == meta.id && row.season == season && row.episode == episode {
+                finished[rowKey] = row
+            }
+        }
+        let finishedAt = Date()
+        for rowKey in finished.keys {
+            items.removeValue(forKey: rowKey)
+            // Retire the periodic row too. Without this, `save()` folds it back
+            // into the snapshot and the finished title returns to Continue
+            // Watching on the next launch — and `serviceBackedForSync()` pushes it
+            // back to the account right after `onRemove` asked for a delete.
+            transientOverrides.removeValue(forKey: rowKey)
+            tombstones[rowKey] = finishedAt
+        }
         if !suppressChange {
-            if removed { onRemove?([key]) }
+            if !finished.isEmpty { onRemove?(accountDeleteKeys(for: Array(finished.values))) }
             onFinished?(meta, video)
         }
         if shouldSave {
@@ -1136,7 +1291,7 @@ final class ProgressStore: ObservableObject {
     }
 
     func remove(id: String) {
-        guard items.removeValue(forKey: id) != nil else { return }
+        guard let row = items.removeValue(forKey: id) else { return }
         transientOverrides.removeValue(forKey: id)
         tombstones[id] = Date()
         // Deliberately NO show-level removal record here: this path's callers
@@ -1145,14 +1300,17 @@ final class ProgressStore: ObservableObject {
         // Watching" goes through `removeShow`, which does record.
         save()
         if !suppressChange {
-            onRemove?([id])
+            onRemove?(accountDeleteKeys(for: [row]))
             onLocalUpdate?()
         }
     }
 
+    /// - Returns: the keys to delete on the account for everything cleared (see
+    ///   `accountDeleteKeys`).
     @discardableResult
     func clearAllProgress(notify: Bool = true, tombstone: Bool = true) -> [String] {
         let removedKeys = Array(items.keys)
+        let removedRows = Array(items.values)
         // The Next Up dismissals are this profile's state too, and on an account
         // switch they would keep suppressing shows for a user who never removed
         // them. Cleared even when there are no rows to remove.
@@ -1190,11 +1348,12 @@ final class ProgressStore: ObservableObject {
         // directly: a save queued moments ago would otherwise land AFTER this
         // and restore the cleared history.
         persist([:], shelf: [])
+        let accountKeys = accountDeleteKeys(for: removedRows)
         if notify && !suppressChange {
-            onRemove?(removedKeys)
+            onRemove?(accountKeys)
             onLocalUpdate?()
         }
-        return removedKeys
+        return accountKeys
     }
 
     /// Rewrite a progress entry's identifiers to their canonical IMDb (`tt`)
@@ -1208,23 +1367,35 @@ final class ProgressStore: ObservableObject {
         transientOverrides.removeValue(forKey: oldID)
         tombstones[oldID] = Date()   // stale key is deleted server-side too
         tombstones.removeValue(forKey: newID)   // the canonical key is being (re)created
-        // Carry episodeThumbnail and newEpisodeCount too: rebuilding without them
-        // made a tmdb:→tt: migrated card drop back to the show poster (and lose
-        // its "new episode" pip) the moment the key was canonicalized.
-        items[newID] = WatchProgress(
-            id: newID, metaID: newMetaID, type: existing.type, name: existing.name,
-            poster: existing.poster, background: existing.background, logo: existing.logo,
-            season: existing.season, episode: existing.episode, episodeTitle: existing.episodeTitle,
-            episodeThumbnail: existing.episodeThumbnail,
-            positionSeconds: existing.positionSeconds, durationSeconds: existing.durationSeconds,
-            streamURL: existing.streamURL, streamSignature: existing.streamSignature,
-            updatedAt: existing.updatedAt,
-            syncSource: existing.syncSource,
-            newEpisodeCount: existing.newEpisodeCount
-        )
+        // A row already under the canonical key that is NEWER is the better
+        // copy — the migration must not roll it back to this older one.
+        let canonicalIsNewer = items[newID].map { $0.updatedAt > existing.updatedAt } ?? false
+        if !canonicalIsNewer {
+            // Carry episodeThumbnail and newEpisodeCount too: rebuilding without them
+            // made a tmdb:→tt: migrated card drop back to the show poster (and lose
+            // its "new episode" pip) the moment the key was canonicalized.
+            items[newID] = WatchProgress(
+                id: newID, metaID: newMetaID, type: existing.type, name: existing.name,
+                poster: existing.poster, background: existing.background, logo: existing.logo,
+                season: existing.season, episode: existing.episode, episodeTitle: existing.episodeTitle,
+                episodeThumbnail: existing.episodeThumbnail,
+                positionSeconds: existing.positionSeconds, durationSeconds: existing.durationSeconds,
+                streamURL: existing.streamURL, streamSignature: existing.streamSignature,
+                updatedAt: existing.updatedAt,
+                syncSource: existing.syncSource,
+                newEpisodeCount: existing.newEpisodeCount
+            )
+        }
         save()
         if !suppressChange {
-            onRemove?([oldID])   // delete the stale tmdb: key server-side
+            // Delete the stale tmdb: key server-side. Nothing is deleted when the
+            // account names both keys' row the same (`_s2e2` → `tt…:2:2`): that
+            // row IS the canonical entry, and deleting it on the way into the
+            // player took the episode off the account — so leaving before the
+            // player saved again dropped it and the card fell back to an
+            // earlier episode.
+            let accountKeys = accountDeleteKeys(for: [existing])
+            if !accountKeys.isEmpty { onRemove?(accountKeys) }
             onLocalUpdate?()     // push the canonical entry
         }
     }
@@ -1249,7 +1420,8 @@ final class ProgressStore: ObservableObject {
             // source can hand the show back until it is watched again.
             recordRemoval(metaID: metaID)
         }
-        let removedKeys = items.values.filter { $0.metaID == metaID }.map(\.id)
+        let removedRows = items.values.filter { $0.metaID == metaID }
+        let removedKeys = removedRows.map(\.id)
         guard !removedKeys.isEmpty else {
             if !suppressChange {
                 onRemove?([metaID])
@@ -1267,7 +1439,7 @@ final class ProgressStore: ObservableObject {
         }
         save()
         if !suppressChange {
-            onRemove?(removedKeys)
+            onRemove?(accountDeleteKeys(for: removedRows))
             if notifyTrakt { for hook in onTrackerProgressRemove { hook(metaID) } }
             onStremioClearProgress?(metaID)
             onLocalUpdate?()

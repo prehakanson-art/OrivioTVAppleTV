@@ -39,6 +39,13 @@ enum OrivioSyncDiagnostics {
     private static let maxEntries = 80
 
     static func record(_ level: OrivioSyncLogEntry.Level, area: String, _ message: String) {
+        // Mirror into the live probe. Every sync milestone the app already
+        // records for the Settings log passes through here — 37 call sites
+        // across Orivio, Trakt, SIMKL and Stremio — so one line puts all of
+        // them on the same clock as the browsing and playback around them,
+        // with nothing to keep in step later.
+        AppProbe.sync("\(area): \(message)")
+        if level == .failure { AppProbe.warn("sync", "\(area): \(message)") }
         var current = entries()
         current.insert(OrivioSyncLogEntry(level: level, area: area, message: message), at: 0)
         if current.count > maxEntries { current.removeLast(current.count - maxEntries) }

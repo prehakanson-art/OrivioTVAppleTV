@@ -28,6 +28,95 @@ enum HomeLayout: String, CaseIterable, Identifiable, Codable {
     }
 }
 
+// MARK: - Hero layout
+
+/// How the Home hero behaves. Replaces the old "Pin hero to the top" switch,
+/// which could only express two of these three.
+enum HeroLayout: String, CaseIterable, Identifiable, Codable {
+    /// A banner at the top of the scroll that cycles the top titles on a
+    /// timer. Browsing never changes it — and it never changes where you are.
+    case rolling
+    /// A fixed header that always shows whatever card holds focus. Never
+    /// rotates; browsing IS what drives it.
+    case pinnedFocus
+    /// Rolls at the top of the page, then hands over: the moment a content
+    /// card takes focus the rolling stops and the hero follows the browse for
+    /// the rest of the visit.
+    case hybrid
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .rolling:     return "Rolling Hero"
+        case .pinnedFocus: return "Pinned Focus"
+        case .hybrid:      return "Hybrid"
+        }
+    }
+
+    var summary: String {
+        switch self {
+        case .rolling:
+            return "A banner that cycles the top titles on its own. Browsing doesn't change it."
+        case .pinnedFocus:
+            return "A fixed header showing whichever card you're on. Never cycles."
+        case .hybrid:
+            return "Cycles at the top, then follows what you're browsing once you move down into the rows."
+        }
+    }
+
+    /// Lenient on purpose. `Persisted` uses synthesized `Codable`, so a raw
+    /// value this build doesn't know (a case added by a LATER build, arriving
+    /// through account sync) would throw out of the whole settings blob and
+    /// reset every unrelated setting with it — see `UnreadableBlobGuard` in
+    /// `load()`. Falling back costs the viewer this ONE preference instead.
+    init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = HeroLayout(rawValue: raw) ?? .hybrid
+    }
+}
+
+
+// MARK: - Navigation position
+
+/// Where the primary navigation sits. The rail is the same component either
+/// way — same items, icons, labels, focus behaviour and glass — turned on its
+/// side; see `GlassSidebar`.
+enum NavigationPosition: String, CaseIterable, Identifiable, Codable {
+    /// The shipped layout: a vertical rail hugging the left edge.
+    case left
+    /// A horizontal bar across the top.
+    case top
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .left: return "Left / Vertical"
+        case .top:  return "Top / Horizontal"
+        }
+    }
+
+    var summary: String {
+        switch self {
+        case .left: return "A vertical rail down the left edge. The default."
+        case .top:  return "A horizontal bar across the top of the screen."
+        }
+    }
+
+    /// True when the rail runs across the top. Reads better than `== .top` at
+    /// the layout call sites.
+    var isHorizontal: Bool { self == .top }
+
+    /// Lenient, for the same reason `HeroLayout` is: a raw value a LATER build
+    /// introduced must not throw out of the whole settings blob and reset every
+    /// unrelated preference with it.
+    init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = NavigationPosition(rawValue: raw) ?? .left
+    }
+}
+
 /// Poster card size — drives the portrait card width everywhere it renders.
 enum PosterSize: String, CaseIterable, Identifiable, Codable {
     case small, medium, large
@@ -76,6 +165,7 @@ struct HomePresentationSnapshot: Codable, Equatable {
     var fullscreenHero = true
     var posterSize: PosterSize = .medium
     var showPosterLabels = true
+    var showPosterBanners = true
     var continueWatchingSortMode: ContinueWatchingSortMode = .recentlyWatched
     var nextUpFromFurthestEpisode = true
     var showUnairedNextUp = true
@@ -87,12 +177,37 @@ struct HomePresentationSnapshot: Codable, Equatable {
     var catalogTypeSuffixEnabled = true
     var showFullReleaseDate = true
     var detailPageTrailerButtonEnabled = true
+    // Which optional sections the details page shows. All default ON, so a
+    // viewer who never opens these settings sees exactly the page they always
+    // did. These are DISPLAY switches — independent of the per-section TMDB
+    // enrichment switches, which decide whether the data is fetched at all.
+    /// Details page: Creator and Cast.
+    var detailShowCast = true
+    /// Details page: the collection ("part of…") row.
+    var detailShowCollection = true
+    /// Details page: More Like This.
+    var detailShowMoreLikeThis = true
+    /// Details page: Production companies.
+    var detailShowProduction = true
+    /// Details page: Trakt comments.
+    var detailShowComments = true
     var showFeaturedBar = true
+    /// Legacy. Superseded by `heroLayout`; kept so an older client's blob
+    /// round-trips, and so the migration below has something to read.
     var pinnedHero = false
+    var heroLayout: HeroLayout = .hybrid
     var autoHideSidebar = false
+    /// Where the navigation rail sits. `.left` is the shipped layout and stays
+    /// the default, so an existing install sees no change.
+    var navigationPosition: NavigationPosition = .left
     var fullStreamTitles = false
     var heroTrailersEnabled = true
     var heroTrailerSound = false
+    /// Which catalog feeds the Home hero, as a `catalogKey`. Empty means
+    /// AUTOMATIC — the first row in Home's order, which is what the hero has
+    /// always used and stays the default, so nothing moves for anyone who
+    /// never opens this setting.
+    var heroCatalogKey = ""
 }
 
 /// Tolerant decoding (in an extension so the memberwise init survives): a blob
@@ -107,6 +222,7 @@ extension HomePresentationSnapshot {
         fullscreenHero = (try? c.decode(Bool.self, forKey: .fullscreenHero)) ?? d.fullscreenHero
         posterSize = (try? c.decode(PosterSize.self, forKey: .posterSize)) ?? d.posterSize
         showPosterLabels = (try? c.decode(Bool.self, forKey: .showPosterLabels)) ?? d.showPosterLabels
+        showPosterBanners = (try? c.decode(Bool.self, forKey: .showPosterBanners)) ?? d.showPosterBanners
         continueWatchingSortMode = (try? c.decode(ContinueWatchingSortMode.self, forKey: .continueWatchingSortMode)) ?? d.continueWatchingSortMode
         nextUpFromFurthestEpisode = (try? c.decode(Bool.self, forKey: .nextUpFromFurthestEpisode)) ?? d.nextUpFromFurthestEpisode
         showUnairedNextUp = (try? c.decode(Bool.self, forKey: .showUnairedNextUp)) ?? d.showUnairedNextUp
@@ -118,12 +234,28 @@ extension HomePresentationSnapshot {
         catalogTypeSuffixEnabled = (try? c.decode(Bool.self, forKey: .catalogTypeSuffixEnabled)) ?? d.catalogTypeSuffixEnabled
         showFullReleaseDate = (try? c.decode(Bool.self, forKey: .showFullReleaseDate)) ?? d.showFullReleaseDate
         detailPageTrailerButtonEnabled = (try? c.decode(Bool.self, forKey: .detailPageTrailerButtonEnabled)) ?? d.detailPageTrailerButtonEnabled
+        detailShowCast = (try? c.decode(Bool.self, forKey: .detailShowCast)) ?? d.detailShowCast
+        detailShowCollection = (try? c.decode(Bool.self, forKey: .detailShowCollection)) ?? d.detailShowCollection
+        detailShowMoreLikeThis = (try? c.decode(Bool.self, forKey: .detailShowMoreLikeThis)) ?? d.detailShowMoreLikeThis
+        detailShowProduction = (try? c.decode(Bool.self, forKey: .detailShowProduction)) ?? d.detailShowProduction
+        detailShowComments = (try? c.decode(Bool.self, forKey: .detailShowComments)) ?? d.detailShowComments
         showFeaturedBar = (try? c.decode(Bool.self, forKey: .showFeaturedBar)) ?? d.showFeaturedBar
         pinnedHero = (try? c.decode(Bool.self, forKey: .pinnedHero)) ?? d.pinnedHero
+        // MIGRATION: a blob written before Hero Layout existed carries only the
+        // boolean. Decoded AFTER `pinnedHero` so the fallback can read it.
+        //
+        // `true` was an explicit choice — someone reached into Settings and
+        // turned that switch on — so it is honoured as `.pinnedFocus`. `false`
+        // was only ever the absence of a choice, so it takes today's default
+        // rather than being frozen as `.rolling` forever.
+        heroLayout = (try? c.decode(HeroLayout.self, forKey: .heroLayout))
+            ?? (pinnedHero ? .pinnedFocus : .hybrid)
         autoHideSidebar = (try? c.decode(Bool.self, forKey: .autoHideSidebar)) ?? d.autoHideSidebar
+        navigationPosition = (try? c.decode(NavigationPosition.self, forKey: .navigationPosition)) ?? d.navigationPosition
         fullStreamTitles = (try? c.decode(Bool.self, forKey: .fullStreamTitles)) ?? d.fullStreamTitles
         heroTrailersEnabled = (try? c.decode(Bool.self, forKey: .heroTrailersEnabled)) ?? d.heroTrailersEnabled
         heroTrailerSound = (try? c.decode(Bool.self, forKey: .heroTrailerSound)) ?? d.heroTrailerSound
+        heroCatalogKey = (try? c.decode(String.self, forKey: .heroCatalogKey)) ?? d.heroCatalogKey
     }
 }
 
@@ -213,6 +345,19 @@ final class HomeCatalogSettingsStore: ObservableObject {
     @Published var showPosterLabels: Bool = true {
         didSet { guard showPosterLabels != oldValue else { return }; save(); notifyPresentationChange() }
     }
+    /// Keep the tags some add-ons print into their poster artwork ("In
+    /// Cinema", "#2 Today"). Off swaps in the plain poster the add-on sends
+    /// alongside (`MetaItem.withPlainPoster()`) as catalogs and details are
+    /// fetched. Written to `PosterBannerPreference` on EVERY assignment, ahead
+    /// of the no-change guard: the fetch path can't read this main-actor store,
+    /// and a profile switch or a sync pull has to reach it too.
+    @Published var showPosterBanners: Bool = true {
+        didSet {
+            PosterBannerPreference.showBanners = showPosterBanners
+            guard showPosterBanners != oldValue else { return }
+            save(); notifyPresentationChange()
+        }
+    }
     /// The inline "Featured" hero bar between Continue Watching and the
     /// catalog rows. Off removes it from Home entirely.
     @Published var showFeaturedBar: Bool = true {
@@ -226,11 +371,20 @@ final class HomeCatalogSettingsStore: ObservableObject {
     @Published var pinnedHero: Bool = false {
         didSet { guard pinnedHero != oldValue else { return }; save(); notifyPresentationChange() }
     }
+    /// Settings → Layout → Hero Layout. The single control for how the hero
+    /// behaves; `pinnedHero` above is the retired two-state version of it.
+    @Published var heroLayout: HeroLayout = .hybrid {
+        didSet { guard heroLayout != oldValue else { return }; save(); notifyPresentationChange() }
+    }
     /// Keep the glass rail off screen until it's wanted. It reappears on a
     /// sideways press from the leftmost content (and on Menu), so the rows run
     /// the full width of the screen the rest of the time.
     @Published var autoHideSidebar: Bool = false {
         didSet { guard autoHideSidebar != oldValue else { return }; save(); notifyPresentationChange() }
+    }
+    /// Settings → Layout → Navigation Position.
+    @Published var navigationPosition: NavigationPosition = .left {
+        didSet { guard navigationPosition != oldValue else { return }; save(); notifyPresentationChange() }
     }
     /// Sources page: let every link's release name wrap in full instead of
     /// truncating — the whole point of a remux hunt is reading the whole name.
@@ -244,6 +398,14 @@ final class HomeCatalogSettingsStore: ObservableObject {
     /// Play that preview with sound instead of muted.
     @Published var heroTrailerSound: Bool = false {
         didSet { guard heroTrailerSound != oldValue else { return }; save(); notifyPresentationChange() }
+    }
+    /// Settings → Layout → Hero source: the `catalogKey` whose row feeds the
+    /// hero. Empty = the first row in Home's order, which is what it always
+    /// was. A key naming a row that is hidden (or ranked past Home's row cap)
+    /// resolves back to that same first row rather than leaving a blank hero
+    /// — see `HomeViewModel.heroCatalogRow`.
+    @Published var heroCatalogKey: String = "" {
+        didSet { guard heroCatalogKey != oldValue else { return }; save(); notifyPresentationChange() }
     }
     /// Continue Watching row ordering.
     @Published var continueWatchingSortMode: ContinueWatchingSortMode = .recentlyWatched {
@@ -298,6 +460,26 @@ final class HomeCatalogSettingsStore: ObservableObject {
     /// Show the Trailer button on the details page.
     @Published var detailPageTrailerButtonEnabled: Bool = true {
         didSet { guard detailPageTrailerButtonEnabled != oldValue else { return }; save(); notifyPresentationChange() }
+    }
+    /// Settings → Layout → Details Page: show Creator and Cast.
+    @Published var detailShowCast: Bool = true {
+        didSet { guard detailShowCast != oldValue else { return }; save(); notifyPresentationChange() }
+    }
+    /// Settings → Layout → Details Page: show the collection ("part of…") row.
+    @Published var detailShowCollection: Bool = true {
+        didSet { guard detailShowCollection != oldValue else { return }; save(); notifyPresentationChange() }
+    }
+    /// Settings → Layout → Details Page: show More Like This.
+    @Published var detailShowMoreLikeThis: Bool = true {
+        didSet { guard detailShowMoreLikeThis != oldValue else { return }; save(); notifyPresentationChange() }
+    }
+    /// Settings → Layout → Details Page: show Production companies.
+    @Published var detailShowProduction: Bool = true {
+        didSet { guard detailShowProduction != oldValue else { return }; save(); notifyPresentationChange() }
+    }
+    /// Settings → Layout → Details Page: show Trakt comments.
+    @Published var detailShowComments: Bool = true {
+        didSet { guard detailShowComments != oldValue else { return }; save(); notifyPresentationChange() }
     }
 
     /// Selectable poster corner radii (points).
@@ -446,9 +628,24 @@ final class HomeCatalogSettingsStore: ObservableObject {
         let target = up ? idx - 1 : idx + 1
         guard units.indices.contains(target) else { return }
         units.swapAt(idx, target)
+        // The collections' own relative order has to come from the order being
+        // EDITED, not from `collectionKeys` — that argument is the store's
+        // array order (whatever sequence the collections happened to load in),
+        // and re-emitting it here overwrote an arrangement made elsewhere.
+        // Moving any row on this screen therefore re-sorted every collection,
+        // and the push that followed sent that re-sort back to the account, so
+        // an order set up on the phone was lost by touching the TV's list at
+        // all. A block move should move the block and nothing else.
+        let collectionKeySet = Set(collectionKeys)
+        var orderedCollectionKeys = order.filter { collectionKeySet.contains($0) }
+        // `mergedOrder` already contains every available collection key, so
+        // this is normally empty — it is here so a key that somehow isn't in
+        // `order` is appended rather than dropped from the layout entirely.
+        let placed = Set(orderedCollectionKeys)
+        orderedCollectionKeys += collectionKeys.filter { !placed.contains($0) }
         var result: [String] = []
         for u in units {
-            if u == Self.collectionsUnit { result.append(contentsOf: collectionKeys) }
+            if u == Self.collectionsUnit { result.append(contentsOf: orderedCollectionKeys) }
             else { result.append(u) }
         }
         setOrder(result)
@@ -564,6 +761,7 @@ final class HomeCatalogSettingsStore: ObservableObject {
         var fullscreenHero: Bool?
         var posterSize: PosterSize?
         var showPosterLabels: Bool?
+        var showPosterBanners: Bool?
         var continueWatchingSortMode: ContinueWatchingSortMode?
         var nextUpFromFurthestEpisode: Bool?
         var showUnairedNextUp: Bool?
@@ -575,12 +773,20 @@ final class HomeCatalogSettingsStore: ObservableObject {
         var catalogTypeSuffixEnabled: Bool?
         var showFullReleaseDate: Bool?
         var detailPageTrailerButtonEnabled: Bool?
+        var detailShowCast: Bool?
+        var detailShowCollection: Bool?
+        var detailShowMoreLikeThis: Bool?
+        var detailShowProduction: Bool?
+        var detailShowComments: Bool?
         var showFeaturedBar: Bool?
         var pinnedHero: Bool?
+        var heroLayout: HeroLayout?
         var autoHideSidebar: Bool?
+        var navigationPosition: NavigationPosition?
         var fullStreamTitles: Bool?
         var heroTrailersEnabled: Bool?
         var heroTrailerSound: Bool?
+        var heroCatalogKey: String?
     }
 
     private func notifyLocalChange() {
@@ -601,6 +807,7 @@ final class HomeCatalogSettingsStore: ObservableObject {
             fullscreenHero: fullscreenHero,
             posterSize: posterSize,
             showPosterLabels: showPosterLabels,
+            showPosterBanners: showPosterBanners,
             continueWatchingSortMode: continueWatchingSortMode,
             nextUpFromFurthestEpisode: nextUpFromFurthestEpisode,
             showUnairedNextUp: showUnairedNextUp,
@@ -612,12 +819,20 @@ final class HomeCatalogSettingsStore: ObservableObject {
             catalogTypeSuffixEnabled: catalogTypeSuffixEnabled,
             showFullReleaseDate: showFullReleaseDate,
             detailPageTrailerButtonEnabled: detailPageTrailerButtonEnabled,
+            detailShowCast: detailShowCast,
+            detailShowCollection: detailShowCollection,
+            detailShowMoreLikeThis: detailShowMoreLikeThis,
+            detailShowProduction: detailShowProduction,
+            detailShowComments: detailShowComments,
             showFeaturedBar: showFeaturedBar,
             pinnedHero: pinnedHero,
+            heroLayout: heroLayout,
             autoHideSidebar: autoHideSidebar,
+            navigationPosition: navigationPosition,
             fullStreamTitles: fullStreamTitles,
             heroTrailersEnabled: heroTrailersEnabled,
-            heroTrailerSound: heroTrailerSound
+            heroTrailerSound: heroTrailerSound,
+            heroCatalogKey: heroCatalogKey
         )
     }
 
@@ -631,6 +846,7 @@ final class HomeCatalogSettingsStore: ObservableObject {
         fullscreenHero = d.fullscreenHero
         posterSize = d.posterSize
         showPosterLabels = d.showPosterLabels
+        showPosterBanners = d.showPosterBanners
         continueWatchingSortMode = d.continueWatchingSortMode
         nextUpFromFurthestEpisode = d.nextUpFromFurthestEpisode
         showUnairedNextUp = d.showUnairedNextUp
@@ -642,12 +858,20 @@ final class HomeCatalogSettingsStore: ObservableObject {
         catalogTypeSuffixEnabled = d.catalogTypeSuffixEnabled
         showFullReleaseDate = d.showFullReleaseDate
         detailPageTrailerButtonEnabled = d.detailPageTrailerButtonEnabled
+        detailShowCast = d.detailShowCast
+        detailShowCollection = d.detailShowCollection
+        detailShowMoreLikeThis = d.detailShowMoreLikeThis
+        detailShowProduction = d.detailShowProduction
+        detailShowComments = d.detailShowComments
         showFeaturedBar = d.showFeaturedBar
         pinnedHero = d.pinnedHero
+        heroLayout = d.heroLayout
         autoHideSidebar = d.autoHideSidebar
+        navigationPosition = d.navigationPosition
         fullStreamTitles = d.fullStreamTitles
         heroTrailersEnabled = d.heroTrailersEnabled
         heroTrailerSound = d.heroTrailerSound
+        heroCatalogKey = d.heroCatalogKey
     }
 
     /// Apply presentation prefs pulled from the account without echoing back up.
@@ -659,6 +883,7 @@ final class HomeCatalogSettingsStore: ObservableObject {
         fullscreenHero = s.fullscreenHero
         posterSize = s.posterSize
         showPosterLabels = s.showPosterLabels
+        showPosterBanners = s.showPosterBanners
         continueWatchingSortMode = s.continueWatchingSortMode
         nextUpFromFurthestEpisode = s.nextUpFromFurthestEpisode
         showUnairedNextUp = s.showUnairedNextUp
@@ -670,12 +895,20 @@ final class HomeCatalogSettingsStore: ObservableObject {
         catalogTypeSuffixEnabled = s.catalogTypeSuffixEnabled
         showFullReleaseDate = s.showFullReleaseDate
         detailPageTrailerButtonEnabled = s.detailPageTrailerButtonEnabled
+        detailShowCast = s.detailShowCast
+        detailShowCollection = s.detailShowCollection
+        detailShowMoreLikeThis = s.detailShowMoreLikeThis
+        detailShowProduction = s.detailShowProduction
+        detailShowComments = s.detailShowComments
         showFeaturedBar = s.showFeaturedBar
         pinnedHero = s.pinnedHero
+        heroLayout = s.heroLayout
         autoHideSidebar = s.autoHideSidebar
+        navigationPosition = s.navigationPosition
         fullStreamTitles = s.fullStreamTitles
         heroTrailersEnabled = s.heroTrailersEnabled
         heroTrailerSound = s.heroTrailerSound
+        heroCatalogKey = s.heroCatalogKey
         suppressChange = false
         save()
     }
@@ -715,6 +948,7 @@ final class HomeCatalogSettingsStore: ObservableObject {
         fullscreenHero = decoded.fullscreenHero ?? true
         posterSize = decoded.posterSize ?? .medium
         showPosterLabels = decoded.showPosterLabels ?? true
+        showPosterBanners = decoded.showPosterBanners ?? true
         continueWatchingSortMode = decoded.continueWatchingSortMode ?? .recentlyWatched
         nextUpFromFurthestEpisode = decoded.nextUpFromFurthestEpisode ?? true
         showUnairedNextUp = decoded.showUnairedNextUp ?? true
@@ -726,12 +960,22 @@ final class HomeCatalogSettingsStore: ObservableObject {
         catalogTypeSuffixEnabled = decoded.catalogTypeSuffixEnabled ?? true
         showFullReleaseDate = decoded.showFullReleaseDate ?? true
         detailPageTrailerButtonEnabled = decoded.detailPageTrailerButtonEnabled ?? true
+        detailShowCast = decoded.detailShowCast ?? true
+        detailShowCollection = decoded.detailShowCollection ?? true
+        detailShowMoreLikeThis = decoded.detailShowMoreLikeThis ?? true
+        detailShowProduction = decoded.detailShowProduction ?? true
+        detailShowComments = decoded.detailShowComments ?? true
         showFeaturedBar = decoded.showFeaturedBar ?? true
         pinnedHero = decoded.pinnedHero ?? false
+        // Same migration as the snapshot: a blob from an older build of this
+        // app has only the boolean.
+        heroLayout = decoded.heroLayout ?? (pinnedHero ? .pinnedFocus : .hybrid)
         autoHideSidebar = decoded.autoHideSidebar ?? false
+        navigationPosition = decoded.navigationPosition ?? .left
         fullStreamTitles = decoded.fullStreamTitles ?? false
         heroTrailersEnabled = decoded.heroTrailersEnabled ?? true
         heroTrailerSound = decoded.heroTrailerSound ?? false
+        heroCatalogKey = decoded.heroCatalogKey ?? ""
         suppressChange = false
     }
 
@@ -753,6 +997,7 @@ final class HomeCatalogSettingsStore: ObservableObject {
             fullscreenHero: fullscreenHero,
             posterSize: posterSize,
             showPosterLabels: showPosterLabels,
+            showPosterBanners: showPosterBanners,
             continueWatchingSortMode: continueWatchingSortMode,
             nextUpFromFurthestEpisode: nextUpFromFurthestEpisode,
             showUnairedNextUp: showUnairedNextUp,
@@ -764,12 +1009,20 @@ final class HomeCatalogSettingsStore: ObservableObject {
             catalogTypeSuffixEnabled: catalogTypeSuffixEnabled,
             showFullReleaseDate: showFullReleaseDate,
             detailPageTrailerButtonEnabled: detailPageTrailerButtonEnabled,
+            detailShowCast: detailShowCast,
+            detailShowCollection: detailShowCollection,
+            detailShowMoreLikeThis: detailShowMoreLikeThis,
+            detailShowProduction: detailShowProduction,
+            detailShowComments: detailShowComments,
             showFeaturedBar: showFeaturedBar,
             pinnedHero: pinnedHero,
+            heroLayout: heroLayout,
             autoHideSidebar: autoHideSidebar,
+            navigationPosition: navigationPosition,
             fullStreamTitles: fullStreamTitles,
             heroTrailersEnabled: heroTrailersEnabled,
-            heroTrailerSound: heroTrailerSound
+            heroTrailerSound: heroTrailerSound,
+            heroCatalogKey: heroCatalogKey
         )
         guard let data = try? JSONEncoder().encode(persisted) else { return }
         UserDefaults.standard.set(data, forKey: storageKey)

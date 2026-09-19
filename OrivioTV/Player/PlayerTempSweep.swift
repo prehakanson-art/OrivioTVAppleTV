@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import SwiftUI
 import UIKit
 
 /// Reclaims the player's scratch space in `tmp/` at launch.
@@ -391,6 +392,14 @@ final class ColorProbeServer {
                                      .removingPercentEncoding ?? String($0) } ?? "mark"
                         PlayerProbe.event("MARK", "──────── \(note) ────────")
                         Self.sendText(on: connection, "marked: \(note)\n")
+                    // `/cachecheck` runs the cache listener check a new playback
+                    // session would run and reports the listener's state — the
+                    // way to prove, from outside, that a listener killed by a
+                    // suspension is rebuilt rather than handed out dead.
+                    case let p where p.hasPrefix("/cachecheck"):
+                        MediaCacheServer.shared.debugCheckListener { line in
+                            Task { @MainActor in Self.sendText(on: connection, line + "\n") }
+                        }
                     case let p where p.hasPrefix("/health"):
                         Self.sendText(on: connection,
                                       PlayerProbe.healthLines().joined(separator: "\n") + "\n")
@@ -671,5 +680,214 @@ enum FlightRecorder {
         trail.append(text)
         if trail.count > capacity { trail.removeFirst(trail.count - capacity) }
         UserDefaults.standard.set(trail, forKey: key)
+    }
+}
+
+
+// MARK: - App-wide probe
+
+/// Everything the player probe never reached: browsing, focus, data loads,
+/// sync and app lifecycle.
+///
+/// The player has been watchable over `:8123` since 2026-09-08; the rest of
+/// the app had no instrumentation at all, so "it got stuck while I was moving
+/// around" had nothing behind it but a guess. This is the SAME bus — one ring,
+/// one clock, one `/live` tail — with app-shaped verbs, so a browse and the
+/// playback it leads into read as one story instead of two.
+///
+/// Everything here is DEBUG-only by construction: `PlayerProbe.event` compiles
+/// its message away in release, and the counters and notes do the same. The
+/// call sites are therefore free to sit anywhere, including in a `body`.
+///
+/// Lives in this file for the same reason `PlayerProbe` does — `project.yml`
+/// globs sources but the checked-in `.xcodeproj` does not, so a NEW file needs
+/// an xcodegen run. See [[nuviotv-device-debugging]].
+enum AppProbe {
+
+    // MARK: Verbs
+    //
+    // One tag per concern rather than a single "app" tag: the live tail is
+    // read by eye, and `grep -w focus` on a recording is the difference
+    // between finding a focus bug and scrolling past it.
+
+    /// Screens appearing and leaving, tab switches, pushes and pops.
+    nonisolated static func nav(_ line: @autoclosure () -> String) {
+        PlayerProbe.event("nav", line())
+    }
+
+    /// Anything that moves focus or refuses to: the rail, the focus router,
+    /// the enable/disable windows. The app's most-repaired area by far.
+    nonisolated static func focus(_ line: @autoclosure () -> String) {
+        PlayerProbe.event("focus", line())
+    }
+
+    /// Catalogs, collections, add-on manifests, metadata, artwork — what was
+    /// asked for, how long it took, and what came back.
+    nonisolated static func data(_ line: @autoclosure () -> String) {
+        PlayerProbe.event("data", line())
+    }
+
+    /// The account sync and everything it writes.
+    nonisolated static func sync(_ line: @autoclosure () -> String) {
+        PlayerProbe.event("sync", line())
+    }
+
+    /// Launch, foreground, background, memory pressure.
+    nonisolated static func life(_ line: @autoclosure () -> String) {
+        PlayerProbe.event("life", line())
+    }
+
+    /// Something went wrong, whether or not the viewer noticed.
+    ///
+    /// Logged AND counted AND kept as the latest note, because the three
+    /// answer different questions: the event says when, the counter says how
+    /// often (a failure that fires once is a blip; the same one forty times is
+    /// the bug), and the note survives past the end of the ring so a long
+    /// session still reports its last failure.
+    nonisolated static func warn(_ area: String, _ line: @autoclosure () -> String) {
+        #if DEBUG
+        let text = line()
+        PlayerProbe.event("WARN", "\(area): \(text)")
+        PlayerProbe.count("warn.\(area)")
+        PlayerProbe.note("lastWarn", "\(area): \(text)")
+        #endif
+    }
+
+    /// Stopwatch for anything that takes time. Returns the closure that ends
+    /// it; call it with a one-word outcome.
+    ///
+    ///     let done = AppProbe.begin("data", "catalog \(name)")
+    ///     …
+    ///     done("\(items.count) items")
+    ///
+    /// Anything past two seconds also bumps a counter, so "it felt slow" has a
+    /// number behind it without anyone having to have been watching the tail
+    /// at the time.
+    nonisolated static func begin(_ tag: String, _ what: String) -> (String) -> Void {
+        #if DEBUG
+        let started = CACurrentMediaTime()
+        PlayerProbe.event(tag, what + " …")
+        return { outcome in
+            let ms = (CACurrentMediaTime() - started) * 1000
+            PlayerProbe.event(tag, String(format: "%@ — %.0fms · %@", what, ms, outcome))
+            if ms > 2000 { PlayerProbe.count("slow.\(tag)") }
+        }
+        #else
+        return { _ in }
+        #endif
+    }
+
+    /// A URL boiled down to what identifies it in a log: host plus the part of
+    /// the path that says what was asked for, with the token query an add-on
+    /// carries dropped. Full URLs are 200 characters of noise, and several of
+    /// them contain credentials.
+    nonisolated static func requestName(_ urlString: String) -> String {
+        guard let url = URL(string: urlString) else { return urlString }
+        let host = url.host ?? "?"
+        var path = url.path
+        if path.hasSuffix(".json") { path.removeLast(5) }
+        // Add-on paths are `/…config…/resource/type/id`; the resource is what
+        // matters and the config in front of it can be enormous.
+        for resource in ["/catalog/", "/meta/", "/stream/", "/subtitles/"] where path.contains(resource) {
+            if let r = path.range(of: resource) { path = String(path[r.lowerBound...]) }
+            break
+        }
+        if path.count > 80 { path = String(path.prefix(80)) + "…" }
+        return host + path
+    }
+
+    // MARK: The [app] block
+
+    /// What is on screen right now. Fed by `RootView` and `probeScreen`, read
+    /// by the sampler below.
+    ///
+    /// Held here rather than sampled out of `RootView` because a sampler that
+    /// captures a SwiftUI `View` reads whatever that struct's snapshot held,
+    /// and a stale tab number in the one block meant to orient the reader is
+    /// worse than no block.
+    @MainActor static var tab = "—"
+    @MainActor static var screen = "—"
+    @MainActor static var rail = "—"
+    @MainActor static var scene = "active"
+
+    /// Screens currently mounted, innermost last — a pushed Detail over Home
+    /// reads as `Home › Detail`, which is the question "where am I" answered
+    /// without inferring it from a stream of appear/disappear events.
+    @MainActor private static var mounted: [String] = []
+
+    @MainActor static func entered(screen name: String, _ detail: String) {
+        mounted.append(name)
+        screen = name
+        nav("→ \(name)" + (detail.isEmpty ? "" : "  \(detail)") + "   [\(breadcrumb)]")
+    }
+
+    @MainActor static func left(screen name: String, after seconds: TimeInterval) {
+        if let i = mounted.lastIndex(of: name) { mounted.remove(at: i) }
+        screen = mounted.last ?? "—"
+        nav(String(format: "← %@ after %.1fs   [%@]", name, seconds, breadcrumb))
+    }
+
+    @MainActor static var breadcrumb: String {
+        mounted.isEmpty ? "—" : mounted.joined(separator: " › ")
+    }
+
+    /// How deep the push stack is, counted off the mounted screens rather than
+    /// a `NavigationPath` — there are five independent paths, one per tab, and
+    /// keeping five counters in step is a bug waiting to be written.
+    @MainActor static var depth: Int { max(mounted.count - 1, 0) }
+
+    /// Register the `[app]` level block. Called once, from the app's `init`,
+    /// so browsing is observable before anything has been played.
+    @MainActor static func installLevels() {
+        PlayerProbe.register("app") {
+            [
+                "tab=\(tab)  screen=\(screen)  depth=\(depth)  scene=\(scene)",
+                "where=\(breadcrumb)",
+                "rail=\(rail)  lastFocusedRow=\(ContentFocusRouter.shared.lastRowID ?? "—")",
+            ]
+        }
+        // A jetsam on a 3 GB box is preceded by this, and "the app just
+        // closed" is otherwise indistinguishable from a crash after the fact.
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification,
+            object: nil, queue: .main
+        ) { _ in
+            warn("memory", String(format: "memory warning at %.0fMB", PlayerProbe.footprintMB()))
+        }
+        life("probe armed — app block registered")
+    }
+}
+
+/// Logs a screen's appear and disappear, and keeps `[app]`'s "where" current.
+///
+/// A modifier rather than two hand-written `onAppear`/`onDisappear` pairs per
+/// screen: the pair has to agree on the name and on the clock, and thirty
+/// hand-written pairs would not. It adds no layout and no state of its own
+/// beyond the entry timestamp.
+private struct ProbeScreen: ViewModifier {
+    let name: String
+    let detail: () -> String
+    @State private var shownAt = Date()
+
+    func body(content: Content) -> some View {
+        content
+            .onAppear {
+                shownAt = Date()
+                AppProbe.entered(screen: name, detail())
+            }
+            .onDisappear {
+                AppProbe.left(screen: name, after: Date().timeIntervalSince(shownAt))
+            }
+    }
+}
+
+extension View {
+    /// Mark this view as a screen for the `[app]` probe block.
+    ///
+    /// `detail` is a closure so it is evaluated once per appearance rather
+    /// than on every body pass — several of these read a title or a count off
+    /// a model that is being rebuilt continuously.
+    func probeScreen(_ name: String, _ detail: @escaping () -> String = { "" }) -> some View {
+        modifier(ProbeScreen(name: name, detail: detail))
     }
 }

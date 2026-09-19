@@ -9,6 +9,18 @@ struct HomeRow: Identifiable {
     /// Source catalog, so the row can navigate to a paginated "See All".
     var addon: InstalledAddon?
     var catalog: ManifestCatalog?
+
+    /// This row's key in `HomeCatalogSettingsStore` terms, so a setting that
+    /// NAMES a catalog can be matched back to the row it produced.
+    ///
+    /// Not `id`: that is built from `addon.id`, which is the manifest URL,
+    /// while the settings keys use `manifest.id`. Two different strings for
+    /// the same addon — matching one against the other would never hit.
+    var catalogKey: String? {
+        guard let addon, let catalog else { return nil }
+        return HomeCatalogSettingsStore.catalogKey(
+            addonID: addon.manifest.id, type: catalog.type, catalogID: catalog.id)
+    }
 }
 
 private extension Sequence where Element == WatchedItem {
@@ -80,6 +92,38 @@ final class HomeViewModel: ObservableObject {
     /// whole first screen, an 880pt hero, sat blank while the rows underneath it
     /// were already drawn from cache and the answer was sitting right here.
     @Published var initialHero: MetaItem?
+
+    /// Settings → Layout → Hero source, captured at the start of each `load`.
+    ///
+    /// Stored rather than read live because every derivation below runs inside
+    /// `load` or straight off `entries`, and the key is in the load fingerprint
+    /// — so changing the setting reloads Home, which re-reads it here. That
+    /// keeps `initialHero`, the spotlight and the Featured bar deciding from
+    /// one value instead of three reads that could disagree mid-load.
+    private var heroCatalogKey: String = ""
+
+    /// The row the hero draws from: the chosen catalog, or the first row when
+    /// nothing is chosen.
+    ///
+    /// Falls back for a chosen key that isn't on screen, which is a real case
+    /// and not a corner one — the row can be switched off in the list right
+    /// below this setting, or ranked past `maxHomeRows`, or come from an addon
+    /// that has since been removed. A hero that silently went blank in any of
+    /// those would look like a bug in the hero rather than a stale preference.
+    private var heroCatalogRow: HomeRow? {
+        Self.heroCatalogRow(entries, heroKey: heroCatalogKey)
+    }
+
+    static func heroCatalogRow(_ entries: [HomeEntry], heroKey: String) -> HomeRow? {
+        let catalogs = entries.compactMap { entry -> HomeRow? in
+            if case .catalog(let row) = entry { return row }
+            return nil
+        }
+        if !heroKey.isEmpty, let chosen = catalogs.first(where: { $0.catalogKey == heroKey }) {
+            return chosen
+        }
+        return catalogs.first
+    }
 
     private var loadedFingerprint: [String] = []
     /// Bumped by every `load`. Loads overlap constantly on launch —
@@ -193,12 +237,19 @@ final class HomeViewModel: ObservableObject {
         fingerprint.append(settings.disabledKeys.sorted().joined(separator: ","))
         fingerprint.append(settings.customTitles.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: ","))
         fingerprint.append("hideUnreleased=\(settings.hideUnreleasedContent)")
+        // "Poster banners" swaps the artwork as catalogs are fetched, so the
+        // rows must be fetched again for a flip of it to show.
+        fingerprint.append("posterBanners=\(settings.showPosterBanners)")
         // Row titles are baked in at load time by rowTitle(), so the two
         // switches that change them belong in the fingerprint. Without these,
         // toggling "Show add-on name" or the type suffix left every row header
         // stale until some unrelated refresh happened to rebuild Home.
         fingerprint.append("addonName=\(settings.catalogAddonNameEnabled)")
         fingerprint.append("typeSuffix=\(settings.catalogTypeSuffixEnabled)")
+        // Hero source. `initialHero` and the spotlight are both derived during
+        // the load, so picking a different catalog has to re-run it — nothing
+        // downstream re-derives them on its own.
+        fingerprint.append("heroCatalog=\(settings.heroCatalogKey)")
         fingerprint.append(collections.collections.map {
             "\($0.id)#\($0.folders.count)#\($0.title)#\($0.viewMode)#\($0.pinToTop)"
         }.joined(separator: ","))
@@ -230,6 +281,10 @@ final class HomeViewModel: ObservableObject {
 
         isLoading = entries.isEmpty
         loadError = nil
+        // Read ONCE per load: everything derived below (the first hero, the
+        // spotlight, the Featured bar) must agree about which catalog the
+        // hero is on, and `loadIfNeeded` re-runs this whenever it changes.
+        heroCatalogKey = settings.heroCatalogKey
 
         // Assemble the available rows keyed the same way the sync payload is,
         // then let the layout settings decide order and visibility.
@@ -264,6 +319,10 @@ final class HomeViewModel: ObservableObject {
               catalogKeys.count, collectionKeys.count,
               collections.collections.filter(\.pinToTop).count,
               settings.orderKeys.count)
+        AppProbe.data("home load: \(catalogKeys.count) catalogs,"
+                      + " \(collectionKeys.count) collections"
+                      + " (\(collections.collections.filter(\.pinToTop).count) pinned),"
+                      + " \(settings.orderKeys.count) order keys")
 
         let mergedKeys = settings
             .mergedOrder(catalogKeys: catalogKeys, collectionKeys: collectionKeys)
@@ -375,7 +434,7 @@ final class HomeViewModel: ObservableObject {
             if !isCurrent() { return }
             if !stale.isEmpty {
                 entries = stale
-                if initialHero == nil { initialHero = Self.firstHero(stale) }
+                if initialHero == nil { initialHero = Self.firstHero(stale, heroKey: heroCatalogKey) }
                 // As early as the rows exist, before the network revalidation
                 // even starts. Backdrops are the one image class nothing warms:
                 // the poster prefetch below only takes `\.poster` from rows 3+,
@@ -447,6 +506,9 @@ final class HomeViewModel: ObservableObject {
                     } catch {
                         NSLog("[OrivioHome] row dropped — fetch failed: %@ (%@): %@",
                               title, key, error.localizedDescription)
+                        // An empty Home is nearly always a pile of these. Each
+                        // one names the row that will simply not be there.
+                        AppProbe.warn("home row", "\(title) [\(key)] — \(error.localizedDescription)")
                         return (index, key, nil)
                     }
                     let fetched = items.count
@@ -459,6 +521,9 @@ final class HomeViewModel: ObservableObject {
                               fetched == 0 ? "addon returned no items"
                                            : "all \(fetched) items hidden by Hide unreleased content",
                               title, key)
+                        AppProbe.data("home row dropped — \(title) [\(key)]: "
+                                      + (fetched == 0 ? "add-on returned no items"
+                                         : "all \(fetched) hidden by Hide unreleased content"))
                         return (index, key, nil)
                     }
                     let row = HomeRow(
@@ -527,7 +592,7 @@ final class HomeViewModel: ObservableObject {
         }
         if !toCache.isEmpty { HomeCatalogCache.save(toCache) }
 
-        if initialHero == nil { initialHero = Self.firstHero(entries) }
+        if initialHero == nil { initialHero = Self.firstHero(entries, heroKey: heroCatalogKey) }
         // Again with the live rows: the fresh top titles may differ from the
         // cached ones, and an already-cached URL costs a `fileExists` here.
         warmSpotlightArt()
@@ -574,12 +639,9 @@ final class HomeViewModel: ObservableObject {
         return title
     }
 
-    static func firstHero(_ entries: [HomeEntry]) -> MetaItem? {
-        let firstCatalog = entries.lazy.compactMap { entry -> HomeRow? in
-            if case .catalog(let row) = entry { return row }
-            return nil
-        }.first
-        return firstCatalog?.items.first { $0.background != nil } ?? firstCatalog?.items.first
+    static func firstHero(_ entries: [HomeEntry], heroKey: String) -> MetaItem? {
+        let source = heroCatalogRow(entries, heroKey: heroKey)
+        return source?.items.first { $0.background != nil } ?? source?.items.first
     }
 
     /// Pull the spotlight's backdrops into the image cache. Gated on the same
@@ -591,27 +653,29 @@ final class HomeViewModel: ObservableObject {
         ImageCache.shared.warm(urls: art)
     }
 
-    /// The top titles for the Apple TV hero's spotlight rotation: the first
-    /// catalog row's items that actually have backdrop art (a hero with no
+    /// The top titles for the Apple TV hero's spotlight rotation: the hero
+    /// catalog's items that actually have backdrop art (a hero with no
     /// backdrop is a dead frame), capped at `max`.
     func spotlightItems(max: Int) -> [MetaItem] {
-        let firstCatalog = entries.lazy.compactMap { entry -> HomeRow? in
-            if case .catalog(let row) = entry { return row }
-            return nil
-        }.first
-        let items = (firstCatalog?.items ?? []).filter { $0.background != nil }
+        let items = (heroCatalogRow?.items ?? []).filter { $0.background != nil }
         return Array(items.prefix(max))
     }
 
-    /// Titles for the inline Fusion hero bar. Sourced from the SECOND catalog
-    /// row (falling back to the first) so the bar doesn't echo the top
-    /// spotlight, which rotates the first row.
+    /// Titles for the inline Fusion hero bar: the first catalog row that ISN'T
+    /// the hero's, so the bar doesn't echo the spotlight above it.
+    ///
+    /// This used to say "the second row" and mean the same thing, because the
+    /// hero was always the first. With the hero's source now a setting, the
+    /// second row can BE the hero — so the rule has to name what it actually
+    /// wants. Falls back to the hero's own row when there is only one catalog,
+    /// exactly as before.
     func heroBarItems(max: Int) -> [MetaItem] {
         let catalogs = entries.compactMap { entry -> HomeRow? in
             if case .catalog(let row) = entry { return row }
             return nil
         }
-        let source = catalogs.count > 1 ? catalogs[1] : catalogs.first
+        let heroRowID = heroCatalogRow?.id
+        let source = catalogs.first { $0.id != heroRowID } ?? catalogs.first
         let items = (source?.items ?? []).filter { $0.background != nil }
         return Array(items.prefix(max))
     }
@@ -632,7 +696,22 @@ final class HomeViewModel: ObservableObject {
 /// for a problem it doesn't have. Flipping `active` remounts the scroll view,
 /// which only happens when the setting itself is toggled.
 private struct HeroFadeMask: ViewModifier {
-    let active: Bool
+    /// Whether the mask is INSTALLED AT ALL, and it must stay constant for as
+    /// long as the view it wraps lives.
+    ///
+    /// `if/else` inside a `ViewModifier` body is `_ConditionalContent`:
+    /// flipping it does not toggle an effect, it tears the wrapped subtree
+    /// down and builds a new one. Here the wrapped subtree is the ENTIRE home
+    /// ScrollView, so a flip would destroy the focused card along with it.
+    /// That never mattered while this tracked the pinned hero, which was fixed
+    /// per mode — but Hybrid pins mid-browse, on the very press that moves
+    /// focus into the first row, which is the worst possible moment to rebuild
+    /// the thing holding focus. So the pin now drives `faded` below, which
+    /// changes only gradient STOPS, and this stays constant across it.
+    let installed: Bool
+    /// Whether the strip above the scroll view actually dissolves right now —
+    /// true only while a hero is really pinned over it.
+    let faded: Bool
 
     /// How much of the strip above the scroll view a row dissolves across on
     /// its way under the billboard. In POINTS, not a fraction: the mask is
@@ -649,7 +728,7 @@ private struct HeroFadeMask: ViewModifier {
     private static let overhang: CGFloat = 260
 
     func body(content: Content) -> some View {
-        if active {
+        if installed {
             content.mask(
                 VStack(spacing: 0) {
                     // The fade sits ENTIRELY ABOVE the scroll view's top edge,
@@ -662,7 +741,11 @@ private struct HeroFadeMask: ViewModifier {
                     // header and See All while they were sitting in perfectly
                     // ordinary, un-overlapped space. The only content that
                     // should be dimmed is the content actually behind the hero.
-                    LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: .bottom)
+                    // Opaque at both stops = an all-black mask = visually
+                    // identical to no mask, which is what Hybrid needs while
+                    // its hero is still rolling inside the scroll.
+                    LinearGradient(colors: faded ? [.clear, .black] : [.black, .black],
+                                   startPoint: .top, endPoint: .bottom)
                         .frame(height: Self.fadeHeight)
                     Color.black
                 }
@@ -686,10 +769,52 @@ private struct HeroFadeMask: ViewModifier {
 /// rail back, so the first thing a viewer tried did nothing.
 private struct RailIsHiddenKey: EnvironmentKey { static let defaultValue = false }
 
+/// Whether the navigation runs across the TOP rather than down the left edge.
+///
+/// Separate from `railIsHidden` on purpose — the two answer different
+/// questions and in the top layout they want opposite values. `railIsHidden`
+/// is about INPUT ("must a Left press escape to the rail?"); this one is about
+/// LAYOUT ("is there a rail at the left edge to clear?").
+private struct NavigationIsTopKey: EnvironmentKey { static let defaultValue = false }
+
 extension EnvironmentValues {
     var railIsHidden: Bool {
         get { self[RailIsHiddenKey.self] }
         set { self[RailIsHiddenKey.self] = newValue }
+    }
+
+    var navigationIsTop: Bool {
+        get { self[NavigationIsTopKey.self] }
+        set { self[NavigationIsTopKey.self] = newValue }
+    }
+}
+
+/// A leading inset that clears the floating glass rail while the rail is on
+/// screen, and goes back to Home's own inset while the rail is hidden.
+///
+/// Home ignores the horizontal safe area so its art can bleed to the edges, so
+/// it doesn't get the padding RootView gives every other tab while the rail is
+/// on screen. It carries the rail's clearance in these insets instead, and
+/// nothing took that clearance away when "Hide the sidebar" removed the rail:
+/// the rows and hero text stayed exactly as far from the edge as they sit
+/// beside the pill. Keyed to whether the rail is actually on screen, the way
+/// RootView's padding is for the other tabs — whenever the rail comes back (a
+/// Left at the edge, Back, or a rail left parked after focus moves out of it)
+/// the clearance returns with it, so nothing ever sits under the pill.
+private struct RailClearingLeading: ViewModifier {
+    @Environment(\.railIsHidden) private var railIsHidden
+    /// With the navigation across the top there is no rail at the left edge to
+    /// clear, so Home goes back to its own title-safe inset — the same one it
+    /// uses when the rail is hidden.
+    @Environment(\.navigationIsTop) private var navigationIsTop
+    /// The inset beside the rail.
+    let withRail: CGFloat
+    /// The inset with no rail: the title-safe `lg` Home's rows had before the
+    /// rail existed, which puts cards and text 84pt from the edge.
+    let withoutRail: CGFloat
+
+    func body(content: Content) -> some View {
+        content.padding(.leading, (railIsHidden || navigationIsTop) ? withoutRail : withRail)
     }
 }
 
@@ -766,14 +891,77 @@ final class HeroFocus: ObservableObject {
     private var lastRotation = Date.distantPast
     /// Seconds each spotlight title stays on screen before the next.
     private let dwellSeconds: TimeInterval = 9
-    /// True while the hero's own Play button holds focus — rotation stays
-    /// frozen so the title can't change out from under a press.
+    /// True while the hero's own Play button holds focus. Read by the
+    /// spotlight stepper to tell a real Left/Right press from a stray focus
+    /// resolve — it no longer FREEZES rotation.
+    ///
+    /// It used to, and that made Hybrid a closed trap: focus is seeded onto
+    /// the hero's Play button, so the roll was frozen from the first frame,
+    /// and the only way off that button is DOWN into a card — which ends the
+    /// roll for good. Hybrid could never roll once. Rolling had the same hole,
+    /// just less visibly: the banner froze for as long as you rested on it,
+    /// which is the one moment a rotating billboard is meant to be rotating.
+    /// The `lastInteraction` gate below still covers what this was protecting:
+    /// landing on the button marks an interaction, so nothing moves for 6s
+    /// after you arrive, and every manual step re-arms that window.
     var heroButtonFocused = false
     /// True while the billboard trailer preview is playing (HeroTrailerLayer).
     /// Rotation holds — the trailer earned the spotlight by the viewer
     /// resting on this title, and swapping it mid-play is the same yank the
     /// idle window exists to prevent.
     var trailerPlaying = false
+
+    // MARK: Hero Layout (Settings → Layout)
+
+    /// Which Hero Layout Home is running. Set by HomeView.
+    ///
+    /// The MODEL owns the rule rather than each call site re-deriving it: cards
+    /// simply report that they took focus and `focus(_:)` decides whether that
+    /// should move the hero. That is what makes the Hybrid hand-off exact —
+    /// the same call that ends the roll also commits the title under the
+    /// highlight, instead of the hero lagging one card behind.
+    /// Matches the store's default so there is no window — before HomeView's
+    /// `onAppear` assigns the real mode — where the model and the settings
+    /// disagree about which layout is running.
+    var layout: HeroLayout = .hybrid
+    /// Hybrid only: true once a content card has taken focus, which is the
+    /// moment the rolling banner hands over to the browse.
+    ///
+    /// Still NOT `@Published`. HomeView holds `hero` as plain `@State` and so
+    /// never observes it anyway — publishing would buy nothing and cost a
+    /// re-render of every row. The layout swap this drives is delivered by
+    /// `onBrowseStateChange` instead, into a HomeView `@State` mirror.
+    private(set) var browsedIntoContent = false {
+        didSet {
+            guard oldValue != browsedIntoContent else { return }
+            onBrowseStateChange?(browsedIntoContent)
+        }
+    }
+    /// Fires on every `browsedIntoContent` transition. THE single source of
+    /// truth stays this property; the mirror is written only from here, so the
+    /// two cannot drift apart.
+    var onBrowseStateChange: ((Bool) -> Void)?
+
+    /// Does the hero follow the focused card right now?
+    var followsFocus: Bool {
+        switch layout {
+        case .pinnedFocus: return true
+        case .hybrid:      return browsedIntoContent
+        case .rolling:     return false
+        }
+    }
+
+    /// Does the spotlight still advance on its own right now?
+    var rolls: Bool {
+        switch layout {
+        case .pinnedFocus: return false
+        case .hybrid:      return !browsedIntoContent
+        case .rolling:     return true
+        }
+    }
+
+    /// Home appeared fresh: a new visit starts the Hybrid roll again.
+    func resetBrowseHandoff() { browsedIntoContent = false }
 
     /// Seed the rotation set and show its first title. Safe to call repeatedly;
     /// only re-seeds when the set actually changed.
@@ -823,7 +1011,7 @@ final class HeroFocus: ObservableObject {
         // setting, it swapped as a HARD CUT, which is strictly worse for the
         // person the setting exists to protect. Manual stepping still works.
         guard !PerformanceSettingsStore.shared.reduceMotion,
-              spotlight.count > 1, !heroButtonFocused, !trailerPlaying,
+              spotlight.count > 1, !trailerPlaying,
               now.timeIntervalSince(lastInteraction) > 6,
               now.timeIntervalSince(lastRotation) >= dwellSeconds else { return }
         lastRotation = now
@@ -861,6 +1049,13 @@ final class HeroFocus: ObservableObject {
     func focus(_ newItem: MetaItem, progress newProgress: WatchProgress? = nil) {
         // Browsing cards counts as interaction — pause spotlight rotation.
         lastInteraction = Date()
+        // THE HYBRID HAND-OFF, and it happens BEFORE the gate below so the very
+        // first content focus both ends the roll and commits its own title.
+        // Ordered the other way the hero would keep the rolling title until the
+        // viewer moved to a second card.
+        if layout == .hybrid, !browsedIntoContent { browsedIntoContent = true }
+        // ROLLING never follows the browse; that is what makes it "rolling".
+        guard followsFocus else { return }
         guard newItem.id != (pendingID ?? item?.id) else {
             // Same title, different context (catalog card ↔ its CW card):
             // nothing to decode, just swap the progress line.
@@ -938,18 +1133,81 @@ struct HomeView: View {
 
     private var layout: HomeLayout { homeCatalogSettings.homeLayout }
 
-    /// Whether the hero chases card focus.
+    /// Whether the hero chases card focus is NO LONGER decided here. Cards
+    /// report every focus move to `HeroFocus.focus(_:)` and the model applies
+    /// the Hero Layout rule (`followsFocus`). Passing the answer down as a
+    /// per-cell flag could not express Hybrid at all: that mode flips mid-
+    /// browse, and the flag would arrive one card late.
     ///
-    /// OFF (the default): the spotlight stays on its rotating Top-10 title as
-    /// you browse down. ON (Layout → "Pin hero to the top"): the hero is
-    /// fixed above the rows and shows whatever card is highlighted — the
-    /// rotation is switched off with it, since the two would otherwise fight
-    /// over the same billboard.
-    private var heroFollowsFocus: Bool { homeCatalogSettings.pinnedHero }
-
     /// The pinned hero sits OUTSIDE the scroll view, so the rows scroll under
     /// a billboard that stays put.
-    private var heroIsPinned: Bool { perf.settings.heroBackdrop && homeCatalogSettings.pinnedHero }
+    /// ONLY `.pinnedFocus` changes the LAYOUT (a fixed header above the
+    /// scroll). Hybrid deliberately keeps the rolling banner's geometry and
+    /// changes only behaviour: swapping the hero between two very different
+    /// containers mid-browse is a view-tree change, and this app has learned
+    /// repeatedly that those make the focus engine re-resolve — which is the
+    /// exact bug this redesign exists to remove.
+    private var heroIsPinned: Bool {
+        guard perf.settings.heroBackdrop else { return false }
+        switch homeCatalogSettings.heroLayout {
+        case .pinnedFocus: return true
+        // The MODEL, not the mirror, and that ordering is the whole bug.
+        //
+        // The handoff is raised synchronously from a cell's focus callback,
+        // inside the same transaction as the press that moved focus off the
+        // hero — and that press also flips `heroPlayFocused`, which invalidates
+        // this view. Reading the model means the container swap is computed in
+        // THAT render pass, before tvOS works out where to scroll.
+        //
+        // Routed through the `@State` mirror it always landed a turn LATE, and
+        // late is what the viewer saw: tvOS measured its focus scroll against
+        // the old layout, where the Continue Watching card sits ~900pt down
+        // past the 880pt banner, and scrolled there — then the banner was
+        // removed under it, leaving that offset in a layout whose first row
+        // starts at ~20. The row ended up shoved under the pinned header.
+        // Only the FIRST row could show it; further down, the old and new
+        // offsets are close enough to look right.
+        case .hybrid:      return hybridPinned
+        case .rolling:     return false
+        }
+    }
+
+    /// NOT read for layout — `heroIsPinned` above reads the model directly.
+    /// This exists only to guarantee an INVALIDATION: `hero` is deliberately
+    /// unobserved `@State`, so mutating it redraws nothing on its own. Every
+    /// normal handoff already redraws Home (focus leaving the hero's Play
+    /// button moves `heroPlayFocused`); this covers the paths that don't, such
+    /// as focus arriving from the sidebar straight onto a card.
+    @State private var hybridBrowsing = false
+    /// Hybrid's pinned hero carries one invisible focusable strip along its
+    /// bottom edge, bound to the SAME `heroPlayFocused` the rolling banner's
+    /// Play button uses. See `hybridReturnStrip`.
+    /// THE Hybrid pin decision — one expression, so the pinned header and the
+    /// focusable strip inside it can never disagree about whether they exist.
+    ///
+    /// The model is the value and it is never behind. `hybridBrowsing` is read
+    /// FIRST purely to register a dependency: `hero` is unobserved, so without
+    /// a `@State` read here a handoff that nothing else redraws would invalidate
+    /// nothing. Their only disagreement is on the way back, where the mirror
+    /// lands a turn after the model and holds the pin one extra frame — with
+    /// focus safely on the strip, which is still there for exactly that frame.
+    private var hybridPinned: Bool {
+        guard homeCatalogSettings.heroLayout == .hybrid else { return false }
+        return hybridBrowsing || hero.browsedIntoContent
+    }
+    /// When focus last LEFT the hero, so the scroll repair below can tell the
+    /// ordinary "down into the first row" handoff from one raised somewhere
+    /// else entirely.
+    @State private var heroLostFocusAt: Date?
+    /// Scroll anchor for the row stack. Under a pinned hero the rows start at
+    /// the very top of the scroll, so this is where the offset belongs.
+    private static let rowsTopID = "home-rows-top"
+
+    /// Whether this MODE ever pins a hero over the rows — constant while Home
+    /// is on screen, which is what `HeroFadeMask.installed` requires.
+    private var heroLayoutCanPin: Bool {
+        perf.settings.heroBackdrop && homeCatalogSettings.heroLayout != .rolling
+    }
 
     // Owned via @State (NOT @StateObject) so HomeView does NOT observe it —
     // hero changes must re-render only the billboard subviews, never the rows.
@@ -967,6 +1225,10 @@ struct HomeView: View {
     /// Coalesces the launch burst of store publishes into one reload.
     @State private var reloadDebounce: Task<Void, Never>?
     @State private var nextUpContinueItems: [WatchProgress] = []
+    /// Continue Watching rows the viewer has moved past (see
+    /// `supersededContinueRows`), by `continueRowStamp`. Their show gets a
+    /// Next Up card instead.
+    @State private var supersededContinueRows: Set<String> = []
     /// metaID → how many episodes have aired since the viewer started that
     /// show and are still unwatched. Drives the green "+N" badge. Covers shows
     /// with a real progress row too, not just the synthesised Next Up cards.
@@ -988,15 +1250,76 @@ struct HomeView: View {
 
     var body: some View {
         layoutContent
-        .onAppear { isVisible = true }
-        .onDisappear { isVisible = false }
+        .onAppear {
+            isVisible = true
+            hero.layout = homeCatalogSettings.heroLayout
+            hero.onBrowseStateChange = { browsing in
+                // DEFERRED BY ONE TURN, and that is the whole fix for "the
+                // first time I go down, the hero doesn't pin".
+                //
+                // The handoff is raised from a poster/Continue-Watching cell's
+                // focus callback — inside SwiftUI's update pass for a
+                // DESCENDANT of this view. Writing an ancestor's `@State`
+                // there is the "Modifying state during view update" case: the
+                // value lands in the box, but no invalidation is scheduled for
+                // HomeView, so the pin only appeared once something unrelated
+                // redrew Home (going back up, which moves `heroPlayFocused`).
+                // Hopping to the next main-actor turn makes it an ordinary
+                // state change with an ordinary re-render — and lands the
+                // container swap one frame AFTER the focus move rather than in
+                // the middle of it, which is the safer moment for it anyway.
+                Task { @MainActor in hybridBrowsing = browsing }
+            }
+            // Re-sync rather than assume. The callback only delivers
+            // TRANSITIONS, so a flip that somehow landed before this ran would
+            // otherwise leave the mirror wrong for the rest of the session.
+            hybridBrowsing = hero.browsedIntoContent
+            registerHeroRouterHandler()
+        }
+        .onDisappear {
+            isVisible = false
+            ContentFocusRouter.shared.unregister(Self.heroRouterID)
+        }
+        // Profile scoping republishes the home settings shortly after launch
+        // (see the debounced-reload block below), so the mode read in
+        // `onAppear` is not necessarily the final one. Switching modes also
+        // clears the handoff, so arriving in Hybrid from Pinned Focus starts
+        // on the roll instead of inheriting a browse that already happened.
+        .onChange(of: homeCatalogSettings.heroLayout) { _, mode in
+            hero.layout = mode
+            hero.resetBrowseHandoff()
+        }
+        // HYBRID, going back UP. The pinned hero's return strip binds the same
+        // `heroPlayFocused` as the rolling banner's Play button, so reaching it
+        // from the first row hands the roll back. Focus is NEVER unowned across
+        // that swap: the binding reads `true` before it, during it and after
+        // it — only which view claims it changes.
+        .onChange(of: heroPlayFocused) { _, focused in
+            // Owned HERE, not only in `ATVHeroInfoView`, because that view's
+            // own handler cannot cover the swap: the rolling banner is INSERTED
+            // already holding focus, and `onChange` does not fire for the value
+            // a view appears with. Left to it alone, returning to the roll left
+            // `heroButtonFocused` stale-false and the first Left/Right press
+            // after it was swallowed by the stepper's guard.
+            hero.heroButtonFocused = focused
+            if focused {
+                hero.markInteraction()
+                // The hero is somewhere the viewer can BE: leaving the rail
+                // from here comes back here (see `heroRouterID`).
+                ContentFocusRouter.shared.noteFocused(row: Self.heroRouterID)
+            } else {
+                heroLostFocusAt = Date()
+            }
+            guard focused, hybridPinned else { return }
+            hero.resetBrowseHandoff()
+        }
         .onReceive(spotlightTick) { _ in
-            // §55: Reduce Motion disables automatic hero rotation (both
-            // modes). The pinned hero cycles only while the viewer is resting
-            // ON it — browsing cards drives it by focus instead, and a timer
-            // swapping the highlighted title out from under someone browsing
-            // is a bug, not a feature (see rotateIfIdle's pinnedBillboard).
-            guard isVisible && !perf.reduceMotion, !heroIsPinned else { return }
+            // §55: Reduce Motion disables automatic hero rotation in every
+            // mode. `hero.rolls` is the Hero Layout gate: Pinned Focus never
+            // rotates (a timer swapping the highlighted title out from under
+            // someone browsing is a bug, not a feature), and Hybrid stops
+            // rotating the moment the browse takes over.
+            guard isVisible && !perf.reduceMotion, hero.rolls else { return }
             hero.rotateIfIdle()
         }
         .task {
@@ -1063,9 +1386,70 @@ struct HomeView: View {
         .onChange(of: homeCatalogSettings.catalogAddonNameEnabled) { _, _ in scheduleReload() }
         .onChange(of: homeCatalogSettings.catalogTypeSuffixEnabled) { _, _ in scheduleReload() }
         .onChange(of: homeCatalogSettings.hideUnreleasedContent) { _, _ in scheduleReload() }
+        .onChange(of: homeCatalogSettings.showPosterBanners) { _, _ in scheduleReload() }
         .task(id: nextUpRefreshKey) { await refreshNextUpContinueItems() }
         // Paint the hero from the cached rows without waiting for the network.
         .onChange(of: viewModel.initialHero) { _, item in seedHero(item) }
+    }
+
+    /// The ONLY focusable thing in Hybrid's pinned hero, and the way back to
+    /// the roll: an invisible strip along the header's bottom edge, so UP out
+    /// of the first row reaches it.
+    ///
+    /// An OVERLAY, not a child, so it adds no height and cannot shift the rows.
+    /// Absent in Pinned Focus, which stays a pure display with nothing to focus
+    /// — that mode has no roll to go back to.
+    ///
+    /// Bound to `heroPlayFocused` on purpose. When the swap drops this strip
+    /// and inserts the rolling banner, the banner's Play button binds the very
+    /// same value, so the request carries across instead of being dropped and
+    /// re-resolved by the focus engine.
+    @ViewBuilder
+    private var hybridReturnStrip: some View {
+        if hybridPinned {
+            // Wrapped and sectioned. The pinned header sits OUTSIDE the
+            // ScrollView, and the sibling comment below explains why it
+            // carries no `.focusSection()` of its own — there was never
+            // anything focusable in it to aim at. Now there is exactly one
+            // thing, so it gets the region the engine needs to find on an UP
+            // press out of the first row. (An EMPTY section is what that
+            // comment warns against; this one is never empty, because the
+            // header only exists in Hybrid while `hybridPinned` is true.)
+            HStack(spacing: 0) {
+                Color.clear
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 60)
+                    .focusable()
+                    .focused($heroPlayFocused)
+            }
+            .focusSection()
+        }
+    }
+
+    /// The rolling hero's Play button as a ContentFocusRouter destination.
+    ///
+    /// Leaving the rail hands focus to "the row the viewer was last in". Every
+    /// row registers for that; the hero never did, so Back on the hero's Play
+    /// button and then Right out of the rail landed on whichever ROW had been
+    /// browsed earlier. In Hybrid that programmatic landing pinned the hero
+    /// without the scroll repair a Down press gets, parking the focused card
+    /// under the pinned header, and the next sideways press hit the header's
+    /// invisible return strip and threw focus back up to the hero.
+    private static let heroRouterID = "home.heroPlay"
+
+    private func registerHeroRouterHandler() {
+        ContentFocusRouter.shared.register(Self.heroRouterID) {
+            // Only while the rolling banner, the one with a Play button, is on
+            // screen. Declining keeps the rail's old fallback everywhere else
+            // (Pinned Focus, a pinned Hybrid, no hero art, nothing loaded yet).
+            guard perf.settings.heroBackdrop,
+                  homeCatalogSettings.heroLayout != .pinnedFocus,
+                  !hero.browsedIntoContent,
+                  hero.item != nil else { return false }
+            heroPlayFocused = true
+            DispatchQueue.main.async { if !heroPlayFocused { heroPlayFocused = true } }
+            return true
+        }
     }
 
     /// Put a title in the billboard and land initial focus on its Play button.
@@ -1111,6 +1495,7 @@ struct HomeView: View {
                                      playFocus: $heroPlayFocused, height: 500,
                                      artCropBias: 0.75, showsTopBadge: false,
                                      playsTrailer: true, showsActions: false)
+                        .overlay(alignment: .bottom) { hybridReturnStrip }
                         // NO `.focusSection()` here, unlike the scrolling
                         // banner. A section exists to give the engine a region
                         // to aim at, and with `showsActions: false` there is
@@ -1126,6 +1511,7 @@ struct HomeView: View {
                         .zIndex(1)
                 }
 
+                ScrollViewReader { proxy in
                 ScrollView(.vertical) {
                     VStack(alignment: .leading, spacing: OrivioSpacing.xl) {
                         if perf.settings.heroBackdrop && !heroIsPinned {
@@ -1142,10 +1528,11 @@ struct HomeView: View {
                         LazyVStack(alignment: .leading, spacing: OrivioSpacing.xl) {
                             rowsContent
                         }
+                        .id(Self.rowsTopID)
                         // Rows keep a title-safe inset that also clears the
                         // floating glass rail; the hero (above) does not, so
                         // its art can bleed to the very edges.
-                        .padding(.leading, 100)
+                        .modifier(RailClearingLeading(withRail: 100, withoutRail: OrivioSpacing.lg))
                         .padding(.trailing, OrivioSpacing.lg)
                     }
                     // Under a pinned hero the first row would otherwise sit
@@ -1164,7 +1551,29 @@ struct HomeView: View {
                 // the top of the screen and the rows must start below it.
                 .ignoresSafeArea(edges: heroIsPinned ? [.horizontal] : [.top, .horizontal])
                 .scrollClipDisabled()
-                .modifier(HeroFadeMask(active: heroIsPinned))
+                // `installed` is per-MODE and so never flips mid-browse;
+                // `faded` is the one that follows the Hybrid handoff.
+                .modifier(HeroFadeMask(installed: heroLayoutCanPin, faded: heroIsPinned))
+                // THE SCROLL REPAIR, and a safety net rather than the fix.
+                //
+                // Pinning removes the 880pt banner from this scroll's content.
+                // Any offset tvOS had already chosen for the old, taller layout
+                // is meaningless afterwards — and the one row where that shows
+                // is the first, whose correct offset is zero. Reading the model
+                // above should make the swap early enough that tvOS never
+                // measures the old layout at all; this puts the rows back at
+                // the top if it ever does.
+                //
+                // Guarded to a handoff that immediately followed leaving the
+                // hero, which is the only one that lands on the first row.
+                // Focus arriving from somewhere else must keep its own scroll.
+                .onChange(of: heroIsPinned) { _, pinned in
+                    guard pinned, homeCatalogSettings.heroLayout == .hybrid,
+                          let left = heroLostFocusAt,
+                          Date().timeIntervalSince(left) < 1 else { return }
+                    proxy.scrollTo(Self.rowsTopID, anchor: .top)
+                }
+                }
             }
         }
     }
@@ -1192,12 +1601,14 @@ struct HomeView: View {
             onContentReady()
         }
 
+        let done = AppProbe.begin("data", "Home reload")
         await viewModel.loadIfNeeded(
             addonManager: addonManager,
             collections: collections,
             settings: homeCatalogSettings,
             providers: collectionProviders
         )
+        done("\(viewModel.entries.count) rows")
         // Usually already done from the cache above; this covers a cold launch
         // where there was nothing to seed from.
         seedHero(viewModel.initialHero)
@@ -1289,7 +1700,7 @@ struct HomeView: View {
                         // stage, which beats the billboard silently holding a
                         // title from three rows up.
                         onFolderFocus: { folder in
-                            if heroFollowsFocus { hero.focus(heroItem(for: folder, in: collection)) }
+                            hero.focus(heroItem(for: folder, in: collection))
                         },
                         onBackAtStart: onHomeBack
                     )
@@ -1297,7 +1708,7 @@ struct HomeView: View {
                     CollectionsRowSection(
                         collections: sharedCollections,
                         onOpen: onOpenCollection,
-                        onFocus: { if heroFollowsFocus { hero.focus(heroItem(for: $0)) } },
+                        onFocus: { hero.focus(heroItem(for: $0)) },
                         onBackAtStart: onHomeBack
                     )
                 }
@@ -1425,7 +1836,6 @@ struct HomeView: View {
         ContinueWatchingRow(
             items: items,
             hero: hero,
-            drivesHero: heroFollowsFocus,
             imageFor: continueImage,
             subtitleFor: continueSubtitle,
             blurFor: { [blur = homeCatalogSettings.blurContinueWatchingNextUp] progress in
@@ -1456,7 +1866,12 @@ struct HomeView: View {
     }
 
     private func mergedContinueItems() -> [WatchProgress] {
-        let active = progressStore.continueWatching(sortMode: homeCatalogSettings.continueWatchingSortMode)
+        let sortMode = homeCatalogSettings.continueWatchingSortMode
+        // By stamp, not by show: a row saved AFTER the judgement (the viewer
+        // went back to that episode) is shown at once, without waiting for the
+        // refresh to re-judge it.
+        let active = progressStore.continueWatching(sortMode: sortMode)
+            .filter { !supersededContinueRows.contains(Self.continueRowStamp($0)) }
         let activeMetaIDs = Set(active.map(\.metaID))
         // Also filtered here, not only in the async refresh: `removeShow` on a
         // synthesised card has no progress rows to delete, so the card would sit
@@ -1476,7 +1891,65 @@ struct HomeView: View {
             copy.newEpisodeCount = count
             return copy
         }
-        return stamped + additions
+        // Next Up cards take their place by recency — each is dated by the
+        // show's last watched episode — instead of queueing behind every
+        // in-progress row. Appended, a show whose episode had just been
+        // finished sat after the show watched the day before, so leaving the
+        // player put the PREVIOUS show at the front. The reference Nuvio client
+        // sorts the two kinds together the same way.
+        return Self.continueOrder(stamped + additions, sortMode: sortMode)
+    }
+
+    /// `ProgressStore.continueWatching(sortMode:)`'s ordering, applied to the
+    /// row once Next Up cards have joined it: newest first on (timestamp, id),
+    /// and for Streaming style the mid-episode titles ahead of the rest.
+    private nonisolated static func continueOrder(
+        _ rows: [WatchProgress], sortMode: ContinueWatchingSortMode
+    ) -> [WatchProgress] {
+        let byRecency = rows.sorted { ($0.updatedAt, $0.id) > ($1.updatedAt, $1.id) }
+        switch sortMode {
+        case .recentlyWatched:
+            return byRecency
+        case .streamingStyle:
+            return byRecency.filter { $0.fraction >= 0.02 } + byRecency.filter { $0.fraction < 0.02 }
+        }
+    }
+
+    /// Identifies one version of a row: its key and when it was written.
+    private nonisolated static func continueRowStamp(_ row: WatchProgress) -> String {
+        "\(row.id)|\(row.updatedAt.timeIntervalSinceReferenceDate)"
+    }
+
+    /// The Continue Watching rows the viewer has moved PAST: an episode at or
+    /// after the row's own was marked watched after the row was last written.
+    ///
+    /// The row keeps one card per show — its newest unfinished episode — and a
+    /// finished episode's row is retired. So finishing S2E2 handed the card to
+    /// whatever older row the show still had, S2E1 at twenty seconds or S1E3
+    /// half-watched weeks ago, and Continue Watching went BACK instead of on to
+    /// S2E3; the furthest-episode rule never ran, because a show with any
+    /// unfinished row gets no Next Up card. A row newer than every such mark is
+    /// the viewer going back to it on purpose, and stays.
+    private nonisolated static func supersededContinueRows(
+        _ rows: [WatchProgress], watched: [WatchedItem]
+    ) -> Set<String> {
+        let episodic = rows.filter { $0.season != nil && $0.episode != nil }
+        guard !episodic.isEmpty else { return [] }
+        let shows = Set(episodic.map(\.metaID))
+        var marks: [String: [(season: Int, episode: Int, at: Date)]] = [:]
+        for item in watched where shows.contains(item.contentID) {
+            guard let season = item.season, let episode = item.episode else { continue }
+            marks[item.contentID, default: []].append((season, episode, item.watchedAt))
+        }
+        var superseded: Set<String> = []
+        for row in episodic {
+            guard let season = row.season, let episode = row.episode,
+                  let showMarks = marks[row.metaID] else { continue }
+            if showMarks.contains(where: { ($0.season, $0.episode) >= (season, episode) && $0.at > row.updatedAt }) {
+                superseded.insert(continueRowStamp(row))
+            }
+        }
+        return superseded
     }
 
     /// One show this pass needs metadata for.
@@ -1493,7 +1966,15 @@ struct HomeView: View {
     }
 
     private func refreshNextUpContinueItems() async {
-        let activeRows = progressStore.continueWatching(sortMode: homeCatalogSettings.continueWatchingSortMode)
+        let allActiveRows = progressStore.continueWatching(sortMode: homeCatalogSettings.continueWatchingSortMode)
+        let superseded = Self.supersededContinueRows(allActiveRows, watched: Array(watched.items.values))
+        // Published before any fetch below. A stale row that stayed up while
+        // up to twenty shows' metadata loaded WAS the wrong-episode card; for
+        // that moment the show simply has no card until its Next Up is ready.
+        if superseded != supersededContinueRows { supersededContinueRows = superseded }
+        // A superseded show counts as having no progress row, so it gets a
+        // synthesised Next Up card like any other watched show.
+        let activeRows = allActiveRows.filter { !superseded.contains(Self.continueRowStamp($0)) }
         let activeMetaIDs = Set(activeRows.map(\.metaID))
         // Series already on the row. No card is synthesised for these — they
         // have a real progress row — but they still need their episode list so
@@ -1764,7 +2245,6 @@ struct HomeView: View {
         HomePosterRow(
             row: row,
             useLandscape: useLandscape,
-            heroFollowsFocus: heroFollowsFocus,
             hero: hero,
             onSelect: onSelect,
             onPlayManually: onPlayManually,
@@ -1859,7 +2339,6 @@ private struct HomePosterRow: View {
     @EnvironmentObject private var homeCatalogSettings: HomeCatalogSettingsStore
     let row: HomeRow
     let useLandscape: Bool
-    let heroFollowsFocus: Bool
     let hero: HeroFocus
     let onSelect: (MetaItem) -> Void
     let onPlayManually: (MetaItem, MetaVideo?) -> Void
@@ -1890,7 +2369,6 @@ private struct HomePosterRow: View {
                                 useLandscape: useLandscape,
                                 captionWidth: useLandscape ? 340 : homeCatalogSettings.posterSize.posterWidth,
                                 showLabel: homeCatalogSettings.showPosterLabels,
-                                heroFollowsFocus: heroFollowsFocus,
                                 hero: hero,
                                 onSelect: onSelect,
                                 onPlayManually: onPlayManually
@@ -1996,7 +2474,6 @@ private struct HomePosterCell: View, Equatable {
     /// comparison and the row would keep its captions until something else
     /// forced a rebuild. Included in `==` below for the same reason.
     let showLabel: Bool
-    let heroFollowsFocus: Bool
     let hero: HeroFocus
     let onSelect: (MetaItem) -> Void
     let onPlayManually: (MetaItem, MetaVideo?) -> Void
@@ -2007,7 +2484,6 @@ private struct HomePosterCell: View, Equatable {
             && lhs.useLandscape == rhs.useLandscape
             && lhs.captionWidth == rhs.captionWidth
             && lhs.showLabel == rhs.showLabel
-            && lhs.heroFollowsFocus == rhs.heroFollowsFocus
     }
 
     var body: some View {
@@ -2034,7 +2510,14 @@ private struct HomePosterCell: View, Equatable {
                     if isFocused, PerformanceSettingsStore.shared.settings.showHoldProbe {
                         HoldProbe.log("focus — poster \(item.name)")
                     }
-                    if isFocused && heroFollowsFocus { hero.focus(item) }
+                    // REPORTED UNCONDITIONALLY, in every mode. `focus(_:)`
+                    // marks the interaction before deciding whether to commit,
+                    // and that mark is what holds the rolling banner still
+                    // while someone is browsing. Gating the call meant Rolling
+                    // never marked anything, so the spotlight advanced every
+                    // 9s straight through an active browse — the hero moving
+                    // under the viewer, which is the whole complaint.
+                    if isFocused { hero.focus(item) }
                 }
             }
             .mediaCardButtonStyle()
@@ -2061,8 +2544,6 @@ private struct ContinueWatchingRow: View {
     /// Plain let (not observed): the row only CALLS into the hero, it never
     /// renders from it.
     let hero: HeroFocus
-    /// False in Grid layout, where no backdrop/billboard renders the hero.
-    let drivesHero: Bool
     let imageFor: (WatchProgress) -> String?
     let subtitleFor: (WatchProgress) -> String?
     let blurFor: (WatchProgress) -> Bool
@@ -2124,7 +2605,6 @@ private struct ContinueWatchingRow: View {
                         imageURL: imageFor(progress),
                         subtitle: subtitleFor(progress),
                         blur: blurFor(progress),
-                        drivesHero: drivesHero,
                         hero: hero,
                         heroItemFor: heroItemFor,
                         onResume: onResume,
@@ -2190,7 +2670,6 @@ private struct ContinueWatchingCell: View, Equatable {
     let imageURL: String?
     let subtitle: String?
     let blur: Bool
-    let drivesHero: Bool
     let hero: HeroFocus
     let heroItemFor: (WatchProgress) -> MetaItem
     let onResume: (WatchProgress) -> Void
@@ -2204,7 +2683,6 @@ private struct ContinueWatchingCell: View, Equatable {
             && lhs.imageURL == rhs.imageURL
             && lhs.subtitle == rhs.subtitle
             && lhs.blur == rhs.blur
-            && lhs.drivesHero == rhs.drivesHero
     }
 
     var body: some View {
@@ -2233,7 +2711,7 @@ private struct ContinueWatchingCell: View, Equatable {
                     if isFocused, PerformanceSettingsStore.shared.settings.showHoldProbe {
                         HoldProbe.log("focus — CW \(progress.name)")
                     }
-                    if isFocused, drivesHero { hero.focus(heroItemFor(progress)) }
+                    if isFocused { hero.focus(heroItemFor(progress)) }
                 }
             }
             // Was FlatCardButtonStyle, under a comment claiming the native
@@ -2419,9 +2897,9 @@ private struct FocusChangeModifier: ViewModifier {
 /// background, with only a compact title label (no synopsis, no buttons).
 /// Classic is meant to feel lighter/faster than Modern's full spotlight.
 /// Netflix-style billboard preview: once the hero has RESTED on one title for
-/// a few seconds, its trailer fades in behind the info block — muted, looping,
-/// and strictly decorative — and the still art returns the moment the hero
-/// moves on.
+/// a few seconds, its trailer fades in behind the info block — muted and
+/// strictly decorative — and the still art returns when the trailer finishes,
+/// or the moment the hero moves on.
 ///
 /// Reuses the Detail page's whole trailer stack (TMDB key lookup, YouTubeKit
 /// extraction, `BackdropVideoView`) and its switches: the Detail page's
@@ -2439,9 +2917,19 @@ private struct HeroTrailerLayer: View {
 
     @State private var player: AVPlayer?
     @State private var visible = false
-    @State private var loopToken: NSObjectProtocol?
+    /// Fires when the trailer reaches its end — see `restoreArtwork()`.
+    @State private var endToken: NSObjectProtocol?
+    /// Holds the teardown until the fade has actually finished. Cancellable,
+    /// because the hero can move on mid-fade and `teardown` must win.
+    @State private var fadeOutTask: Task<Void, Never>?
     /// Fires when the player actually starts rendering — see `run()`.
     @State private var statusObserver: NSKeyValueObservation?
+    /// Watches the ITEM rather than the player: a googlevideo URL that was
+    /// minted for a network path the box has since left (a VPN tunnel raised
+    /// or dropped mid-browse) is answered with 403, and the item fails. The
+    /// resolved URL is cached for half an hour, so without this the same dead
+    /// link would be handed back on every later rest on the title.
+    @State private var itemFailureObserver: NSKeyValueObservation?
     /// Whether THIS layer activated the audio session (sound on) — teardown
     /// only deactivates what it activated, and never out from under the real
     /// player or a Picture in Picture session.
@@ -2519,18 +3007,22 @@ private struct HeroTrailerLayer: View {
         // max(delay, resolve) instead of delay + resolve, and a repeat visit
         // (TrailerResolver's URL cache) resolves in milliseconds.
         let t0 = Date()
-        async let prepared: AVPlayerItem? = {
-            guard let key = await TMDBService.firstTrailerKey(id: item.id, type: item.type)
-            else { return nil }
-            NSLog("[OrivioHeroTrailer] key %@ resolved in %.2fs", key, Date().timeIntervalSince(t0))
-            let r = await TrailerResolver.backdropItem(youtubeKey: key)
+        // EVERY trailer TMDB ranked, not just the best one: the top pick can
+        // be geo-restricted where the connection comes out (routine on a VPN),
+        // and the next one down usually isn't. `backdropItem` walks them.
+        async let prepared: (item: AVPlayerItem, youtubeKey: String)? = {
+            let keys = await TMDBService.trailerKeys(id: item.id, type: item.type)
+            guard !keys.isEmpty else { return nil }
+            NSLog("[OrivioHeroTrailer] %d key(s) resolved in %.2fs", keys.count, Date().timeIntervalSince(t0))
+            let r = await TrailerResolver.backdropItem(candidates: keys)
             NSLog("[OrivioHeroTrailer] item ready in %.2fs (nil=%@)", Date().timeIntervalSince(t0), r == nil ? "y" : "n")
             return r
         }()
         try? await Task.sleep(for: .seconds(Self.restDebounce))
         guard !Task.isCancelled, !PiPHandoff.shared.isActive,
               !OrivioSyncManager.playbackActive else { return }
-        guard let avItem = await prepared, !Task.isCancelled else { return }
+        guard let resolved = await prepared, !Task.isCancelled else { return }
+        let avItem = resolved.item
         guard Date().timeIntervalSince(t0) < Self.resolveTimeout else {
             NSLog("[OrivioHeroTrailer] gave up after %.2fs", Date().timeIntervalSince(t0))
             return
@@ -2544,14 +3036,30 @@ private struct HeroTrailerLayer: View {
         // would duck whatever music another app is playing, for a silent
         // preview. Layout → "Hero trailer sound" opts into the session.
         setSound(homeCatalogSettings.heroTrailerSound, on: p)
+        // Play ONCE and hand the hero back, rather than restarting forever.
+        // `.none` rather than `.pause` so the player holds its last frame at
+        // the end instead of resetting — that held frame is what dissolves
+        // into the artwork below.
         p.actionAtItemEnd = .none
-        loopToken = NotificationCenter.default.addObserver(
+        endToken = NotificationCenter.default.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime, object: avItem, queue: .main
-        ) { [weak p] _ in
-            p?.seek(to: .zero)
-            p?.playImmediately(atRate: 1)
+        ) { _ in
+            Task { @MainActor in restoreArtwork() }
         }
         player = p
+        // A dead URL never reaches `.playing`, so the reveal observer below
+        // would simply wait forever — leaving the title looking trailer-less
+        // for the whole cache window. Drop what we resolved so the next rest
+        // on this title extracts again instead of replaying the same 403.
+        // Capture the KEY, not the resolved pair — the observation outlives
+        // this scope and shouldn't be the reason the item stays alive.
+        let resolvedKey = resolved.youtubeKey
+        itemFailureObserver = avItem.observe(\.status, options: [.new]) { observed, _ in
+            guard observed.status == .failed else { return }
+            NSLog("[OrivioHeroTrailer] %@ failed to load: %@", resolvedKey,
+                  String(describing: observed.error))
+            TrailerResolver.invalidate(youtubeKey: resolvedKey)
+        }
         // Reveal on the FIRST FRAME, not on the call to play(). Fading the
         // layer in at `play()` put an empty (black) video layer over the
         // artwork for however long the stream took to buffer — a black hole
@@ -2596,11 +3104,49 @@ private struct HeroTrailerLayer: View {
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 
+    /// How long the trailer takes to dissolve back into the hero artwork.
+    /// A shade slower than the 0.45s fade IN: arriving wants to feel prompt,
+    /// leaving wants to feel like the picture settling rather than being cut.
+    private static let fadeOutSeconds: TimeInterval = 0.7
+
+    /// The trailer finished. Dissolve it back into the still artwork, and only
+    /// then take the player down.
+    ///
+    /// The order is the whole point. `teardown` clears the layer's player,
+    /// which empties it to black at once — doing that first and animating
+    /// afterwards would fade out a black rectangle over the artwork rather
+    /// than the last frame of the trailer. So the opacity animates first and
+    /// the teardown waits for it.
+    @MainActor
+    private func restoreArtwork() {
+        // The preview may already be gone: the hero moved on, Home went away,
+        // or a real player took over — all of which run `teardown` and leave
+        // `player` nil. Nothing to dissolve, and nothing to schedule.
+        guard player != nil else { return }
+        // Never revealed (the item ended while still buffering behind the
+        // artwork): there is no fade to run, just let go.
+        guard visible else { teardown(); return }
+        withAnimation(.easeInOut(duration: Self.fadeOutSeconds)) { visible = false }
+        fadeOutTask?.cancel()
+        fadeOutTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(Self.fadeOutSeconds))
+            guard !Task.isCancelled else { return }
+            teardown()
+        }
+    }
+
     private func teardown() {
+        // A fade still in flight is answered by whatever called this — a new
+        // hero, Home leaving, real playback starting — so drop it rather than
+        // letting it tear down a preview that has already been replaced.
+        fadeOutTask?.cancel()
+        fadeOutTask = nil
         hero.trailerPlaying = false
         visible = false
         statusObserver?.invalidate()
         statusObserver = nil
+        itemFailureObserver?.invalidate()
+        itemFailureObserver = nil
         player?.pause()
         // Clear the item, not just pause — a paused muted player otherwise
         // stays the system "Now Playing" target and the transport overlay
@@ -2608,9 +3154,9 @@ private struct HeroTrailerLayer: View {
         player?.replaceCurrentItem(with: nil)
         player = nil
         releaseAudioIfHeld()
-        if let loopToken {
-            NotificationCenter.default.removeObserver(loopToken)
-            self.loopToken = nil
+        if let endToken {
+            NotificationCenter.default.removeObserver(endToken)
+            self.endToken = nil
         }
     }
 }
@@ -2731,7 +3277,7 @@ private struct FusionHeroHeader: View {
             // even though the art bleeds to the edge.
             ATVHeroInfoView(hero: hero, onPlay: onPlay, playFocus: playFocus,
                             showsActions: showsActions)
-                .padding(.leading, 100)
+                .modifier(RailClearingLeading(withRail: 100, withoutRail: OrivioSpacing.lg))
         }
         .frame(height: height)
         .frame(maxWidth: .infinity)
@@ -2742,7 +3288,8 @@ private struct FusionHeroHeader: View {
                     .font(FusionType.badge(theme.font))
                     .tracking(2)
                     .foregroundStyle(theme.palette.secondary)
-                    .padding(.leading, OrivioSpacing.huge + 100)
+                    .modifier(RailClearingLeading(withRail: OrivioSpacing.huge + 100,
+                                                withoutRail: OrivioSpacing.huge + OrivioSpacing.lg))
                     .padding(.top, 64)
             }
         }
@@ -2765,6 +3312,10 @@ private struct ATVHeroInfoView: View {
     /// -1 / 1 while an invisible stepping sentinel beside the Play button
     /// holds focus for a beat (see the hero button HStack).
     @FocusState private var spotlightStep: Int?
+    /// When focus last LEFT the hero's Play button — a real Left/Right press
+    /// lands on a stepping sentinel within milliseconds of that. See the
+    /// `spotlightStep` handler.
+    @State private var heroFocusLeftAt: Date?
     @State private var contentRating: String?
     @Environment(\.railIsHidden) private var railIsHidden
 
@@ -2851,7 +3402,20 @@ private struct ATVHeroInfoView: View {
                 // focused Play button (Select then opened the wrong title).
                 .onChange(of: playFocus.wrappedValue) { _, focused in
                     hero.heroButtonFocused = focused
-                    if focused { hero.markInteraction() }
+                    if focused {
+                        hero.markInteraction()
+                        // HYBRID: navigating back UP to the hero is what ends
+                        // the browse and resumes rolling — not `onAppear`,
+                        // which also fires on every return from a detail page,
+                        // where focus is restored DOWN in the rows and the
+                        // static hero is still the correct thing to show.
+                        // `markInteraction()` above holds the first rotation
+                        // for the idle window, so nothing changes the instant
+                        // focus lands here.
+                        hero.resetBrowseHandoff()
+                    } else {
+                        heroFocusLeftAt = Date()
+                    }
                 }
                 Color.clear.frame(width: 1, height: 44)
                     .focusable()
@@ -2859,8 +3423,36 @@ private struct ATVHeroInfoView: View {
             }
             .onChange(of: spotlightStep) { _, step in
                 guard let step else { return }
-                hero.stepSpotlight(by: step)
                 spotlightStep = nil
+                // THE ONE PLACE ANYTHING MOVES FOCUS TO THE HERO, so it answers
+                // to the rule this redesign is built on: focus moves only when
+                // the VIEWER navigates. The sentinels are 1pt focusable slivers
+                // beside the Play button; a step is only real if the viewer was
+                // ON that button a moment ago. A focus resolve that lands on a
+                // sliver while they are down in the rows now steps nothing and
+                // pulls nobody back to the top.
+                //
+                // TWO conditions for ONE question, because Play→sentinel writes
+                // both `heroButtonFocused` and `heroFocusLeftAt` in the SAME
+                // focus transaction as this handler, and SwiftUI does not
+                // promise which of two `@FocusState` observers runs first. Ran
+                // this one first, `heroButtonFocused` is still true; ran the
+                // other first, the timestamp is microseconds old. Either order
+                // satisfies exactly one of these — and browsing down in the
+                // rows satisfies neither.
+                let cameFromPlay = hero.heroButtonFocused
+                    || (heroFocusLeftAt.map { Date().timeIntervalSince($0) < 0.35 } ?? false)
+                if cameFromPlay { hero.stepSpotlight(by: step) }
+                // The bounce is UNCONDITIONAL, and deliberately so. Reaching
+                // here means the focus engine has ALREADY put focus on a 1pt
+                // invisible sliver — pressing UP out of the first row can pick
+                // one when the card happens to line up with it. Returning
+                // early would leave focus stranded on something the viewer
+                // cannot see and Select cannot use; this moves it the last
+                // millimetre to the real button. It does not pull focus INTO
+                // the hero — focus was already here — so the rule this
+                // redesign is built on still holds. Only the SPOTLIGHT STEP is
+                // gated, which is the part that was lurching on its own.
                 playFocus.wrappedValue = true
             }
             .padding(.top, OrivioSpacing.xs)
@@ -2938,11 +3530,16 @@ private struct ATVHeroPlayButtonStyle: ButtonStyle {
 
         var body: some View {
             configuration.label
-                // Focused: accent fill + white text; at rest: neutral white pill.
-                .foregroundStyle(isFocused ? .white : .black)
+                // Focused: accent fill + the palette's text colour for it (dark
+                // on White, Lavender and Mint); at rest: neutral white pill, or
+                // glass on White, whose accent fill is that same white.
+                .foregroundStyle(isFocused ? theme.palette.onSecondary
+                                 : (restsOnGlass ? theme.palette.textPrimary : .black))
                 .padding(.horizontal, 36)
                 .padding(.vertical, 16)
-                .background(Capsule().fill(isFocused ? theme.palette.secondary : Color.white.opacity(0.9)))
+                .background(Capsule().fill(isFocused ? theme.palette.secondary
+                                           : (restsOnGlass ? Color.clear : Color.white.opacity(0.9))))
+                .liquidGlassIf(restsOnGlass && !isFocused, in: Capsule())
                 // Bright ring on focus so it reads as selected even over busy art.
                 .overlay(
                     Capsule().strokeBorder(isFocused ? Color.white.opacity(0.95) : .clear, lineWidth: 4)
@@ -2953,5 +3550,9 @@ private struct ATVHeroPlayButtonStyle: ButtonStyle {
                 .focusLift(OrivioFocus.card, isFocused)
                 .cardPressDip(configuration.isPressed)
         }
+
+        /// Same rule as the detail page's `DetailPillButtonStyle`: White's accent
+        /// fill is the white this pill rests on, so there it rests on glass.
+        private var restsOnGlass: Bool { theme.palette.id == OrivioThemes.white.id }
     }
 }

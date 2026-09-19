@@ -182,6 +182,12 @@ struct OrivioCollectionFolder: Codable, Identifiable, Hashable {
     var heroBackdropUrl: String?
     var heroVideoUrl: String?
     var titleLogoUrl: String?
+    // Xperience's cover fields. Not part of the Android shape; carried through
+    // so a round-trip through this app doesn't strip them from the account
+    // copy, and read by `tileCoverImageUrl`.
+    var customCoverImageUrl: String?
+    var defaultCoverSlug: String?
+    var coverSetId: String?
 
     /// Effective sources: modern `sources` wins, legacy `catalogSources` as fallback.
     var effectiveSources: [CollectionSourceDTO] {
@@ -191,6 +197,32 @@ struct OrivioCollectionFolder: Codable, Identifiable, Hashable {
 
     var addonSources: [CollectionSourceDTO] {
         effectiveSources.filter { $0.isAddonSource }
+    }
+
+    /// The picture a folder's TILE draws: its own cover, else the custom cover
+    /// an Xperience pack records separately, else that pack's default cover.
+    ///
+    /// Xperience names most folder art only by slug (`defaultCoverSlug`, e.g.
+    /// "streaming_services.netflix") and leaves `coverImageUrl` empty — 366 of
+    /// 434 folders in a real export — so those tiles drew the placeholder stack
+    /// icon. The address is the one Xperience's own `coverImageUrl` values use,
+    /// `covers/<set>/<slug>.webp` on its CDN, with the "default" set unless the
+    /// folder names another.
+    var tileCoverImageUrl: String? {
+        if let coverImageUrl, !coverImageUrl.isEmpty { return coverImageUrl }
+        if let customCoverImageUrl, !customCoverImageUrl.isEmpty { return customCoverImageUrl }
+        guard let slug = defaultCoverSlug, Self.isCoverName(slug, allowDots: true) else { return nil }
+        let set = coverSetId.flatMap { Self.isCoverName($0, allowDots: false) ? $0 : nil } ?? "default"
+        return "https://cdn.xperience-app.com/covers/\(set)/\(slug).webp"
+    }
+
+    /// Lowercase letters, digits and underscores (and dots, in a slug): the
+    /// only characters Xperience's cover names use, so nothing else can end up
+    /// spliced into the URL.
+    private static let coverNameCharacters = Set("abcdefghijklmnopqrstuvwxyz0123456789_")
+
+    private static func isCoverName(_ name: String, allowDots: Bool) -> Bool {
+        !name.isEmpty && name.allSatisfy { coverNameCharacters.contains($0) || (allowDots && $0 == ".") }
     }
 
     init(from decoder: Decoder) throws {
@@ -209,6 +241,11 @@ struct OrivioCollectionFolder: Codable, Identifiable, Hashable {
         heroBackdropUrl = try c.decodeIfPresent(String.self, forKey: .heroBackdropUrl)
         heroVideoUrl = try c.decodeIfPresent(String.self, forKey: .heroVideoUrl)
         titleLogoUrl = try c.decodeIfPresent(String.self, forKey: .titleLogoUrl)
+        // `try?`: an unexpected type in one of these optional extras must not
+        // throw — a folder that throws is dropped from its collection.
+        customCoverImageUrl = (try? c.decodeIfPresent(String.self, forKey: .customCoverImageUrl)) ?? nil
+        defaultCoverSlug = (try? c.decodeIfPresent(String.self, forKey: .defaultCoverSlug)) ?? nil
+        coverSetId = (try? c.decodeIfPresent(String.self, forKey: .coverSetId)) ?? nil
     }
 
     init(id: String, title: String, sources: [CollectionSourceDTO]) {
@@ -241,12 +278,16 @@ struct OrivioCollectionFolder: Codable, Identifiable, Hashable {
         try c.encodeIfPresent(heroBackdropUrl, forKey: .heroBackdropUrl)
         try c.encodeIfPresent(heroVideoUrl, forKey: .heroVideoUrl)
         try c.encodeIfPresent(titleLogoUrl, forKey: .titleLogoUrl)
+        try c.encodeIfPresent(customCoverImageUrl, forKey: .customCoverImageUrl)
+        try c.encodeIfPresent(defaultCoverSlug, forKey: .defaultCoverSlug)
+        try c.encodeIfPresent(coverSetId, forKey: .coverSetId)
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, title, coverImageUrl, focusGifUrl, focusGifEnabled, coverEmoji
         case tileShape, hideTitle, sources, catalogSources
         case heroBackdropUrl, heroVideoUrl, titleLogoUrl
+        case customCoverImageUrl, defaultCoverSlug, coverSetId
     }
 }
 
@@ -839,17 +880,36 @@ final class CollectionsStore: ObservableObject {
             let persisted = Self.readPersistedLibrary()
             let migrated = (persisted == nil && !legacyMigrated) ? Self.migrateLegacyProfileCollections() : nil
             await MainActor.run { [weak self] in
-                guard let self, self.library.isEmpty else { return }
+                guard let self else { return }
                 let decoded = Self.uniqueByID(
                     persisted ?? (migrated ?? []).filter { self.removedAt[$0.id] == nil }
                 )
-                self.library = decoded
-                self.recomputeVisible()
+                // Something wrote before the decode landed — the account sync's
+                // `mergeIntoLibrary`, which the app-open sync now runs seconds
+                // after launch rather than half a minute later. This used to
+                // `guard library.isEmpty else { return }`, which DROPPED the
+                // whole persisted library in that case; worse, the merge had
+                // already re-persisted its own (smaller) copy over the file, so
+                // every collection this device held that the account did not
+                // was gone for good — and the first full sync then pushed the
+                // reduced set up as the account's new truth.
+                //
+                // Same rule ProgressStore / WatchedStore / LibraryStore follow
+                // for their own decodes: keep the newer in-memory copies, fold
+                // the persisted ones in underneath, re-persist the union.
+                let resident = self.library
+                let known = Set(resident.map(\.id))
+                let missing = resident.isEmpty ? decoded : decoded.filter { !known.contains($0.id) }
+                if resident.isEmpty || !missing.isEmpty {
+                    self.library = resident + missing   // no duplicate ids by construction
+                    self.recomputeVisible()
+                }
                 // Persist only if this came from the legacy per-profile
                 // migration (readPersistedLibrary already wrote the file for
-                // the defaults-key migration), then retire the legacy blobs so
-                // they can neither be re-adopted nor keep ~900 KB parked in
-                // the NSUserDefaults domain.
+                // the defaults-key migration) — or if the union above is news
+                // the file doesn't have — then retire the legacy blobs so they
+                // can neither be re-adopted nor keep ~900 KB parked in the
+                // NSUserDefaults domain.
                 if persisted == nil {
                     if !decoded.isEmpty {
                         // Retire the legacy blobs only once THIS write has
@@ -863,11 +923,14 @@ final class CollectionsStore: ObservableObject {
                         // deleted collections.
                         Self.retireLegacyProfileCollections()
                     }
-                } else if !legacyMigrated {
-                    // A library already exists (file or carried-over key), so
-                    // the legacy blobs were never going to be adopted — they
-                    // are the ~900 KB parked in the defaults domain for nothing.
-                    Self.retireLegacyProfileCollections()
+                } else {
+                    if !resident.isEmpty && !missing.isEmpty { self.saveLibrary() }
+                    if !legacyMigrated {
+                        // A library already exists (file or carried-over key), so
+                        // the legacy blobs were never going to be adopted — they
+                        // are the ~900 KB parked in the defaults domain for nothing.
+                        Self.retireLegacyProfileCollections()
+                    }
                 }
             }
         }
