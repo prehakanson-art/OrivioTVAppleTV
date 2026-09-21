@@ -359,7 +359,10 @@ final class WatchedStore: ObservableObject {
         let expectedProfile = profileID
         let generation = loadGeneration
         Task.detached(priority: .userInitiated) {
-            let decoded = try? JSONDecoder().decode([String: WatchedItem].self, from: data)
+            // `inflated` returns the stored bytes untouched when they carry no
+            // compression magic, so a blob an older build wrote still decodes.
+            let decoded = try? JSONDecoder().decode([String: WatchedItem].self,
+                                                    from: StoreBlob.inflated(data))
             await MainActor.run { [weak self] in
                 guard let self, self.profileID == expectedProfile,
                       self.loadGeneration == generation else { return }
@@ -414,6 +417,8 @@ private actor WatchedPersister {
         guard sequence > (lastSequence[key] ?? 0) else { return }
         lastSequence[key] = sequence
         guard let data = try? JSONEncoder().encode(snapshot) else { return }
-        UserDefaults.standard.set(data, forKey: key)
+        // Compressed: a large imported history is the key that can push the
+        // whole defaults domain past the ~1 MB CFPreferences abort. See StoreBlob.
+        UserDefaults.standard.set(StoreBlob.deflated(data), forKey: key)
     }
 }

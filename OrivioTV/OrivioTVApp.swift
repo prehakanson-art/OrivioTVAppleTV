@@ -16,6 +16,14 @@ struct OrivioTVApp: App {
         // remove the add-on. This is a reducing write, which CFPreferences
         // accepts, so it breaks the loop. See AddonManager.
         AddonManager.reclaimUncompressedStorage()
+        // Same emergency reclaim for the content stores. A large SIMKL/Trakt
+        // import can put the watched history or the library past the ~1 MB
+        // CFPreferences abort on its own, and on such a box the first save
+        // crash-loops the app before it can ever compress — so shrink those
+        // blobs here, first. Both namespaces: the rename migration below would
+        // otherwise copy an oversized `nuvio.*` blob into `orivio.*`.
+        StoreBlob.reclaim(prefixes: ["orivio.watched.v1", "orivio.library.v1",
+                                     "nuvio.watched.v1", "nuvio.library.v1"])
         #if !DEBUG
         // A pre-v8 release build persisted an unbounded PiP dev trail (measured
         // ~97 KB, the single largest key in the domain) that the PiP code only

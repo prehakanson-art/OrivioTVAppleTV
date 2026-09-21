@@ -311,35 +311,48 @@ final class SimklSyncManager: ObservableObject {
     private func syncWatchHistory(remote: [SimklService.SyncItem], token: String, profile: Int) async -> Int {
         guard profileStillActive(profile) else { return 0 }
         let clearedAt = WatchHistoryClearState.clearedAt
+        // Snapshot local rows BEFORE the merge below: a row the merge adds is
+        // one SIMKL already has, so `remoteKeys` excludes it from `pushable`
+        // either way — exactly the reasoning Trakt's manager uses.
+        let localRows = watched.allForSync()
         // History is EPISODE rows (whatever bucket their show sits in — a
         // show mid-binge lives under "watching", and its watched episodes are
         // just as watched) plus movies from the completed bucket. A movie row
         // from any other bucket is a plan or a rating, not a viewing, and the
         // show-level row that `allItems` also emits carries the rating.
-        let remoteItems = remote
-            .filter { ($0.type == "movie" && $0.status == "completed")
-                   || ($0.season != nil && $0.episode != nil) }
-            .compactMap(watchedItem(from:))
-            .filter { item in
-                guard let clearedAt else { return true }
-                return item.watchedAt > clearedAt
-            }
+        //
+        // Off the main actor, like Trakt's: this is O(remote × local) value
+        // work — struct building, key-string interpolation, and a set over the
+        // viewer's ENTIRE library — and for a large SIMKL import it was seconds
+        // of main-thread work on every sync. That is what the tvOS watchdog
+        // kills (0x8BADF00D).
+        let (remoteItems, pushable) = await Task.detached(priority: .utility) { [self] in
+            let remoteItems = remote
+                .filter { ($0.type == "movie" && $0.status == "completed")
+                       || ($0.season != nil && $0.episode != nil) }
+                .compactMap(watchedItem(from:))
+                .filter { item in
+                    guard let clearedAt else { return true }
+                    return item.watchedAt > clearedAt
+                }
+            // Built from EVERY remote row, not just the ones that survived the
+            // history filter above. A row SIMKL holds but this filter drops (an
+            // anime entry, a bucket we don't import) is still a row SIMKL has —
+            // treating it as missing is what re-uploaded it on every sync.
+            let remoteKeys = Set(remote.flatMap { s in
+                localIDs(from: s).map { WatchedItem.key(contentID: $0, season: s.season, episode: s.episode) }
+            })
+            let pushable = localRows
+                .filter { !remoteKeys.contains($0.key) }
+                .compactMap(syncItem(from:))
+            return (remoteItems, pushable)
+        }.value
+        guard profileStillActive(profile) else { return 0 }
         // Additive — never delete local history from a partial SIMKL response.
         // Anything new goes on to the Orivio account as well.
         if !remoteItems.isEmpty, watched.mergeRemote(remoteItems, reconcile: false) {
             watched.requestSyncPush()
         }
-
-        // Built from EVERY remote row, not just the ones that survived the
-        // history filter above. A row SIMKL holds but this filter drops (an
-        // anime entry, a bucket we don't import) is still a row SIMKL has —
-        // treating it as missing is what re-uploaded it on every sync.
-        let remoteKeys = Set(remote.flatMap { s in
-            localIDs(from: s).map { WatchedItem.key(contentID: $0, season: s.season, episode: s.episode) }
-        })
-        let pushable = watched.allForSync()
-            .filter { !remoteKeys.contains($0.key) }
-            .compactMap(syncItem(from:))
         if !pushable.isEmpty, !(await SimklService.addToHistory(pushable, accessToken: token)) {
             pushRetryNeeded = true
         }
@@ -585,7 +598,7 @@ final class SimklSyncManager: ObservableObject {
         TraktSyncManager.parseRuntimeMinutes(raw)
     }
 
-    private func syncItem(from w: WatchedItem) -> SimklService.SyncItem? {
+    private nonisolated func syncItem(from w: WatchedItem) -> SimklService.SyncItem? {
         let (imdb, tmdb) = Self.ids(from: w.contentID)
         guard imdb != nil || tmdb != nil else { return nil }
         return SimklService.SyncItem(imdb: imdb, tmdb: tmdb, type: w.contentType,
@@ -593,7 +606,7 @@ final class SimklSyncManager: ObservableObject {
                                      watchedAt: w.watchedAt)
     }
 
-    private func watchedItem(from s: SimklService.SyncItem) -> WatchedItem? {
+    private nonisolated func watchedItem(from s: SimklService.SyncItem) -> WatchedItem? {
         guard let cid = localID(from: s) else { return nil }
         return WatchedItem(contentID: cid, contentType: s.type, title: s.title,
                            season: s.season, episode: s.episode,
@@ -607,32 +620,32 @@ final class SimklSyncManager: ObservableObject {
     /// SIMKL row returned as `tt1160419`, so it counted as "SIMKL doesn't have
     /// this" on every sync and was re-uploaded forever — and the pull added a
     /// SECOND local row under the IMDb id, so one film showed twice.
-    private func localIDs(from s: SimklService.SyncItem) -> [String] {
+    private nonisolated func localIDs(from s: SimklService.SyncItem) -> [String] {
         var out: [String] = []
         if let imdb = s.imdb, imdb.hasPrefix("tt") { out.append(imdb) }
         if let tmdb = s.tmdb { out.append("tmdb:\(tmdb)") }
         return out
     }
 
-    private func localID(from s: SimklService.SyncItem) -> String? {
+    private nonisolated func localID(from s: SimklService.SyncItem) -> String? {
         if let imdb = s.imdb, imdb.hasPrefix("tt") { return imdb }
         if let tmdb = s.tmdb { return "tmdb:\(tmdb)" }
         return nil
     }
 
-    private func syncItem(fromLibrary item: SavedLibraryItem) -> SimklService.SyncItem? {
+    private nonisolated func syncItem(fromLibrary item: SavedLibraryItem) -> SimklService.SyncItem? {
         let (imdb, tmdb) = Self.ids(from: item.id)
         guard imdb != nil || tmdb != nil else { return nil }
         return SimklService.SyncItem(imdb: imdb, tmdb: tmdb, type: item.type, title: item.name)
     }
 
-    private func syncItem(metaID: String, type: String, rating: Int?) -> SimklService.SyncItem? {
+    private nonisolated func syncItem(metaID: String, type: String, rating: Int?) -> SimklService.SyncItem? {
         let (imdb, tmdb) = Self.ids(from: metaID)
         guard imdb != nil || tmdb != nil else { return nil }
         return SimklService.SyncItem(imdb: imdb, tmdb: tmdb, type: type, rating: rating)
     }
 
-    private static func ids(from contentID: String) -> (imdb: String?, tmdb: Int?) {
+    private nonisolated static func ids(from contentID: String) -> (imdb: String?, tmdb: Int?) {
         if contentID.hasPrefix("tt") { return (contentID, nil) }
         if contentID.hasPrefix("tmdb:"), let n = Int(contentID.dropFirst("tmdb:".count)) { return (nil, n) }
         return (nil, nil)

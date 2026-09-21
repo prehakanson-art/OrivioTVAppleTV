@@ -13,6 +13,66 @@ enum SyncTimestamp {
     static let unknown = Date(timeIntervalSince1970: 0)
 }
 
+// MARK: - UserDefaults blob compression
+
+/// Compression for the content stores' UserDefaults blobs (watched history,
+/// the library).
+///
+/// NSUserDefaults on tvOS aborts the process once the app's domain crosses
+/// roughly 1 MB — `__CFPREFERENCES_HAS_DETECTED_THIS_APP_TRYING_TO_STORE_TOO_MUCH_DATA__`,
+/// observed on a real box at ~984 KB — and these two stores grow with the
+/// viewer's library: a large tracker import (SIMKL/Trakt) is tens of thousands
+/// of rows of highly repetitive JSON, which is exactly the shape zlib crushes
+/// (the add-on list has shipped this way since v8, 18x on real data). Without
+/// it, importing a large library makes the very next `save()` abort — the app
+/// "crashes constantly when connected" and can never settle.
+///
+/// Backward compatible by magic: anything without the prefix is plain JSON
+/// from an older build and is returned untouched, so the reader accepts both
+/// and a downgrade simply re-saves plain.
+enum StoreBlob {
+    static let magic = Data([0x4F, 0x41, 0x5A, 0x31])   // "OAZ1"
+
+    /// Compressed, behind the magic — or the plain JSON when compression
+    /// fails, which `inflated` reads just as happily.
+    static func deflated(_ json: Data) -> Data {
+        guard let squeezed = try? (json as NSData).compressed(using: .zlib) as Data else { return json }
+        return magic + squeezed
+    }
+
+    /// The JSON back out. Anything without the magic is returned untouched.
+    static func inflated(_ stored: Data) -> Data {
+        guard stored.starts(with: magic),
+              let json = try? (Data(stored.dropFirst(magic.count)) as NSData)
+                .decompressed(using: .zlib) as Data
+        else { return stored }
+        return json
+    }
+
+    /// Compress any key under `prefixes` still stored uncompressed.
+    ///
+    /// Runs at launch, BEFORE any other write, for the same reason
+    /// `AddonManager.reclaimUncompressedStorage` exists: on a box already past
+    /// the CFPreferences abort threshold, the first unrelated write (the rename
+    /// migration, a store save) aborts the process and the app crash-loops, so
+    /// it never reaches the `save()` that would compress. This is a REDUCING
+    /// write, which CFPreferences accepts, so it breaks the loop. Lossless —
+    /// the same JSON, just compressed. BOTH namespaces, because the rename
+    /// migration copies an oversized `nuvio.*` blob into `orivio.*` and that
+    /// copy would abort the domain this is meant to shrink.
+    static func reclaim(prefixes: [String], in defaults: UserDefaults = .standard) {
+        for key in defaults.dictionaryRepresentation().keys
+        where prefixes.contains(where: key.hasPrefix) {
+            guard let stored = defaults.data(forKey: key),
+                  !stored.starts(with: magic) else { continue }
+            let squeezed = deflated(stored)
+            guard squeezed.count < stored.count else { continue }
+            defaults.set(squeezed, forKey: key)
+            NSLog("[OrivioStore] reclaimed %@: %d → %d bytes", key, stored.count, squeezed.count)
+        }
+    }
+}
+
 // MARK: - Stremio addon manifest
 
 struct AddonManifest: Codable, Identifiable, Hashable {

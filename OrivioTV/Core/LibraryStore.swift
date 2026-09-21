@@ -440,7 +440,10 @@ final class LibraryStore: ObservableObject {
         let expectedProfile = profileID
         let generation = loadGeneration
         Task.detached(priority: .userInitiated) {
-            let decoded = try? JSONDecoder().decode([String: SavedLibraryItem].self, from: data)
+            // `inflated` passes an uncompressed blob through untouched, so the
+            // plain JSON older builds wrote still decodes. See StoreBlob.
+            let decoded = try? JSONDecoder().decode([String: SavedLibraryItem].self,
+                                                    from: StoreBlob.inflated(data))
             await MainActor.run { [weak self] in
                 guard let self, self.profileID == expectedProfile,
                       self.loadGeneration == generation else { return }
@@ -476,9 +479,12 @@ final class LibraryStore: ObservableObject {
         let snapshot = items
         Task.detached(priority: .utility) { [weak self] in
             guard let data = try? JSONEncoder().encode(snapshot) else { return }
+            // Compressed: a large imported library is a key that can push the
+            // whole defaults domain past the ~1 MB CFPreferences abort.
+            let stored = StoreBlob.deflated(data)
             await MainActor.run {
                 guard let self, self.saveSequences[key] == sequence else { return }
-                UserDefaults.standard.set(data, forKey: key)
+                UserDefaults.standard.set(stored, forKey: key)
             }
         }
     }

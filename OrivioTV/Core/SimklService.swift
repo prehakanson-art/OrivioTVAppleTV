@@ -499,36 +499,48 @@ extension SimklService {
             return nil
         }
         guard !data.isEmpty else { return [] }
-        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            // A 200 with an unreadable body is an outage, not an empty library.
+        // Decode straight into lightweight structs rather than
+        // JSONSerialization's `[String: Any]`. That object graph is several
+        // times the size of the response, and for a viewer whose SIMKL library
+        // runs to tens of thousands of rows it was the single largest
+        // allocation in the whole sync — large enough to be jetsammed on a
+        // 3 GB box before a single item had been imported, which is exactly
+        // the "huge library crashes on sync" report. Trakt's pulls, which
+        // handle the same volume, already decode with JSONDecoder.
+        //
+        // Every field is read through `try?` so a type SIMKL changes (or a row
+        // another client wrote oddly) yields nil for that field rather than
+        // failing the WHOLE response — the tolerance the old `as?` casts gave.
+        // A 200 with an unreadable body is an outage, not an empty library.
+        guard let root = try? JSONDecoder().decode(AllItemsPayload.self, from: data) else {
             return nil
         }
         var out: [SyncItem] = []
-        for (bucket, appType) in [("movies", "movie"), ("shows", "series"), ("anime", "series")] {
-            guard let rows = root[bucket] as? [[String: Any]] else { continue }
+        for (bucket, rows, appType) in [("movies", root.movies, "movie"),
+                                        ("shows", root.shows, "series"),
+                                        ("anime", root.anime, "series")] {
+            guard let rows else { continue }
             for row in rows {
                 // The title object sits under a key named for its kind.
-                let node = (row["movie"] ?? row["show"] ?? row["anime"]) as? [String: Any]
-                guard let node, let ids = node["ids"] as? [String: Any] else { continue }
+                let node = row.movie ?? row.show ?? row.anime
+                guard let node, let ids = node.ids else { continue }
                 // SIMKL files anime FILMS in the same bucket as anime series,
                 // and mapping the whole bucket to "series" typed a film as a
                 // show with no season — which the history filter rejects on
                 // both arms, so the film could never be recognised as
                 // already-synced and was re-uploaded on every single sync.
                 // `anime_type` is the row's own kind ("tv", "movie", "ova"…).
-                let animeKind = (node["anime_type"] as? String)?.lowercased()
+                let animeKind = node.animeType?.lowercased()
                 let appType = (bucket == "anime" && animeKind == "movie") ? "movie" : appType
-                let imdb = ids["imdb"] as? String
-                let tmdb = (ids["tmdb"] as? Int) ?? (ids["tmdb"] as? String).flatMap(Int.init)
+                let imdb = ids.imdb
+                let tmdb = ids.tmdb
                 guard imdb != nil || tmdb != nil else { continue }
-                let title = (node["title"] as? String) ?? ""
-                let rating = (row["user_rating"] as? Int)
-                    ?? (row["user_rating"] as? Double).map(Int.init)
-                let watched = (row["last_watched_at"] as? String).flatMap(parseDate)
-                let listStatus = row["status"] as? String
+                let title = node.title ?? ""
+                let rating = row.userRating.map { Int($0) }
+                let watched = row.lastWatchedAt.flatMap(parseDate)
+                let listStatus = row.status
 
-                guard appType == "series", let seasons = row["seasons"] as? [[String: Any]],
-                      !seasons.isEmpty else {
+                guard appType == "series", let seasons = row.seasons, !seasons.isEmpty else {
                     out.append(SyncItem(imdb: imdb, tmdb: tmdb, type: appType, title: title,
                                         rating: rating, watchedAt: watched, status: listStatus))
                     continue
@@ -539,11 +551,10 @@ extension SimklService {
                 out.append(SyncItem(imdb: imdb, tmdb: tmdb, type: appType, title: title,
                                     rating: rating, watchedAt: watched, status: listStatus))
                 for season in seasons {
-                    guard let number = season["number"] as? Int,
-                          let episodes = season["episodes"] as? [[String: Any]] else { continue }
+                    guard let number = season.number, let episodes = season.episodes else { continue }
                     for episode in episodes {
-                        guard let epNumber = episode["number"] as? Int else { continue }
-                        let at = (episode["watched_at"] as? String).flatMap(parseDate) ?? watched
+                        guard let epNumber = episode.number else { continue }
+                        let at = episode.watchedAt.flatMap(parseDate) ?? watched
                         out.append(SyncItem(imdb: imdb, tmdb: tmdb, type: appType, title: title,
                                             season: number, episode: epNumber, watchedAt: at,
                                             status: listStatus))
@@ -552,6 +563,126 @@ extension SimklService {
             }
         }
         return out
+    }
+
+    /// The `/sync/all-items` response, decoded straight into structs (see
+    /// `allItems`). Optional fields and custom initialisers are deliberate:
+    /// SIMKL's ids arrive as strings on some rows and numbers on others, and
+    /// its seasons tree carries only the watched episodes, often without a
+    /// `watched_at` of their own.
+    private struct AllItemsPayload: Decodable {
+        var movies: [Row]?
+        var shows: [Row]?
+        var anime: [Row]?
+
+        enum CodingKeys: String, CodingKey { case movies, shows, anime }
+
+        // Each bucket independently, so a malformed one (a shape SIMKL changed)
+        // yields nil for THAT bucket and leaves the other two usable — the
+        // tolerance the old `root[bucket] as? [[String: Any]] else continue`
+        // gave. A synthesized init would fail the whole response instead.
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            movies = try? c.decode([Row].self, forKey: .movies)
+            shows = try? c.decode([Row].self, forKey: .shows)
+            anime = try? c.decode([Row].self, forKey: .anime)
+        }
+
+        struct Row: Decodable {
+            var status: String?
+            var lastWatchedAt: String?
+            var userRating: Double?
+            var movie: Node?
+            var show: Node?
+            var anime: Node?
+            var seasons: [Season]?
+
+            enum CodingKeys: String, CodingKey {
+                case status, movie, show, anime, seasons
+                case lastWatchedAt = "last_watched_at"
+                case userRating = "user_rating"
+            }
+
+            init(from decoder: Decoder) throws {
+                let c = try decoder.container(keyedBy: CodingKeys.self)
+                status = try? c.decode(String.self, forKey: .status)
+                lastWatchedAt = try? c.decode(String.self, forKey: .lastWatchedAt)
+                // `decode(Double.self)` accepts an integer JSON number too.
+                userRating = try? c.decode(Double.self, forKey: .userRating)
+                movie = try? c.decode(Node.self, forKey: .movie)
+                show = try? c.decode(Node.self, forKey: .show)
+                anime = try? c.decode(Node.self, forKey: .anime)
+                seasons = try? c.decode([Season].self, forKey: .seasons)
+            }
+        }
+
+        struct Node: Decodable {
+            var title: String?
+            var ids: IDs?
+            var animeType: String?
+
+            enum CodingKeys: String, CodingKey {
+                case title, ids
+                case animeType = "anime_type"
+            }
+
+            init(from decoder: Decoder) throws {
+                let c = try decoder.container(keyedBy: CodingKeys.self)
+                title = try? c.decode(String.self, forKey: .title)
+                ids = try? c.decode(IDs.self, forKey: .ids)
+                animeType = try? c.decode(String.self, forKey: .animeType)
+            }
+        }
+
+        /// `ids.tmdb` is a STRING on the live API ("67195") and a number on
+        /// some rows, so read both; an unparseable value is nil, never a throw.
+        struct IDs: Decodable {
+            var imdb: String?
+            var tmdb: Int?
+
+            enum CodingKeys: String, CodingKey { case imdb, tmdb }
+
+            init(from decoder: Decoder) throws {
+                let c = try decoder.container(keyedBy: CodingKeys.self)
+                imdb = try? c.decode(String.self, forKey: .imdb)
+                if let n = try? c.decode(Int.self, forKey: .tmdb) {
+                    tmdb = n
+                } else if let s = try? c.decode(String.self, forKey: .tmdb) {
+                    tmdb = Int(s)
+                } else {
+                    tmdb = nil
+                }
+            }
+        }
+
+        struct Season: Decodable {
+            var number: Int?
+            var episodes: [Episode]?
+
+            enum CodingKeys: String, CodingKey { case number, episodes }
+
+            init(from decoder: Decoder) throws {
+                let c = try decoder.container(keyedBy: CodingKeys.self)
+                number = try? c.decode(Int.self, forKey: .number)
+                episodes = try? c.decode([Episode].self, forKey: .episodes)
+            }
+        }
+
+        struct Episode: Decodable {
+            var number: Int?
+            var watchedAt: String?
+
+            enum CodingKeys: String, CodingKey {
+                case number
+                case watchedAt = "watched_at"
+            }
+
+            init(from decoder: Decoder) throws {
+                let c = try decoder.container(keyedBy: CodingKeys.self)
+                number = try? c.decode(Int.self, forKey: .number)
+                watchedAt = try? c.decode(String.self, forKey: .watchedAt)
+            }
+        }
     }
 
     /// GET /sync/activities — the tiny "what changed and when" endpoint SIMKL

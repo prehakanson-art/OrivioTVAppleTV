@@ -977,7 +977,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 8.5;
+				MARKETING_VERSION = 9;
 				PRODUCT_BUNDLE_IDENTIFIER = com.orivio.tv.appletv.dev.topshelf;
 				SDKROOT = appletvos;
 				SWIFT_VERSION = 5.9;
@@ -1135,7 +1135,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 8.5;
+				MARKETING_VERSION = 9;
 				PRODUCT_BUNDLE_IDENTIFIER = com.orivio.tv.appletv.dev.topshelf;
 				SDKROOT = appletvos;
 				SWIFT_VERSION = 5.9;
@@ -1162,7 +1162,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 8.5;
+				MARKETING_VERSION = 9;
 				PRODUCT_BUNDLE_IDENTIFIER = com.orivio.tv.appletv.dev;
 				SDKROOT = appletvos;
 				SWIFT_VERSION = 5.9;
@@ -1189,7 +1189,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 8.5;
+				MARKETING_VERSION = 9;
 				PRODUCT_BUNDLE_IDENTIFIER = com.orivio.tv.appletv.dev;
 				SDKROOT = appletvos;
 				SWIFT_VERSION = 5.9;
