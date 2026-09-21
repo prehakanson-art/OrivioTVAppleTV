@@ -1,4 +1,6 @@
+import AVFoundation
 import Foundation
+import KSPlayer
 import Network
 import SwiftUI
 import UIKit
@@ -118,8 +120,45 @@ enum PlayerTempSweep {
     }
 }
 
-/// Dev-only live probe bus: timestamped EVENTS from anywhere, plus LEVELS
-/// pulled on demand from whoever holds them.
+/// Master switch for the whole probe suite (bus + LAN server + flight recorder).
+///
+/// DEBUG builds default ON. RELEASE builds — what `make-ipa.sh` produces and
+/// what a sideloaded install actually runs — default OFF and are turned on from
+/// Settings → Performance → "Capture diagnostics". The old `#if DEBUG` gate
+/// compiled every probe away in release, so the build people really use had no
+/// instrumentation at all; this makes the same suite available there without
+/// paying for it unless someone asks.
+enum ProbeGate {
+    /// Persisted choice. Absent means "DEBUG default" (see `configureFromDefaults`).
+    static let defaultsKey = "orivio.diag.capture.v1"
+
+    private static let lock = NSLock()
+    private static var enabled = false
+
+    /// Read on every `PlayerProbe` call (including the scrub path), so it is a
+    /// cheap lock, not a `UserDefaults` hit.
+    static var isEnabled: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return enabled
+    }
+
+    /// Called once from the app's `init`, before any probe is started.
+    static func configureFromDefaults() {
+        let stored = UserDefaults.standard.object(forKey: defaultsKey) as? Bool
+        #if DEBUG
+        set(stored ?? true)
+        #else
+        set(stored ?? false)
+        #endif
+    }
+
+    static func set(_ on: Bool) {
+        lock.lock(); enabled = on; lock.unlock()
+    }
+}
+
+/// Live probe bus: timestamped EVENTS from anywhere, plus LEVELS pulled on
+/// demand from whoever holds them.
 ///
 /// The colour and DV trails are the wrong shape for watching an interaction.
 /// They go through `UserDefaults` (a disk-backed write per line, capped at a
@@ -131,8 +170,8 @@ enum PlayerTempSweep {
 /// and a monotonically increasing sequence number so a streaming reader can ask
 /// for "everything since N" without re-reading what it already has.
 ///
-/// DEBUG only, like the server that serves it. Every call site compiles away in
-/// release — `event` in particular sits on the scrub path.
+/// Gated by `ProbeGate`. When off, the `@autoclosure` message is never built,
+/// so the call sites (including the scrub path) stay cheap.
 enum PlayerProbe {
     /// Ring capacity. Big enough to hold a whole scrub gesture at full rate —
     /// and, since the live tail only drains it twice a second, big enough that
@@ -152,18 +191,17 @@ enum PlayerProbe {
     /// call sites sit on the scrub publish path and in every seek, and a
     /// `String(format:)` per call there is real work for a log nobody can read.
     nonisolated static func event(_ tag: String, _ line: @autoclosure () -> String) {
-        #if DEBUG
+        guard ProbeGate.isEnabled else { return }
         lock.lock()
         ring.append((nextSeq, Date(), tag, line()))
         nextSeq &+= 1
         if ring.count > capacity { ring.removeFirst(ring.count - capacity) }
         lock.unlock()
-        #endif
     }
 
     /// Events newer than `seq`, formatted, with the sequence to ask from next.
     static func events(since seq: UInt64, limit: Int = capacity) -> (lines: [String], next: UInt64) {
-        #if DEBUG
+        guard ProbeGate.isEnabled else { return ([], seq) }
         lock.lock()
         let fresh = ring.filter { $0.seq > seq }.suffix(limit)
         let next = ring.last?.seq ?? seq
@@ -172,9 +210,6 @@ enum PlayerProbe {
             String(format: "%8.3f  %-9@ %@",
                    entry.at.timeIntervalSince(startedAt), entry.tag, entry.line)
         }, next)
-        #else
-        return ([], seq)
-        #endif
     }
 
     // MARK: Counters and sticky notes
@@ -194,31 +229,29 @@ enum PlayerProbe {
 
     /// Bump a counter. Same threading contract as `event`.
     nonisolated static func count(_ name: String, by amount: Int = 1) {
-        #if DEBUG
+        guard ProbeGate.isEnabled else { return }
         lock.lock()
         if counters[name] == nil { counterOrder.append(name) }
         counters[name, default: 0] += amount
         lock.unlock()
-        #endif
     }
 
     /// Record a last-known value (with the time it was set). Use for the one
     /// fact whose LATEST value matters — the last error, the URL in play, how
     /// long the open took.
     nonisolated static func note(_ key: String, _ value: @autoclosure () -> String) {
-        #if DEBUG
+        guard ProbeGate.isEnabled else { return }
         let v = value()
         lock.lock()
         notes.removeAll { $0.key == key }
         notes.append((key, v, Date()))
         lock.unlock()
-        #endif
     }
 
     /// Drop every counter and note. Called when a new playback session starts
     /// so the numbers describe THIS title, not the afternoon.
     nonisolated static func resetHealth(keeping prefix: String? = nil) {
-        #if DEBUG
+        guard ProbeGate.isEnabled else { return }
         lock.lock()
         if let prefix {
             counters = counters.filter { $0.key.hasPrefix(prefix) }
@@ -228,11 +261,10 @@ enum PlayerProbe {
             counters = [:]; counterOrder = []; notes = []
         }
         lock.unlock()
-        #endif
     }
 
     nonisolated static func healthLines() -> [String] {
-        #if DEBUG
+        guard ProbeGate.isEnabled else { return [] }
         lock.lock()
         let c = counterOrder.compactMap { name -> String? in
             guard let value = counters[name] else { return nil }
@@ -253,9 +285,6 @@ enum PlayerProbe {
         if !row.isEmpty { out.append(row) }
         out.append(contentsOf: n)
         return out
-        #else
-        return []
-        #endif
     }
 
     // MARK: Levels
@@ -361,7 +390,7 @@ final class ColorProbeServer {
     private var listener: NWListener?
 
     func start() {
-        #if DEBUG
+        guard ProbeGate.isEnabled else { return }
         guard listener == nil, let port = NWEndpoint.Port(rawValue: Self.port) else { return }
         let params = NWParameters.tcp
         params.allowLocalEndpointReuse = true
@@ -397,9 +426,13 @@ final class ColorProbeServer {
                     // way to prove, from outside, that a listener killed by a
                     // suspension is rebuilt rather than handed out dead.
                     case let p where p.hasPrefix("/cachecheck"):
+                        #if DEBUG
                         MediaCacheServer.shared.debugCheckListener { line in
                             Task { @MainActor in Self.sendText(on: connection, line + "\n") }
                         }
+                        #else
+                        Self.sendText(on: connection, "cachecheck: debug builds only\n")
+                        #endif
                     case let p where p.hasPrefix("/health"):
                         Self.sendText(on: connection,
                                       PlayerProbe.healthLines().joined(separator: "\n") + "\n")
@@ -415,7 +448,12 @@ final class ColorProbeServer {
         }
         listener.start(queue: .main)
         self.listener = listener
-        #endif
+    }
+
+    /// Tear the listener down when the Diagnostics toggle is switched off.
+    func stop() {
+        listener?.cancel()
+        listener = nil
     }
 
     /// Live tail: an HTTP response with NO Content-Length that simply never
@@ -581,7 +619,7 @@ enum FlightRecorder {
     }
 
     static func start() {
-        #if DEBUG
+        guard ProbeGate.isEnabled else { return }
         guard !started else { return }
         started = true
         NSLog("[OrivioFlight] recorder armed — tick %.0fs, ring %d, key %@",
@@ -612,7 +650,6 @@ enum FlightRecorder {
         tickTimer = recorder
 
         observeLifecycle()
-        #endif
     }
 
     // MARK: - Internals
@@ -683,6 +720,88 @@ enum FlightRecorder {
     }
 }
 
+/// The electronic equivalent of toggling the TV input, used to recover a panel
+/// wedged grey by a bad HDMI mode switch.
+///
+/// Deliberately GLOBAL (not owned by a player): the wedge is most often escaped
+/// by backing out of the player, and at that point there is no view model left
+/// to run a recovery — the display manager is still there, though, so this is
+/// driven straight off it. `sessionTarget` lets a live player put its own mode
+/// back; with no player the target is home mode (nil).
+@MainActor
+enum DisplayResync {
+    /// Set by the active player so step 3 restores the SESSION's HDR/DV mode
+    /// rather than dropping to SDR. Cleared on teardown.
+    static var sessionTarget: (() -> AVDisplayCriteria?)?
+
+    static func force(reason: String) {
+        guard let manager = UIApplication.shared.ks_keyWindow?.avDisplayManager else {
+            PlayerProbe.event("display", "force re-sync: no display manager")
+            return
+        }
+        let held = manager.preferredDisplayCriteria
+        let target = held ?? sessionTarget?()
+        // 1/3 — drop the criteria and the app's pin, so tvOS is allowed to move
+        // the panel and a later request is not deduped.
+        manager.preferredDisplayCriteria = nil
+        SessionDisplayMode.resetPinForResync()
+        PlayerProbe.event("display", "force re-sync 1/3 — dropped criteria (held="
+            + (held != nil ? "set" : "nil") + ") reason=\(reason)")
+        // 2/3 — force a DEFINITE different mode (SDR) so the link re-trains even
+        // if tvOS thought it was already home.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
+            let sdr = AVDisplayCriteria(
+                refreshRate: Float(UIScreen.main.maximumFramesPerSecond),
+                videoDynamicRange: DynamicRange.sdr.rawValue
+            )
+            manager.preferredDisplayCriteria = sdr
+            PlayerProbe.event("display", "force re-sync 2/3 — stepped through SDR")
+            // 3/3 — restore.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
+                manager.preferredDisplayCriteria = target
+                PlayerProbe.event("display", "force re-sync 3/3 — restored "
+                    + (target == nil ? "home mode" : "session mode"))
+            }
+        }
+    }
+}
+
+/// Remote probe commands, fired from the Mac with:
+///
+///   xcrun devicectl device notification post --device <id> \
+///     --name com.orivio.tv.probe.resyncDisplay
+///
+/// The grey-screen wedge leaves the WHOLE TV grey, so recovery must not depend
+/// on the viewer finding the remote gesture. This lets the person reading the
+/// probe trigger the SAME display re-sync from outside, and lets a support
+/// session recover the panel without touching the Apple TV.
+enum ProbeRemote {
+    static let resyncDarwinName = "com.orivio.tv.probe.resyncDisplay"
+    static let resyncNotification = Notification.Name("orivio.probe.resyncDisplay")
+
+    private static let callback: CFNotificationCallback = { _, _, _, _, _ in
+        // Darwin callbacks are not on a known queue; hop to main and run the
+        // GLOBAL display re-sync (works even with no player open, which is the
+        // case the moment the viewer backs out of a wedged grey player).
+        DispatchQueue.main.async {
+            PlayerProbe.event("display", "remote re-sync command received")
+            MainActor.assumeIsolated { DisplayResync.force(reason: "remote") }
+            NotificationCenter.default.post(name: resyncNotification, object: nil)
+        }
+    }
+
+    nonisolated(unsafe) private static var installed = false
+    static func install() {
+        guard !installed else { return }
+        installed = true
+        CFNotificationCenterAddObserver(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            nil, callback,
+            resyncDarwinName as CFString, nil, .deliverImmediately
+        )
+        PlayerProbe.event("life", "remote probe commands armed — \(resyncDarwinName)")
+    }
+}
 
 // MARK: - App-wide probe
 
@@ -695,9 +814,10 @@ enum FlightRecorder {
 /// one clock, one `/live` tail — with app-shaped verbs, so a browse and the
 /// playback it leads into read as one story instead of two.
 ///
-/// Everything here is DEBUG-only by construction: `PlayerProbe.event` compiles
-/// its message away in release, and the counters and notes do the same. The
-/// call sites are therefore free to sit anywhere, including in a `body`.
+/// Gated by `ProbeGate`, not by the compiler: with capture off the message is
+/// never built (it is an `@autoclosure` behind a cheap flag check), so the call
+/// sites are still free to sit anywhere, including in a `body`. With capture on
+/// — the Settings toggle in a Release/sideloaded build — they all record.
 ///
 /// Lives in this file for the same reason `PlayerProbe` does — `project.yml`
 /// globs sources but the checked-in `.xcodeproj` does not, so a NEW file needs
@@ -745,12 +865,11 @@ enum AppProbe {
     /// the bug), and the note survives past the end of the ring so a long
     /// session still reports its last failure.
     nonisolated static func warn(_ area: String, _ line: @autoclosure () -> String) {
-        #if DEBUG
+        guard ProbeGate.isEnabled else { return }
         let text = line()
         PlayerProbe.event("WARN", "\(area): \(text)")
         PlayerProbe.count("warn.\(area)")
         PlayerProbe.note("lastWarn", "\(area): \(text)")
-        #endif
     }
 
     /// Stopwatch for anything that takes time. Returns the closure that ends
@@ -764,7 +883,7 @@ enum AppProbe {
     /// number behind it without anyone having to have been watching the tail
     /// at the time.
     nonisolated static func begin(_ tag: String, _ what: String) -> (String) -> Void {
-        #if DEBUG
+        guard ProbeGate.isEnabled else { return { _ in } }
         let started = CACurrentMediaTime()
         PlayerProbe.event(tag, what + " …")
         return { outcome in
@@ -772,9 +891,6 @@ enum AppProbe {
             PlayerProbe.event(tag, String(format: "%@ — %.0fms · %@", what, ms, outcome))
             if ms > 2000 { PlayerProbe.count("slow.\(tag)") }
         }
-        #else
-        return { _ in }
-        #endif
     }
 
     /// A URL boiled down to what identifies it in a log: host plus the part of
@@ -836,14 +952,50 @@ enum AppProbe {
     /// keeping five counters in step is a bug waiting to be written.
     @MainActor static var depth: Int { max(mounted.count - 1, 0) }
 
+    /// Thermal pressure, the one OS signal that explains "it only stutters
+    /// after twenty minutes" without anything in the app having changed.
+    nonisolated static func thermalLabel(_ state: ProcessInfo.ThermalState) -> String {
+        switch state {
+        case .nominal: return "nominal"
+        case .fair: return "fair"
+        case .serious: return "SERIOUS"
+        case .critical: return "CRITICAL"
+        @unknown default: return "?"
+        }
+    }
+
+    /// One-line output-route summary. Route changes are a classic source of
+    /// dropouts and A/V drift ("it went out of sync when the soundbar woke"),
+    /// and nothing else in the app records them.
+    @MainActor static var audioRouteLabel: String {
+        let session = AVAudioSession.sharedInstance()
+        let outputs = session.currentRoute.outputs.map { "\($0.portType.rawValue):\($0.portName)" }
+        return (outputs.isEmpty ? "—" : outputs.joined(separator: ","))
+            + "  cat=\(session.category.rawValue)/\(session.mode.rawValue)"
+    }
+
     /// Register the `[app]` level block. Called once, from the app's `init`,
     /// so browsing is observable before anything has been played.
     @MainActor static func installLevels() {
+        // Pin the probe clock at LAUNCH. `PlayerProbe.startedAt` is lazy, so
+        // without this it was first touched when a client read the log —
+        // making every event logged before that read show a NEGATIVE time.
+        _ = PlayerProbe.startedAt
+        ProbeRemote.install()
         PlayerProbe.register("app") {
             [
                 "tab=\(tab)  screen=\(screen)  depth=\(depth)  scene=\(scene)",
                 "where=\(breadcrumb)",
                 "rail=\(rail)  lastFocusedRow=\(ContentFocusRouter.shared.lastRowID ?? "—")",
+                "thermal=\(thermalLabel(ProcessInfo.processInfo.thermalState))"
+                    + "  lowPower=\(ProcessInfo.processInfo.isLowPowerModeEnabled.probe)"
+                    + "  cpus=\(ProcessInfo.processInfo.activeProcessorCount)",
+                // Live player-model census. More than 1 while nothing is being
+                // handed to PiP is a leak, and this is the block a browse is
+                // read against.
+                "playerVMs=\(PlayerViewModel.liveInstanceCounter.wrappedValue)"
+                    + "  mem=\(String(format: "%.0fMB", PlayerProbe.footprintMB()))",
+                "audio=\(audioRouteLabel)",
             ]
         }
         // A jetsam on a 3 GB box is preceded by this, and "the app just
@@ -853,6 +1005,23 @@ enum AppProbe {
             object: nil, queue: .main
         ) { _ in
             warn("memory", String(format: "memory warning at %.0fMB", PlayerProbe.footprintMB()))
+        }
+        // Thermal throttling and audio-route changes both show up as "it just
+        // started stuttering / drifted" with nothing in the player log.
+        NotificationCenter.default.addObserver(
+            forName: ProcessInfo.thermalStateDidChangeNotification, object: nil, queue: .main
+        ) { _ in
+            life("thermal → \(thermalLabel(ProcessInfo.processInfo.thermalState))")
+        }
+        NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main
+        ) { note in
+            guard ProbeGate.isEnabled else { return }
+            let raw = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
+            let reason = raw.flatMap { AVAudioSession.RouteChangeReason(rawValue: $0) }
+            Task { @MainActor in
+                life("audio route → \(audioRouteLabel)  reason=\(reason.map(String.init(describing:)) ?? "?")")
+            }
         }
         life("probe armed — app block registered")
     }

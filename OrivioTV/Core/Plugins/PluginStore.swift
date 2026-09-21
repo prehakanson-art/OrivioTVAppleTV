@@ -208,8 +208,13 @@ final class PluginStore: ObservableObject {
     /// Download + cache a scraper's JS. nil = transient failure, try again later.
     @discardableResult
     nonisolated private static func downloadBody(for scraper: ScraperInfo, session: URLSession) async -> String? {
+        // Status-checked: the body cache has an infinite TTL, so a 404/error
+        // page (non-empty UTF-8) would otherwise be stored and evaluated on
+        // every future search, and the lazy re-download that is supposed to
+        // self-heal a bad install would never run.
         guard let url = URL(string: scraper.sourceURL),
-              let (data, _) = try? await session.data(from: url),
+              let (data, response) = try? await session.data(from: url),
+              let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
               let js = String(data: data, encoding: .utf8), !js.isEmpty else { return nil }
         await jsCache.store(js, for: scraper.id)
         return js
@@ -349,12 +354,24 @@ final class PluginStore: ObservableObject {
     ///     mid-URL.
     private static func resolve(filename: String, against manifestURL: String) -> String {
         if filename.hasPrefix("http://") || filename.hasPrefix("https://") { return filename }
+        // Split any query/fragment off BEFORE inspecting the last path
+        // component, exactly as `canonicalManifestURL` does. A tokenized repo
+        // URL (`…/manifest.json?token=abc`) does not end in ".json", so the old
+        // check left the filename in place and produced
+        // `…/manifest.json?token=abc/scraper.js` — a guaranteed 404, retried on
+        // every search.
         var base = manifestURL
+        var suffix = ""
+        if let mark = base.firstIndex(where: { $0 == "?" || $0 == "#" }) {
+            suffix = String(base[mark...])
+            base = String(base[base.startIndex..<mark])
+        }
         if let slash = base.lastIndex(of: "/") {
             let last = base[base.index(after: slash)...]
             if last.hasSuffix(".json") { base = String(base[base.startIndex..<slash]) }
         }
-        return "\(base)/\(filename.hasPrefix("/") ? String(filename.dropFirst()) : filename)"
+        let name = filename.hasPrefix("/") ? String(filename.dropFirst()) : filename
+        return "\(base)/\(name)\(suffix)"
     }
 
     /// See `AddonManager.missedLocalChangeWhileSuppressed` — `applyRemote`

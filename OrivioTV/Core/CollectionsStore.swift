@@ -584,7 +584,10 @@ final class CollectionsStore: ObservableObject {
     /// tombstone for each one, which would then suppress the incoming account's
     /// collections of the same id, and writes the library file N times.
     func clearAll() {
-        guard !library.isEmpty || !removedAt.isEmpty else { return }
+        guard !library.isEmpty || !removedAt.isEmpty
+                || !hiddenIDs.isEmpty || !hiddenFolderIDs.isEmpty
+                || !globalHiddenIDs.isEmpty || !globalHiddenFolderIDs.isEmpty
+        else { return }
         suppressChange = true
         defer { suppressChange = false }
         library = []

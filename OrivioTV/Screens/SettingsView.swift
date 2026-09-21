@@ -557,7 +557,7 @@ struct SelectableChip: View {
     var body: some View {
         Text(title)
             .font(.system(size: 22, weight: .semibold))
-            .foregroundStyle(isFocused ? theme.palette.onSecondary : (selected ? theme.palette.textPrimary : theme.palette.textSecondary))
+            .foregroundStyle(isFocused ? theme.palette.onSecondary : (selected ? theme.palette.onAccentTint : theme.palette.textSecondary))
             .frame(maxWidth: .infinity)
             .padding(.vertical, OrivioSpacing.md)
             .background(
@@ -623,7 +623,13 @@ struct OrivioSwitch: View {
                 .fill(isOn ? theme.palette.secondary : Color.primary.opacity(0.18))
                 .frame(width: 64, height: 36)
             Circle()
-                .fill(.white)
+                // The knob has to read against TWO different tracks: the dark
+                // off-track and the accent on-track. A hardcoded white knob
+                // vanished on the White theme, whose accent track is white too
+                // — the "toggles are invisible with the white colour" report.
+                // `onSecondary` is the accent's own ink (dark on White), so the
+                // knob contrasts when on; white is right for the dark off-track.
+                .fill(isOn ? theme.palette.onSecondary : .white)
                 .frame(width: 28, height: 28)
                 .padding(4)
         }
@@ -1182,6 +1188,9 @@ private struct AddonsManagementView: View {
     @State private var showDiscover = false
     @State private var showCommunityCollections = false
     @State private var refreshing = false
+    /// Bumped per refresh so a fast second sync can't have its status message
+    /// overwritten by the first one's trailing "idle" linger.
+    @State private var refreshGeneration = 0
     @State private var showExport = false
     @State private var showImport = false
     @State private var showHealth = false
@@ -1395,17 +1404,23 @@ private struct AddonsManagementView: View {
     private func refresh() {
         guard !refreshing else { return }
         refreshing = true
+        refreshGeneration &+= 1
+        let generation = refreshGeneration
         Task {
             // Report what ACTUALLY happened. This used to say "Add-ons
             // refreshed just now" unconditionally, including when the account
             // pull had failed or been skipped entirely.
             let outcome = await addonManager.syncWithAccount()
+            guard generation == refreshGeneration else { return }
             refreshing = false
             refreshSubtitle = outcome.message
             // Leave a failure on screen longer than a success — it's the one
             // the user needs to read.
             let linger: UInt64 = { if case .failed = outcome { return 10 } else { return 4 } }()
             try? await Task.sleep(nanoseconds: linger * 1_000_000_000)
+            // A second refresh may have started during the linger; its message
+            // owns the row now.
+            guard generation == refreshGeneration else { return }
             refreshSubtitle = Self.refreshIdle
         }
     }

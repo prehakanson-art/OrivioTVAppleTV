@@ -216,10 +216,31 @@ final class DebridStore: ObservableObject {
     }
 
     func refreshRealDebridIfNeeded() async {
-        guard configuredProviders.contains(.realDebrid), let refresh = rdRefresh else { return }
+        guard configuredProviders.contains(.realDebrid), rdRefresh != nil else { return }
         // Only when it is actually near expiry: this now runs before every
         // resolve, not just once at launch.
         guard realDebridTokenIsStale else { return }
+        // Coalesce. The body below suspends on the network, so two concurrent
+        // callers (source failover and the Sources sheet) both saw a stale token
+        // and POSTed the same refresh token — and RD ROTATES refresh tokens, so
+        // the loser could invalidate the winner's. Join the in-flight refresh.
+        if let inFlight = realDebridRefreshTask {
+            await inFlight.value
+            return
+        }
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.performRealDebridRefresh()
+        }
+        realDebridRefreshTask = task
+        await task.value
+        realDebridRefreshTask = nil
+    }
+
+    private var realDebridRefreshTask: Task<Void, Never>?
+
+    private func performRealDebridRefresh() async {
+        guard let refresh = rdRefresh, realDebridTokenIsStale else { return }
         guard let result = await DebridService.refreshRealDebrid(refresh) else { return }
         applyingRemote = true          // don't treat a token refresh as a user edit
         keys[.realDebrid] = result.token
@@ -364,15 +385,24 @@ enum DebridService {
         episode: Int?,
         fileIdx: Int? = nil
     ) async -> (result: DebridResult, provider: DebridProvider?) {
+        // Debrid resolution is the single most common cause of a long "loading"
+        // pause or a mid-binge stall (an uncached torrent, a dead link), and it
+        // happens off the player's own clock. Timed here so the log shows how
+        // long each provider took before the next was tried.
+        let done = AppProbe.begin("debrid", "resolve \(stream.infoHash?.prefix(12) ?? "?")")
         var lastResult: DebridResult = .missingKey
         for (provider, apiKey) in providers {
             let result = await resolve(
                 stream: stream, provider: provider, apiKey: apiKey,
                 season: season, episode: episode, fileIdx: fileIdx
             )
-            if case .success = result { return (result, provider) }
+            if case .success = result {
+                done("ok via \(provider.displayName)")
+                return (result, provider)
+            }
             lastResult = result
         }
+        done("failed — \(lastResult)")
         return (lastResult, nil)
     }
 
@@ -665,9 +695,18 @@ enum DebridService {
             guard let url = comps.url else { return false }
             request = URLRequest(url: url)
         }
-        guard let (_, response) = try? await session.data(for: request),
-              let http = response as? HTTPURLResponse else { return false }
-        return (200..<300).contains(http.statusCode)
+        guard let (data, response) = try? await session.data(for: request),
+              let http = response as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode) else { return false }
+        // AllDebrid's v4 API answers most failures — a bad key included — with
+        // HTTP 200 and an {"status":"error",...} envelope, so the status-only
+        // check reported a mistyped key as valid. Look at the envelope.
+        if provider == .allDebrid {
+            struct Resp: Decodable { let status: String? }
+            guard let r = try? JSONDecoder().decode(Resp.self, from: data) else { return false }
+            return r.status?.lowercased() == "success"
+        }
+        return true
     }
 
     // MARK: File selection

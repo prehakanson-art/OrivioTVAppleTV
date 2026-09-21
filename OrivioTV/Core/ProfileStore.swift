@@ -361,9 +361,23 @@ final class ProfileStore: ObservableObject {
         let suffix = ".p\(id)"
         let defaults = UserDefaults.standard
         var removed = 0
-        for key in defaults.dictionaryRepresentation().keys where key.hasSuffix(suffix) {
-            defaults.removeObject(forKey: key)
-            removed += 1
+        for key in defaults.dictionaryRepresentation().keys {
+            if key.hasSuffix(suffix) {
+                defaults.removeObject(forKey: key)
+                removed += 1
+            } else if key.hasPrefix("orivio.sync.dirty.") {
+                // The per-profile dirty flags live under an UNSCOPED key as an
+                // array of profile ids, so the `.p<id>` sweep above misses them.
+                // Left behind, a later profile that reuses this id inherits a
+                // spurious "unpushed changes" mark.
+                var ids = defaults.array(forKey: key) as? [Int] ?? []
+                if let idx = ids.firstIndex(of: id) {
+                    ids.remove(at: idx)
+                    if ids.isEmpty { defaults.removeObject(forKey: key) }
+                    else { defaults.set(ids, forKey: key) }
+                    removed += 1
+                }
+            }
         }
         NSLog("[OrivioProfiles] deleted profile %d — retired %d stored keys", id, removed)
     }
@@ -508,10 +522,19 @@ final class ProfileStore: ObservableObject {
         let localAutoLink = Dictionary(profiles.compactMap { p in
             p.autoLink.map { (p.id, $0) }
         }, uniquingKeysWith: { first, _ in first })
+        // The pull RPC has no `pinEnabled` column, so every row arrives false
+        // and the REAL value only lands in the separate `pull_profile_locks`
+        // call, which is best-effort (`try?`). Carrying the local lock state
+        // forward — exactly like the hash — stops a failed or slow locks call
+        // from silently UNLOCKING a protected profile. `applyLockStates` still
+        // overwrites it once the authoritative answer arrives.
+        let localPinEnabled = Dictionary(profiles.map { ($0.id, $0.pinEnabled) },
+                                         uniquingKeysWith: { first, _ in first })
         profiles = remote.sorted { $0.id < $1.id }.map { p in
             var merged = p
             merged.pinHash = merged.pinHash ?? localHashes[p.id]
             merged.autoLink = merged.autoLink ?? localAutoLink[p.id]
+            merged.pinEnabled = localPinEnabled[p.id] ?? merged.pinEnabled
             return merged
         }
         saveList()

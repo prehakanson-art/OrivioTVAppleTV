@@ -27,14 +27,24 @@ cd "$(dirname "$0")/.."
 DIST_ID="com.orivio.tv.appletv"
 # Config/Info.plist holds $(MARKETING_VERSION), so PlistBuddy would return the
 # literal variable (or a stale 1.0). project.yml is the real source.
-VERSION=$(grep -m1 'MARKETING_VERSION:' project.yml | sed 's/.*: *"\(.*\)"/\1/')
+# `|| true` is required: with `set -o pipefail`, a grep that finds nothing makes
+# the pipeline non-zero, and `set -e` would abort the assignment before the
+# fallback below could run.
+VERSION=$(grep -m1 'MARKETING_VERSION:' project.yml 2>/dev/null | sed 's/.*: *"\(.*\)"/\1/' || true)
 [ -n "$VERSION" ] || VERSION="0.0.0"
 OUT_DIR="ipa_out"
 
 echo "==> Building Release…"
+# Capture xcodebuild's OWN exit status. Piping into grep masks it (the pipeline
+# returns grep's status, which is 1 whenever the build printed no matching
+# line), so `set -e` could not catch a failed build.
+set +e
 xcodebuild -project OrivioTV.xcodeproj -scheme OrivioTV \
   -destination 'generic/platform=tvOS' -configuration Release \
   -allowProvisioningUpdates build 2>&1 | grep -E "error:|BUILD (SUCCEEDED|FAILED)"
+BUILD_STATUS="${pipestatus[1]}"
+set -e
+[ "$BUILD_STATUS" -eq 0 ] || { echo "!! xcodebuild build failed (status $BUILD_STATUS)"; exit 1; }
 
 # `ls DerivedData/OrivioTV-*/… | head -1` used to pick an ARBITRARY (often
 # months-stale) derived-data dir, so a failed build still packaged an old .app.
@@ -45,13 +55,9 @@ BUILT=$(xcodebuild -project OrivioTV.xcodeproj -scheme OrivioTV \
   | awk -F' = ' '/ BUILT_PRODUCTS_DIR = /{print $2; exit}')
 APP="$BUILT/OrivioTV.app"
 [ -d "$APP" ] || { echo "!! Release .app not found at $APP"; exit 1; }
-
-# A build that failed leaves the PREVIOUS .app in place, so freshness is the
-# only thing separating a real artifact from a stale one.
-if [ -n "$(find "$APP" -maxdepth 0 -mmin +10)" ]; then
-  echo "!! $APP is over 10 minutes old — the build did not produce it. Refusing."
-  exit 1
-fi
+# The old mtime heuristic here ("refuse if the .app is over 10 minutes old")
+# also rejected a valid incremental build that had nothing to relink. The
+# xcodebuild exit status above is the real success signal, so trust it.
 
 mkdir -p "$OUT_DIR"
 

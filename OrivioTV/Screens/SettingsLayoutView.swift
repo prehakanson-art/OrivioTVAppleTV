@@ -294,7 +294,7 @@ private struct PosterSizeChip: View {
 
     private var foreground: Color {
         if isFocused { return theme.palette.onSecondary }
-        if selected { return .white }
+        if selected { return theme.palette.onAccentTint }
         return theme.palette.textSecondary
     }
     private var background: Color {
@@ -977,6 +977,11 @@ struct CollectionEditorView: View {
                         // the one with no other way to be deleted.
                         if collections.library.contains(where: { $0.id == collectionID }) {
                             Button("Delete Collection", role: .destructive) {
+                                // Cancel the debounced title autosave FIRST: it
+                                // would otherwise fire after the delete, find no
+                                // existing collection, and re-add the one just
+                                // removed.
+                                titlePersistTask?.cancel()
                                 collections.remove(id: collectionID)
                                 onDone()
                             }

@@ -83,6 +83,7 @@ final class WatchedStore: ObservableObject {
         // Parked per profile, not dropped: see LibraryStore.setProfile.
         tombstonesByProfile[profileID] = tombstones
         profileID = id
+        loadGeneration &+= 1   // invalidate any in-flight load; see clearAll
         suppressChange = true
         items = [:]
         tombstones = tombstonesByProfile[id] ?? [:]
@@ -212,6 +213,8 @@ final class WatchedStore: ObservableObject {
 
     @discardableResult
     func clearAll(notify: Bool = true, tombstone: Bool = true) -> [WatchedItem] {
+        // Invalidate any in-flight async load: see ProgressStore.clearAllProgress.
+        loadGeneration &+= 1
         let removedItems = Array(items.values)
         guard !removedItems.isEmpty else { return [] }
         // See ProgressStore.clearAllProgress: on an account switch tombstoning
@@ -243,12 +246,18 @@ final class WatchedStore: ObservableObject {
     func importItems(_ imported: [WatchedItem]) {
         guard !imported.isEmpty else { return }
         var changed = false
+        var marksChanged = false
         for item in imported {
             if let local = items[item.key], local.watchedAt >= item.watchedAt { continue }
             tombstones.removeValue(forKey: item.key)
+            // Re-marking clears the un-mark record, exactly as `set` does — a
+            // restored backup otherwise kept a `removedMarks` entry that would
+            // block this key on a later account pull.
+            if removedMarks.removeValue(forKey: item.key) != nil { marksChanged = true }
             items[item.key] = item
             changed = true
         }
+        if marksChanged { saveRemovedMarks() }
         if changed {
             save()
             if !suppressChange { onLocalChange?() }
@@ -288,11 +297,20 @@ final class WatchedStore: ObservableObject {
 
         // ── Add rows from the account ── skipping ones the user just un-marked
         // whose delete hasn't landed yet (the snapshot can still contain them).
+        //
+        // Existing keys are deliberately NOT updated from the remote copy. The
+        // tracker merges (Trakt/SIMKL/Stremio) call this too and build their
+        // rows with `watchedAt: s.watchedAt ?? Date()`, so a missing timestamp
+        // becomes "now". Adopting that would raise the mark above a live
+        // Continue Watching row's `updatedAt`, and `ProgressStore.episodeWatchedAfter`
+        // would then retire the episode the viewer is part-way through. Add-only
+        // is the safe direction here.
+        var marksChanged = false
         for item in remote where items[item.key] == nil {
             if let removedAt = removedMarks[item.key] {
                 if item.watchedAt > removedAt {
                     removedMarks.removeValue(forKey: item.key)   // watched again elsewhere
-                    saveRemovedMarks()
+                    marksChanged = true
                 } else {
                     continue
                 }
@@ -307,6 +325,7 @@ final class WatchedStore: ObservableObject {
             items[item.key] = item
             changed = true
         }
+        if marksChanged { saveRemovedMarks() }
         if changed { save() }
         return changed
     }
@@ -322,6 +341,11 @@ final class WatchedStore: ObservableObject {
 
     // MARK: - Persistence
 
+    /// Bumped by `setProfile`/`clearAll`; an async `load()` checks it so it
+    /// cannot repopulate `items` from a blob captured before an intentional
+    /// clear. See `ProgressStore.loadGeneration`.
+    private var loadGeneration = 0
+
     private func load() {
         loadRemovedMarks()
         guard let data = UserDefaults.standard.data(forKey: storageKey) else { return }
@@ -333,10 +357,12 @@ final class WatchedStore: ObservableObject {
         // dominant pre-first-frame cost on the A8.
         let key = storageKey
         let expectedProfile = profileID
+        let generation = loadGeneration
         Task.detached(priority: .userInitiated) {
             let decoded = try? JSONDecoder().decode([String: WatchedItem].self, from: data)
             await MainActor.run { [weak self] in
-                guard let self, self.profileID == expectedProfile else { return }
+                guard let self, self.profileID == expectedProfile,
+                      self.loadGeneration == generation else { return }
                 guard let decoded else {
                     UnreadableBlobGuard.preserve(data, key: key)   // see ProgressStore
                     return

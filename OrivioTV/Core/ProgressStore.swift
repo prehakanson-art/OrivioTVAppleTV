@@ -441,6 +441,10 @@ final class ProgressStore: ObservableObject {
         // against re-adding what that profile removed.
         tombstonesByProfile[profileID] = tombstones
         profileID = id
+        // Invalidate a load still in flight for the profile we are leaving (the
+        // profile guard also catches it, but the bump keeps the two paths
+        // identical and covers a clear that races the switch).
+        loadGeneration &+= 1
         suppressChange = true
         items = [:]
         // The in-playback overrides belong to the profile we are LEAVING. Left
@@ -591,9 +595,15 @@ final class ProgressStore: ObservableObject {
 
     func importEntries(_ entries: [WatchProgress]) {
         guard !entries.isEmpty else { return }
+        AppProbe.data("cw import \(entries.count)")
         var changed = false
         for entry in entries {
-            guard let entry = Self.sanitized(entry) else { continue }
+            guard var entry = Self.sanitized(entry) else { continue }
+            // `load()` drops rows with no `syncSource` (a legacy-purge), so an
+            // imported row that arrived without one would survive in memory and
+            // then vanish on the next launch. A restore is explicit user
+            // intent — stamp it local rather than let it be silently discarded.
+            if entry.syncSource == nil { entry.syncSource = "local" }
             if let local = items[entry.id], local.updatedAt >= entry.updatedAt { continue }
             tombstones.removeValue(forKey: entry.id)
             // A restore is the user's explicit word: it overrides a removal.
@@ -1139,6 +1149,7 @@ final class ProgressStore: ObservableObject {
     /// of its own body.
     func markFinished(meta: MetaItem, video: MetaVideo?, save shouldSave: Bool = true) {
         let key = Self.key(metaID: meta.id, video: video)
+        AppProbe.data("cw finish \(meta.id) \(video?.seasonEpisodeCode ?? "")")
         // Finishing an episode is watching the show, so it lifts a previous
         // "remove from Continue Watching" just as an in-progress save does.
         // Without this, removing a show and later watching a new episode
@@ -1180,6 +1191,13 @@ final class ProgressStore: ObservableObject {
         }
         if !suppressChange {
             if !finished.isEmpty { onRemove?(accountDeleteKeys(for: Array(finished.values))) }
+            // Stremio keeps its resume point per SHOW and its watched pass skips
+            // series episodes, so a finished episode never cleared it — the next
+            // Stremio pull re-added the card at the credits position. The push's
+            // clear pass skips any id that still has an in-progress row, so this
+            // is safe even when the viewer moved straight on to the next episode
+            // (the progress pass nominates that one instead).
+            onStremioClearProgress?(meta.id)
             onFinished?(meta, video)
         }
         if shouldSave {
@@ -1292,6 +1310,7 @@ final class ProgressStore: ObservableObject {
 
     func remove(id: String) {
         guard let row = items.removeValue(forKey: id) else { return }
+        AppProbe.data("cw remove \(id)")
         transientOverrides.removeValue(forKey: id)
         tombstones[id] = Date()
         // Deliberately NO show-level removal record here: this path's callers
@@ -1309,6 +1328,11 @@ final class ProgressStore: ObservableObject {
     ///   `accountDeleteKeys`).
     @discardableResult
     func clearAllProgress(notify: Bool = true, tombstone: Bool = true) -> [String] {
+        // Invalidate any in-flight async `load()`. It captured its blob BEFORE
+        // this clear, so its continuation would otherwise see `items` empty and
+        // repopulate it from the retired account's snapshot — and the next save
+        // (and the new account's first push) would write that history back.
+        loadGeneration &+= 1
         let removedKeys = Array(items.keys)
         let removedRows = Array(items.values)
         // The Next Up dismissals are this profile's state too, and on an account
@@ -1408,6 +1432,7 @@ final class ProgressStore: ObservableObject {
     /// from Continue Watching") — it deletes the title's playback rows on the
     /// user's Trakt account, which no internal cleanup/migration should do.
     func removeShow(metaID: String, notifyTrakt: Bool = false) {
+        AppProbe.data("cw removeShow \(metaID) trakt=\(notifyTrakt.probe)")
         // Suppress the Next Up suggestion too, even when there is nothing
         // stored to delete. A Next Up card is synthesised from watched history
         // and has no progress row, so this method used to bail immediately and
@@ -1471,6 +1496,11 @@ final class ProgressStore: ObservableObject {
         continueFractions = latest.mapValues { $0.fraction }
     }
 
+    /// Bumped by `setProfile`/`clearAllProgress`. An async `load()` captured its
+    /// blob before an intentional clear; the continuation checks this so it
+    /// cannot repopulate `items` from the stale snapshot (see clearAllProgress).
+    private var loadGeneration = 0
+
     private func load() {
         dismissedNextUpShows = Set(UserDefaults.standard.stringArray(forKey: dismissedNextUpKey) ?? [])
         loadRemovedShows()
@@ -1485,6 +1515,7 @@ final class ProgressStore: ObservableObject {
         // first frame, the dominant launch cost on the A8.
         let key = storageKey
         let expectedProfile = profileID
+        let generation = loadGeneration
         Task.detached(priority: .userInitiated) {
             let decoded = try? JSONDecoder().decode([String: WatchProgress].self, from: data)
             let sanitized = decoded.map { raw in
@@ -1492,7 +1523,8 @@ final class ProgressStore: ObservableObject {
                     .filter { _, item in item.syncSource != nil }
             }
             await MainActor.run { [weak self] in
-                guard let self, self.profileID == expectedProfile else { return }
+                guard let self, self.profileID == expectedProfile,
+                      self.loadGeneration == generation else { return }
                 guard let decoded, let sanitized else {
                     // An UNREADABLE blob is not an empty one. Treating it as
                     // empty let the first save overwrite the whole history

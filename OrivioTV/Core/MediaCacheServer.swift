@@ -59,6 +59,12 @@ final class MediaCacheServer {
     // MARK: Session state (queue-confined)
 
     private var origin: URL?
+    /// Addon-declared request headers (Referer/User-Agent/Cookie/…) for the
+    /// origin fetches, from `behaviorHints.proxyHeaders`. Without them the
+    /// download workers send a bare request and a header-gated CDN answers 403
+    /// — the engine's own headers only ever reach localhost, so the proxy must
+    /// carry them on to the origin. Queue-confined, like `origin`.
+    private var sessionHeaders: [String: String]?
     private var token = ""
     private var fileURL: URL?
     private var writeHandle: FileHandle?
@@ -281,8 +287,24 @@ final class MediaCacheServer {
     /// request routing and the sliding window's eviction.)
     private var lastReadOffset: Int64 = 0
 
-    /// Free-space slack always left for the system and other apps.
-    private static let slackBytes: Int64 = 1500 * 1_048_576
+    /// Free space the volume must ALWAYS retain, at session start and for as
+    /// long as the download runs.
+    ///
+    /// tvOS is not a general-purpose OS with a user-managed disk. When internal
+    /// storage runs out the app's own writes begin failing mid-playback, the
+    /// whole UI thrashes on I/O, and the system itself can stutter or reboot.
+    /// The old 1.5 GB slack left the box sitting exactly on that cliff — which
+    /// is why the cache "worked" while taking the Apple TV down with it. 4 GB is
+    /// the floor tvOS needs for its own caches, logs, swap and updates.
+    private static let slackBytes: Int64 = 4096 * 1_048_576
+    /// How often the write path re-samples REAL free space.
+    ///
+    /// The budget is decided once, when the file's length is learned. A session
+    /// can then run for hours while the rest of the box consumes storage (the
+    /// DV remuxer, CFNetwork spools, scrub previews, the system itself), so a
+    /// budget that was safe at second one is not a promise about minute ninety.
+    /// Sampling is a cheap stat, but not free enough to sit on every 4 MB flush.
+    private static let freeSpaceCheckInterval: TimeInterval = 5
     /// A window smaller than this isn't worth running.
     private static let minWindowBytes: Int64 = 2048 * 1_048_576
     /// Never evict the container header (MKV SeekHead/Tracks, MP4 moov-at-
@@ -346,10 +368,24 @@ final class MediaCacheServer {
     /// session gives up and hands the engine the origin. Shorter than an
     /// engine's own patience on purpose: the fallback should happen while the
     /// viewer is still waiting for a first frame, not after it has given up.
-    private static let stallTimeout: TimeInterval = 25
+    ///
+    /// 25 s DID NOT HONOUR THAT. Both engines bound a stalled read at
+    /// `rw_timeout` = 20 s (PlayerViewModel.formatContextOptions and
+    /// DVSampleEngine's open options), so a stalled download was declared dead
+    /// by the ENGINE five seconds before this could fail open — the player
+    /// errored, the app failed over to the next source, and every source served
+    /// through the same proxy could stall the same way ("most of them fail as
+    /// well"). A seek or an audio/subtitle switch is a fresh reader on bytes
+    /// the pool has not delivered, so it hit the identical race. 12 s leaves a
+    /// full 8 s of margin for the engine to follow the 307 and read direct,
+    /// and matches `metadataTimeout`.
+    private static let stallTimeout: TimeInterval = 12
     /// How long the download may sit parked on a full window with nothing to
-    /// evict before the cache gives up and plays from the origin instead.
-    private static let wedgeTimeout: TimeInterval = 20
+    /// evict before the cache gives up and plays from the origin instead. Must
+    /// also beat the engines' 20 s read bound — this is the ONE failure path
+    /// where `downloadDead` is suppressed (`pausedForSpace`), so it is the only
+    /// clock that can hand a wedged reader back to the origin.
+    private static let wedgeTimeout: TimeInterval = 12
     /// When the download parked for space, so the deadlock above is escapable.
     private var pausedForSpaceSince: Date?
     /// How long the first request may wait for the origin to reveal the file
@@ -487,6 +523,9 @@ final class MediaCacheServer {
     private var snapshotPaused = false
     private var snapshotBudget: Int64 = 0
     private var snapshotEvicted: Int64 = 0
+    /// Last live free-space sample, so the probe can show the floor being
+    /// approached instead of only reporting the failure once it trips.
+    private var snapshotFreeBytes: Int64 = -1
     private var snapshotSideFetches = 0
     private var snapshotLastWriteAge: TimeInterval = 0
     private var snapshotBusy = 0
@@ -548,6 +587,7 @@ final class MediaCacheServer {
         snapshotPaused = pausedForSpace
         snapshotBudget = budget
         snapshotEvicted = evictedTotal
+        snapshotFreeBytes = lastKnownFreeBytes
         snapshotSideFetches = sideFetchSpans.count
         snapshotLastWriteAge = now.timeIntervalSince(lastWriteAt)
         // A rate that has gone quiet is 0, not the last busy reading.
@@ -617,6 +657,8 @@ final class MediaCacheServer {
         var evictedBytes: Int64 = 0
         var pausedForSpace = false
         var lastWriteAge: TimeInterval = 0
+        /// Real free space on the cache volume, last sampled (-1 = unknown).
+        var freeBytes: Int64 = -1
         var failure: String?
     }
 
@@ -637,6 +679,7 @@ final class MediaCacheServer {
         h.evictedBytes = snapshotEvicted
         h.pausedForSpace = snapshotPaused
         h.lastWriteAge = snapshotLastWriteAge
+        h.freeBytes = snapshotFreeBytes
         h.failure = snapshotFailure
         return h
     }
@@ -693,7 +736,8 @@ final class MediaCacheServer {
                 + ") lastWrite=\(String(format: "%.1f", snapshotLastWriteAge))s ago",
             "pool=\(snapshotBusy)/\(snapshotLimit) segments=\(snapshotSegments.map { mb($0) }.joined(separator: ","))"
                 + " sideFetch=\(snapshotSideFetches)",
-            "window budget=\(mb(snapshotBudget)) paused=\(snapshotPaused) evicted=\(mb(snapshotEvicted))",
+            "window budget=\(mb(snapshotBudget)) paused=\(snapshotPaused) evicted=\(mb(snapshotEvicted))"
+                + " free=\(snapshotFreeBytes < 0 ? "?" : mb(snapshotFreeBytes))",
             "anchor=\(mb(snapshotAnchor)) ceiling=\(mb(snapshotCeiling))"
                 + " windowed=\(snapshotWindowed ? "Y" : "n")"
                 + " allowed=\(mb(max(snapshotCeiling - snapshotAnchor, 0)))",
@@ -815,7 +859,7 @@ final class MediaCacheServer {
     /// Start caching `origin` and return the localhost URL to play instead,
     /// or nil when the stream doesn't qualify (non-http, already proxied,
     /// HLS/playlist) or the listener can't start. Ends any previous session.
-    func beginSession(origin: URL) -> URL? {
+    func beginSession(origin: URL, headers: [String: String]? = nil) -> URL? {
         guard let scheme = origin.scheme?.lowercased(), scheme == "http" || scheme == "https",
               origin.host != "127.0.0.1", origin.host != "localhost" else { return nil }
         let ext = origin.pathExtension.lowercased()
@@ -857,12 +901,17 @@ final class MediaCacheServer {
             // (the token is session state, so the same URL keeps working).
             if self.origin == origin, !token.isEmpty,
                writeHandle != nil, failureReason == nil {
+                // Same film, possibly re-entered with refreshed headers (a
+                // re-signed link keeps the origin). Keep the bytes, but let the
+                // pool use the current headers from here on.
+                sessionHeaders = headers
                 guard startListenerLocked() else { return nil }
                 return proxyURL(for: origin)
             }
             teardownSessionLocked()
             guard startListenerLocked() else { return nil }
             self.origin = origin
+            sessionHeaders = headers
             token = UUID().uuidString
             redirectAll = false
             rangeCapable = true
@@ -882,6 +931,8 @@ final class MediaCacheServer {
             readTouchedAt = [:]
             lastReadOffset = 0
             lastWriteAt = Date()   // a fresh session starts with a clean heartbeat
+            freeSpaceCheckedAt = .distantPast   // and re-samples storage at once
+            lastKnownFreeBytes = -1
             let dir = Self.cacheDirectory()
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             let file = dir.appendingPathComponent("current.bin")
@@ -996,6 +1047,7 @@ final class MediaCacheServer {
         }
         fileURL = nil
         origin = nil
+        sessionHeaders = nil
         token = ""
         ranges = []
         totalLength = -1
@@ -1052,7 +1104,8 @@ final class MediaCacheServer {
         }
         sideFetchSpans[start] = endExclusive
         sideFetchers[start] = SideFetcher(
-            origin: origin, start: start, endExclusive: endExclusive, queue: q
+            origin: origin, headers: sessionHeaders,
+            start: start, endExclusive: endExclusive, queue: q
         ) { [weak self] data in
             guard let self else { return }
             self.sideFetchers[start] = nil
@@ -1409,7 +1462,13 @@ final class MediaCacheServer {
         guard connections[ObjectIdentifier(connection)] != nil else { return }
         let total = totalLength
         let start = min(max(range?.0 ?? 0, 0), total)
-        let endExclusive = range.map { min(($0.1 ?? (total - 1)) + 1, total) } ?? total
+        // Clamp the CLOSED end first, then add one. `(end) + 1` on a client-
+        // supplied `Int64.max` end (a common "whole file" Range) overflowed
+        // before `min` could clamp it and trapped the process. total >= 1 here
+        // (the caller guards totalLength > 0), so total - 1 is safe.
+        let endExclusive = range.map { r -> Int64 in
+            min(r.1 ?? (total - 1), total - 1) + 1
+        } ?? total
         guard start < endExclusive else { sendSimple(connection, "416 Range Not Satisfiable"); return }
 
         requestTrail("\(cacheOnly ? "/t" : "/m") \(method) start=\(start) end=\(endExclusive)"
@@ -1804,6 +1863,8 @@ final class MediaCacheServer {
             // sitting idle while one did all the work at half the achievable
             // speed. A 429 at one connection is a RATE limit or a transient;
             // back off in time, never pin the level.
+            let previousLimit = parallelLimit
+            let previousCeiling = throttleCeiling
             if parallelLimit > 1 {
                 throttleCeiling = min(throttleCeiling ?? Int.max, parallelLimit)
             }
@@ -1815,10 +1876,20 @@ final class MediaCacheServer {
             throttledUntil = Date().addingTimeInterval(8)
             rampInterval = min(rampInterval * 2, Self.rampIntervalMax)
             lastRampAt = Date()
-            requestTrail("origin throttled (\(response.statusCode)) — ceiling is"
-                + " \(throttleCeiling ?? 0), settling at \(parallelLimit)", important: true)
-            PlayerProbe.event("cache", "origin throttled (\(response.statusCode)) —"
-                + " ceiling \(throttleCeiling ?? 0), now \(parallelLimit) connection(s)")
+            // LOG THE TRANSITION, NOT EVERY 429. A provider that is simply
+            // rate-limiting keeps returning 429 every retry; logging each one
+            // flushed the colour trail (40 entries, shared with every
+            // display-mode decision) and evicted exactly the HDR/DV lines a
+            // "why is this dark" investigation needs. Only speak when the
+            // ceiling or the settled level actually changes.
+            if parallelLimit != previousLimit || throttleCeiling != previousCeiling {
+                requestTrail("origin throttled (\(response.statusCode)) — ceiling is"
+                    + " \(throttleCeiling ?? 0), settling at \(parallelLimit)", important: true)
+                PlayerProbe.event("cache", "origin throttled (\(response.statusCode)) —"
+                    + " ceiling \(throttleCeiling ?? 0), now \(parallelLimit) connection(s)")
+            } else {
+                PlayerProbe.count("cache.throttled")
+            }
             publishSnapshot()
             return .retryLater(4)
         default:
@@ -1885,6 +1956,12 @@ final class MediaCacheServer {
             evictOldest(target: max(over + Self.resumeHeadroomBytes, Self.resumeHeadroomBytes))
             if usedBytes() + Self.writeHeadroomBytes > budget { pauseForSpaceIfNeeded() }
         }
+        // STORAGE FLOOR. The budget above is what the cache MAY hold; this is
+        // what the DEVICE must keep. Checked on the write path, on a slow timer,
+        // because a session can run for hours while everything else on the box
+        // also consumes storage. When it trips the cache is stood down (and, in
+        // full-file mode, the file is handed back) rather than filling the disk.
+        if !enforceStorageFloor() { return }
         // Time-paced ramp probe: while data is flowing and the throttle
         // window has passed, try one more connection every few seconds. If
         // the provider objects, the 429 halves it right back — the ceiling
@@ -1996,7 +2073,8 @@ final class MediaCacheServer {
         guard !redirectAll, writeHandle != nil, let origin else { return }
         let target = rangeCapable ? Self.workerCount : 1
         while workers.count < target {
-            workers.append(SegmentDownloader(server: self, origin: origin, queue: q))
+            workers.append(SegmentDownloader(server: self, origin: origin,
+                                              headers: sessionHeaders, queue: q))
         }
         kickPool()
     }
@@ -2052,6 +2130,11 @@ final class MediaCacheServer {
     /// When a worker last wrote bytes — the download's own heartbeat, which is
     /// what separates "the origin is gone" from "this one reader is waiting".
     private var lastWriteAt = Date()
+
+    /// Last live storage sample and when it was taken (q-confined). The budget
+    /// is fixed, but the free space around it is not — see `enforceStorageFloor`.
+    private var freeSpaceCheckedAt = Date.distantPast
+    private var lastKnownFreeBytes: Int64 = -1
 
     /// Every byte this session has written, for comparing the pool's aggregate
     /// throughput against the one number that matters to the player.
@@ -2646,13 +2729,19 @@ final class MediaCacheServer {
     /// bigger one gets a sliding window when the origin can seek; only a box
     /// too full for even a useful window falls back to direct playback.
     private func configureBudget() -> Bool {
-        guard let dir = fileURL?.deletingLastPathComponent() else { return false }
-        // Plain capacity — the "important usage" variant doesn't exist on tvOS.
-        let values = try? dir.resourceValues(forKeys: [.volumeAvailableCapacityKey])
-        guard let free = values?.volumeAvailableCapacity.map(Int64.init) else {
-            budget = totalLength   // unknowable — behave as before and hope
-            return true
+        // WHY A WRITE-BLIND FALLBACK WAS A BUG. This used to read `budget =
+        // totalLength; windowed = false` when the free-space query failed — an
+        // unbounded full-file download decided on a volume whose free space we
+        // could not read. On a near-full Apple TV that is precisely how the
+        // cache filled the disk and took the system down with it. Refusing to
+        // cache is a slower film; gambling the box is not a trade.
+        guard let free = volumeFreeBytes() else {
+            failSession("could not read the Apple TV's free space — not caching this stream",
+                        retryable: false)
+            return false
         }
+        lastKnownFreeBytes = free
+        freeSpaceCheckedAt = Date()
         let available = max(0, free - Self.slackBytes)
         let totalGB = Double(totalLength) / 1e9
         let freeGB = Double(free) / 1e9
@@ -2678,6 +2767,131 @@ final class MediaCacheServer {
         PlayerViewModel.colorTrail(line)
         return true
     }
+
+    /// Real free space on the volume the cache file lives on, or nil when the
+    /// filesystem won't say.
+    ///
+    /// Two sources on purpose: the URL resource value is the documented one, but
+    /// it can be absent for a URL (and the "important usage" variant is not
+    /// available on tvOS), and `attributesOfFileSystem` is the long-standing
+    /// fallback that has never been sandboxed away.
+    private func volumeFreeBytes() -> Int64? {
+        guard let dir = fileURL?.deletingLastPathComponent() else { return nil }
+        if let values = try? dir.resourceValues(forKeys: [.volumeAvailableCapacityKey]),
+           let free = values.volumeAvailableCapacity {
+            return Int64(free)
+        }
+        if let attrs = try? FileManager.default.attributesOfFileSystem(forPath: dir.path),
+           let free = attrs[.systemFreeSize] as? NSNumber {
+            return free.int64Value
+        }
+        return nil
+    }
+
+    /// Keep the device's own storage floor intact, whatever the budget says.
+    ///
+    /// Returns false when the cache has been stood down to protect the box.
+    /// Sampling is throttled because this runs on the same serial queue that
+    /// feeds the player its bytes.
+    @discardableResult
+    private func enforceStorageFloor() -> Bool {
+        guard !redirectAll, writeHandle != nil else { return true }
+        let now = Date()
+        guard now.timeIntervalSince(freeSpaceCheckedAt) >= Self.freeSpaceCheckInterval else {
+            return true
+        }
+        freeSpaceCheckedAt = now
+        guard let free = volumeFreeBytes() else {
+            // Unknowable is not a licence to write blind. If no budget was ever
+            // established, stand the cache down rather than gamble the box.
+            if budget <= 0 { failStorageEmergency(free: 0); return false }
+            return true
+        }
+        lastKnownFreeBytes = free
+        guard free < Self.slackBytes else { return true }
+        let shortfall = Self.slackBytes - free
+        PlayerProbe.event("cache", "STORAGE FLOOR — \(free / 1_048_576)MB free,"
+            + " need \(shortfall / 1_048_576)MB back")
+        PlayerProbe.note("lastStorageFloor", "\(free / 1_048_576)MB free")
+        // Try to hand the space back before giving anything up.
+        if windowed {
+            evictOldest(target: shortfall + Self.resumeHeadroomBytes)
+            if let after = volumeFreeBytes(), after >= Self.slackBytes {
+                publishSnapshot()
+                return true
+            }
+            // Still short: there may be nothing evictable this instant (it is
+            // all lead, or a live reader's rewind margin). Park the download
+            // and let playback coast on what is on disk; the window frees
+            // itself as the viewer advances.
+            pauseForStorage()
+            return true
+        }
+        // Full-file mode has nothing to evict — the whole premise was that the
+        // film fit. The volume has lost space underneath us, so the only safe
+        // move is to give the cache file back and let the engine play direct.
+        failStorageEmergency(free: free)
+        return false
+    }
+
+    /// Park the download because the VOLUME is low, not because the window is
+    /// full.
+    ///
+    /// Separate from `pauseForSpaceIfNeeded`, which re-checks the budget and may
+    /// decide nothing is wrong — and that is exactly the case the floor exists
+    /// for: the window is within budget while the box around it is running out
+    /// of room.
+    private func pauseForStorage() {
+        guard !pausedForSpace else { return }
+        pausedForSpace = true
+        pausedForSpaceSince = Date()
+        for worker in workers { worker.cancelSegment() }
+        publishSnapshot()
+        NSLog("[OrivioCache] storage floor reached (%lld bytes free) — download parked",
+              lastKnownFreeBytes)
+        PlayerProbe.event("cache", "STORAGE FLOOR — download parked"
+            + " (\(lastKnownFreeBytes / 1_048_576)MB free)")
+    }
+
+    /// The volume is critically low: stop writing and DELETE the cache file,
+    /// which is the whole reason the volume got there.
+    ///
+    /// The session is not torn down — the token and origin have to survive so
+    /// that the 307 fail-open redirects keep working — but the bytes are handed
+    /// straight back.
+    private func failStorageEmergency(free: Int64) {
+        let reading = free > 0 ? " (\(free / 1_048_576)MB free)" : ""
+        failSessionCore("device storage critically low\(reading) —"
+            + " cache stopped to protect the Apple TV")
+        reclaimCacheFileLocked()
+    }
+
+    /// Delete the cache file now, independently of session teardown. Open read
+    /// handles keep working against the unlinked inode; new requests redirect.
+    private func reclaimCacheFileLocked() {
+        try? writeHandle?.close()
+        writeHandle = nil
+        if let fileURL {
+            let doomed = fileURL.deletingLastPathComponent()
+                .appendingPathComponent("expired-\(UUID().uuidString).bin")
+            if (try? FileManager.default.moveItem(at: fileURL, to: doomed)) != nil {
+                DispatchQueue.global(qos: .utility).async {
+                    try? FileManager.default.removeItem(at: doomed)
+                }
+            } else {
+                try? FileManager.default.removeItem(at: fileURL)
+            }
+        }
+        fileURL = nil
+        ranges = []
+        totalLength = -1
+        budget = 0
+        windowed = false
+        pausedForSpace = false
+        pausedForSpaceSince = nil
+        publishSnapshot()
+    }
+
 
     /// Bytes currently held on disk.
     private func usedBytes() -> Int64 {
@@ -2902,6 +3116,18 @@ final class MediaCacheServer {
     /// try to slide it and pick the download back up.
     private func resumeIfRoom() {
         guard pausedForSpace else { return }
+        // A window within budget can still be parked because the VOLUME is
+        // below the storage floor. Hold until there is real room — and sample
+        // here, because a parked download writes nothing, so the write-path
+        // sampler is not running to notice the recovery.
+        if lastKnownFreeBytes >= 0, lastKnownFreeBytes < Self.slackBytes {
+            let now = Date()
+            if now.timeIntervalSince(freeSpaceCheckedAt) >= Self.freeSpaceCheckInterval {
+                freeSpaceCheckedAt = now
+                if let free = volumeFreeBytes() { lastKnownFreeBytes = free }
+            }
+            if lastKnownFreeBytes < Self.slackBytes { return }
+        }
         let over = max(usedBytes() + Self.resumeHeadroomBytes - budget, 0)
         evictOldest(target: over + Self.resumeHeadroomBytes)
         guard usedBytes() + Self.resumeHeadroomBytes <= budget else {
@@ -2961,7 +3187,8 @@ private final class SideFetcher: NSObject, URLSessionDataDelegate {
     private var buffer = Data()
     private var finished = false
 
-    init(origin: URL, start: Int64, endExclusive: Int64, queue: DispatchQueue,
+    init(origin: URL, headers: [String: String]? = nil,
+         start: Int64, endExclusive: Int64, queue: DispatchQueue,
          completion: @escaping (Data?) -> Void) {
         span = endExclusive - start
         self.completion = completion
@@ -2977,6 +3204,9 @@ private final class SideFetcher: NSObject, URLSessionDataDelegate {
         delegateQueue.maxConcurrentOperationCount = 1
         session = URLSession(configuration: config, delegate: self, delegateQueue: delegateQueue)
         var request = URLRequest(url: origin)
+        for (key, value) in headers ?? [:] {
+            request.setValue(value, forHTTPHeaderField: key)
+        }
         request.setValue("bytes=\(start)-\(endExclusive - 1)", forHTTPHeaderField: "Range")
         session.dataTask(with: request).resume()
     }
@@ -3032,6 +3262,8 @@ private final class SideFetcher: NSObject, URLSessionDataDelegate {
 private final class SegmentDownloader: NSObject, URLSessionDataDelegate {
     private weak var server: MediaCacheServer?
     private let origin: URL
+    /// Addon-declared headers for every origin request this worker makes.
+    private let headers: [String: String]?
     private let q: DispatchQueue
     private var session: URLSession!
     private var task: URLSessionDataTask?
@@ -3119,9 +3351,11 @@ private final class SegmentDownloader: NSObject, URLSessionDataDelegate {
         task = nil
     }
 
-    init(server: MediaCacheServer, origin: URL, queue: DispatchQueue) {
+    init(server: MediaCacheServer, origin: URL,
+         headers: [String: String]? = nil, queue: DispatchQueue) {
         self.server = server
         self.origin = origin
+        self.headers = headers
         self.q = queue
         super.init()
         let config = URLSessionConfiguration.default
@@ -3145,6 +3379,9 @@ private final class SegmentDownloader: NSObject, URLSessionDataDelegate {
         requestedOffset = offset
         writeOffset = offset
         var request = URLRequest(url: origin)
+        for (key, value) in headers ?? [:] {
+            request.setValue(value, forHTTPHeaderField: key)
+        }
         if let endExclusive {
             request.setValue("bytes=\(offset)-\(endExclusive - 1)", forHTTPHeaderField: "Range")
         } else if offset > 0 {

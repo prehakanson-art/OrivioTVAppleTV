@@ -254,6 +254,7 @@ enum TMDBService {
         cacheLock.lock(); defer { cacheLock.unlock() }
         seasonEpisodeCache.removeAll()
         episodeCastCache.removeAll()
+        trailerKeyCache.removeAll()
         // The id maps stay: a few bytes per row, and they save the paired
         // find/rating round trips that make collection loads cheap.
     }
@@ -1386,6 +1387,9 @@ enum TMDBService {
 
     private static func storeTrailerKeys(_ value: [String], for key: String) {
         cacheLock.lock(); defer { cacheLock.unlock() }
+        // Capped like the id maps: this was the one cache in the file that never
+        // evicted, so a long browse accumulated an entry per title viewed.
+        capped(&trailerKeyCache, limit: idCacheLimit)
         trailerKeyCache[key] = value
     }
 
@@ -1401,7 +1405,11 @@ enum TMDBService {
         let cacheKey = "\(type):\(id)"
         if let hit = cachedTrailerKeys(cacheKey) { return hit }
         guard let (tmdbID, isMovie) = await resolveTMDBID(from: id, type: type) else {
-            storeTrailerKeys([], for: cacheKey)
+            // A failed `/find` is not a miss: caching [] here branded the title
+            // trailer-less for the whole session on one transient error — the
+            // rule the sibling caches (contentRating/seasonEpisodes/episodeCast)
+            // already follow via `lastFindFailed`.
+            if !lastFindFailed(id) { storeTrailerKeys([], for: cacheKey) }
             return []
         }
         struct VideosResponse: Decodable {

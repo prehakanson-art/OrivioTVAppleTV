@@ -102,6 +102,7 @@
 		863516B242BE074238412A8B /* AddonDiscoverView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02830E2CD2474508165BC44F /* AddonDiscoverView.swift */; };
 		8B6068EC5B4E24C42D9D120E /* OrivioSyncDiagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 49ED8ECA821B841DB1B0D0B5 /* OrivioSyncDiagnostics.swift */; };
 		8C4912B13F8AE3628D164A69 /* SyncCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = AF0B8F923F6EDC743AB76179 /* SyncCoordinator.swift */; };
+		8D1473D54947DE8A6E3B76BD /* AtmosHLS.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3C842A8EAF87F1D8422E8F21 /* AtmosHLS.swift */; };
 		907533AF9BAF45F3FD373B50 /* RemoteInput.swift in Sources */ = {isa = PBXBuildFile; fileRef = A8DCE70635C3C65E8553BFE1 /* RemoteInput.swift */; };
 		90D3F695AF7459951FE0693A /* StreamTitleMatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = 70C79FED6539EC9E30896C38 /* StreamTitleMatcher.swift */; };
 		91DB34DE5C2B64B6624FCBF7 /* CatalogSeeAllView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 78D74FCDE486BE869E0193FA /* CatalogSeeAllView.swift */; };
@@ -212,6 +213,7 @@
 		397C4520601062A6C4875571 /* TMDBBrowseView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TMDBBrowseView.swift; sourceTree = "<group>"; };
 		39B30E006EDC24452F5B2080 /* OrivioSyncModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrivioSyncModels.swift; sourceTree = "<group>"; };
 		3B4A29D8AF76C72EC59202C8 /* TopShelfProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TopShelfProvider.swift; sourceTree = "<group>"; };
+		3C842A8EAF87F1D8422E8F21 /* AtmosHLS.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AtmosHLS.swift; sourceTree = "<group>"; };
 		3CDC06B1C4E03B40E71C6410 /* PlaybackMemory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackMemory.swift; sourceTree = "<group>"; };
 		3D2D0D7E27B31C1E68A3ED79 /* AppGroupResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppGroupResolver.swift; sourceTree = "<group>"; };
 		3F163B74531D7869D14E6E88 /* GlassSidebar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlassSidebar.swift; sourceTree = "<group>"; };
@@ -532,6 +534,7 @@
 		CA0E9EB4692008915E19C3FD /* Player */ = {
 			isa = PBXGroup;
 			children = (
+				3C842A8EAF87F1D8422E8F21 /* AtmosHLS.swift */,
 				7A3AFDB961B9973EB6F41B42 /* Atomic.swift */,
 				EC88B7827A15F09EC43F4C34 /* DoviConverter.swift */,
 				F07580EF70623B0981FB2BE3 /* DVSampleEngine.swift */,
@@ -798,6 +801,7 @@
 				321709B26C90C869D0ECE1FE /* AnimatedGIFView.swift in Sources */,
 				04409CF4F100848004803ED6 /* AnimeSkipService.swift in Sources */,
 				5661971DB8D72E70B847E90E /* AppGroupResolver.swift in Sources */,
+				8D1473D54947DE8A6E3B76BD /* AtmosHLS.swift in Sources */,
 				23FA98A11900D11B66862E4A /* Atomic.swift in Sources */,
 				C7CFA5192D7DE1712F892A84 /* AudioLanguageMatch.swift in Sources */,
 				0F7838681EDF605D7922912C /* BoundedConcurrency.swift in Sources */,
@@ -973,7 +977,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 8;
+				MARKETING_VERSION = 8.5;
 				PRODUCT_BUNDLE_IDENTIFIER = com.orivio.tv.appletv.dev.topshelf;
 				SDKROOT = appletvos;
 				SWIFT_VERSION = 5.9;
@@ -1131,7 +1135,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 8;
+				MARKETING_VERSION = 8.5;
 				PRODUCT_BUNDLE_IDENTIFIER = com.orivio.tv.appletv.dev.topshelf;
 				SDKROOT = appletvos;
 				SWIFT_VERSION = 5.9;
@@ -1158,7 +1162,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 8;
+				MARKETING_VERSION = 8.5;
 				PRODUCT_BUNDLE_IDENTIFIER = com.orivio.tv.appletv.dev;
 				SDKROOT = appletvos;
 				SWIFT_VERSION = 5.9;
@@ -1185,7 +1189,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 8;
+				MARKETING_VERSION = 8.5;
 				PRODUCT_BUNDLE_IDENTIFIER = com.orivio.tv.appletv.dev;
 				SDKROOT = appletvos;
 				SWIFT_VERSION = 5.9;

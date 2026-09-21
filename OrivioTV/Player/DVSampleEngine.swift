@@ -42,7 +42,15 @@ final class DVSampleEngine {
     // MARK: Public surface
 
     /// Hosts the AVSampleBufferDisplayLayer; hand this to PlayerVideoView.
-    let videoView = DVSampleLayerView()
+    /// Created in `init` from a local so the layer can be captured without
+    /// touching `self` before every stored property is set.
+    let videoView: DVSampleLayerView
+
+    /// The panel's refresh rate, read ONCE here on the constructing (main)
+    /// thread. `UIScreen` is main-thread-only, and the demux thread's 2s probe
+    /// used to read it directly — a Main Thread Checker violation and
+    /// undefined behaviour.
+    private let panelRefreshHz: Int
 
     /// Fired on main ~2×/s with the current position (absolute source secs).
     var onTime: ((Double) -> Void)?
@@ -168,6 +176,19 @@ final class DVSampleEngine {
     func setMuted(_ muted: Bool) {
         audioRenderer.isMuted = muted
     }
+
+    /// Align the video clock to an external audio clock (source seconds). Used
+    /// when an `AVPlayer` owns the audio (Atmos passthrough): the synchronizer
+    /// keeps running at its rate, but its time is nudged onto the audio clock
+    /// so the picture follows the sound.
+    func alignClock(to seconds: Double) {
+        guard seconds.isFinite, seconds >= 0 else { return }
+        synchronizer.setRate(synchronizer.rate,
+                             time: CMTime(seconds: seconds, preferredTimescale: 90_000))
+    }
+
+    /// The video clock in source seconds (the AVPlayer-alignment reference).
+    var currentClockSeconds: Double { CMTimeGetSeconds(synchronizer.currentTime()) }
 
     /// Switch audio live, then RE-DEMUX FROM THE PLAYHEAD.
     ///
@@ -307,7 +328,14 @@ final class DVSampleEngine {
     private let requestHeaders: [String: String]?
 
     private let synchronizer = AVSampleBufferRenderSynchronizer()
-    private var displayLayer: AVSampleBufferDisplayLayer { videoView.displayLayer }
+    /// The view's backing layer, CACHED. `DVSampleLayerView.displayLayer` reads
+    /// `UIView.layer`, which is main-thread-only, and everything that drives
+    /// the renderers (`installFeeders`, `feed`, `vtFeedVideo`, `signalEndOnce`)
+    /// runs on `feedQueue`. Reading it through the view from there tripped the
+    /// Main Thread Checker and is undefined behaviour besides. The layer is
+    /// fixed for the view's lifetime (`layerClass`), so one main-thread read at
+    /// init is the whole fix.
+    private let displayLayer: AVSampleBufferDisplayLayer
     private let audioRenderer = AVSampleBufferAudioRenderer()
 
     private var videoFormat: CMFormatDescription?
@@ -388,6 +416,14 @@ final class DVSampleEngine {
     /// REACHABLE — a cushion the demuxer has parked itself out of reach of is
     /// a hold that never lifts.
     static let audioResumeCushion = 4
+
+    /// The audio depth the demuxer is allowed to push VIDEO past its cap to
+    /// reach. Bigger than `audioResumeCushion` on purpose: 4 compressed E-AC-3
+    /// frames is ~130ms, which is not a cushion — the live probe caught the
+    /// queue parked there (`v=60/60 a=4/48`) with the video side full, so the
+    /// demuxer was blocked and the audio drained to the resume threshold before
+    /// the exemption let it read on. 24 ≈ 0.8s of runway.
+    static let audioFeedTarget = 24
 
     /// Seconds of audio the RENDERER must still hold for an empty audio queue
     /// NOT to count as starvation. The hold is re-evaluated every 0.5s, so one
@@ -794,7 +830,7 @@ final class DVSampleEngine {
         feedQueue.async { [weak self] in
             guard let self, !self.cancelled else { return }
             self.didSignalEnd = false
-            self.endSignalGeneration += 1
+            self.$endSignalGeneration.mutate { $0 += 1 }
             // Nothing the renderers held survives the seek's flush.
             self.lastRenderedEnd = 0
             self.lastVideoHandedEnd = 0
@@ -872,12 +908,27 @@ final class DVSampleEngine {
     /// Exact-label track memory ("English · AC3 · 6ch"): outranks language.
     let preferredAudioLabel: String?
 
+    /// The release/stream NAME says "Atmos". MKV rarely tags the audio track
+    /// with "Atmos"/"JOC", so the container metadata alone reads "not tagged"
+    /// even for links named Atmos — this is the second, honest signal used to
+    /// decide whether the track is worth the Atmos passthrough path. It never
+    /// claims OUTPUT is Atmos; only the passthrough path can do that.
+    let streamNameSaysAtmos: Bool
+
     init(input: String, startAt: Double,
          preferredAudioLanguage: String, convertProfile7: Bool,
          requestHeaders: [String: String]? = nil,
          downmixToStereo: Bool = false,
          forceHDR10: Bool = false,
-         preferredAudioLabel: String? = nil) {
+         preferredAudioLabel: String? = nil,
+         streamNameSaysAtmos: Bool = false) {
+        // Read `UIView.layer` HERE, on the constructing (main) actor, and hand
+        // the layer to the feed queue as a plain reference — see `displayLayer`.
+        let view = DVSampleLayerView()
+        videoView = view
+        displayLayer = view.displayLayer
+        panelRefreshHz = Thread.isMainThread
+            ? Int(UIScreen.main.maximumFramesPerSecond) : 0
         inputURLString = input
         self.startAt = max(startAt, 0)
         self.preferredAudioLanguage = preferredAudioLanguage
@@ -887,6 +938,7 @@ final class DVSampleEngine {
         foldToStereo = downmixToStereo
         self.forceHDR10 = forceHDR10
         self.preferredAudioLabel = preferredAudioLabel
+        self.streamNameSaysAtmos = streamNameSaysAtmos
     }
 
     // MARK: Lifecycle
@@ -939,6 +991,21 @@ final class DVSampleEngine {
         guard par.codec_id == AV_CODEC_ID_EAC3 || par.codec_id == AV_CODEC_ID_TRUEHD else {
             return false
         }
+        // THE PARSED PROFILE IS THE SIGNAL A MATROSKA REMUX ACTUALLY CARRIES.
+        //
+        // FFmpeg 6.1 flags Atmos in `AVCodecParameters.profile`:
+        // `FF_PROFILE_EAC3_DDP_ATMOS` when the E-AC-3 bitstream carries the JOC
+        // extension (`ec3_extension_type_a`), and `FF_PROFILE_TRUEHD_ATMOS` for
+        // TrueHD Atmos — both 30 (the macros are `#define`s Swift cannot
+        // import, hence the literal). `avformat_find_stream_info` populates it.
+        //
+        // Checking only the track metadata missed almost every real Atmos file:
+        // a remux tags the track "English · EAC3 · 5.1", never "atmos". With
+        // the flag false, the AVPlayer Atmos passthrough never started and the
+        // receiver got the sample renderer's PCM — the "E-AC-3 Atmos plays as
+        // 2.0/5.1/7.1 PCM" report. The bitstream is authoritative; the tag is
+        // not.
+        if par.profile == Self.atmosProfile { return true }
         guard let stream else { return false }
         for key in ["title", "handler_name", "comment"] {
             guard let value = av_dict_get(stream.pointee.metadata, key, nil, 0)?.pointee.value
@@ -948,6 +1015,11 @@ final class DVSampleEngine {
         }
         return false
     }
+
+    /// `FF_PROFILE_EAC3_DDP_ATMOS` / `FF_PROFILE_TRUEHD_ATMOS` — both 30 in the
+    /// FFmpeg headers, and both `#define`s the Swift importer does not surface.
+    private static let atmosProfile: Int32 = 30
+
 
     /// Open the source and start feeding. Returns false (with a reason via
     /// the completion) when the file can't ride this pipeline — the caller
@@ -1112,8 +1184,15 @@ final class DVSampleEngine {
     var rate: Float {
         get { synchronizer.rate }
         set {
+            // Changing speed while PAUSED must not start playback. `pause()`
+            // leaves `playbackClockStarted` true, so pushing the new rate
+            // unconditionally restarted the synchronizer and the video resumed
+            // the instant the speed picker was used on a paused DV session.
+            // The new speed is still remembered in `userRate`, so a later
+            // `play()` uses it.
+            let wasRunning = synchronizer.rate > 0
             userRate = newValue
-            if playbackClockStarted, !autoPaused {
+            if playbackClockStarted, !autoPaused, wasRunning || newValue == 0 {
                 synchronizer.setRate(newValue, time: synchronizer.currentTime())
             }
         }
@@ -1136,7 +1215,7 @@ final class DVSampleEngine {
         seekRefill = true
         // An end signal waiting out its drain delay belongs to the position
         // this seek is leaving.
-        endSignalGeneration += 1
+        $endSignalGeneration.mutate { $0 += 1 }
         // The renderers are about to be flushed, so nothing they held counts
         // towards the end-of-stream drain wait any more — and neither does the
         // DEMUXER's old read-ahead: `bufferedUpTo` kept reporting the pre-seek
@@ -1352,6 +1431,7 @@ final class DVSampleEngine {
                 report.sampleRate = Int(par.pointee.sample_rate)
                 report.passthrough = passthrough
                 report.sourceSaysAtmos = Self.streamSaysAtmos(stream: stream, par: par.pointee)
+                    || streamNameSaysAtmos
                 report.downmixed = !passthrough && downmixToStereo && channels > 2
                 audioPathByStream[Int32(i)] = report
                 // RANKED default, not first-wins: remuxes routinely put a 2ch
@@ -1742,7 +1822,7 @@ final class DVSampleEngine {
                               self.displayLayer.isReadyForMoreMediaData ? 1 : 0,
                               self.audioRenderer.isReadyForMoreMediaData ? 1 : 0,
                               self.synchronizer.rate,
-                              UIScreen.main.maximumFramesPerSecond,
+                              self.panelRefreshHz,
                               feedMbps)
                     }
                     self.lastProbeWall = wall
@@ -2280,7 +2360,7 @@ final class DVSampleEngine {
     /// the demux thread — it was already crossing threads before either of
     /// those readers existed.
     @Atomic private var lastQueuedVideoPTS: Double = 0
-    private var lastQueuedAudioPTS: Double = 0
+    @Atomic private var lastQueuedAudioPTS: Double = 0
 
     private func censusAudioPTS(_ sample: CMSampleBuffer) {
         let pts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample))
@@ -2347,14 +2427,19 @@ final class DVSampleEngine {
         // on the full-power tier, on the box that is already the one being
         // jetsammed.
         let cap = isVideo ? videoQueueCap : audioQueueCap
-        let hardCeiling = cap + 32
+        // Video may overshoot FURTHER than audio: the demuxer reads in file
+        // order, so the only way to reach the (small, frequent) audio packets
+        // is to keep pulling video. A +32 margin parked it just past the cap
+        // and the audio still drained; +96 gives it room to fetch a real audio
+        // cushion. Bounded, and only while the other side is starving.
+        let hardCeiling = cap + (isVideo ? 96 : 32)
         while !cancelled, seekGeneration == generation {
             let count = isVideo ? videoQueue.count : audioQueue.count
             guard count >= cap else { break }
             // Feeding the starved side is worth going over cap for; it is the
             // only thing that can unblock this side.
             let otherStarving = isVideo
-                ? audioQueue.count < Self.audioResumeCushion
+                ? audioQueue.count < Self.audioFeedTarget
                 : videoQueue.isEmpty
             if otherStarving, count < hardCeiling {
                 // Only on the FIRST overshoot of an episode — this is the
@@ -2596,7 +2681,7 @@ final class DVSampleEngine {
                 if foldToStereo, channels > 2,
                    AVAudioSession.sharedInstance().maximumOutputNumberOfChannels > 2 {
                     foldToStereo = false
-                    audioPath.downmixed = false
+                    $audioPath.mutate { $0.downmixed = false }
                     PlayerProbe.event("audio", "route came up multichannel after load — not folding \(channels)ch to stereo")
                     NSLog("[DVSample] downmix stood down: route reports %d channels once playing",
                           AVAudioSession.sharedInstance().maximumOutputNumberOfChannels)

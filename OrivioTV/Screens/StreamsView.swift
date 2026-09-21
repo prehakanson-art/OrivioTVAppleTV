@@ -1261,6 +1261,11 @@ struct StreamsView: View {
         } message: {
             Text(resolveError ?? "")
         }
+        // A failed source resolve is a user-visible dead end and a classic
+        // "it just spun / didn't play" report. Record it with the reason.
+        .onChange(of: resolveError) { _, new in
+            if let new { AppProbe.warn("resolve", new) }
+        }
     }
 
     /// The right-hand source panel: loading / empty / grouped list.
@@ -1412,6 +1417,8 @@ struct StreamsView: View {
         // Back already popped this page — never present the player from a
         // torn-down navigation entry (crashes / quits the app).
         guard !isGone else { return }
+        AppProbe.data("pick \(entry.addonName) · \(entry.stream.name) · "
+            + (entry.stream.isTorrent ? "torrent" : (entry.stream.isExternal ? "cast" : "direct")))
         // Cast / open-externally stream (DMM Cast): hand the link to the system
         // rather than the in-app player. On tvOS this only succeeds for a URL
         // scheme the platform can open — plain https has no browser to open, so
@@ -1896,7 +1903,9 @@ private struct AddonFilterChipLabel: View {
 
     private var foreground: Color {
         if isFocused { return theme.palette.onSecondary }
-        if selected { return theme.palette.secondary }
+        // A light accent (White/Lavender/Mint) has to use its own dark ink on
+        // the faint accent tint, or the label disappears into it.
+        if selected { return theme.palette.hasLightAccent ? theme.palette.onSecondary : theme.palette.secondary }
         return theme.palette.textSecondary
     }
 

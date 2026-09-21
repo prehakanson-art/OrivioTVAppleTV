@@ -22,6 +22,15 @@ if [ -z "$HOST" ]; then
     exit 64
 fi
 
+# Fail fast instead of looping forever with silently-failing redirections if the
+# output path is unwritable or curl is missing. `>>` creates the file without
+# truncating an existing recording.
+command -v curl >/dev/null 2>&1 || { echo "!! curl not found on PATH" >&2; exit 69; }
+if ! ( : >> "$OUT" ) 2>/dev/null; then
+    echo "!! cannot write output file: $OUT" >&2
+    exit 73
+fi
+
 echo "recording $HOST → $OUT   (Ctrl-C to stop)"
 printf '==== recording started %s ====\n' "$(date '+%H:%M:%S')" >> "$OUT"
 

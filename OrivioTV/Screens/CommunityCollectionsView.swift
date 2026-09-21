@@ -403,7 +403,10 @@ enum CommunityCollections {
     static func remeasureInstalledLogos(collections: CollectionsStore) async {
         guard !UserDefaults.standard.bool(forKey: logoMigrationKey) else { return }
         defer { UserDefaults.standard.set(true, forKey: logoMigrationKey) }
-        for collection in collections.collections where collection.id.hasPrefix(idPrefix) {
+        // The LIBRARY, not the visible subset: a community pack switched off
+        // account-wide is still installed and still needs its tiles re-measured,
+        // and `update` writes the library copy anyway.
+        for collection in collections.library where collection.id.hasPrefix(idPrefix) {
             var changed = false
             var updated = collection
             for i in updated.folders.indices {
@@ -533,7 +536,10 @@ struct CommunityCollectionsView: View {
     }
 
     private func section(for group: CommunityCollectionPreset.Group) -> some View {
-        VStack(alignment: .leading, spacing: OrivioSpacing.lg) {
+        // Computed ONCE per section, not once per card: the scan over every
+        // community collection × folder was otherwise repeated for every preset.
+        let installed = installedPresetIDs
+        return VStack(alignment: .leading, spacing: OrivioSpacing.lg) {
             HStack(spacing: OrivioSpacing.md) {
                 Image(systemName: group.icon)
                     .font(.system(size: 22))
@@ -555,7 +561,7 @@ struct CommunityCollectionsView: View {
                         logoURL: logos[preset.id],
                         logosLoaded: logosLoaded,
                         isBright: isBright(preset.id),
-                        isInstalled: installedPresetIDs.contains(preset.id),
+                        isInstalled: installed.contains(preset.id),
                         isInstalling: installing.contains(preset.id),
                         onInstall: { Task { await install(preset) } },
                         onRemove: { remove(preset) },

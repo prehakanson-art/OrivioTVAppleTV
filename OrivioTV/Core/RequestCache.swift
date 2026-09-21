@@ -80,7 +80,15 @@ actor DiskCache<Value: Codable & Sendable> {
         } else {
             entry = nil
         }
-        guard let entry, Date().timeIntervalSince(entry.time) < ttl else { return nil }
+        guard let entry else { return nil }
+        guard Date().timeIntervalSince(entry.time) < ttl else {
+            // Stale: evict from BOTH layers. Nothing ever unlinked these, so
+            // Caches/OrivioCache grew for the life of the install (full-series
+            // MetaItem payloads included). A fresh request repopulates it.
+            memory.removeValue(forKey: key)
+            try? FileManager.default.removeItem(at: fileURL(key))
+            return nil
+        }
         return entry.value
     }
 

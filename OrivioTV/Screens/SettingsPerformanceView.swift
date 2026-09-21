@@ -186,6 +186,24 @@ struct PerformanceSettingsDetail: View {
                     isOn: Binding(get: { playerStore.settings.showInputDebug },
                                   set: { playerStore.settings.showInputDebug = $0 })
                 )
+
+                // The one switch that makes everything else diagnosable on a
+                // Release/sideloaded build. Turn it on, reproduce the problem,
+                // then pull the log with scripts/record.sh (or probe.sh).
+                PerfToggleRow(
+                    icon: "dot.radiowaves.left.and.right",
+                    title: "Capture diagnostics (LAN log server)",
+                    subtitle: "Record app and playback events (navigation, buffering, stalls, seeks, source picks, errors, memory) and serve a live plain-text log at http://<this Apple TV's IP>:8123. Use scripts/record.sh <ip> to save a session. Off by default; costs a little CPU while on.",
+                    isOn: Binding(
+                        get: { ProbeGate.isEnabled },
+                        set: { on in
+                            UserDefaults.standard.set(on, forKey: ProbeGate.defaultsKey)
+                            ProbeGate.set(on)
+                            if on { ColorProbeServer.shared.start() }
+                            else { ColorProbeServer.shared.stop() }
+                        }
+                    )
+                )
             }
 
             Text("Everything ON is the app's full look. Turn things OFF top-to-bottom until the Home screen feels right — each switch only removes visual polish, never content or features. These switches are per-device and don't sync to your account.")

@@ -546,9 +546,18 @@ enum StremioSync {
                 overallTimeWatched: st.overallTimeWatched
             )
             let (season, episode) = parseVideoID(st.video_id)
-            let lastWatched = StremioDate.parse(st.lastWatched) ?? Date()
+            let parsedLastWatched = StremioDate.parse(st.lastWatched)
+            // Epoch 0 is the ordering sentinel for "no timestamp" — correct for
+            // sorting, but it must NOT be fed to the clear-horizon test below:
+            // it would read as "watched before the clear" and suppress every
+            // timestamp-less Stremio row for as long as the horizon exists.
+            // Only a REAL timestamp can be proven to predate the clear.
+            let lastWatched = parsedLastWatched ?? SyncTimestamp.unknown
             if pos > 0 { withPosition += 1 }
-            if let clearedAt, lastWatched <= clearedAt { skippedCleared += 1; continue }
+            if let clearedAt, let parsedLastWatched, parsedLastWatched <= clearedAt {
+                skippedCleared += 1
+                continue
+            }
             let finished = (st.flaggedWatched ?? 0) > 0
             let inferredDuration = dur > 0 ? dur : 0
             // Stremio very often stores a real resume point with NO duration —
@@ -964,6 +973,13 @@ enum StremioSync {
         // unsave the title. Applied before the watched pass, which may then
         // legitimately overwrite the state with a "watched" marker.
         for id in clearedProgressIDs {
+            // A show with a live resume point keeps it: the progress pass above
+            // just nominated its current episode, and zeroing the state here
+            // would wipe that. This is the "finished one episode, already on the
+            // next" case, or a clear queued earlier landing after a re-watch
+            // started. An explicit Remove-from-Continue-Watching has no row left,
+            // so it still clears.
+            guard newestByMeta[id] == nil else { continue }
             let known = lastPulledItemMeta[id]
             var row = rows[id] ?? [
                 "_id": id,

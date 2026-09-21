@@ -279,12 +279,11 @@ final class OrivioSyncManager: ObservableObject {
         }
         addonsDirty = false
         profilesDirty = false
-        pluginsDirty = false
-        appPreferencesDirty = false
-        collectionsDirty = false
-        homeCatalogDirty = false
-        badgeSettingsDirty = false
-        providerCredentialsDirty = false
+        // `collections`, `homeCatalog`, `badges`, `providerCredentials`,
+        // `plugins` and `appPreferences` are now persisted per profile under
+        // `orivio.sync.dirty.*` (see `dirtyKey`): the sweep above already drops
+        // them for a different account and preserves them for a plain sign-out,
+        // so a pending edit still uploads. Nothing to clear here.
         // Whoever signs in next gets a full first cycle again.
         completedFullSyncProfiles.removeAll()
         lastBadgePull.removeAll()
@@ -1518,13 +1517,25 @@ final class OrivioSyncManager: ObservableObject {
         }
     }
 
+    /// True while a `refreshContinueWatching` task is running. Checked and set
+    /// SYNCHRONOUSLY on the main actor — see the method.
+    private var refreshContinueWatchingInFlight = false
+
     /// Pull the latest Continue Watching (and library) from the account — call
     /// on foreground so changes made on other devices show up without a
     /// relaunch. Local pushes already fire immediately on every change.
     func refreshContinueWatching() {
         guard account.accessToken != nil else { return }
+        // Check-and-set BEFORE the Task. The overlap guard used to live inside
+        // it, so two calls in the same runloop turn — the `scenePhase` change
+        // and the 30s Home poll, or two poll ticks — both spawned a task, both
+        // saw `isSyncing == false`, and both ran the push/drain/pull sequence
+        // over the same stores. A second run is redundant, not newer.
+        guard !refreshContinueWatchingInFlight else { return }
+        refreshContinueWatchingInFlight = true
         Task { [weak self] in
             guard let self else { return }
+            defer { self.refreshContinueWatchingInFlight = false }
             // The 30s Home poll and the 30s auto-sync tick run on separate
             // timers, and this method pulls the library as well — so on Home
             // the account was being pulled roughly twice per window, with the
@@ -1796,7 +1807,13 @@ final class OrivioSyncManager: ObservableObject {
         let payload = await Task.detached(priority: .utility) {
             Self.encodeWatchProgressBody(snapshot, pid: profile, clientID: client)
         }.value
-        guard let payload else { return }
+        guard let payload else {
+            // Nothing to send (empty history, or every row filtered out): the
+            // flag is still satisfied. Left set, it could never clear and every
+            // sync re-attempted the no-op push. Same rule as pushWatchedItems.
+            setDirty("progress", profile: profile, false)
+            return
+        }
         // The encode above suspends. The rows in `payload` are stamped with
         // `profile`; if the user has since switched, sending them would write
         // this profile's history under the other profile's id.
@@ -2366,7 +2383,17 @@ final class OrivioSyncManager: ObservableObject {
         // was read from are the same `profile`, and it is still the live one.
         try ensureProfile(profile)
         _ = try await authedPost(RPC.url(RPC.pushLibrary), payload: payload)
-        let accountDeleteKeys = pendingDeletes.union(staleAlternateLibraryDeleteKeys(for: items))
+        // Never delete a key that is in the list we just uploaded: a removal
+        // queued while offline, followed by a re-add before the queue drains,
+        // would otherwise upsert the item and then immediately delete it
+        // server-side — and the next reconciling pull would drop it here too.
+        // ProgressStore guards this exact case (`dropPendingDeletesHeldLocally`);
+        // the library push had no equivalent. The alternate-type cleanup below is
+        // still applied.
+        let heldKeys = Set(items.map(\.key))
+        let accountDeleteKeys = pendingDeletes
+            .subtracting(heldKeys)
+            .union(staleAlternateLibraryDeleteKeys(for: items))
         try await deleteLibraryItems(keys: accountDeleteKeys, profile: profile)
         // The push landed, so the account now holds exactly `items` — every
         // queued removal it doesn't contain is done. (Replace semantics mean an
@@ -2447,7 +2474,12 @@ final class OrivioSyncManager: ObservableObject {
         // First-ever pull for this profile merges additively (union → pushed
         // up); once seeded, pulls reconcile so removals propagate.
         let seeded = isSeeded("library", profile: profile)
-        libraryStore.mergeRemote(collected, reconcile: seeded)
+        // `trusted: true` — this IS the Orivio account, the one source whose
+        // `addedAt` round-trips as a real date. Without it the `removedItems`
+        // record could never be lifted by a genuine re-add on another device:
+        // this device would skip the title on every pull, and the next
+        // replace-push would delete it from the account.
+        libraryStore.mergeRemote(collected, reconcile: seeded, trusted: true)
         setSeeded("library", profile: profile)
     }
 
@@ -2856,10 +2888,26 @@ final class OrivioSyncManager: ObservableObject {
     /// reverting, a debrid key coming back — and then pushed the reverted
     /// state up as the new truth. `syncNow` now flushes each of these before
     /// the matching pull.
-    private var collectionsDirty = false
-    private var homeCatalogDirty = false
-    private var badgeSettingsDirty = false
-    private var providerCredentialsDirty = false
+    /// All four are keyed per profile, like `addonsDirty`. As in-memory globals a
+    /// profile switch inside the debounce let the NEW profile's push clear the
+    /// flag the OLD profile's edit had set, so that edit never uploaded and the
+    /// next reconciling pull overwrote it.
+    private var collectionsDirty: Bool {
+        get { isDirty("collections", profile: pid) }
+        set { setDirty("collections", profile: pid, newValue) }
+    }
+    private var homeCatalogDirty: Bool {
+        get { isDirty("homeCatalog", profile: pid) }
+        set { setDirty("homeCatalog", profile: pid, newValue) }
+    }
+    private var badgeSettingsDirty: Bool {
+        get { isDirty("badges", profile: pid) }
+        set { setDirty("badges", profile: pid, newValue) }
+    }
+    private var providerCredentialsDirty: Bool {
+        get { isDirty("providerCredentials", profile: pid) }
+        set { setDirty("providerCredentials", profile: pid, newValue) }
+    }
 
     private func scheduleCollectionsPush() {
         // Never while the previous account's state is being retired: the
@@ -2898,7 +2946,9 @@ final class OrivioSyncManager: ObservableObject {
             "p_origin_client_id": clientID
         ]
         _ = try await authedPost(RPC.url(RPC.pushCollections), body: body)
-        collectionsDirty = false   // only once the account actually has them
+        // Explicit profile, not `pid`: the profile can switch during the await,
+        // and clearing the NEW profile's flag would drop its pending edit.
+        setDirty("collections", profile: profile, false)
         NSLog("[OrivioCollections] pushed %d collections to the shared table (p%d)",
               (collectionsValue as? [Any])?.count ?? 0, profile)
     }
@@ -3049,7 +3099,7 @@ final class OrivioSyncManager: ObservableObject {
         // `profile`'s row; the write has to go back to the same one.
         try ensureProfile(profile)
         _ = try await authedPost(RPC.url(RPC.pushHomeCatalogSettings), body: body)
-        homeCatalogDirty = false   // only once the account actually has them
+        setDirty("homeCatalog", profile: profile, false)   // explicit profile; see pushCollections
     }
 
     private func pullHomeCatalogSettings(profile: Int) async throws {
@@ -3393,7 +3443,7 @@ final class OrivioSyncManager: ObservableObject {
         // Same rule as the credentials push: a failed upload must stay dirty
         // or the gated tail push never retries it.
         if (try? await authedPost(RPC.url(RPC.pushProfileSettingsBlob), body: body)) != nil {
-            badgeSettingsDirty = false
+            setDirty("badges", profile: profile, false)
         }
     }
 
@@ -3460,10 +3510,10 @@ final class OrivioSyncManager: ObservableObject {
     /// the local edit with the stale server blob: pick a theme, watch it
     /// revert to Classic a few minutes later. Now a killed-before-push edit
     /// re-flushes on the next sync BEFORE the pull, so local wins.
-    private var appPreferencesDirty = UserDefaults.standard.bool(forKey: appPrefsDirtyKey) {
-        didSet { UserDefaults.standard.set(appPreferencesDirty, forKey: Self.appPrefsDirtyKey) }
+    private var appPreferencesDirty: Bool {
+        get { isDirty("appPreferences", profile: pid) }
+        set { setDirty("appPreferences", profile: pid, newValue) }
     }
-    private static let appPrefsDirtyKey = "orivio.sync.appPrefsDirty.v1"
     private var appPrefsGeneration = 0
 
     private func scheduleAppPreferencesPush() {
@@ -3632,7 +3682,7 @@ final class OrivioSyncManager: ObservableObject {
         // `profile`'s stores and everything below writes it to `profile`'s row.
         guard pid == profile else { return }
         if let last = lastPushedAppPrefs, last.profile == profile, last.json == json {
-            if appPrefsGeneration == generationAtStart { appPreferencesDirty = false }
+            if appPrefsGeneration == generationAtStart { setDirty("appPreferences", profile: profile, false) }
             return
         }
 
@@ -3662,8 +3712,9 @@ final class OrivioSyncManager: ObservableObject {
             lastPushedAppPrefs = (profile, json)
             if appPrefsGeneration == generationAtStart {
                 // Clear only if no NEWER edit arrived while this push was in
-                // flight — that edit's own flag/push must survive.
-                appPreferencesDirty = false
+                // flight — that edit's own flag/push must survive. Explicit
+                // profile: a switch during the await must not clear the new one.
+                setDirty("appPreferences", profile: profile, false)
             }
         }
     }
@@ -3726,7 +3777,7 @@ final class OrivioSyncManager: ObservableObject {
         // or Trakt login for good: with the tail push now gated on this flag,
         // nothing ever retried it.
         if (try? await authedPost(RPC.url(RPC.pushProviderCredentials), body: body)) != nil {
-            providerCredentialsDirty = false
+            setDirty("providerCredentials", profile: profile, false)
         }
     }
 
@@ -3798,8 +3849,11 @@ final class OrivioSyncManager: ObservableObject {
 
     /// Set on any local plugin-repo edit, cleared once a push lands. Same role
     /// as `addonsDirty`: dirty ⇒ push before pulling, so a reconcile can't
-    /// restore a repo the user just removed.
-    private var pluginsDirty = false
+    /// restore a repo the user just removed. Per profile like `addonsDirty`.
+    private var pluginsDirty: Bool {
+        get { isDirty("plugins", profile: pid) }
+        set { setDirty("plugins", profile: pid, newValue) }
+    }
 
     private func schedulePluginsPush() {
         // Never while the previous account's state is being retired: the
@@ -3868,7 +3922,7 @@ final class OrivioSyncManager: ObservableObject {
             "p_origin_client_id": clientID
         ]
         _ = try await authedPost(RPC.url(RPC.pushPlugins), body: body)
-        pluginsDirty = false
+        setDirty("plugins", profile: profile, false)
         if !repos.isEmpty { setSeeded("plugins", profile: profile) }
     }
 

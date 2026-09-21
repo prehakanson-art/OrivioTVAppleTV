@@ -713,6 +713,41 @@ final class AddonManager: ObservableObject {
         return json
     }
 
+    /// Emergency launch reclaim: compress any add-on list still stored
+    /// UNCOMPRESSED.
+    ///
+    /// `save()` is the only writer, and it only runs once the app gets far
+    /// enough to mutate the list. On a box whose UserDefaults domain is already
+    /// at the ~1 MB CFPreferences abort — a big catalog pack installed by a
+    /// build from before compression shipped (v7 had none) — the first
+    /// unrelated write at launch aborts the process, so the app can never reach
+    /// that `save()` and loops on every launch with no way to reach Settings.
+    /// This runs before any other write and shrinks the domain with a REDUCING
+    /// write (CFPreferences accepts those), which breaks the loop. Lossless:
+    /// the same JSON, just compressed. Anything already carrying the magic is
+    /// skipped, and a non-`Data` value (the UI tests' launch-argument override)
+    /// is left alone.
+    static func reclaimUncompressedStorage() {
+        let defaults = UserDefaults.standard
+        // BOTH namespaces. The oversized blob this exists for was written by a
+        // PRE-RENAME build under `nuvio.addons.v1`; reclaiming only
+        // `orivio.addons.v1` left it untouched, and the rename migration then
+        // copied those oversized bytes into the new key — a large write that
+        // aborts the very domain this is meant to shrink. The legacy key is
+        // compressed HERE, first, so the migration carries the small copy.
+        let prefixes = ["orivio.addons.v1", "nuvio.addons.v1"]
+        for prefix in prefixes {
+            for key in defaults.dictionaryRepresentation().keys where key.hasPrefix(prefix) {
+                guard let stored = defaults.data(forKey: key),
+                      !stored.starts(with: compressionMagic) else { continue }
+                let squeezed = deflated(stored)
+                guard squeezed.count < stored.count else { continue }
+                defaults.set(squeezed, forKey: key)
+                NSLog("[OrivioAddons] reclaimed %@: %d → %d bytes", key, stored.count, squeezed.count)
+            }
+        }
+    }
+
     /// Add-ons every install gets, with or without an account.
     ///
     /// Someone who chose "Use without an account" still has to be able to

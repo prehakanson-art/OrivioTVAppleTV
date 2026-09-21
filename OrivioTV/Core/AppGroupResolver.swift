@@ -21,6 +21,18 @@ enum AppGroupResolver {
     static let fallback = "group.com.innerapns.pubtest.CYCSPZ5MTR"
 
     static let identifier: String = {
+        if let live = liveEntitlementGroup() { return live }
+        // The private-API read can fail (a future tvOS, or a re-signer whose
+        // signature the dlsym path can't see). The sideloader's assigned group
+        // is ALSO baked into the embedded provisioning profile, which needs no
+        // private API to read — so use that before giving up on the template.
+        if let fromProfile = provisioningProfileGroup() { return fromProfile }
+        return fallback
+    }()
+
+    /// The group from the LIVE code signature (private `SecTask` API, via
+    /// dlsym because it isn't in tvOS's public Security module).
+    private static func liveEntitlementGroup() -> String? {
         typealias CreateSelf = @convention(c) (CFAllocator?) -> AnyObject?
         typealias CopyValue = @convention(c)
             (AnyObject?, CFString, UnsafeMutableRawPointer?) -> AnyObject?
@@ -28,7 +40,7 @@ enum AppGroupResolver {
         guard let handle = dlopen(nil, RTLD_NOW),
               let createSym = dlsym(handle, "SecTaskCreateFromSelf"),
               let copySym = dlsym(handle, "SecTaskCopyValueForEntitlement")
-        else { return fallback }
+        else { return nil }
 
         let create = unsafeBitCast(createSym, to: CreateSelf.self)
         let copyValue = unsafeBitCast(copySym, to: CopyValue.self)
@@ -37,9 +49,44 @@ enum AppGroupResolver {
               let value = copyValue(task, "com.apple.security.application-groups" as CFString, nil),
               let groups = value as? [String],
               let first = groups.first
-        else { return fallback }
+        else { return nil }
         return first
-    }()
+    }
+
+    /// The group from the embedded provisioning profile.
+    ///
+    /// A sideloader (Sideloadly/AltStore) re-signs with the viewer's own Apple
+    /// ID and writes its assigned group into `embedded.mobileprovision`; this
+    /// reads that directly, so a re-signed install resolves the SAME group on
+    /// both sides even when the live-entitlement read fails. The profile is a
+    /// CMS blob wrapping an XML plist, so the plist is sliced out and parsed.
+    ///
+    /// The profile lives at the APP bundle root; inside the extension
+    /// (`…/App.app/PlugIns/X.appex`) that is two levels up — the same host
+    /// lookup `ownerBundleID` uses.
+    private static func provisioningProfileGroup() -> String? {
+        let main = Bundle.main
+        let appBundle: URL
+        if main.bundleURL.pathExtension == "appex" {
+            appBundle = main.bundleURL.deletingLastPathComponent().deletingLastPathComponent()
+        } else {
+            appBundle = main.bundleURL
+        }
+        let profileURL = appBundle.appendingPathComponent("embedded.mobileprovision")
+        guard let data = try? Data(contentsOf: profileURL),
+              let xmlStart = data.range(of: Data("<?xml".utf8)),
+              let xmlEnd = data.range(of: Data("</plist>".utf8),
+                                     in: xmlStart.lowerBound ..< data.endIndex)
+        else { return nil }
+        let plistData = data.subdata(in: xmlStart.lowerBound ..< xmlEnd.upperBound)
+        guard let plist = try? PropertyListSerialization
+                .propertyList(from: plistData, format: nil) as? [String: Any],
+              let entitlements = plist["Entitlements"] as? [String: Any],
+              let groups = entitlements["com.apple.security.application-groups"] as? [String],
+              let first = groups.first, !first.isEmpty
+        else { return nil }
+        return first
+    }
 
     /// The shared container for the resolved group, or nil when app groups
     /// aren't available (a signer that stripped the entitlement) — every Top

@@ -67,7 +67,12 @@ final class VLCEngine: NSObject {
         // setter is what VLCKit honors reliably for HTTP input. Use it when
         // the media length is known, keeping the time setter as the fallback
         // for local/parsed media and as a best-effort first shot.
-        player.time = VLCTime(int: Int32(target * 1000))
+        // `Int32(Double)` traps on NaN/overflow; clamp before converting (a
+        // sanitized duration can legitimately reach the 30-day ceiling, whose
+        // millisecond value exceeds Int32.max).
+        let millis = target * 1000
+        let clampedMs = millis.isFinite ? min(millis, Double(Int32.max)) : Double(Int32.max)
+        player.time = VLCTime(int: Int32(clampedMs))
         let lengthMs = player.media?.length.intValue ?? 0
         if lengthMs > 0 {
             player.position = Float(min(max(target * 1000 / Double(lengthMs), 0), 0.999))
@@ -134,16 +139,27 @@ extension VLCEngine: VLCMediaPlayerDelegate {
         let ended = state == .ended
         let errored = state == .error
         let playing = player.isPlaying
-        MainActor.assumeIsolated {
-            onState?(playing, buffering, ended, errored)
+        // VLCKit is documented to deliver these on the main thread, but
+        // `assumeIsolated` TRAPS rather than degrading if that ever changes.
+        // Confirm instead and hop only when we actually have to.
+        if Thread.isMainThread {
+            MainActor.assumeIsolated { onState?(playing, buffering, ended, errored) }
+        } else {
+            Task { @MainActor [weak self] in
+                self?.onState?(playing, buffering, ended, errored)
+            }
         }
     }
 
     func mediaPlayerTimeChanged(_ aNotification: Notification) {
         let current = currentTime
         let total = duration
-        MainActor.assumeIsolated {
-            onTime?(current, total)
+        if Thread.isMainThread {
+            MainActor.assumeIsolated { onTime?(current, total) }
+        } else {
+            Task { @MainActor [weak self] in
+                self?.onTime?(current, total)
+            }
         }
     }
 }

@@ -244,7 +244,7 @@ private struct LibraryChip: View {
     var body: some View {
         Text(title)
             .font(.system(size: 24, weight: .semibold))
-            .foregroundStyle(selected ? theme.palette.textPrimary : theme.palette.textSecondary)
+            .foregroundStyle(selected ? theme.palette.onAccentTint : theme.palette.textSecondary)
             .padding(.horizontal, OrivioSpacing.xl)
             .padding(.vertical, OrivioSpacing.sm)
             .background {

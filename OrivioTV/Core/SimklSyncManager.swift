@@ -524,7 +524,7 @@ final class SimklSyncManager: ObservableObject {
         let candidates: [(id: String, show: SimklService.SyncItem, seen: (season: Int, episode: Int, at: Date?), updatedAt: Date)] =
             ordered.compactMap { id, show in
                 guard let seen = furthest[id] else { return nil }
-                let updatedAt = seen.at ?? show.watchedAt ?? Date()
+                let updatedAt = seen.at ?? show.watchedAt ?? SyncTimestamp.unknown
                 if let clearedAt, updatedAt <= clearedAt { return nil }
                 return (id, show, seen, updatedAt)
             }
@@ -597,7 +597,7 @@ final class SimklSyncManager: ObservableObject {
         guard let cid = localID(from: s) else { return nil }
         return WatchedItem(contentID: cid, contentType: s.type, title: s.title,
                            season: s.season, episode: s.episode,
-                           watchedAt: s.watchedAt ?? Date())
+                           watchedAt: s.watchedAt ?? SyncTimestamp.unknown)
     }
 
     /// EVERY local id form this remote row could correspond to.

@@ -122,10 +122,19 @@ enum AudioOutputCapability {
     /// session from the user's Default Audio Output.
     static func configureForMoviePlayback() {
         let session = AVAudioSession.sharedInstance()
-        try? session.setCategory(.playback, mode: .moviePlayback)
+        var categoryOK = true
+        do { try session.setCategory(.playback, mode: .moviePlayback) } catch { categoryOK = false }
+        var multichannelOK = false
         if #available(tvOS 15.0, *) {
-            try? session.setSupportsMultichannelContent(true)
+            multichannelOK = (try? session.setSupportsMultichannelContent(true)) != nil
         }
+        // The single most direct read on "why did audio come out stereo /
+        // cause a dropout": what the session actually accepted and how wide
+        // the route says it is. Logged at every playback start.
+        AppProbe.life("audio session → playback/moviePlayback ok=\(categoryOK.probe)"
+            + " multichannel=\(multichannelOK.probe)"
+            + " maxCh=\(session.maximumOutputNumberOfChannels)"
+            + " out=\(session.currentRoute.outputs.map(\.portType.rawValue).joined(separator: ","))")
     }
 
     /// Channels the route reports it can take. Only meaningful once the
@@ -345,9 +354,15 @@ enum SessionDisplayMode {
         // declared the pin stale on every load — every title re-requested the
         // HDMI switch, DV-first sessions re-paid their black-screen hold, and
         // the 3:2 softening was cleared as if the panel ran at 24.
-        let current = Float(UIScreen.main.maximumFramesPerSecond)
+        // UIScreen is main-thread-only and this function is also reached from
+        // KSPlayer's setup thread, so read it only where it is safe to. Off
+        // main we skip the staleness probe (it is a heuristic; the pin logic
+        // below still runs) rather than touch UIKit from a background thread.
+        let current: Float? = Thread.isMainThread
+            ? Float(UIScreen.main.maximumFramesPerSecond)
+            : nil
         lock.lock()
-        if pinned, settledRate > 0, abs(current - settledRate) > 1.5 {
+        if let current, pinned, settledRate > 0, abs(current - settledRate) > 1.5 {
             NSLog("[OrivioDisplay] pin stale (panel %.0f vs settled %.0f) — re-requesting", current, settledRate)
             pinned = false
         }
@@ -418,6 +433,14 @@ enum SessionDisplayMode {
         UIApplication.shared.ks_keyWindow?.avDisplayManager.preferredDisplayCriteria = nil
         lock.lock(); pinned = false; pinnedRate = 0; pinnedRange = -1; settledRate = 0; lock.unlock()
         NSLog("[OrivioDisplay] released on exit — panel returns to its home format")
+    }
+
+    /// The manual re-sync gesture's pin clear: drop the pin (so a re-request is
+    /// allowed to drive a fresh handshake) WITHOUT touching the criteria, which
+    /// the caller has already dropped. `releaseForExit` does both; the resync
+    /// needs the two steps separated in time.
+    static func resetPinForResync() {
+        lock.lock(); pinned = false; pinnedRate = 0; pinnedRange = -1; settledRate = 0; lock.unlock()
     }
 
     /// Diagnostics: whether an earlier title in THIS foreground stint already
@@ -538,6 +561,16 @@ final class OrivioPlayerOptions: KSOptions {
     /// opt-in, may request the switch even when the general "match content
     /// display mode" toggle is off.
     override func updateVideo(refreshRate: Float, isDovi: Bool, formatDescription: CMFormatDescription?) {
+        // Reached from MetalPlayView's frame path, which is not main, while the
+        // `UIScreen` / `UIApplication` reads below are main-thread-only. Hop
+        // instead of touching UIKit off-main; the call is rare (fps/format
+        // change) so an async hop costs nothing.
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.updateVideo(refreshRate: refreshRate, isDovi: isDovi, formatDescription: formatDescription)
+            }
+            return
+        }
         // A mismatched panel (or Match Frame Rate off) stays at its home rate
         // (typically 60Hz): keep the pulldown softening on. Only until this
         // session has actually DECIDED, though — KSPlayer calls this 2–3× per
@@ -551,13 +584,22 @@ final class OrivioPlayerOptions: KSOptions {
         // this title never gets to ask. A panel pinned by an earlier title in
         // the same foreground stint keeps that title's dynamic range, and SDR
         // content sent into an HDR mode is exactly the washed-out picture.
-        PlayerViewModel.colorTrail(
-            "display gate content=\(formatDescription?.dynamicRange.description ?? "unknown")"
-                + " rate=\(refreshRate) matchToggle=\(matchDisplayCriteria) nativeDV=\(nativeDV)"
-                + " panelNow=\(UIScreen.main.maximumFramesPerSecond)fps"
-                + " pin=\(SessionDisplayMode.pinDescription)"
-                + " panelSupports=[\(DynamicRange.availableHDRModes.map(\.description).joined(separator: ","))]"
-        )
+        let displayGate = "display gate content=\(formatDescription?.dynamicRange.description ?? "unknown")"
+            + " rate=\(refreshRate) matchToggle=\(matchDisplayCriteria) nativeDV=\(nativeDV)"
+            + " panelNow=\(UIScreen.main.maximumFramesPerSecond)fps"
+            + " pin=\(SessionDisplayMode.pinDescription)"
+            + " panelSupports=[\(DynamicRange.availableHDRModes.map(\.description).joined(separator: ","))]"
+            // The Apple TV's own Video and Audio → Match Content → Match
+            // Dynamic Range setting, read live off AVDisplayManager. If this is
+            // false the app's request is IGNORED and HDR/DV is tone-mapped into
+            // the home format — the classic "this movie looks too dark".
+            + " matchContentSetting="
+            + (UIApplication.shared.ks_keyWindow?.avDisplayManager.isDisplayCriteriaMatchingEnabled.probe ?? "?")
+        PlayerViewModel.colorTrail(displayGate)
+        // Also into the LIVE probe tail, which the colour trail (UserDefaults,
+        // served at `/`) never reached — the per-title darkness question needs
+        // to be answerable from the one recording.
+        PlayerProbe.event("display", displayGate)
         // THE INFUSE POLICY. Dolby Vision sessions may request the DV mode by
         // default (`nativeDV`) — that's the point of playing DV. Everything
         // else (HDR10/SDR via this path) stays hands-off unless the user opts
@@ -628,14 +670,23 @@ final class OrivioPlayerOptions: KSOptions {
         // frame every ~42 seconds. Two of the three request sites were moved
         // over; this one was missed, and it is the one every FFmpeg and native
         // session goes through.
-        let rate = SessionDisplayMode.snapToBroadcastRate(refreshRate)
+        let contentRate = SessionDisplayMode.snapToBroadcastRate(refreshRate)
+        // RATE: only ask for the content's rate when the viewer opted in. With
+        // `matchFrameRate` OFF (the default) we pass the rate the panel is
+        // ALREADY running, so the request changes only the dynamic range — the
+        // 60↔24 renegotiation is the heavy HDMI mode switch that wedges some
+        // panels into a solid grey screen, while a range-only change is
+        // handled in-band. This is exactly what the setting's own doc always
+        // said ("off = keep the current rate, only vary dynamic range"); it was
+        // simply read nowhere and the content rate was always sent.
+        let rate = matchFrameRate ? contentRate : Float(UIScreen.main.maximumFramesPerSecond)
         // The pin may ALREADY hold this content's cadence — a previous title at
         // the same rate in this foreground stint. The panel is therefore running
         // at the content rate and the 3:2 softening must be off, even though no
         // switch happens on this call and the dedupe guard below returns first.
         // Clearing it only after a successful `applyOnce` left the second and
         // every later 24fps title fighting a cadence that was not there.
-        if let pinned = lastAppliedRefreshRate, abs(pinned - rate) <= 1.5 {
+        if let pinned = lastAppliedRefreshRate, abs(pinned - contentRate) <= 1.5 {
             pulldown60Hz = false
         }
         guard lastAppliedDynamicRange != target.rawValue
@@ -1161,6 +1212,16 @@ final class PlayerViewModel: ObservableObject {
     /// CoreMedia retention) — the Infuse architecture. Mutually exclusive
     /// with the other engines while active.
     private(set) var dvDirectEngine: DVSampleEngine?
+
+    /// Experimental Atmos passthrough (see `AtmosHLS.swift`). Set only for an
+    /// E-AC-3/AC-3 track on an HDMI route with the setting on.
+    private var atmosPassthrough: AtmosPassthrough?
+    private var atmosSyncTask: Task<Void, Never>?
+    /// When the last seek was issued. The Atmos sync task nudges the video
+    /// clock onto the AVPlayer's audio clock; right after a seek the AVPlayer
+    /// is still catching up, so letting the sync run would drag the picture
+    /// straight back to where the audio still is. Suppress it briefly.
+    private var lastSeekIssuedAt = Date.distantPast
     var usingDVDirect: Bool { dvDirectEngine != nil }
     /// The UIView the active engine renders into (KSPlayer's player view,
     /// VLC's drawable, or the DV sample layer), handed to PlayerVideoView.
@@ -1428,6 +1489,7 @@ final class PlayerViewModel: ObservableObject {
     private func engineSeek(to seconds: Double, autoPlay: Bool) {
         let issuedAt = Date()
         let from = position
+        lastSeekIssuedAt = issuedAt
         PlayerProbe.event("seek", String(format: "ISSUE %.1f → %.1f autoPlay=%@ engine=%@",
                                          from, seconds, autoPlay.probe, engineLabelForProbe))
         PlayerProbe.count("seek.issued")
@@ -1435,6 +1497,11 @@ final class PlayerViewModel: ObservableObject {
         // window, no offset, no re-remux. Seeks are plain.
         if let dvDirectEngine {
             dvDirectEngine.seek(to: seconds)
+            // The Atmos AVPlayer owns the audio for this session, so it has to
+            // be seeked too. Skip this and the 1s sync task (which follows the
+            // audio clock) pulls the picture straight back to the audio's old
+            // position — the seek appears to do nothing.
+            atmosPassthrough?.seek(to: seconds)
             if autoPlay { dvDirectEngine.play() }
             return
         }
@@ -1541,7 +1608,9 @@ final class PlayerViewModel: ObservableObject {
 
     deinit {
         Self.liveInstanceCounter.mutate { $0 -= 1 }
-        NSLog("[OrivioPlayer] PlayerViewModel deinit (live=%d)", Self.liveInstanceCounter.wrappedValue)
+        let live = Self.liveInstanceCounter.wrappedValue
+        NSLog("[OrivioPlayer] PlayerViewModel deinit (live=%d)", live)
+        PlayerProbe.event("leak", "deinit — liveVMs=\(live)")
         for token in notificationTokens { NotificationCenter.default.removeObserver(token) }
     }
     private var dvAttempted = false
@@ -1703,11 +1772,17 @@ final class PlayerViewModel: ObservableObject {
         let generation = dvFirstGeneration
         dvFirstTask = Task { [weak self] in
             let audioOnly = self?.dvFirstIsAudioOnly ?? false
+            // Timed: on a big remote link this header probe is one of the two
+            // source opens on the load path (the engine's own open is the
+            // other), so its share of "why does this take ten seconds" needs to
+            // be on the record.
+            let preflightDone = AppProbe.begin("load", "DV-first preflight \(url.host ?? "?")")
             let probe = await StreamProbe.inspect(
                 url: url.absoluteString,
                 needsStyledASS: false, needsHDR10Plus: false,
                 needsDolbyVision: true, timeoutSeconds: audioOnly ? 3 : 5
             )
+            preflightDone(probe.dvProfile.map { "DV profile \($0)" } ?? "no DV profile")
             guard let self, !Task.isCancelled, !self.isExiting,
                   // A newer load (source switch, episode change) superseded this
                   // probe while it was in flight. Acting now would either revert
@@ -1716,24 +1791,40 @@ final class PlayerViewModel: ObservableObject {
                   // engine on top of the stream already playing, doubling audio.
                   self.dvFirstGeneration == generation
             else { return }
-            // Profile 7 conversion is decided by the DEVICE, not by a setting
-            // and not unconditionally. The on-the-fly P7 -> 8.1 conversion
-            // re-processes the whole file, which the 2-3 GB boxes cannot
-            // absorb alongside decode — `recommendsDolbyVisionProfile7` is
-            // exactly that judgement (`!isLowPower && !isMidPower`), and it was
-            // already this setting's default before the control was retired.
-            // Maximum Fidelity still overrides, because that mode's contract is
-            // that it never downgrades and it is still a setting the user picks.
+            // Profile 7 conversion: ON by default (Settings → Playback →
+            // "Brighten Profile 7 Dolby Vision") on everything but the oldest
+            // 2 GB box.
+            //
+            // The on-the-fly P7 -> 8.1 conversion re-processes the whole file,
+            // which is why it was once gated to 4 GB machines. The alternative
+            // on a cheaper box was worse: it played the HDR10 BASE LAYER only,
+            // and Profile 7 carries much of its brightness in the enhancement
+            // layer, so the picture came out genuinely DARK (the "why is this
+            // movie so dark" report, on a P7 title on the 3 GB 4K). Conversion
+            // runs in the SAME sample engine and keeps the Dolby audio
+            // bitstream, so the only thing traded is CPU — and on the 3 GB
+            // A10X that cost can show as early stalls on a heavy P7 remux, so
+            // the setting is the escape hatch. Maximum Fidelity still forces
+            // it, Compatibility declines the engine outright (the guard
+            // below), and the A8/2 GB HD always keeps the base-layer shortcut.
             let p7ok = self.activeMode == .fidelity
                 || PerformanceProfile.recommendsDolbyVisionProfile7
+                || (self.settings.convertProfile7ForBrightness && !PerformanceProfile.isLowPower)
             // profile 0 = plain HEVC (HDR10/HDR10+/SDR) — the engine plays it
             // natively with every bitstream SEI intact, so a DV-hinted title
             // that turns out non-DV still direct-starts instead of falling to
             // the decode path.
             let profile = probe.dvProfile ?? 0
             var dvOK = profile == 0 || profile == 5 || profile == 8 || (profile == 7 && p7ok)
-            // PROFILE 7 WITHOUT THE CONVERSION: keep the Dolby AUDIO.
+            // PROFILE 7 WITHOUT THE CONVERSION: the 2 GB HD's last resort.
             //
+            // `p7ok` is now true on every box except the A8/2 GB Apple TV HD,
+            // so this branch is only reached there: conversion is too heavy for
+            // that SoC, and stripping to the base layer at least keeps the
+            // Dolby audio bitstream. Everywhere else the conversion is taken
+            // and the picture stays bright.
+            //
+            // Original rationale for the branch:
             // P7 is the UHD-remux profile, and on the 2-3 GB boxes the P7 → 8.1
             // conversion is off by tier (`recommendsDolbyVisionProfile7`). That
             // declined the whole engine, so the file fell to FFmpeg — which
@@ -1874,7 +1965,10 @@ final class PlayerViewModel: ObservableObject {
                 requestHeaders: entry.stream.behaviorHints?.proxyHeaders?.requestHeaders,
                 downmixToStereo: !multichannel,
                 forceHDR10: felHDR10,
-                preferredAudioLabel: titleMemory?.audioTrackLabel
+                preferredAudioLabel: titleMemory?.audioTrackLabel,
+                // A link NAMED Atmos is a real signal the container tags don't
+                // carry; used only to decide whether to try the Atmos path.
+                streamNameSaysAtmos: entry.stream.hasAtmos
             )
             self.dvDirectEngine = engine
             // The title's remembered lip-sync offset, before any audio is fed.
@@ -2182,6 +2276,10 @@ final class PlayerViewModel: ObservableObject {
                     self.chapters = engine.chapters
                     self.startThumbnailsIfNeeded()
                     self.trailMem("direct start")
+                    // Experimental: hand the E-AC-3 audio to AVPlayer so the
+                    // receiver gets real Atmos (see AtmosHLS.swift). No-op
+                    // unless the setting is on and the route is HDMI.
+                    self.startAtmosPassthroughIfEligible(engine: engine, entry: entry, resume: resume)
                 } else {
                     Self.dvTrail("direct engine declined (\(reason)) — FFmpeg reload")
                     // A shape verdict, not a transient: every H.264 gate
@@ -2270,7 +2368,11 @@ final class PlayerViewModel: ObservableObject {
         guard let displayManager = UIApplication.shared.ks_keyWindow?.avDisplayManager,
               displayManager.isDisplayCriteriaMatchingEnabled else { return false }
         var rate = Float(UIScreen.main.maximumFramesPerSecond)
-        if SessionDisplayMode.isPlausibleRate(fps) {   // match the content rate when it's real
+        // Range-only by default: keep the panel's current rate so the request
+        // does not trigger the 60↔24 HDMI renegotiation that wedges grey
+        // panels. Only switch the rate when the viewer opted into
+        // "Match frame rate".
+        if self.settings.matchFrameRate, SessionDisplayMode.isPlausibleRate(fps) {
             rate = SessionDisplayMode.snapToBroadcastRate(fps)
         }
         // Clamp to what the TV actually advertises, same as updateVideo: a
@@ -2308,7 +2410,11 @@ final class PlayerViewModel: ObservableObject {
         guard let displayManager = UIApplication.shared.ks_keyWindow?.avDisplayManager,
               displayManager.isDisplayCriteriaMatchingEnabled else { return false }
         var rate = Float(UIScreen.main.maximumFramesPerSecond)
-        if SessionDisplayMode.isPlausibleRate(fps) {   // match the content rate when it's real
+        // Range-only by default: keep the panel's current rate so the request
+        // does not trigger the 60↔24 HDMI renegotiation that wedges grey
+        // panels. Only switch the rate when the viewer opted into
+        // "Match frame rate".
+        if self.settings.matchFrameRate, SessionDisplayMode.isPlausibleRate(fps) {
             rate = SessionDisplayMode.snapToBroadcastRate(fps)
         }
         guard DynamicRange.availableHDRModes.contains(.hdr10),
@@ -2909,6 +3015,11 @@ final class PlayerViewModel: ObservableObject {
             MainActor.assumeIsolated { self?.configureWheelTracking() }
         })
         registerLifecycleObservers()
+        // Let the global display re-sync (triple-press gesture OR the remote
+        // command from the Mac) put THIS session's HDR/DV mode back when it
+        // fires while a player is open. Weak, so a retired session contributes
+        // nothing; the next load overwrites it.
+        DisplayResync.sessionTarget = { [weak self] in self?.recoveredDisplayCriteria() }
         // NB: the idle timer is managed by `isPlaying` (kept awake only while
         // actually playing) — NOT disabled for the whole session, which used
         // to leave the Apple TV never sleeping / never showing its screensaver.
@@ -3116,6 +3227,34 @@ final class PlayerViewModel: ObservableObject {
             guard let self else { return [] }
             return self.atmosDiagnostics
         }
+        // The HDR/DV picture side: what the panel is in, what it can take, and
+        // whether the Apple TV is configured to match content at all. This is
+        // the block to read for "why is this movie dark" — see the gate event.
+        PlayerProbe.register("display") { [weak self] in
+            guard let self else { return [] }
+            let manager = UIApplication.shared.ks_keyWindow?.avDisplayManager
+            var lines = [
+                "matchContent=\(manager?.isDisplayCriteriaMatchingEnabled.probe ?? "?")"
+                    + " panelNow=\(UIScreen.main.maximumFramesPerSecond)fps"
+                    + " supports=[\(DynamicRange.availableHDRModes.map(\.description).joined(separator: ","))]",
+                "pin=\(SessionDisplayMode.pinDescription)",
+            ]
+            if let opts = self.currentOptions as? OrivioPlayerOptions {
+                lines.append("nativeDV=\(opts.nativeDV.probe) matchFrameRate=\(opts.matchFrameRate.probe)"
+                    + " contentVideoRange=\(self.currentVideoDynamicRangeProbe)")
+            }
+            return lines
+        }
+    }
+
+    /// Best-effort current video dynamic range for the `[display]` block.
+    var currentVideoDynamicRangeProbe: String {
+        if let track = playerLayer?.player.tracks(mediaType: .video).first(where: \.isEnabled)
+            ?? playerLayer?.player.tracks(mediaType: .video).first,
+           let range = track.dynamicRange {
+            return range.description
+        }
+        return dvDirectIsPQ ? "HDR10 (DV-direct PQ)" : "-"
     }
 
     /// What the audio pipeline is actually doing, gathered ONCE.
@@ -3178,14 +3317,39 @@ final class PlayerViewModel: ObservableObject {
                         : "audio is decoded to PCM here"
         }
 
+        /// Which physical output the route is. A Dolby bitstream can only
+        /// reach a receiver over HDMI; AirPlay and Bluetooth (A2DP) cannot
+        /// carry it, and tvOS decodes/re-encodes on those routes. The old
+        /// wording said "→ HDMI" unconditionally, which is a lie on AirPods.
+        var routeKind: String {
+            let d = routeDescription.lowercased()
+            if d.contains("bluetooth") { return "bluetooth" }
+            if d.contains("airplay") { return "airplay" }
+            if d.contains("hdmi") { return "hdmi" }
+            return "other"
+        }
+
         var verdict: String {
-            nativeDolbyPath ? "YES — compressed Dolby leaves the app"
-                            : "no — " + whyNotNative
+            guard nativeDolbyPath else { return "no — " + whyNotNative }
+            if routeKind == "bluetooth" || routeKind == "airplay" {
+                return "compressed Dolby leaves the app, but this route can't pass it through"
+            }
+            return "YES — compressed Dolby leaves the app"
         }
 
         var finalOutput: String {
             if nativeDolbyPath {
-                return "Dolby bitstream → tvOS → HDMI (Atmos rides a 2ch MAT carrier — the route's channel count says nothing about it)"
+                switch routeKind {
+                case "bluetooth":
+                    return "Dolby bitstream left the app → tvOS decodes it → Bluetooth"
+                        + " (A2DP is stereo; no Dolby/Atmos reaches a soundbar)"
+                case "airplay":
+                    return "Dolby bitstream left the app → tvOS unwraps to LPCM → AirPlay"
+                        + " (no Dolby/Atmos passthrough)"
+                default:
+                    return "Dolby bitstream → tvOS → HDMI"
+                        + " (Atmos rides a 2ch MAT carrier — the route's channel count says nothing about it)"
+                }
             }
             if passthrough, routeIsMultichannel {
                 return "compressed non-Dolby (\(codec)) → tvOS → HDMI"
@@ -3250,7 +3414,7 @@ final class PlayerViewModel: ObservableObject {
         return [
             "source codec=\(f.codec) channels=\(f.channelsText) rate=\(f.rateText)",
             "source says Atmos=\(f.sourceSaysAtmos ? "yes" : "no / not tagged")"
-                + "  (container metadata only — see DVSampleEngine.streamSaysAtmos)",
+                + "  (the container tag OR the release name says Atmos — not a claim about output)",
             "engine=\(f.engine)  decoder=\(f.decoder)",
             "PCM conversion in-app=\(f.pcmConversionInApp ? "yes" : "no")"
                 + "  downmixed here=\(f.downmixedInApp ? "yes → 2ch" : "no")",
@@ -3367,14 +3531,14 @@ final class PlayerViewModel: ObservableObject {
     @Published private(set) var isResyncing = false
     private var resyncClearTask: Task<Void, Never>?
 
-    /// Is the audio session's current output an AirPlay route (HomePods,
-    /// AirPlay speakers as the Apple TV's Default Audio Output)?
-    private static var isAirPlayRoute: Bool {
-        AVAudioSession.sharedInstance().currentRoute.outputs.contains { $0.portType == .airPlay }
-    }
     /// The route the FFmpeg session's audio output was chosen for, so a route
     /// change can tell whether the running output is still the right one.
     private var audioOutputChosenForAirPlay = false
+    /// Whether the running FFmpeg engine was opened on the sample-buffer
+    /// renderer (`true`) or the realtime AVAudioEngine (`false`). KSMEPlayer
+    /// snapshots the type at creation, so a route change that flips this needs
+    /// a reopen.
+    private var audioOutputChosenIsRenderer = false
 
     /// Pick the FFmpeg engine's audio output for the CURRENT route. Called
     /// before every engine open (KSMEPlayer snapshots the type at creation),
@@ -3383,34 +3547,12 @@ final class PlayerViewModel: ObservableObject {
     private func selectAudioOutput() {
         let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
         let spatialRoute = outputs.contains { $0.isSpatialAudioEnabled }
-        let airPlay = Self.isAirPlayRoute
+        let airPlay = outputs.contains { $0.portType == .airPlay }
         audioOutputChosenForAirPlay = airPlay
-        let useRenderer: Bool
-        if airPlay {
-            // AirPlay 2 is a buffered transport with seconds of latency. The
-            // realtime AVAudioEngine path fights that — dropouts, drift and
-            // stop-and-go over Wi-Fi — while AVSampleBufferAudioRenderer is
-            // the same buffered path AVPlayer itself uses for AirPlay. This
-            // beats every mode and setting below: on AirPlay the engine path
-            // is not "battle-tested", it is the one that misbehaves.
-            useRenderer = true
-        } else {
-            // Playback mode overrides: Fidelity insists on the Atmos-capable
-            // renderer whenever the route can use it; Compatibility pins the
-            // battle-tested AVAudioEngine. Automatic follows the audio setting.
-            switch settings.playbackMode {
-            case .fidelity:
-                useRenderer = spatialRoute || settings.audioOutputMode == .renderer
-            case .compatibility:
-                useRenderer = false
-            case .automatic:
-                switch settings.audioOutputMode {
-                case .auto: useRenderer = spatialRoute
-                case .renderer: useRenderer = true
-                case .engine: useRenderer = false
-                }
-            }
-        }
+        let useRenderer = Self.wantsSampleBufferRenderer(
+            outputs: outputs, settings: settings
+        )
+        audioOutputChosenIsRenderer = useRenderer
         // NOT "Atmos-capable". Both outputs sit at the end of the FFmpeg
         // pipeline, where `AudioSwresample` has already decoded every codec to
         // LPCM — E-AC-3 JOC included. Whichever wins here is playing
@@ -3431,25 +3573,79 @@ final class PlayerViewModel: ObservableObject {
             ? AudioRendererPlayer.self : AudioEnginePlayer.self
     }
 
-    /// The output route moved onto or off AirPlay mid-session. The FFmpeg
-    /// engine cannot swap its audio output in place, so reopen the same
-    /// source at the same position with the output the new route needs. The
-    /// other engines already ride AVFoundation's own AirPlay handling.
+    /// Does THIS route want the sample-buffer renderer? A pure function of the
+    /// route and the settings, so a mid-session route change can ask the same
+    /// question the open asked (see `handleAudioRouteChange`).
+    private static func wantsSampleBufferRenderer(
+        outputs: [AVAudioSessionPortDescription], settings: PlayerSettings
+    ) -> Bool {
+        let spatialRoute = outputs.contains { $0.isSpatialAudioEnabled }
+        // AirPlay 2 is a buffered transport with seconds of latency. The
+        // realtime AVAudioEngine path fights that — dropouts, drift and
+        // stop-and-go over Wi-Fi — while AVSampleBufferAudioRenderer is the
+        // same buffered path AVPlayer itself uses for AirPlay. This beats
+        // every mode and setting below.
+        if outputs.contains(where: { $0.portType == .airPlay }) { return true }
+        // Bluetooth headphones are the same shape of problem: a high-latency
+        // buffered link the realtime engine handles badly, and one the system
+        // STOPS the engine on when the route changes. AirPods often report
+        // spatial audio (which already routes them to the renderer below) but
+        // not always, so treat any Bluetooth output as renderer-worthy too.
+        let bluetooth = outputs.contains {
+            [.bluetoothA2DP, .bluetoothLE, .bluetoothHFP].contains($0.portType)
+        }
+        // Playback mode overrides: Fidelity insists on the Atmos-capable
+        // renderer whenever the route can use it; Compatibility pins the
+        // battle-tested AVAudioEngine. Automatic follows the audio setting.
+        switch settings.playbackMode {
+        case .fidelity:
+            return spatialRoute || bluetooth || settings.audioOutputMode == .renderer
+        case .compatibility:
+            return false
+        case .automatic:
+            switch settings.audioOutputMode {
+            case .auto: return spatialRoute || bluetooth
+            case .renderer: return true
+            case .engine: return false
+            }
+        }
+    }
+
+    /// The output route moved mid-session. The FFmpeg engine snapshots its
+    /// audio output when it is built, so a route that wants a different one
+    /// must be reopened — reopening was done for AirPlay only, and switching
+    /// the sound to Bluetooth headphones (AirPods) was the case it missed.
+    ///
+    /// AirPods report spatial audio, so the app's own rule wants the buffered
+    /// `AudioRendererPlayer` for them, but the running session was opened for
+    /// HDMI on the realtime `AVAudioEngine` — which the system STOPS on a
+    /// route change. The audio clock freezes with it and the picture, slaved
+    /// to that clock, sits frozen until the engine happens to be rebuilt: the
+    /// "switched to AirPods and it froze, then came back a while later"
+    /// report. Reopening onto the renderer also means later route changes are
+    /// handled by AVFoundation's own buffered path.
     private func handleAudioRouteChange() {
         guard !isExiting, !isSwitchingSource, hasStartedPlayback,
               playerLayer?.player is KSMEPlayer else { return }
-        let airPlay = Self.isAirPlayRoute
-        guard airPlay != audioOutputChosenForAirPlay else { return }
-        NSLog("[OrivioAudio] route %@ AirPlay — reopening for the right audio output",
-              airPlay ? "moved to" : "left")
-        PictureInPictureController.trail("audio route change: airPlay=\(airPlay) — reloading")
+        let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
+        let airPlay = outputs.contains { $0.portType == .airPlay }
+        let wanted = Self.wantsSampleBufferRenderer(outputs: outputs, settings: settings)
+        // Nothing to do when the running output is still the right one for
+        // this route (the common case: a volume HUD or a `.categoryChange`).
+        guard wanted != audioOutputChosenIsRenderer
+                || airPlay != audioOutputChosenForAirPlay else { return }
+        NSLog("[OrivioAudio] route changed — reopening for the right audio output"
+            + " (renderer=%@ airPlay=%@)", wanted.probe, airPlay.probe)
+        PictureInPictureController.trail(
+            "audio route change: renderer=\(wanted) airPlay=\(airPlay) — reloading")
         let resumeAt = resumeTargetForReload
         pendingResume = resumeAt > 10 ? resumeAt : nil
         // A reload autoplays, so the pause card must not stay up over a
         // running picture (the next ⏯ would then pause instead of resume).
         // The sibling reload paths (switchSource / switchEngine) do the same.
         if overlay == .pauseInfo { overlay = .none }
-        showToast(airPlay ? "Audio moved to AirPlay — reconnecting" : "Audio output changed — reconnecting")
+        showToast(airPlay ? "Audio moved to AirPlay — reconnecting"
+                          : "Audio output changed — reconnecting")
         load(entry: currentEntry)
     }
 
@@ -3788,7 +3984,9 @@ final class PlayerViewModel: ObservableObject {
             Self.colorTrail("cache: not attempted — Hybrid disk cache is off in Settings → Playback")
         }
         if overrideURL == nil, wantsHybridCache,
-           let proxied = MediaCacheServer.shared.beginSession(origin: originURL) {
+           let proxied = MediaCacheServer.shared.beginSession(
+               origin: originURL,
+               headers: entry.stream.behaviorHints?.proxyHeaders?.requestHeaders) {
             // Remember an origin that refuses ranges, so the picker stops
             // choosing this addon. Captured per load; the closure is replaced
             // on the next one.
@@ -5213,11 +5411,15 @@ final class PlayerViewModel: ObservableObject {
             guard self.isCurrentLoad(generation) else { return }
             var added = false
             for batch in batches {
-                for sub in batch.subs.prefix(25) {
+                // No per-addon cap: an addon that returns 30 tracks with
+                // Vietnamese past the 25th used to lose it silently. Every
+                // track the addon actually supplied becomes selectable.
+                for sub in batch.subs {
                     guard let url = URL(string: sub.url) else { continue }
-                    let language = sub.lang.flatMap {
-                        Locale.current.localizedString(forLanguageCode: $0)
-                    } ?? sub.lang ?? "Unknown"
+                    // Canonicalise the tag for the label, but keep the addon's
+                    // own tag as the fallback: an unrecognized code shows the
+                    // raw tag instead of vanishing or reading "Unknown".
+                    let language = AudioLanguageMatch.displayName(for: sub.lang) ?? "Unknown"
                     if let engine = self.vlcEngine {
                         // VLC downloads + renders the sub itself; added without
                         // auto-selecting so the user picks from the panel.
@@ -5449,21 +5651,133 @@ final class PlayerViewModel: ObservableObject {
 
     func resyncDisplay() {
         overlay = .none
-        guard let manager = UIApplication.shared.ks_keyWindow?.avDisplayManager else { return }
-        let held = manager.preferredDisplayCriteria
-        manager.preferredDisplayCriteria = nil
         showToast("Re-syncing display…")
-        NSLog("[OrivioDisplay] manual display re-sync — dropping and re-requesting the mode")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
-            // If the viewer bailed out during the blind re-sync, do NOT fire a
-            // fresh HDMI handshake over the browsing UI — that is the exact
-            // wedge this recovery gesture exists to escape.
-            guard let self, !self.isExiting else { return }
-            manager.preferredDisplayCriteria = held
+        // One implementation, shared with the remote command and usable with no
+        // player open (see DisplayResync). The session's mode comes from
+        // `DisplayResync.sessionTarget`, which this model installs.
+        DisplayResync.force(reason: "gesture")
+    }
+
+    // MARK: - Experimental Atmos passthrough
+
+    /// Start the AVPlayer audio path when the track is E-AC-3/AC-3, the setting
+    /// is on, and the route is HDMI. The sample engine's own audio is muted so
+    /// only the AVPlayer is heard; the video clock is nudged onto the audio
+    /// clock. Any failure leaves the normal engine untouched.
+    private func startAtmosPassthroughIfEligible(
+        engine: DVSampleEngine, entry: StreamEntry, resume: Double
+    ) {
+        // Only for a track the container actually declares Atmos, so an
+        // ordinary DD+ 5.1 title doesn't pay for a second read of the source.
+        guard settings.atmosPassthrough, atmosPassthrough == nil,
+              let urlString = entry.stream.url,
+              engine.audioPath.passthrough,
+              engine.audioPath.sourceSaysAtmos,
+              ["eac3", "ac3"].contains(engine.audioPath.codec.lowercased()),
+              AudioOutputCapability.routeDescription.lowercased().contains("hdmi")
+        else { return }
+        let passthrough = AtmosPassthrough()
+        passthrough.onError = { [weak self] message in
+            PlayerProbe.event("atmos", "passthrough failed: \(message) — restoring engine audio")
+            self?.dvDirectEngine?.setMuted(false)
+            self?.stopAtmosPassthrough()
+        }
+        passthrough.onReady = { [weak self, weak engine] in
+            guard let self, let engine, self.dvDirectEngine === engine, !self.isExiting else { return }
+            // The AVPlayer owns the audio now; silence the sample renderer so
+            // the two don't play over each other.
+            engine.setMuted(true)
+            passthrough.play()
+            self.startAtmosSync(engine: engine, passthrough: passthrough)
+            PlayerProbe.event("atmos", "passthrough READY — AVPlayer owns the \(engine.audioPath.codec) audio")
+        }
+        passthrough.start(
+            inputURL: urlString,
+            headers: entry.stream.behaviorHints?.proxyHeaders?.requestHeaders,
+            startAt: resume,
+            trackIndex: engine.currentAudioIndex
+        )
+        atmosPassthrough = passthrough
+        PlayerProbe.event("atmos", "passthrough starting for \(engine.audioPath.codec)")
+    }
+
+    /// Keep the picture on the audio clock. A 0.2s threshold means only a real
+    /// drift is corrected, so the synchronizer isn't re-timed every second.
+    private func startAtmosSync(engine: DVSampleEngine, passthrough: AtmosPassthrough) {
+        atmosSyncTask?.cancel()
+        atmosSyncTask = Task { @MainActor [weak self, weak engine] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard let self, let engine, !self.isExiting,
+                      self.dvDirectEngine === engine, self.atmosPassthrough === passthrough
+                else { return }
+                // A seek was just issued and the AVPlayer audio is still
+                // catching up: nudging now would undo the seek. Give it a beat
+                // to land (both were seeked in `engineSeek`).
+                if Date().timeIntervalSince(self.lastSeekIssuedAt) < 2 { continue }
+                let want = passthrough.currentTime
+                let have = engine.currentClockSeconds
+                if abs(want - have) > 0.2 {
+                    engine.alignClock(to: want)
+                    PlayerProbe.event("atmos", String(format: "sync nudge %+.2fs (video %.2f → audio %.2f)",
+                                                      want - have, have, want))
+                }
+            }
         }
     }
 
+    private func stopAtmosPassthrough() {
+        atmosSyncTask?.cancel()
+        atmosSyncTask = nil
+        atmosPassthrough?.stop()
+        atmosPassthrough = nil
+    }
+
+    /// Best-effort display criteria for the manual re-sync when the session
+    /// never pinned one. Mirrors the direct engine's HDR10 request: the content
+    /// rate when it is real, clamped to a mode the panel advertises.
+    private func recoveredDisplayCriteria() -> AVDisplayCriteria? {
+        var range: DynamicRange?
+        if let track = playerLayer?.player.tracks(mediaType: .video).first(where: \.isEnabled)
+            ?? playerLayer?.player.tracks(mediaType: .video).first,
+           let dr = track.dynamicRange {
+            range = dr
+        } else if dvDirectIsPQ {
+            range = .hdr10
+        }
+        guard var r = range, r != .sdr else { return nil }
+        let available = DynamicRange.availableHDRModes
+        if !available.contains(r) {
+            if available.contains(.hdr10) { r = .hdr10 }
+            else if available.contains(.hlg) { r = .hlg }
+            else { return nil }
+        }
+        let fps: Float = dvDirectEngine?.videoFPS
+            ?? (playerLayer?.player.tracks(mediaType: .video).first?.nominalFrameRate ?? 0)
+        // Same range-only policy as the normal request: keep the panel's rate
+        // unless the viewer opted into frame-rate matching.
+        let rate = (settings.matchFrameRate && SessionDisplayMode.isPlausibleRate(fps))
+            ? SessionDisplayMode.snapToBroadcastRate(fps)
+            : Float(UIScreen.main.maximumFramesPerSecond)
+        return AVDisplayCriteria(refreshRate: rate, videoDynamicRange: r.rawValue)
+    }
+
     func togglePlayPause() {
+        // The triple-press display re-sync is checked FIRST, before every other
+        // guard: the HDMI wedge leaves the WHOLE screen grey and this is the
+        // only way out of it, so it has to be reachable even while the player
+        // is exiting or mid post-background resync.
+        playPausePressTimes.append(Date())
+        playPausePressTimes.removeAll { Date().timeIntervalSince($0) > 2.0 }
+        if playPausePressTimes.count >= 2 {
+            PlayerProbe.event("transport", "⏯ press \(playPausePressTimes.count) within 2.0s"
+                + " (3 triggers the blind display re-sync)")
+        }
+        if playPausePressTimes.count >= 3 {
+            playPausePressTimes.removeAll()
+            resyncDisplay()
+            return
+        }
         // Ignore input while exiting, or during the sub-second post-background
         // resync (a play press then would race the in-flight flush-seek).
         guard !isExiting, !isResyncing else {
@@ -5476,17 +5790,6 @@ final class PlayerViewModel: ObservableObject {
         // (audio over black, video attaching while the panel link-trains).
         // Every other transport entry point already carries this gate.
         if pictureInPicture.isActive { PictureInPictureController.trail("togglePlayPause (PiP active) playing=\(isPlaying)") }
-        // The triple-press display resync stays reachable BEFORE the first
-        // frame: the DV path holds the engine paused through the HDMI
-        // handshake, and a panel that wedges grey there is exactly when the
-        // blind rescue gesture is needed.
-        playPausePressTimes.append(Date())
-        playPausePressTimes.removeAll { Date().timeIntervalSince($0) > 1.5 }
-        if playPausePressTimes.count >= 3 {
-            playPausePressTimes.removeAll()
-            resyncDisplay()
-            return
-        }
         guard acceptsTransportInput else {
             // The gate that eats a ⏯ before the first frame or during the DV
             // display handshake. Silent by design, which is exactly why it has
@@ -6809,7 +7112,7 @@ final class PlayerViewModel: ObservableObject {
             // spelled-out match, not optionMatchesLanguage's bare two-letter
             // contains — "Chinese" contains "es"); otherwise just clear it.
             let name = track.displayName.lowercased()
-            let lang = PlayerSettings.subtitleLanguageOptions.first {
+            let lang = PlayerSettings.allSubtitleLanguageOptions.first {
                 guard !$0.0.isEmpty,
                       let localized = Locale.current.localizedString(forLanguageCode: $0.0)?.lowercased()
                 else { return false }
@@ -8889,20 +9192,24 @@ final class PlayerViewModel: ObservableObject {
         advanceTarget = episode
         advanceAttempt = 1
         advanceDeferrals = 0
-        // With the Auto Link Selector OFF there is no "best source" to advance
-        // ONTO — nothing has been told which addon to trust — so picking one
-        // automatically is a guess, and on an episode the debrid has not cached
-        // it is a guess that fails sixteen times in a row. Hand over the
-        // episode's source list instead and let the viewer choose.
-        let pickManually = !autoLinkPrefs.enabled
-        PlayerProbe.event("next", "advance \(pickManually ? "→ SOURCE LIST (selector off)" : "auto")"
-            + (pickManually ? "" : " on \(advanceAddonAllowList.joined(separator: " / "))"))
-        play(episode: episode, autoAdvance: !userInitiated, presentSources: pickManually,
+        // ALWAYS auto-advance onto the best link — do NOT open the source list
+        // up front.
+        //
+        // With auto-selection off this used to hand the viewer the list AND
+        // start the auto-pick behind it, so a link was already playing under a
+        // panel that was supposed to be a choice: the screen appeared, the
+        // episode was already running beneath it, and a binge needed a dismiss
+        // it was never meant to. The next episode now just plays; if it cannot
+        // start, the retry ladder ends on the error card, whose "Other Sources"
+        // opens the list on demand — and the Up Next card's long-press "Select
+        // Source" is still the explicit way in.
+        PlayerProbe.event("next", "advance → auto"
+            + (advanceAddonAllowList.isEmpty
+                ? "" : " on \(advanceAddonAllowList.joined(separator: " / "))"))
+        play(episode: episode, autoAdvance: !userInitiated, presentSources: false,
              finishingCurrent: finishingCurrent)
         advanceTarget = episode      // `play` clears the ladder's bookkeeping
         advanceAttempt = 1
-        // A manual pick has no deadline — the viewer is choosing.
-        guard !pickManually else { endAdvanceLadder(); return }
         scheduleAdvanceRetry()
     }
 
@@ -9268,8 +9575,13 @@ final class PlayerViewModel: ObservableObject {
             }
 
             // Re-check after the awaits above: the viewer may have exited while
-            // the episode's sources were being fetched.
-            guard !isExiting else { return }
+            // the episode's sources were being fetched — or a SECOND
+            // `play(episode:)` may have superseded this one. Without the
+            // identity check, the slower of two overlapping picks wins and
+            // hijacks the session back to the episode the viewer already left
+            // (`episodeSwitchTargetID` is only cleared once a stream actually
+            // loads, which cannot have happened yet).
+            guard !isExiting, episodeSwitchTargetID == episode.id else { return }
             currentVideo = episode
             allEntries = panelEntries
             pendingResume = progressStore.progress(for: episode.id)?.positionSeconds
@@ -9658,6 +9970,7 @@ final class PlayerViewModel: ObservableObject {
         playerLayer = nil
         vlcEngine?.stop()
         vlcEngine = nil
+        stopAtmosPassthrough()
         dvDirectEngine?.stop()
         // Hand the audio session back so whatever the player interrupted (music
         // from another app, a HomePod group) gets its shouldResume — the app
@@ -9674,6 +9987,10 @@ final class PlayerViewModel: ObservableObject {
         // call.
         if ownedSharedState {
             try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            // Stop offering this (now-dead) session's mode to the global
+            // re-sync — but only when we still own the shared state, so a late
+            // PiP teardown can't strip a live session's provider.
+            DisplayResync.sessionTarget = nil
         }
         // Leak probes: 5s after teardown everything below should be freed.
         // Whichever line still prints ALIVE names the retention layer.
@@ -9683,17 +10000,22 @@ final class PlayerViewModel: ObservableObject {
         weak let probeVideoView: UIView? = dvDirectEngine?.videoView
         dvDirectEngine = nil
         NSLog("[OrivioLeak] teardown() ran")
+        // Also onto the probe bus: NSLog only reaches a console-attached
+        // device, and the leak is exactly what a live tail needs to show.
+        PlayerProbe.event("leak", "teardown ran — title=\(meta.name) liveVMs=\(PlayerViewModel.liveInstances)")
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
             // presentedVC tells us whether the DISMISSED player cover is still
             // mounted in the window: a dead 4K layer tree the render server
             // keeps compositing would explain both the re-entry stutter and
             // the corrupted-strip glitch.
             let pvc = UIApplication.shared.ks_keyWindow?.rootViewController?.presentedViewController
-            NSLog("[OrivioLeak] +5s: vm=%@ engine=%@ videoView=%@ presentedVC=%@ liveVMs=\(PlayerViewModel.liveInstances)",
-                  probeVM == nil ? "freed" : "ALIVE",
-                  probeEngine == nil ? "freed" : "ALIVE",
-                  probeVideoView == nil ? "freed" : "ALIVE",
-                  pvc.map { String(describing: type(of: $0)) } ?? "nil")
+            let line = "[OrivioLeak] +5s: vm=\(probeVM == nil ? "freed" : "ALIVE")"
+                + " engine=\(probeEngine == nil ? "freed" : "ALIVE")"
+                + " videoView=\(probeVideoView == nil ? "freed" : "ALIVE")"
+                + " presentedVC=\(pvc.map { String(describing: type(of: $0)) } ?? "nil")"
+                + " liveVMs=\(PlayerViewModel.liveInstances)"
+            NSLog("%@", line)
+            PlayerProbe.event("leak", line)
         }
         #endif
         resetNativeDV()

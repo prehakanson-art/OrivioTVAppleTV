@@ -93,6 +93,13 @@ final class HomeViewModel: ObservableObject {
     /// were already drawn from cache and the answer was sitting right here.
     @Published var initialHero: MetaItem?
 
+    /// Bumped when the hero SOURCE changes (Settings → Layout → Hero source).
+    /// `initialHero` is otherwise seeded once and never reassigned, so a source
+    /// change left the old catalog's first title on the rolling billboard until
+    /// rotation happened to walk the new spotlight. The view observes this to
+    /// force one reseed.
+    @Published private(set) var heroSourceRevision = 0
+
     /// Settings → Layout → Hero source, captured at the start of each `load`.
     ///
     /// Stored rather than read live because every derivation below runs inside
@@ -284,7 +291,15 @@ final class HomeViewModel: ObservableObject {
         // Read ONCE per load: everything derived below (the first hero, the
         // spotlight, the Featured bar) must agree about which catalog the
         // hero is on, and `loadIfNeeded` re-runs this whenever it changes.
-        heroCatalogKey = settings.heroCatalogKey
+        let resolvedHeroKey = settings.heroCatalogKey
+        if resolvedHeroKey != heroCatalogKey {
+            // A different source must be able to replace the billboard, so let
+            // the `initialHero == nil` guards below recompute it and tell the
+            // view to force one reseed.
+            initialHero = nil
+            heroSourceRevision &+= 1
+        }
+        heroCatalogKey = resolvedHeroKey
 
         // Assemble the available rows keyed the same way the sync payload is,
         // then let the layout settings decide order and visibility.
@@ -529,7 +544,11 @@ final class HomeViewModel: ObservableObject {
                     let row = HomeRow(
                         id: rowID,
                         title: title,
-                        items: Array(items.prefix(30)),
+                        // Dedupe by id, exactly as the cache-paint path above
+                        // does: a repeated MetaItem.id inside a tvOS ForEach
+                        // crashes the focus engine, and aggregator catalogs do
+                        // return the same title twice.
+                        items: Array(items.deduplicatedByID().prefix(30)),
                         addon: request.addon,
                         catalog: request.catalog
                     )
@@ -1026,6 +1045,11 @@ final class HeroFocus: ObservableObject {
     /// landed while focus sat on X — the "wrong hero" flash.
     private var pendingID: String?
     private var enriched: [String: MetaItem] = [:]
+    /// Insertion order for `enriched`, so the cache can be capped. Each entry
+    /// can be a full series (hundreds of episodes); unbounded, a long browse
+    /// retained every series ever focused (worst on a 2 GB Apple TV HD).
+    private var enrichedOrder: [String] = []
+    private static let enrichedCap = 40
 
     /// Debounced so fast scrolling through a row doesn't thrash the backdrop,
     /// animated for a smooth crossfade.
@@ -1080,6 +1104,12 @@ final class HeroFocus: ObservableObject {
                   enriched[display.id] == nil else { return }
             guard let full = await enrich(display), !Task.isCancelled,
                   self.item?.id == display.id else { return }
+            if enriched[display.id] == nil {
+                enrichedOrder.append(display.id)
+                while enrichedOrder.count > Self.enrichedCap {
+                    enriched.removeValue(forKey: enrichedOrder.removeFirst())
+                }
+            }
             enriched[display.id] = full
             withAnimation(fade ? FusionMotion.heroCrossfade : nil) { self.item = full }
         }
@@ -1222,9 +1252,20 @@ struct HomeView: View {
     /// in the background), and re-seeding there yanked focus out of whatever
     /// row you were browsing back up to the hero.
     @State private var didSeedHeroFocus = false
+    /// Set when the hero source changes, so `seedHero` replaces the billboard
+    /// once even though `hero.item` is already populated (see `seedHero`).
+    @State private var forceHeroReseed = false
     /// Coalesces the launch burst of store publishes into one reload.
     @State private var reloadDebounce: Task<Void, Never>?
+    /// The deferred `onContentReady` nudge from `reload()`. Held so a repeat
+    /// reload or a teardown can cancel it instead of firing into a gone view.
+    @State private var contentReadyTask: Task<Void, Never>?
     @State private var nextUpContinueItems: [WatchProgress] = []
+    /// Coarse wall-clock tick. Air dates are day-granular, so a newly aired
+    /// episode only becomes eligible when the DAY changes — nothing else in the
+    /// stores moves at midnight. Bumping this on the hour is enough to notice
+    /// the rollover and re-run the Next Up refresh (see `nextUpRefreshKey`).
+    @State private var clockTick = Date()
     /// Continue Watching rows the viewer has moved past (see
     /// `supersededContinueRows`), by `continueRowStamp`. Their show gets a
     /// Next Up card instead.
@@ -1278,6 +1319,8 @@ struct HomeView: View {
         }
         .onDisappear {
             isVisible = false
+            reloadDebounce?.cancel()
+            contentReadyTask?.cancel()
             ContentFocusRouter.shared.unregister(Self.heroRouterID)
         }
         // Profile scoping republishes the home settings shortly after launch
@@ -1388,8 +1431,20 @@ struct HomeView: View {
         .onChange(of: homeCatalogSettings.hideUnreleasedContent) { _, _ in scheduleReload() }
         .onChange(of: homeCatalogSettings.showPosterBanners) { _, _ in scheduleReload() }
         .task(id: nextUpRefreshKey) { await refreshNextUpContinueItems() }
+        // Hourly clock nudge so the day bucket in `nextUpRefreshKey` notices a
+        // midnight rollover while Home is left open. The key only changes once
+        // per day, so this does NOT re-run the Next Up fetch every hour.
+        .task {
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 3_600_000_000_000)
+                guard !Task.isCancelled else { return }
+                clockTick = Date()
+            }
+        }
         // Paint the hero from the cached rows without waiting for the network.
         .onChange(of: viewModel.initialHero) { _, item in seedHero(item) }
+        // Hero source changed: arm one forced reseed for the recomputed hero.
+        .onChange(of: viewModel.heroSourceRevision) { _, _ in forceHeroReseed = true }
     }
 
     /// The ONLY focusable thing in Hybrid's pinned hero, and the way back to
@@ -1456,9 +1511,18 @@ struct HomeView: View {
     /// Idempotent and one-shot for focus: called both from the cache (early, via
     /// `onChange`) and after the live load, whichever happens first.
     private func seedHero(_ item: MetaItem?) {
-        guard let item, hero.item == nil else { return }
-        hero.item = item
-        hero.setSpotlight(viewModel.spotlightItems(max: 10))
+        guard let item else { return }
+        // `hero.item == nil` is the normal one-shot seed. After a SOURCE change
+        // the model republishes a recomputed `initialHero` while the old
+        // source's title is still up, so allow one forced reseed. Never while
+        // the hero follows focus — there it tracks the focused card, and forcing
+        // it back to `initialHero` would yank the billboard.
+        let force = forceHeroReseed
+        forceHeroReseed = false
+        if hero.item == nil || (force && !hero.followsFocus) {
+            hero.item = item
+            hero.setSpotlight(viewModel.spotlightItems(max: 10))
+        }
         // The PINNED hero has no Play button to land on — it is a display, and
         // its title is whatever the focused card is. Seeding focus at it would
         // be a request into a view that isn't in the tree, leaving the page
@@ -1595,7 +1659,8 @@ struct HomeView: View {
         // Let the root enable focus/sidebar input after the first frame instead
         // of waiting for every Home catalog request to finish. Slow or broken
         // add-ons should leave Home loading, not make the whole app feel frozen.
-        Task { @MainActor in
+        contentReadyTask?.cancel()
+        contentReadyTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 500_000_000)
             guard !Task.isCancelled else { return }
             onContentReady()
@@ -1862,7 +1927,13 @@ struct HomeView: View {
             progressHash ^= item.id.hashValue &+ Int(item.positionSeconds)
         }
         for show in progressStore.dismissedNextUpShows { dismissedHash ^= show.hashValue }
-        return "\(watchedHash)#\(progressHash)#\(homeCatalogSettings.showUnairedNextUp)#\(dismissedHash)"
+        // Day bucket: an episode "becomes available" on its air DATE, which is
+        // invisible to every store. Without this the row only recomputed when
+        // something else changed, so a new episode that aired while the app sat
+        // open (or overnight) stayed absent until the next launch.
+        let dayBucket = Int(clockTick.timeIntervalSince1970 / 86_400)
+        return "\(watchedHash)#\(progressHash)#\(homeCatalogSettings.showUnairedNextUp)"
+            + "#\(dismissedHash)#\(dayBucket)"
     }
 
     private func mergedContinueItems() -> [WatchProgress] {
@@ -2191,6 +2262,18 @@ struct HomeView: View {
         if contentID.hasPrefix("tt"), let s = episode.season, let e = episode.episode {
             episodeID = "\(contentID):\(s):\(e)"
         }
+        // A Next Up episode that has AIRED since the viewer last watched the
+        // show is newly available and belongs near the top; one that had
+        // already aired before their last watch is just the next back-catalogue
+        // episode and keeps the show's own recency. Stamping with the air date
+        // (stable across refreshes, unlike `Date()`) floats the new episode up
+        // through `continueOrder`'s recency sort without reordering everything
+        // on every pass.
+        let lastWatched = lastWatchedAt
+        var availableAt = lastWatched
+        if let aired = episode.airedDate, aired > lastWatched, aired <= Date() {
+            availableAt = aired
+        }
         return WatchProgress(
             id: episodeID,
             metaID: contentID,
@@ -2206,7 +2289,7 @@ struct HomeView: View {
             positionSeconds: 0,
             durationSeconds: 1,
             streamURL: nil,
-            updatedAt: lastWatchedAt,
+            updatedAt: availableAt,
             newEpisodeCount: newEpisodeCount
         )
     }
@@ -2314,13 +2397,11 @@ struct HomeView: View {
     }
 
     private func catalogMeta(for id: String) -> MetaItem? {
-        for entry in viewModel.entries {
-            if case .catalog(let row) = entry,
-               let match = row.items.first(where: { $0.id == id }) {
-                return match
-            }
-        }
-        return nil
+        // O(1) via the index the view model already maintains — this is called
+        // twice per Continue Watching card image and once per card on every
+        // focus step, so the old linear scan of every row × item showed up as
+        // per-keypress cost on the A8/A10X.
+        viewModel.itemIndex[id]
     }
 }
 
@@ -2999,14 +3080,28 @@ private struct HeroTrailerLayer: View {
         guard homeCatalogSettings.heroTrailersEnabled else { return }
         guard !perf.reduceMotion,
               tmdbSettings.settings.isUsable, tmdbSettings.settings.useTrailers else { return }
-        // The WHOLE pipeline — TMDB key lookup AND the YouTube extraction —
-        // overlaps the rest delay. It was only the key lookup at first, with
-        // extraction serialized after the sleep, and extraction is the slow
-        // half: the preview routinely started seconds after the delay ended,
-        // which reads as "the trailer takes too long". Now the wait is
-        // max(delay, resolve) instead of delay + resolve, and a repeat visit
-        // (TrailerResolver's URL cache) resolves in milliseconds.
+        // The pipeline — TMDB key lookup AND the YouTube extraction — overlaps
+        // the rest delay (after the short settle above). It was only the key
+        // lookup at first, with extraction serialized after the sleep, and
+        // extraction is the slow half: the preview routinely started seconds
+        // after the delay ended, which reads as "the trailer takes too long".
+        // The wait is max(delay, settle + resolve) instead of delay + resolve,
+        // and a repeat visit (TrailerResolver's URL cache) resolves in
+        // milliseconds.
         let t0 = Date()
+        // A SHORT SETTLE BEFORE THE EXPENSIVE RESOLVE.
+        //
+        // The resolve used to start immediately, so every title the hero
+        // settled on — and a browse step is well past `HeroFocus`'s commit —
+        // fired a TMDB lookup and a YouTube extraction. `.task(id:)` can cancel
+        // the previous one, but a request already on the wire cannot be
+        // un-sent, so stepping across a row saturated the link with
+        // extractions that were thrown away: artwork crawled and the focus
+        // stuttered. 200ms is under any deliberate rest, so a real rest still
+        // overlaps the rest debounce below; a fast browse cancels here, before
+        // a request leaves the box.
+        try? await Task.sleep(for: .milliseconds(200))
+        guard !Task.isCancelled else { return }
         // EVERY trailer TMDB ranked, not just the best one: the top pick can
         // be geo-restricted where the connection comes out (routine on a VPN),
         // and the next one down usually isn't. `backdropItem` walks them.

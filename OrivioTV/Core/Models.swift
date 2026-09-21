@@ -1,5 +1,18 @@
 import Foundation
 
+/// Timestamp for a synced row whose SOURCE reported none.
+///
+/// Deliberately NOT `Date()`. A tracker (Trakt/SIMKL/Stremio) that omits a
+/// timestamp would otherwise stamp "now", which outranks a live Continue
+/// Watching row's `updatedAt`: `ProgressStore.episodeWatchedAfter` would then
+/// retire the episode the viewer is part-way through, and `mergeExternal` could
+/// clobber a precise local resume point with an approximate tracker position.
+/// The epoch is older than any real row, so it can never win an ordering
+/// comparison, and non-negative so it serializes safely as milliseconds.
+enum SyncTimestamp {
+    static let unknown = Date(timeIntervalSince1970: 0)
+}
+
 // MARK: - Stremio addon manifest
 
 struct AddonManifest: Codable, Identifiable, Hashable {
@@ -645,6 +658,23 @@ struct MetaVideo: Codable, Identifiable, Hashable {
         }
         guard let date else { return nil }
         return ReleaseDateParser.mediumDisplay.string(from: date)
+    }
+
+    /// "Airs in 3 days" / "Airs tomorrow" for an episode that has NOT aired
+    /// yet, or nil once it has. The addon's air date is the only schedule the
+    /// app has, so this is what an upcoming episode can honestly say.
+    var airCountdownText: String? {
+        guard !hasAired else { return nil }
+        guard let date = airedDate else { return "Not aired yet" }
+        let calendar = Calendar.current
+        let days = calendar.dateComponents(
+            [.day],
+            from: calendar.startOfDay(for: Date()),
+            to: calendar.startOfDay(for: date)
+        ).day ?? 0
+        if days <= 0 { return "Airs today" }
+        if days == 1 { return "Airs tomorrow" }
+        return "Airs in \(days) days"
     }
 }
 

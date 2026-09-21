@@ -20,12 +20,26 @@
 const http = require('http');
 const torrentStream = require('torrent-stream');
 
-const PORT = Number(process.env.ORIVIO_STREAM_PORT || 11470);
+// A bad ORIVIO_STREAM_PORT used to reach server.listen() unvalidated: a
+// non-numeric value throws ERR_SOCKET_BAD_PORT synchronously at load (taking the
+// in-process app down with it), and a whitespace value silently becomes 0,
+// binding an ephemeral port while the Swift side still dials 11470. Clamp to a
+// valid TCP port.
+const DEFAULT_PORT = 11470;
+const configuredPort = Number(process.env.ORIVIO_STREAM_PORT);
+const PORT = Number.isInteger(configuredPort) && configuredPort > 0 && configuredPort <= 65535
+  ? configuredPort
+  : DEFAULT_PORT;
 const HOST = '127.0.0.1';
 const VIDEO_EXT = ['.mkv', '.mp4', '.avi', '.mov', '.m4v', '.ts', '.webm'];
 
 // infoHash -> { engine, ready }
 const engines = new Map();
+
+// Each engine holds up to 60 peer connections and its own disk store. Unbounded
+// /add calls with distinct magnets could exhaust the device, so cap how many can
+// be live at once. Real playback only ever holds one or two.
+const MAX_ENGINES = 8;
 
 function magnetFor(input) {
   if (/^magnet:/i.test(input)) return input;
@@ -45,14 +59,34 @@ function destroyEngine(engine) {
   try { engine.destroy(() => {}); } catch (e) { /* already torn down */ }
 }
 
+// Tear down the swarm AND delete the on-disk payload. Only call this for an
+// engine we know is the SOLE owner of its infoHash (e.g. /drop, after removing
+// it from the map). Never for a duplicate discarded in getEngine: two engines
+// for the same infoHash share one temp directory, so removing it would delete
+// the surviving engine's data.
+function removeEngine(engine) {
+  try { engine.destroy(() => {}); } catch (e) { /* already torn down */ }
+  try { engine.remove(() => {}); } catch (e) { /* already removed */ }
+}
+
 function getEngine(magnet) {
   const uri = magnetFor(magnet);
+  // Only a magnet URI may reach torrent-stream. Before this, any string that
+  // wasn't a magnet or a bare 40-hex hash was handed straight through, so
+  // torrent-stream would happily fetch an arbitrary http(s) URL — an SSRF
+  // primitive reachable from any loopback client.
+  if (typeof uri !== 'string' || !/^magnet:\?/i.test(uri)) {
+    return Promise.reject(new Error('invalid magnet'));
+  }
   // A repeat /add for the same magnet used to build a SECOND engine and
   // overwrite the map entry — the first engine's swarm, its 60 connections and
   // its disk store stayed alive with no handle left to destroy them, so /drop
   // could never free them. Reuse the engine we already have.
   const known = infoHashFrom(uri);
   if (known && engines.has(known)) return Promise.resolve(engines.get(known));
+  if (engines.size >= MAX_ENGINES) {
+    return Promise.reject(new Error('too many active torrents'));
+  }
 
   return new Promise((resolve, reject) => {
     const engine = torrentStream(uri, { connections: 60 });
@@ -120,24 +154,32 @@ function sendJSON(res, code, obj) {
 // string inside the app's own process and jetsam it.
 const MAX_BODY_BYTES = 64 * 1024;
 
-// Resolves the parsed body, or null when it blew the cap (caller answers 413).
+// Resolves the parsed body, or the BODY_TOO_LARGE sentinel when it blew the cap
+// (caller answers 413). The sentinel must be distinct from any valid parsed
+// value: a legitimately falsy JSON body (null, 0, false, "") is not an
+// overflow, but the old `null` sentinel made every one of them report 413.
 // Overflow stops ACCUMULATING but does not destroy the request: the response
 // still has to go out, and Node closes the connection itself once we reply
 // without having drained the body.
+const BODY_TOO_LARGE = Symbol('body too large');
+
 function readBody(req) {
   return new Promise((resolve) => {
-    let data = '';
+    const chunks = [];
     let bytes = 0;
     let done = false;
     const settle = (value) => { if (!done) { done = true; resolve(value); } };
     req.on('data', (c) => {
       if (done) return;
       bytes += c.length;
-      if (bytes > MAX_BODY_BYTES) { data = ''; return settle(null); }
-      data += c;
+      if (bytes > MAX_BODY_BYTES) return settle(BODY_TOO_LARGE);
+      chunks.push(c);
     });
     req.on('end', () => {
-      try { settle(JSON.parse(data || '{}')); } catch (e) { settle({}); }
+      // Decode once at the end: per-chunk `toString()` split any multi-byte
+      // character that straddled a chunk boundary into replacement characters.
+      const text = Buffer.concat(chunks).toString('utf8');
+      try { settle(JSON.parse(text || '{}')); } catch (e) { settle({}); }
     });
     // Without these a client that hung up mid-body left the promise pending
     // forever, holding the handler (and the request) open.
@@ -165,8 +207,10 @@ function contentTypeFor(name) {
   return MIME_BY_EXT[ext] || 'application/octet-stream';
 }
 
-// Parses a single byte range against the real file size. Returns null when the
-// range is unsatisfiable, so the caller can answer 416 instead of a lying 206.
+// Parses a single byte range against the real file size. Returns:
+//   { start, end }         -> a satisfiable single range (caller sends 206)
+//   { unsatisfiable: true }-> syntactically valid but no overlap (caller 416)
+//   null                   -> ignore the header and serve the whole file (200)
 //
 // The old two-line parser got four things wrong: it never clamped `end` to
 // total-1 (so the Content-Range advertised bytes that don't exist), it answered
@@ -174,10 +218,17 @@ function contentTypeFor(name) {
 // NEGATIVE Content-Length, and it read the suffix form `bytes=-500` ("the LAST
 // 500 bytes") as start=0/end=500 — the FIRST 501 bytes, i.e. the wrong end of
 // the file entirely.
+//
+// RFC 7233 requires a server to IGNORE a syntactically invalid Range, and lets
+// it ignore one it doesn't support, so unsupported/multi-range/garbage input
+// now yields null (→ 200 full file) instead of a bogus 416. The unit token is
+// also matched case-insensitively (`bytes=`/`Bytes=`).
 function parseRange(header, total) {
-  const m = /^bytes=(\d*)-(\d*)$/.exec(String(header).trim());
-  if (!m || (!m[1] && !m[2])) return null;
   if (total <= 0) return null;
+  const raw = String(header).trim();
+  if (raw.includes(',')) return null;              // multi-range: unsupported
+  const m = /^bytes=\s*(\d*)-(\d*)$/i.exec(raw);
+  if (!m || (!m[1] && !m[2])) return null;
 
   let start;
   let end;
@@ -192,15 +243,21 @@ function parseRange(header, total) {
     end = m[2] ? parseInt(m[2], 10) : total - 1;
   }
   if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
-  if (start >= total || end < start) return null;
+  if (start >= total || end < start) return { unsatisfiable: true };
   return { start, end: Math.min(end, total - 1) };
 }
 
 function streamFile(req, res, engine, index) {
   const file = engine.files[index];
   if (!file) { res.writeHead(404); return res.end('no file'); }
-  // Prioritize sequential download so the swarm fills toward the play head.
-  if (engine.select) engine.select(index);
+  // No explicit prioritization here: file.createReadStream() below already calls
+  // engine.select(startPiece, endPiece, /* priority */ true, notify) for the exact
+  // requested range and deselects it at end-of-stream. The old
+  // `engine.select(index)` was doubly wrong — engine.select takes PIECE indices
+  // (from, to, priority, notify), not a file index — and, with `to` left
+  // undefined, its selection entry could never be garbage-collected. That leaked
+  // a phantom selection on every range request and kept the swarm permanently
+  // interested. Removing it fixes both; the range is still prioritized.
 
   const total = file.length;
   const range = req.headers.range;
@@ -212,20 +269,23 @@ function streamFile(req, res, engine, index) {
 
   if (range) {
     const parsed = parseRange(range, total);
-    if (!parsed) {
+    if (parsed && parsed.unsatisfiable) {
       // RFC 7233: unsatisfiable range -> 416 plus the real size, so the player
       // can retry correctly instead of consuming a malformed 206.
       res.writeHead(416, { 'Content-Range': `bytes */${total}`, 'Content-Type': 'text/plain' });
       return res.end();
     }
-    opts = { start: parsed.start, end: parsed.end };
-    code = 206;
-    head = {
-      'Content-Range': `bytes ${parsed.start}-${parsed.end}/${total}`,
-      'Accept-Ranges': 'bytes',
-      'Content-Length': parsed.end - parsed.start + 1,
-      'Content-Type': type
-    };
+    if (parsed) {
+      opts = { start: parsed.start, end: parsed.end };
+      code = 206;
+      head = {
+        'Content-Range': `bytes ${parsed.start}-${parsed.end}/${total}`,
+        'Accept-Ranges': 'bytes',
+        'Content-Length': parsed.end - parsed.start + 1,
+        'Content-Type': type
+      };
+    }
+    // parsed === null → unsupported/invalid Range: ignore it and serve 200.
   }
 
   // Build the stream BEFORE writing any header. createReadStream can throw
@@ -266,8 +326,8 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'POST' && url.pathname === '/add') {
       const body = await readBody(req);
-      if (!body) return sendJSON(res, 413, { error: 'request body too large' });
-      const { magnet } = body;
+      if (body === BODY_TOO_LARGE) return sendJSON(res, 413, { error: 'request body too large' });
+      const magnet = body && typeof body === 'object' ? body.magnet : null;
       if (!magnet) return sendJSON(res, 400, { error: 'magnet required' });
       try {
         const engine = await getEngine(magnet);
@@ -283,16 +343,20 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'POST' && url.pathname === '/drop') {
       const body = await readBody(req);
-      if (!body) return sendJSON(res, 413, { error: 'request body too large' });
-      const { hash } = body;
+      if (body === BODY_TOO_LARGE) return sendJSON(res, 413, { error: 'request body too large' });
+      const rawHash = body && typeof body === 'object' ? body.hash : null;
+      if (!rawHash) return sendJSON(res, 400, { error: 'hash required' });
+      // Normalize to match the lowercased keys getEngine stores, otherwise an
+      // uppercase hash from the client silently missed (and leaked the engine).
+      const hash = String(rawHash).toLowerCase();
       const engine = engines.get(hash);
-      if (engine) { engine.destroy(() => {}); engines.delete(hash); }
+      if (engine) { engines.delete(hash); removeEngine(engine); }
       return sendJSON(res, 200, { ok: true });
     }
 
     // GET /stream/:hash/:index
     if (req.method === 'GET' && parts[0] === 'stream' && parts.length === 3) {
-      const engine = engines.get(parts[1]);
+      const engine = engines.get(parts[1].toLowerCase());
       if (!engine) return sendJSON(res, 404, { error: 'unknown torrent' });
       return streamFile(req, res, engine, parseInt(parts[2], 10));
     }
@@ -309,6 +373,13 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(500, { 'Content-Type': 'text/plain' });
     res.end(String((e && e.message) || e));
   }
+});
+
+// listen() reports EADDRINUSE (and similar) asynchronously via an 'error' event.
+// With no listener that becomes an uncaught exception, and because this server
+// runs in-process inside nodejs-mobile it would take the whole tvOS app down.
+server.on('error', (e) => {
+  console.error('[orivio-stream] server error:', (e && e.message) || e);
 });
 
 server.listen(PORT, HOST, () => {

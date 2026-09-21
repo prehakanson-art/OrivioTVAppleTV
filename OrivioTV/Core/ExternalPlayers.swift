@@ -67,6 +67,7 @@ struct ExternalPlayer: Identifiable, Equatable {
 
     func open(_ handoff: ExternalPlayerHandoff) {
         guard let url = makeURL(handoff) else { return }
+        ExternalLaunchMarker.markLaunched()
         UIApplication.shared.open(url)
     }
 
@@ -168,6 +169,35 @@ enum ExternalPlayers {
 
     private static func encode(_ urlString: String) -> String {
         urlString.addingPercentEncoding(withAllowedCharacters: .urlQueryValue) ?? urlString
+    }
+}
+
+/// A one-shot "we just sent the viewer into an external player" marker.
+///
+/// Unlike `ExternalPlaybackSession`, which only exists for handoffs that carry
+/// a callback, this is written for EVERY external launch (including the legacy
+/// "Play in Infuse" action). tvOS suspends us the moment the other app takes
+/// the screen, so the marker lives in UserDefaults and is consumed the first
+/// time the app is active again — that foreground is the return from the other
+/// app, and the source page the viewer left should not be what they land on.
+enum ExternalLaunchMarker {
+    private static let key = "orivio.externalPlayback.launched.v1"
+
+    /// A handoff older than this is STALE. tvOS can kill us while the other
+    /// player owns the screen, so the marker survives to the next launch — and
+    /// an unrelated background/foreground hours later must not hijack
+    /// navigation back to Home. The marker is still cleared either way.
+    private static let maxAge: TimeInterval = 8 * 60 * 60
+
+    static func markLaunched() {
+        UserDefaults.standard.set(Date(), forKey: key)
+    }
+
+    /// True once per fresh launch, then clears.
+    static func consume() -> Bool {
+        guard let at = UserDefaults.standard.object(forKey: key) as? Date else { return false }
+        UserDefaults.standard.removeObject(forKey: key)
+        return Date().timeIntervalSince(at) <= maxAge
     }
 }
 

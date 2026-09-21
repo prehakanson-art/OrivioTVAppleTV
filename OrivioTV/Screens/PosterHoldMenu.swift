@@ -133,16 +133,49 @@ extension View {
 
 struct ContinueHoldMenu: ViewModifier {
     @EnvironmentObject private var progressStore: ProgressStore
+    @EnvironmentObject private var watched: WatchedStore
     let progress: WatchProgress
     let onDetails: () -> Void
     let onPlayManually: () -> Void
     let onResumeFromStart: () -> Void
+
+    /// True for a series row, whatever type spelling a sync source used.
+    private var isSeriesType: Bool {
+        ["series", "tv", "show", "tvshow", "anime"].contains(progress.type.lowercased())
+    }
+
+    /// The (season, episode) this row is for, from the stored columns or — when
+    /// a sync source dropped them — from a row key shaped "…:<season>:<episode>"
+    /// (e.g. "tt0903747:5:6"). Only the two trailing components AFTER the show
+    /// id are trusted, so an exotic "kitsu:1234:5" show id is not mistaken for
+    /// season 1234.
+    private var episodeCoordinates: (season: Int, episode: Int)? {
+        if let season = progress.season, let episode = progress.episode {
+            return (season, episode)
+        }
+        let prefix = progress.metaID + ":"
+        guard progress.id.hasPrefix(prefix) else { return nil }
+        let tail = progress.id.dropFirst(prefix.count).split(separator: ":")
+        guard tail.count == 2, let season = Int(tail[0]), let episode = Int(tail[1]) else {
+            return nil
+        }
+        return (season, episode)
+    }
+
+    /// A Continue Watching card for one specific episode (as opposed to a
+    /// movie). Only episodes get the manual "Mark Episode Watched" action.
+    private var isEpisode: Bool { isSeriesType && episodeCoordinates != nil }
 
     func body(content: Content) -> some View {
         content.contextMenu {
             let _ = HoldProbe.log("MENU BUILT — CW \(progress.name)")
             Button { onPlayManually() } label: { Label("Play Manually", systemImage: "list.and.film") }
             Button { onDetails() } label: { Label("Go to Details", systemImage: "info.circle") }
+            if isEpisode {
+                Button { markEpisodeWatched() } label: {
+                    Label("Mark Episode Watched", systemImage: "checkmark.circle")
+                }
+            }
             Button { onResumeFromStart() } label: { Label("Start Over", systemImage: "gobackward") }
             // NO `role: .destructive` — tvOS will not present a context menu
             // that contains one, so this single item silently killed the whole
@@ -155,6 +188,44 @@ struct ContinueHoldMenu: ViewModifier {
                 Label("Remove from Continue Watching", systemImage: "xmark")
             }
         }
+    }
+
+    /// Mark ONLY this episode watched through the same progress/watch-history
+    /// path the player uses when an episode finishes: the progress row is
+    /// retired (so Continue Watching stops offering it) and the episode is
+    /// recorded in watch history, which lets Home's existing Next Up logic
+    /// advance the card to the following episode. Every other episode's resume
+    /// position is untouched, and no season/series mark is written.
+    private func markEpisodeWatched() {
+        guard let (season, episode) = episodeCoordinates else { return }
+        let meta = MetaItem(
+            id: progress.metaID,
+            type: "series",
+            name: progress.name,
+            poster: progress.poster,
+            background: progress.background,
+            logo: progress.logo
+        )
+        let video = MetaVideo(
+            id: progress.id,
+            title: progress.episodeTitle ?? progress.name,
+            season: season,
+            episode: episode,
+            thumbnail: progress.episodeThumbnail
+        )
+        // Record the watch FIRST, as a user action (not `fromPlayback`). The
+        // player's `onFinished` marks the same key with `fromPlayback: true`,
+        // which flags it as "already reported by the stop scrobble" and makes
+        // the Trakt push SKIP the history add — correct for a finished
+        // playback, wrong for a manual mark that has no scrobble behind it.
+        // Doing it here, before `markFinished` can set that flag, sends the
+        // watched state to Trakt/SIMKL immediately. `mark` is idempotent.
+        if !watched.isWatched(contentID: progress.metaID, season: season, episode: episode) {
+            watched.mark(meta: meta, video: video)
+        }
+        // `markFinished` then retires the progress row and clears the account /
+        // Stremio resume point, through the same path in-app playback uses.
+        progressStore.markFinished(meta: meta, video: video)
     }
 }
 

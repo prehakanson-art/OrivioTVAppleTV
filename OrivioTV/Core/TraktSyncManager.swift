@@ -309,7 +309,7 @@ final class TraktSyncManager: ObservableObject {
                 poster: poster, background: background, logo: nil,
                 season: s.season, episode: s.episode, episodeTitle: nil,
                 positionSeconds: pos, durationSeconds: dur, streamURL: nil,
-                updatedAt: s.watchedAt ?? Date(), syncSource: "trakt"))
+                updatedAt: s.watchedAt ?? SyncTimestamp.unknown, syncSource: "trakt"))
         }
         // The meta enrichment above awaits.
         guard profileStillActive(profile) else { return 0 }
@@ -684,7 +684,7 @@ final class TraktSyncManager: ObservableObject {
         guard let cid = localID(from: s) else { return nil }
         return WatchedItem(
             contentID: cid, contentType: s.type, title: s.title,
-            season: s.season, episode: s.episode, watchedAt: s.watchedAt ?? Date())
+            season: s.season, episode: s.episode, watchedAt: s.watchedAt ?? SyncTimestamp.unknown)
     }
 
     /// EVERY local id form this remote row could correspond to.

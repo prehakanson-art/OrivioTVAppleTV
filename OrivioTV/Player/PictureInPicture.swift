@@ -242,7 +242,9 @@ final class PictureInPictureController: NSObject, ObservableObject {
     private func routeGenericViewIntoPiP() {
         guard let view = attachedGenericView, let contentVC = contentViewController else { return }
         genericViewHome = view.superview
-        let host = contentVC.view!
+        // `view` is an implicitly-unwrapped optional; binding instead of
+        // force-unwrapping avoids a trap if the content VC's view never loads.
+        guard let host = contentVC.view else { return }
         host.backgroundColor = .black
         view.removeFromSuperview()
         view.translatesAutoresizingMaskIntoConstraints = true

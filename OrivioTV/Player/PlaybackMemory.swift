@@ -17,6 +17,10 @@ import Foundation
 enum ContainerSniffer {
     private static let cacheKey = "orivio.player.containerCache.v1"
     private static let cacheLimit = 300
+    /// Serializes the read-modify-write in `store`. `sniff` runs off the main
+    /// actor, and two overlapping loads each do a whole-dictionary
+    /// read→mutate→write, so one could silently drop the other's entry.
+    private static let cacheLock = NSLock()
 
     /// A previously learned container for this URL, if any.
     static func cached(_ url: String) -> String? {
@@ -24,6 +28,7 @@ enum ContainerSniffer {
     }
 
     private static func store(_ ext: String, for url: String) {
+        cacheLock.lock(); defer { cacheLock.unlock() }
         var cache = (UserDefaults.standard.dictionary(forKey: cacheKey) as? [String: String]) ?? [:]
         // Cheap bound: clear rather than LRU — relearning costs one ranged read.
         if cache.count >= cacheLimit { cache = [:] }

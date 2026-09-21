@@ -316,27 +316,17 @@ struct PlayerScreen: View {
         .onPlayPauseCommand {
             if viewModel.isScrubbing {
                 viewModel.commitScrub()
-            // ⏯ SKIPS THE INTRO ONLY OVER BARE, RUNNING VIDEO.
+            // ⏯ MEANS PLAY/PAUSE, ALWAYS.
             //
-            // It used to skip whenever the pill was on screen, which includes
-            // while PAUSED (a pause raises the transport, and the pill stays up
-            // under it). Pressing play/pause on a paused film and having it
-            // jump the intro instead of resuming is the single least forgivable
-            // thing this button can do — it is the most-used control in the
-            // player and it has to mean one thing. Over bare running video
-            // there is nothing else it could mean, so the shortcut stays there;
-            // everywhere else the pill is still reachable by focus and Select.
-            } else if skipIntroPillVisible && viewModel.overlay == .none && viewModel.isPlaying {
-                // While the Skip Intro pill is up, ⏯ skips (focus never has to
-                // leave the video).
-                //
-                // Keyed to the PILL, not to `skipIntroActive`. The flag stays
-                // raised for the whole intro chapter no matter what is on
-                // screen, so opening the info sheet or a picker during an
-                // opening turned ⏯ into an invisible seek: the pill isn't
-                // drawn over those, and the only thing the viewer could see
-                // was the film jumping forward instead of pausing.
-                viewModel.skipIntro()
+            // It used to ALSO skip the intro while the pill was up over bare
+            // running video. That is the one control the viewer reaches for
+            // without looking, and it has to mean exactly one thing: pausing
+            // during an intro skipped it instead, so the press looked ignored
+            // and the pause only landed on the second press — "it sometimes
+            // takes 2 presses to pause". The Skip Intro pill is still a real
+            // focusable button (Select skips, and the gesture layer hands it
+            // focus on the first trackpad nudge), so the shortcut costs more
+            // than it saves.
             } else {
                 viewModel.togglePlayPause()
             }

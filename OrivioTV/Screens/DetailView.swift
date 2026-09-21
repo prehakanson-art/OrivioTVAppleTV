@@ -673,6 +673,12 @@ struct DetailView: View {
         }
         let item = resolvedTrailer.item
         guard !Task.isCancelled else { return }
+        // This task re-runs whenever `autoTrailerKey` changes (the delay setting
+        // or the trailer list). Tear the previous player down first, or the old
+        // AVPlayer kept decoding/playing with its reference simply dropped —
+        // two players fighting, and a leaked decoder. Full teardown also clears
+        // its observers, item, audio session and fullscreen state.
+        teardownBackdropTrailer()
         let player = AVPlayer(playerItem: item)
         // Silent hero preview (Netflix-style). Muting also means we don't need
         // an active audio session, which on tvOS can otherwise stall a raw
@@ -1205,6 +1211,17 @@ struct DetailView: View {
             if let season = viewModel.selectedSeason {
                 HStack(alignment: .firstTextBaseline) {
                     RowHeader(title: season == 0 ? "Specials" : "Season \(season)")
+                    // How many AIRED episodes are still unwatched. The count
+                    // deliberately excludes anything that has not aired — a
+                    // season listed through to next month's finale is not
+                    // "12 left", it is however many you can actually watch.
+                    let left = episodesLeft(season: season)
+                    if left > 0 {
+                        Text(left == 1 ? "1 episode left" : "\(left) episodes left")
+                            .font(.system(size: 21, weight: .semibold))
+                            .foregroundStyle(theme.palette.textSecondary)
+                            .padding(.leading, OrivioSpacing.sm)
+                    }
                     Spacer()
                     // Mark/unmark the whole season in one press.
                     Button {
@@ -1234,7 +1251,8 @@ struct DetailView: View {
                         ForEach(viewModel.episodes(season: season)) { episode in
                             let extra = episode.episode.flatMap { viewModel.episodeExtras[season]?[$0] }
                             EpisodeCell(
-                                imageURL: episode.thumbnail ?? extra?.still ?? viewModel.meta.background,
+                                imageURL: episode.thumbnail ?? extra?.still
+                                    ?? viewModel.meta.background ?? viewModel.meta.poster,
                                 title: episodeTitle(episode),
                                 subtitle: episodeSubtitle(episode, extra: extra),
                                 progress: progressStore.progress(for: episode.id)?.fraction,
@@ -1245,6 +1263,7 @@ struct DetailView: View {
                                 ),
                                 rating: extra?.rating.map { String(format: "%.1f", $0) },
                                 detailLine: episodeCastLine(viewModel.episodeCasts[episode.id]),
+                                unreleasedText: episode.airCountdownText,
                                 blurImage: shouldBlurEpisode(episode, season: season),
                                 onPlay: { onPlay(viewModel.meta, episode) },
                                 onToggleWatched: { toggleWatched(episode, season: season) },
@@ -1307,10 +1326,24 @@ struct DetailView: View {
         }
     }
 
-    /// Episode caption: the overview if present, otherwise the localized air date.
+    /// Episode caption: the overview if present, otherwise the localized air
+    /// date. An episode that has not aired yet leads with when it WILL — the
+    /// overview is written for the episode, not for the wait.
     private func episodeSubtitle(_ episode: MetaVideo, extra: TMDBService.EpisodeExtra?) -> String? {
-        if let overview = episode.overview, !overview.isEmpty { return overview }
-        return DateFormat.releaseDate(extra?.airDate ?? episode.released)
+        let air = episode.airCountdownText
+        if let overview = episode.overview, !overview.isEmpty {
+            return air.map { "\($0) · \(overview)" } ?? overview
+        }
+        return air ?? DateFormat.releaseDate(extra?.airDate ?? episode.released)
+    }
+
+    /// Aired episodes in this season the viewer has not watched.
+    private func episodesLeft(season: Int) -> Int {
+        viewModel.episodes(season: season).filter {
+            $0.hasAired && !watched.isWatched(contentID: viewModel.meta.id,
+                                              season: $0.season ?? season,
+                                              episode: $0.episode)
+        }.count
     }
 
     private func episodeTitle(_ episode: MetaVideo) -> String {
@@ -1481,6 +1514,8 @@ private struct EpisodeCell: View {
     var isWatched: Bool
     var rating: String?
     var detailLine: String?
+    /// "Airs in 3 days" / "Airs tomorrow" for an episode that has not aired yet.
+    var unreleasedText: String?
     var blurImage: Bool
     let onPlay: () -> Void
     let onToggleWatched: () -> Void
@@ -1507,6 +1542,7 @@ private struct EpisodeCell: View {
                     width: Self.cardWidth,
                     subtitleBehavior: .readableOnFocus,
                     detailLine: detailLine,
+                    remainingText: unreleasedText,
                     blurImage: blurImage,
                     showsCaption: false
                 )
@@ -1785,12 +1821,19 @@ struct DetailPillButtonStyle: ButtonStyle {
                 // The palette's own text colour for its fill — White, Lavender
                 // and Mint are light fills, and white text vanished into them.
                 .foregroundStyle(isFocused ? theme.palette.onSecondary
-                                 : (restsOnGlass ? theme.palette.textPrimary : .black))
+                                 : (restsOnGlass ? .white : .black))
                 .padding(.horizontal, 36)
                 .padding(.vertical, 16)
+                // White's accent fill is the same white this pill rests on, so
+                // focus needs a resting look that differs from it. It used to
+                // rest on BARE GLASS with `textPrimary` — white label on a
+                // translucent light material, i.e. INVISIBLE, which is the
+                // "white theme: play button text is gone" report. A dark
+                // translucent pill keeps the white label readable on any
+                // backdrop and still leaves the focused white fill distinct.
                 .background(Capsule().fill(isFocused ? theme.palette.secondary
-                                           : (restsOnGlass ? Color.clear : Color.white.opacity(0.9))))
-                .liquidGlassIf(restsOnGlass && !isFocused, in: Capsule())
+                                           : (restsOnGlass ? Color.black.opacity(0.5)
+                                                           : Color.white.opacity(0.9))))
                 .overlay(
                     Capsule().strokeBorder(isFocused ? Color.white.opacity(0.95) : .clear, lineWidth: 4)
                 )
@@ -1818,7 +1861,7 @@ struct SeasonChip: View {
         Text(season == 0 ? "Specials" : "Season \(season)")
             .font(.system(size: 23, weight: .semibold))
             .foregroundStyle(isFocused ? .black
-                             : (selected ? theme.palette.textPrimary : theme.palette.textSecondary))
+                             : (selected ? theme.palette.onAccentTint : theme.palette.textSecondary))
             .padding(.horizontal, OrivioSpacing.lg)
             .padding(.vertical, OrivioSpacing.sm)
             .background {

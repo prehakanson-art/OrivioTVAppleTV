@@ -79,6 +79,18 @@ struct ThemePalette: Identifiable, Equatable {
     var textPrimary: Color = OrivioPrimitives.white
     var textSecondary: Color = OrivioPrimitives.neutral400
     var textTertiary: Color = OrivioPrimitives.neutral500
+
+    /// The accent is LIGHT — White, Lavender, Mint. Their own ink
+    /// (`onSecondary`) is dark, which is exactly what a translucent tint of
+    /// them needs: a 28% tint of a light accent over the dark card is itself
+    /// light, so the usual white label vanished into it. A dark accent keeps
+    /// the normal light text.
+    var hasLightAccent: Bool { onSecondary != OrivioPrimitives.white }
+
+    /// Ink for a translucent accent TINT — the "selected" chip fill
+    /// (`secondary.opacity(~0.28)`), NOT the solid accent focus fill (which
+    /// uses `onSecondary` directly).
+    var onAccentTint: Color { hasLightAccent ? onSecondary : textPrimary }
 }
 
 enum OrivioThemes {

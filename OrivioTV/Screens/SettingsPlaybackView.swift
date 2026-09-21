@@ -7,12 +7,24 @@ import SwiftUI
 struct PlaybackSettingsDetail: View {
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var store: PlayerSettingsStore
+    @State private var showAudioLanguages = false
+    @State private var showSubtitleLanguages = false
 
     private var s: Binding<PlayerSettings> {
         Binding(get: { store.settings }, set: { store.settings = $0 })
     }
 
     var body: some View {
+        settingsScaffold
+            .fullScreenCover(isPresented: $showAudioLanguages) { audioLanguagesSheet }
+            .fullScreenCover(isPresented: $showSubtitleLanguages) { subtitleLanguagesSheet }
+    }
+
+    /// The pane itself. Kept apart from `body` so the (large) card tree and the
+    /// two sheet modifiers are type-checked separately — together they were too
+    /// much for the checker, which failed on the first `.fullScreenCover`.
+    @ViewBuilder
+    private var settingsScaffold: some View {
         DetailScaffold(title: SettingsCategory.playback.title, subtitle: SettingsCategory.playback.subtitle) {
             SettingsGroupCard(title: "Auto-play", subtitle: "What happens when an episode finishes") {
                 autoPlayControls
@@ -209,6 +221,27 @@ struct PlaybackSettingsDetail: View {
                 ) { store.settings.playbackMode = PlaybackMode(rawValue: $0) ?? .automatic }
 
                 PlaybackToggleRow(
+                    icon: "sun.max.fill",
+                    title: "Brighten Profile 7 Dolby Vision",
+                    subtitle: "Convert Dolby Vision Profile 7 to 8.1 so the enhancement layer's brightness survives, instead of playing the dark HDR10 base layer. Costs CPU on older Apple TVs — turn off if a Profile 7 title stutters.",
+                    isOn: s.convertProfile7ForBrightness
+                )
+
+                PlaybackToggleRow(
+                    icon: "speedometer",
+                    title: "Match frame rate (24p)",
+                    subtitle: "Switch the TV to the film's true rate (e.g. 24Hz), which removes 3:2 pulldown so 24p film plays with no repeated frames. OFF by default: this rate change is a heavier HDMI renegotiation than a range-only switch, and some TVs mis-handshake it into a grey screen (recovering flashes through several more mode changes). Turn ON only if your TV handles 24p switches cleanly.",
+                    isOn: s.matchFrameRate
+                )
+
+                PlaybackToggleRow(
+                    icon: "waveform.badge.plus",
+                    title: "Dolby Atmos passthrough (experimental)",
+                    subtitle: "ON by default. For an E-AC-3 track the container tags as Dolby Atmos, re-mux the audio into a local HLS stream and play it with AVPlayer, so an HDMI receiver gets true Dolby Atmos instead of PCM. Engages only when the track declares Atmos and the route is HDMI; falls back automatically otherwise.",
+                    isOn: s.atmosPassthrough
+                )
+
+                PlaybackToggleRow(
                     icon: "internaldrive.fill",
                     title: "Hybrid disk cache",
                     subtitle: "Download the film to the Apple TV's storage at full speed while playing, so seeking anywhere already-downloaded is instant — like Infuse. A film too big for the free space keeps a sliding window instead, filling in around wherever you have been. Direct-file streams only (HLS plays normally); the cache is deleted when playback ends.",
@@ -283,8 +316,22 @@ struct PlaybackSettingsDetail: View {
                     subtitle: "Automatically pick a matching audio track when the stream has one",
                     icon: "waveform",
                     selection: store.settings.preferredAudioLanguage,
-                    options: PlayerSettings.audioLanguageOptions.map { OrivioDropdownOption($0.0, $0.1) }
+                    options: PlayerSettings.audioLanguageOptions(
+                        showAll: store.settings.allAudioLanguages,
+                        enabled: Set(store.settings.enabledAudioLanguages),
+                        current: store.settings.preferredAudioLanguage
+                    ).map { OrivioDropdownOption($0.0, $0.1) }
                 ) { store.settings.preferredAudioLanguage = $0 }
+
+                Button { showAudioLanguages = true } label: {
+                    SettingsActionRow(
+                        title: "Audio languages",
+                        subtitle: "Choose which languages the picker lists",
+                        value: audioLanguagesSummary,
+                        leadingIcon: "globe"
+                    )
+                }
+                .buttonStyle(PlainCardButtonStyle())
 
                 OrivioDropdown(
                     title: "Surround & Dolby Atmos",
@@ -317,7 +364,11 @@ struct PlaybackSettingsDetail: View {
                         subtitle: "Chosen automatically when the stream has a matching subtitle; otherwise the first available is used",
                         icon: "globe",
                         selection: store.settings.preferredSubtitleLanguage,
-                        options: PlayerSettings.subtitleLanguageOptions.map { OrivioDropdownOption($0.0, $0.1) }
+                        options: PlayerSettings.subtitleLanguageOptions(
+                            showAll: store.settings.allSubtitleLanguages,
+                            enabled: Set(store.settings.enabledSubtitleLanguages),
+                            current: store.settings.preferredSubtitleLanguage
+                        ).map { OrivioDropdownOption($0.0, $0.1) }
                     ) { store.settings.preferredSubtitleLanguage = $0 }
 
                     OrivioDropdown(
@@ -325,7 +376,11 @@ struct PlaybackSettingsDetail: View {
                         subtitle: "Used when the preferred language isn't available",
                         icon: "globe.badge.chevron.backward",
                         selection: store.settings.subtitleSecondaryLanguage,
-                        options: PlayerSettings.subtitleLanguageOptions.map { OrivioDropdownOption($0.0, $0.1) }
+                        options: PlayerSettings.subtitleLanguageOptions(
+                            showAll: store.settings.allSubtitleLanguages,
+                            enabled: Set(store.settings.enabledSubtitleLanguages),
+                            current: store.settings.subtitleSecondaryLanguage
+                        ).map { OrivioDropdownOption($0.0, $0.1) }
                     ) { store.settings.subtitleSecondaryLanguage = $0 }
 
                     PlaybackToggleRow(
@@ -335,6 +390,16 @@ struct PlaybackSettingsDetail: View {
                         isOn: s.subtitlePreferForced
                     )
                 }
+
+                Button { showSubtitleLanguages = true } label: {
+                    SettingsActionRow(
+                        title: "Subtitle languages",
+                        subtitle: "Turn on every language, or pick only the ones you want in the list",
+                        value: subtitleLanguagesSummary,
+                        leadingIcon: "globe"
+                    )
+                }
+                .buttonStyle(PlainCardButtonStyle())
 
                 OrivioDropdown(
                     title: "Text size",
@@ -507,6 +572,46 @@ struct PlaybackSettingsDetail: View {
         }
     }
 
+    private var audioLanguagesSheet: some View {
+        LanguageSelectionDetail(
+            title: "Audio languages",
+            subtitle: "Turn on every language, or pick only the ones you want the audio picker to list.",
+            allLabel: "All languages",
+            allHint: "List every language the platform knows. Off = only the ones you turn on below.",
+            all: s.allAudioLanguages,
+            enabled: s.enabledAudioLanguages,
+            options: Array(PlayerSettings.allAudioLanguageOptions.dropFirst())
+        )
+        .environmentObject(theme)
+        .environmentObject(store)
+        .onExitCommand { showAudioLanguages = false }
+    }
+
+    private var subtitleLanguagesSheet: some View {
+        LanguageSelectionDetail(
+            title: "Subtitle languages",
+            subtitle: "Turn on every language, or pick only the ones you want the subtitle pickers to list.",
+            allLabel: "All languages",
+            allHint: "List every language the platform knows. Off = only the ones you turn on below.",
+            all: s.allSubtitleLanguages,
+            enabled: s.enabledSubtitleLanguages,
+            options: Array(PlayerSettings.allSubtitleLanguageOptions.dropFirst())
+        )
+        .environmentObject(theme)
+        .environmentObject(store)
+        .onExitCommand { showSubtitleLanguages = false }
+    }
+
+    /// "All languages" or "N selected" for the drill-in rows.
+    private var audioLanguagesSummary: String {
+        store.settings.allAudioLanguages
+            ? "All" : "\(store.settings.enabledAudioLanguages.count) selected"
+    }
+    private var subtitleLanguagesSummary: String {
+        store.settings.allSubtitleLanguages
+            ? "All" : "\(store.settings.enabledSubtitleLanguages.count) selected"
+    }
+
     private func sizeLabel(_ size: Int) -> String {
         switch size {
         case ..<32: return "Small (\(size)pt)"
@@ -522,6 +627,69 @@ struct PlaybackSettingsDetail: View {
         return "\(seconds)s"
     }
 
+}
+
+// MARK: - Language selection
+
+/// A drill-in language picker: an "All languages" master switch plus one
+/// toggle per language. Keeps the audio/subtitle dropdowns short by default
+/// while still making an uncommon language reachable — the alternative was a
+/// ~180-entry dropdown or a language that simply could not be chosen.
+struct LanguageSelectionDetail: View {
+    @EnvironmentObject private var theme: ThemeManager
+    let title: String
+    let subtitle: String
+    let allLabel: String
+    let allHint: String
+    @Binding var all: Bool
+    @Binding var enabled: [String]
+    /// Every selectable (code, name), WITHOUT the "no preference" first entry.
+    let options: [(String, String)]
+
+    var body: some View {
+        DetailScaffold(title: title, subtitle: subtitle) {
+            SettingsGroupCard(title: allLabel, subtitle: allHint) {
+                PlaybackToggleRow(icon: "globe", title: allLabel,
+                                  subtitle: allHint, isOn: allBinding)
+            }
+            if !all {
+                SettingsGroupCard(
+                    title: "Languages",
+                    subtitle: "On: listed in the picker. Off: hidden. You can switch All languages back on at any time."
+                ) {
+                    ForEach(options, id: \.0) { code, name in
+                        PlaybackToggleRow(icon: "character.bubble", title: name,
+                                          subtitle: "", isOn: binding(for: code))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Turning "All" off with nothing selected would leave an empty picker —
+    /// seed the common set so there is always something to choose.
+    private var allBinding: Binding<Bool> {
+        Binding(
+            get: { all },
+            set: { on in
+                if !on, enabled.isEmpty { enabled = PlayerSettings.commonLanguageCodes.sorted() }
+                all = on
+            }
+        )
+    }
+
+    private func binding(for code: String) -> Binding<Bool> {
+        Binding(
+            get: { enabled.contains(code) },
+            set: { on in
+                if on {
+                    if !enabled.contains(code) { enabled.append(code); enabled.sort() }
+                } else {
+                    enabled.removeAll { $0 == code }
+                }
+            }
+        )
+    }
 }
 
 // MARK: - Rows

@@ -38,32 +38,93 @@ enum AudioLanguageMatch {
         "hi": ["hi", "hin", "hindi"],
         "ru": ["ru", "rus", "russian"],
         "ar": ["ar", "ara", "arabic"],
+        // Not an allow-list: any language NOT named here still matches through
+        // `normalizedCode` + the localized-name fallback below. This (and the
+        // table above) only add the endonyms / 639-2 forms Foundation does not
+        // know for a few languages people configure most.
+        "vi": ["vi", "vie", "vietnamese", "tieng viet"],
+        "th": ["th", "tha", "thai"],
+        "tr": ["tr", "tur", "turkish", "turkce"],
+        "nl": ["nl", "nld", "dut", "dutch", "nederlands"],
+        "pl": ["pl", "pol", "polish", "polski"],
+        "id": ["id", "ind", "indonesian", "bahasa"],
+        "uk": ["uk", "ukr", "ukrainian"],
+        "el": ["el", "ell", "gre", "greek"],
+        "he": ["he", "iw", "heb", "hebrew"],
+        "sv": ["sv", "swe", "swedish", "svenska"],
+        "no": ["no", "nor", "norwegian", "norsk"],
+        "da": ["da", "dan", "danish", "dansk"],
+        "fi": ["fi", "fin", "finnish", "suomi"],
+        "cs": ["cs", "ces", "cze", "czech"],
+        "hu": ["hu", "hun", "hungarian", "magyar"],
+        "ro": ["ro", "ron", "rum", "romanian"],
+        "fa": ["fa", "fas", "per", "persian", "farsi"],
+        "ms": ["ms", "msa", "may", "malay"],
+        "ta": ["ta", "tam", "tamil"],
+        "te": ["te", "tel", "telugu"],
+        "bn": ["bn", "ben", "bengali"],
+        "ur": ["ur", "urd", "urdu"],
+        "tl": ["tl", "fil", "tagalog", "filipino"],
     ]
 
-    /// Every alias of the preferred language, or just the code itself for a
-    /// language not in the table (the setting only offers these twelve, but a
-    /// remembered per-title choice can carry any tag a file happened to use).
+    /// Every alias of the preferred language. Unknown languages still get the
+    /// code itself plus its localized name, so nothing is excluded by omission.
     static func aliases(for preferred: String) -> Set<String> {
         let base = normalizedCode(preferred)
-        if let known = aliases[base] { return known }
+        if let known = aliases[base] {
+            var out = known
+            // Include the current locale's name for the language too: a track
+            // labelled "Vietnamese" must satisfy a preference stored as "vi".
+            if let full = Locale.current.localizedString(forLanguageCode: base)?.lowercased() {
+                out.insert(full)
+            }
+            return out
+        }
         // Not a language we have a table for: match its own spellings only.
         var out: Set<String> = [base]
         if let full = Locale.current.localizedString(forLanguageCode: base)?.lowercased() {
             out.insert(full)
         }
+        if let full = Locale.current.localizedString(forLanguageCode: preferred)?.lowercased() {
+            out.insert(full)
+        }
         return out
     }
 
-    /// Reduce a tag to its two-letter base: "en-US" → "en", "eng" → "en".
-    /// Anything unrecognized is returned lowercased and otherwise untouched.
+    /// Reduce any language tag to its canonical two-letter ISO 639-1 base:
+    /// "en-US" → "en", "eng" → "en", "vie" → "vi", "ger" → "de".
+    ///
+    /// Foundation's own identifier parser does the 639-2/B and 639-2/T mapping,
+    /// so this works for EVERY language rather than only the alias table above.
+    /// Unrecognized tags are returned lowercased and otherwise untouched.
     static func normalizedCode(_ code: String) -> String {
         let bare = code.lowercased()
             .split(whereSeparator: { $0 == "-" || $0 == "_" })
             .first
             .map(String.init) ?? code.lowercased()
+        guard !bare.isEmpty, bare != "und" else { return bare }
         if bare.count == 2 { return bare }
         for (short, forms) in aliases where forms.contains(bare) { return short }
+        if let canonical = Locale(identifier: bare).language.languageCode?.identifier,
+           canonical.count == 2, canonical != bare {
+            return canonical
+        }
         return bare
+    }
+
+    /// A human-readable name for a language tag, preserving the raw tag as the
+    /// fallback when Foundation doesn't recognize it. Returns nil only for an
+    /// empty tag, so callers can still choose their own "Unknown" wording.
+    static func displayName(for code: String?) -> String? {
+        guard let code, !code.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
+        if let name = Locale.current.localizedString(forLanguageCode: normalizedCode(code)),
+           !name.isEmpty {
+            return name
+        }
+        if let name = Locale.current.localizedString(forLanguageCode: code), !name.isEmpty {
+            return name
+        }
+        return code
     }
 
     /// Does this track carry the preferred language?

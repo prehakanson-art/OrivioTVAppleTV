@@ -68,7 +68,7 @@ final class ImageCache: @unchecked Sendable {
         // read from this same queue. Deferred past first paint; a trim is
         // housekeeping, and a cache a little over budget for ten seconds
         // costs nothing.
-        ioQueue.asyncAfter(deadline: .now() + 10, flags: .barrier) { [weak self] in self?.trimDisk() }
+        ioQueue.asyncAfter(deadline: .now() + 10) { [weak self] in self?.trimDisk() }
         // Under real memory pressure, decoded pixels are the cheapest thing to
         // give back (they re-decode from disk on demand) — dropping them here
         // is what keeps tvOS from jetsamming the whole app instead.
@@ -274,7 +274,7 @@ final class ImageCache: @unchecked Sendable {
             if count >= Self.trimRearmBytes { count = 0; shouldTrim = true }
         }
         if shouldTrim {
-            ioQueue.async(flags: .barrier) { [weak self] in self?.trimDisk() }
+            trimDisk()
         }
     }
 
@@ -455,24 +455,42 @@ final class ImageCache: @unchecked Sendable {
     }
 
     /// Evict oldest files (by mtime) until the directory is under budget.
+    ///
+    /// The SCAN runs on its own queue, not on `ioQueue`: `contentsOfDirectory`
+    /// plus a `resourceValues` call per file is thousands of stats on a full
+    /// 512 MB cache, and running that under a `.barrier` on the concurrent read
+    /// queue drained and then blocked every already-cached poster's read for the
+    /// whole walk — placeholders persisted on a warm cache. Only the removals
+    /// take the barrier, and those are fast.
+    private let trimQueue = DispatchQueue(label: "orivio.imagecache.trim", qos: .utility)
+
     private func trimDisk() {
-        let keys: [URLResourceKey] = [.fileSizeKey, .contentModificationDateKey]
-        guard let contents = try? fm.contentsOfDirectory(
-            at: diskURL, includingPropertiesForKeys: keys
-        ) else { return }
-        var files = contents.compactMap { url -> (url: URL, size: Int, date: Date)? in
-            guard let values = try? url.resourceValues(forKeys: Set(keys)),
-                  let size = values.fileSize,
-                  let date = values.contentModificationDate else { return nil }
-            return (url, size, date)
-        }
-        var total = files.reduce(0) { $0 + $1.size }
-        guard total > diskBudget else { return }
-        files.sort { $0.date < $1.date }   // oldest first
-        for file in files {
-            if total <= diskBudget { break }
-            try? fm.removeItem(at: file.url)
-            total -= file.size
+        trimQueue.async { [weak self] in
+            guard let self else { return }
+            let keys: [URLResourceKey] = [.fileSizeKey, .contentModificationDateKey]
+            guard let contents = try? self.fm.contentsOfDirectory(
+                at: self.diskURL, includingPropertiesForKeys: keys
+            ) else { return }
+            var files = contents.compactMap { url -> (url: URL, size: Int, date: Date)? in
+                guard let values = try? url.resourceValues(forKeys: Set(keys)),
+                      let size = values.fileSize,
+                      let date = values.contentModificationDate else { return nil }
+                return (url, size, date)
+            }
+            var total = files.reduce(0) { $0 + $1.size }
+            guard total > self.diskBudget else { return }
+            files.sort { $0.date < $1.date }   // oldest first
+            var doomed: [URL] = []
+            for file in files {
+                if total <= self.diskBudget { break }
+                doomed.append(file.url)
+                total -= file.size
+            }
+            guard !doomed.isEmpty else { return }
+            self.ioQueue.sync(flags: .barrier) { [weak self] in
+                guard let self else { return }
+                for url in doomed { try? self.fm.removeItem(at: url) }
+            }
         }
     }
 }

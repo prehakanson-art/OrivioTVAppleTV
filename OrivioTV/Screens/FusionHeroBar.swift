@@ -299,6 +299,10 @@ struct FusionHeroBar: View {
 
     /// Manual / auto step through the hero titles (wraps).
     private func advance(by delta: Int) {
+        // `% 0` traps, and the sentinel focus path that reaches here does not
+        // itself check `items.count` (only rotateIfIdle and the dots do), so an
+        // empty bar could crash on a stray focus change.
+        guard !items.isEmpty else { return }
         lastInteraction = Date()
         let fade = perf.heroCrossfadeEffective
         withAnimation(fade ? FusionMotion.heroSlide : nil) {

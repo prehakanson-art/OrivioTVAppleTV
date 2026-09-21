@@ -40,6 +40,9 @@ ipa_build/
 ipa_clean/
 *.ipa
 
+# Obsidian scratch artifacts (the vault itself is .obsidian/, above).
+Untitled.canvas
+
 # internal design/spec notes (kept locally, not published)
 APK_LIVE_SWEEP.md
 APK_SETTINGS_SPEC.md
@@ -47,3 +50,10 @@ PARITY_ROADMAP.md
 NETFLIX_DETAILS_SPEC.md
 NETFLIX_THEME_SPEC.md
 THEME_SYSTEM.md
+
+# graphify — the knowledge graph and Obsidian vault.
+# Local only, and deliberately so: graphify-out/knowledge/ stages engineering
+# notes that carry the test device's UDID, its LAN address and other details
+# that have no business in a public repo. The graph is rebuildable from source
+# in one command, so nothing here is worth tracking.
+graphify-out/

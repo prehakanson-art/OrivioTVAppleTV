@@ -165,6 +165,7 @@ final class LibraryStore: ObservableObject {
         // rather than dropping them.
         tombstonesByProfile[profileID] = tombstones
         profileID = id
+        loadGeneration &+= 1   // invalidate any in-flight load; see clearAll
         suppressChange = true
         items = [:]
         tombstones = tombstonesByProfile[id] ?? [:]
@@ -287,6 +288,8 @@ final class LibraryStore: ObservableObject {
     /// instead suppress the INCOMING account's rows for the whole grace period.
     @discardableResult
     func clearAll(notify: Bool = true, tombstone: Bool = true) -> [SavedLibraryItem] {
+        // Invalidate any in-flight async load: see ProgressStore.clearAllProgress.
+        loadGeneration &+= 1
         let removed = Array(items.values)
         guard !removed.isEmpty else { return [] }
         if tombstone {
@@ -421,6 +424,11 @@ final class LibraryStore: ObservableObject {
 
     // MARK: - Persistence
 
+    /// Bumped by `setProfile`/`clearAll`; an async `load()` checks it so it
+    /// cannot repopulate `items` from a blob captured before an intentional
+    /// clear. See `ProgressStore.loadGeneration`.
+    private var loadGeneration = 0
+
     private func load() {
         loadRemovedItems()   // per profile, like the items themselves
         guard let data = UserDefaults.standard.data(forKey: storageKey) else { return }
@@ -430,10 +438,12 @@ final class LibraryStore: ObservableObject {
         // decode was part of the A8's launch stall.
         let key = storageKey
         let expectedProfile = profileID
+        let generation = loadGeneration
         Task.detached(priority: .userInitiated) {
             let decoded = try? JSONDecoder().decode([String: SavedLibraryItem].self, from: data)
             await MainActor.run { [weak self] in
-                guard let self, self.profileID == expectedProfile else { return }
+                guard let self, self.profileID == expectedProfile,
+                      self.loadGeneration == generation else { return }
                 guard let decoded else {
                     UnreadableBlobGuard.preserve(data, key: key)   // see ProgressStore
                     return

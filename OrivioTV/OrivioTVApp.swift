@@ -8,13 +8,34 @@ struct OrivioTVApp: App {
     /// with no owner left to delete it, and nothing else in the app ever
     /// swept them — launch is the one moment we know none of them are live.
     init() {
-        // FIRST: carry `nuvio.*` prefs and caches forward to `orivio.*` before
+        // FIRST of all, before ANY UserDefaults write below: shrink an
+        // oversized add-on blob a pre-compression build left behind. On a box
+        // already at the ~1 MB CFPreferences abort, the first unrelated write
+        // (the migration stamp, a store save) aborts the process, so the app
+        // crash-loops on launch and the viewer can never reach Settings to
+        // remove the add-on. This is a reducing write, which CFPreferences
+        // accepts, so it breaks the loop. See AddonManager.
+        AddonManager.reclaimUncompressedStorage()
+        #if !DEBUG
+        // A pre-v8 release build persisted an unbounded PiP dev trail (measured
+        // ~97 KB, the single largest key in the domain) that the PiP code only
+        // clears once PiP actually runs. Clear it here so a viewer who never
+        // opens PiP still reclaims the space before the domain can reach the
+        // abort.
+        UserDefaults.standard.removeObject(forKey: "dev.pipTrail")
+        #endif
+        // THEN: carry `nuvio.*` prefs and caches forward to `orivio.*` before
         // any store reads them, or an existing install boots as a factory
         // reset — no add-ons, library, profiles, progress or credentials.
         OrivioRenameMigration.runIfNeeded()
         PlayerTempSweep.sweepAtLaunch()
-        // Dev-only LAN read-out of the colour trail, so a session can be
-        // watched live without `devicectl` backgrounding the app mid-playback.
+        // Diagnostics capture (Settings → Performance). Resolved BEFORE any
+        // probe starts so a Release install can be probed without a Debug
+        // rebuild: DEBUG defaults on, Release defaults off, and the stored
+        // choice wins either way.
+        ProbeGate.configureFromDefaults()
+        // LAN read-out of the probe bus, so a session can be watched live
+        // without `devicectl` backgrounding the app mid-playback.
         ColorProbeServer.shared.start()
         // …and a recording that SURVIVES the failure, for when the live probe
         // cannot answer: a suspended app, a wedged one, or a box that panics.
@@ -265,6 +286,12 @@ struct RootView: View {
             // back to Home so you're not stranded on a now-hidden tab.
             .onChange(of: liveTV.enabled) { _, enabled in
                 if !enabled && selectedTab == 4 { selectedTab = 0 }
+                // Also drop the tab's stack. Left in place, re-enabling Live TV
+                // later rebuilt the NavigationStack with the old path intact
+                // and reopened whatever pushed screen (a channel's sources)
+                // was up when it was switched off. Pop, don't reset, per the
+                // app's own convention.
+                if !enabled, !liveTVPath.isEmpty { liveTVPath.removeLast(liveTVPath.count) }
             }
             // Install the hold trace when the setting is switched ON, not only
             // in onAppear: turning "Hold menu probe" on mid-session used to
@@ -754,6 +781,14 @@ struct RootView: View {
                 AppProbe.scene = "\(phase)"
                 AppProbe.life("scene → \(phase)")
                 if phase == .active {
+                    // First foreground after an external handoff is the return
+                    // from that app. Players that don't call back (VLC, nPlayer,
+                    // VidHub, SenPlayer) have no deep link, so this marker is
+                    // the only signal; consuming it also keeps a plain later
+                    // foreground from re-triggering the navigation.
+                    if ExternalLaunchMarker.consume() {
+                        returnToHomeFromExternalPlayback()
+                    }
                     // Opening the app syncs the whole account, not just
                     // Continue Watching — add-ons, collections, the layout and
                     // the player/theme settings all change on other devices
@@ -1627,7 +1662,7 @@ struct RootView: View {
                 // Like the external branch of `startPlayback`: no in-app cover
                 // opens here, so nothing would ever consume a deferred auto-play
                 // pop and it would fire against the wrong screen later.
-                consumePendingAutoPlayPop()
+                discardPendingAutoPlayPopAroundHandoff()
                 ExternalPlayers.openInInfuse(urlString: url)
             }
         case .streamsManual(let meta, let video):
@@ -1900,6 +1935,18 @@ struct RootView: View {
         DispatchQueue.main.async { popActivePathForAutoPlay() }
     }
 
+    /// The external-handoff variant. `StreamsView` runs its `onSelect` callback
+    /// (which reaches here) BEFORE its `autoDismiss()` arms
+    /// `pendingAutoPlayPop`, so a plain `consumePendingAutoPlayPop()` runs one
+    /// step too early and the pop it exists to prevent is armed immediately
+    /// afterwards — then fires against whatever screen is open the next time an
+    /// in-app player closes. Clear it on the NEXT runloop turn (after the arm)
+    /// and never pop: an external return lands on Home, not a source page.
+    private func discardPendingAutoPlayPopAroundHandoff() {
+        consumePendingAutoPlayPop()
+        DispatchQueue.main.async { pendingAutoPlayPop = false }
+    }
+
     private func popActivePathForAutoPlay() {
         switch selectedTab {
         case 0: if !homePath.isEmpty { homePath.removeLast() }
@@ -1920,7 +1967,7 @@ struct RootView: View {
                 // ever consume a deferred auto-play pop. Left set, it fires
                 // against the WRONG screen the next time any in-app playback
                 // ends, throwing the viewer back one page too far.
-                consumePendingAutoPlayPop()
+                discardPendingAutoPlayPopAroundHandoff()
                 if playerSettings.settings.externalPlayerForwardSubtitles {
                     // Fetch a preferred-language subtitle, then hand off (async).
                     Task {
@@ -1968,7 +2015,9 @@ struct RootView: View {
             let subs = (try? await StremioAPI.subtitles(addon: addon, type: type, id: id)) ?? []
             if firstAny == nil { firstAny = subs.first?.url }
             if !preferred.isEmpty,
-               let match = subs.first(where: { ($0.lang ?? "").lowercased().hasPrefix(preferred) }) {
+               let match = subs.first(where: {
+                   AudioLanguageMatch.matches(code: $0.lang, label: nil, preferred: preferred)
+               }) {
                 return match.url
             }
         }
@@ -2184,6 +2233,50 @@ struct RootView: View {
         progressStore.progress(for: ProgressStore.key(metaID: item.meta.id, video: item.video))?.durationSeconds
     }
 
+    /// Landing spot after an external player. The viewer chose a stream on a
+    /// source (or title) page; when the other app hands the screen back, drop
+    /// the whole pushed stack and show Home instead of leaving them on that
+    /// picker. Only called from a confirmed external return — the callback
+    /// deep link, or the one-shot launch marker on foreground — so ordinary
+    /// playback navigation is untouched.
+    private func returnToHomeFromExternalPlayback() {
+        // A stream is on screen (or about to be): never yank the navigation
+        // stack out from under a live player. The external handoff has no
+        // cover of its own, so this only catches a pathological overlap.
+        guard playback == nil else { return }
+        // Any deferred auto-play pop pointed at the source page this is about
+        // to remove; left set it would later fire against Home.
+        pendingAutoPlayPop = false
+        // DEFERRED, not synchronous. Mutating `selectedTab` and the
+        // NavigationPaths in the same runloop tick the app becomes active (or
+        // the callback deep link lands) desyncs the NavigationStack: the path
+        // empties while the pushed screen lingers as a grey, focusable ghost.
+        // The in-app player's own `onDismiss` defers for exactly this reason.
+        DispatchQueue.main.async {
+            // Pop the stack we are LEAVING (the tab that launched the handoff)
+            // so its source page can't be landed on later, plus Home's own
+            // stack so we truly arrive at the Home root. The OTHER tabs' places
+            // are deliberately left alone — this change is only about where an
+            // external return lands, not a global navigation reset.
+            // `removeLast(count)`, NOT `path = NavigationPath()`: this app
+            // deliberately never resets a path wholesale (every other pop is a
+            // single `removeLast()`), and assigning an empty path is what
+            // leaves the pushed screen behind as a grey ghost.
+            switch selectedTab {
+            case 1: if !searchPath.isEmpty { searchPath.removeLast(searchPath.count) }
+            case 2: if !libraryPath.isEmpty { libraryPath.removeLast(libraryPath.count) }
+            case 4: if !liveTVPath.isEmpty { liveTVPath.removeLast(liveTVPath.count) }
+            default: break
+            }
+            if !homePath.isEmpty { homePath.removeLast(homePath.count) }
+            selectedTab = 0
+            // Home is the finished screen: make the rail focusable right away
+            // so it is usable instead of waiting on a stale tab-switch timer.
+            sidebarAwaitingContent = false
+            setSidebarEnabled(false, reenableAfter: 0.8)
+        }
+    }
+
     /// Route an incoming `orivio://` / `stremio://` deep link.
     private func handleDeepLink(_ url: URL) {
         guard let link = DeepLinkService.parse(url) else { return }
@@ -2193,10 +2286,19 @@ struct RootView: View {
             // canonicalizes tmdb→tt from this id.
             let meta = MetaItem(id: id, type: type, name: "")
             selectedTab = 0
-            homePath.append(Route.detail(meta))
+            // Defer the push one runloop turn so it lands AFTER the tab switch
+            // has rebuilt the Home NavigationStack. Mutating `selectedTab` and
+            // the path in the same tick is the documented grey/ghost shape the
+            // player cover's own deferral exists to avoid.
+            DispatchQueue.main.async { homePath.append(Route.detail(meta)) }
         case .addonInstall(let manifestURL):
             requestAddonInstall(manifestURL)
         case .externalPlaybackFinished(let streamURL, let position):
+            // The callback itself proves we are returning from the other app.
+            // Clear the launch marker so the foreground handler can't fire the
+            // same navigation a second time.
+            _ = ExternalLaunchMarker.consume()
+            returnToHomeFromExternalPlayback()
             finishExternalPlayback(streamURL: streamURL, position: position)
         case .externalPlaybackFailed(let message):
             // The stream never played over there, so drop the optimistic
@@ -2206,6 +2308,8 @@ struct RootView: View {
                 progressStore.remove(id: ProgressStore.key(metaID: first.meta.id, video: first.video))
             }
             ExternalPlaybackSession.clear()
+            _ = ExternalLaunchMarker.consume()
+            returnToHomeFromExternalPlayback()
             NSLog("[OrivioPlayer] external player error: %@", message ?? "(none)")
         }
     }

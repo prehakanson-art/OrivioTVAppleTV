@@ -15,6 +15,22 @@ set -u
 HOST="${1:-${ORIVIO_TV:-}}"
 MODE="${2:-live}"
 
+# Percent-encode a query value byte-for-byte. The old mark route only replaced
+# spaces with `+`, so `&`, `#`, `%` and newlines either broke the query or
+# injected parameters. The server percent-decodes (PlayerTempSweep), so this is
+# the correct encoding.
+urlencode() {
+    local LC_ALL=C s="$1" out="" c hex i
+    for (( i=0; i<${#s}; i++ )); do
+        c="${s:i:1}"
+        case "$c" in
+            [a-zA-Z0-9.~_-]) out+="$c" ;;
+            *) printf -v hex '%%%02X' "'$c"; out+="$hex" ;;
+        esac
+    done
+    printf %s "$out"
+}
+
 if [ -z "$HOST" ]; then
     echo "usage: $0 <apple-tv-ip> [live|events|once|health|trail|mark <note>]" >&2
     echo "  (or export ORIVIO_TV=<ip>)" >&2
@@ -30,7 +46,7 @@ case "$MODE" in
     # A mark is an anchor in the tail: what the viewer just reported, written
     # into the same clock as the events, so the two can be lined up later
     # instead of guessed at.
-    mark)   PATH_="/mark?$(printf %s "${3:-mark}" | sed 's/ /+/g')" ;;
+    mark)   PATH_="/mark?$(urlencode "${3:-mark}")" ;;
     *)      echo "unknown mode: $MODE" >&2; exit 64 ;;
 esac
 

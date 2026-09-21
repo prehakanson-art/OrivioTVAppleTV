@@ -96,12 +96,15 @@ final class PiPPlaybackBridge: NSObject {
     @Atomic private var durationState: Double = 0
     @Atomic private var sizeState = CGSize(width: 1920, height: 1080)
     @Atomic private var mutedState = false
-    private var interrupted = false
-    private var wasPlayingBeforeInterruption = false
-    private var allowsPiP = true
-    private var supported = true
-    private var active = false
-    private var canToggle = true
+    // The adapter reads AND writes these back from its own queue while the main
+    // thread may read them, so they are locked like the fields above — the
+    // header comment already claimed that, but only the @Atomic ones were.
+    @Atomic private var interrupted = false
+    @Atomic private var wasPlayingBeforeInterruption = false
+    @Atomic private var allowsPiP = true
+    @Atomic private var supported = true
+    @Atomic private var active = false
+    @Atomic private var canToggle = true
     @Atomic private var activitySessionIdentifier: String?
     private weak var pictureInPictureController: AnyObject?
 

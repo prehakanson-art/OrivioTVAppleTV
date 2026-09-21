@@ -122,6 +122,7 @@ struct PlayerSettings: Codable, Equatable {
         didMigrateUpNextTimeout = true
         if autoPlayTimeoutSeconds == 3 { autoPlayTimeoutSeconds = 10 }
     }
+
     var stillWatchingEnabled: Bool = false
     var stillWatchingEpisodeThreshold: Int = 3
     /// Fallback for files WITHOUT an end-credits chapter: how many seconds
@@ -190,9 +191,24 @@ struct PlayerSettings: Codable, Equatable {
     /// Preferred audio language (ISO 639-1 code); "" = stream default. When a
     /// stream carries a matching track it's selected automatically.
     var preferredAudioLanguage: String = ""
+    /// Picker language lists. Each picker shows the short common set by
+    /// default; the "… languages" drill-ins under Audio / Subtitles turn on
+    /// either EVERY language or a hand-picked subset, so a viewer who needs an
+    /// uncommon language can still find it without scrolling ~180 entries on
+    /// every pick.
+    var allAudioLanguages: Bool = false
+    var enabledAudioLanguages: [String] = PlayerSettings.commonLanguageCodes.sorted()
+    var allSubtitleLanguages: Bool = false
+    var enabledSubtitleLanguages: [String] = PlayerSettings.commonLanguageCodes.sorted()
     /// Playback policy: Automatic / Maximum Fidelity / Compatibility.
     /// Governs the DV path, P7 conversion and audio route (see PlaybackMode).
     var playbackMode: PlaybackMode = .automatic
+    /// Convert Dolby Vision Profile 7 → 8.1 so the enhancement layer's
+    /// brightness survives, instead of playing the dark HDR10 base layer.
+    /// Costs CPU on older boxes (the A10X/3 GB 4K); ON by default, and the
+    /// escape hatch when a Profile 7 title stutters. See `p7ok` in
+    /// PlayerViewModel.
+    var convertProfile7ForBrightness: Bool = true
     /// Playback engine selection (see PlayerEngine).
     var playerEngine: PlayerEngine = .auto
     /// Playback buffer sizing (see BufferProfile).
@@ -293,13 +309,19 @@ struct PlayerSettings: Codable, Equatable {
     var matchContentDisplayMode: Bool = false
     /// Also switch the panel's REFRESH RATE to the content's (e.g. 60→23.976
     /// for film) when matching display mode / playing native DV. OFF by
-    /// default: a rate switch is a much heavier HDMI renegotiation than a
-    /// dynamic-range switch, and reverting it on exit is what makes some TVs
-    /// drop to standby / turn off. Off keeps the panel at its current rate
-    /// (24p content runs under softened 3:2 pulldown) while still switching
-    /// dynamic range for HDR/DV. Turn ON only if your TV handles 24p mode
-    /// switches cleanly.
+    /// default: it removes 3:2 pulldown (24p film at its true cadence), but the
+    /// rate change is a much heavier HDMI renegotiation than a range-only
+    /// switch, and the target panel mis-handshakes it into a grey screen —
+    /// recovering from that then flashes through several more mode changes.
+    /// Turn ON only on a TV that handles 24p switches cleanly.
     var matchFrameRate: Bool = false
+    /// True Dolby Atmos passthrough from MKV sources. The sample engine hands
+    /// compressed E-AC-3 to a renderer that DECODES it (PCM, no Atmos), so this
+    /// re-muxes the E-AC-3 into a loopback HLS playlist and plays it with
+    /// AVPlayer — the only path that emits Dolby MAT 2.0. ON by default, but it
+    /// only engages when the container actually declares Atmos AND the route is
+    /// HDMI, so non-Atmos titles pay nothing; it falls back untouched otherwise.
+    var atmosPassthrough: Bool = true
     /// Native Dolby Vision output. When a Dolby Vision file
     /// (profile 5/8) plays on a DV-capable TV, the stream is remuxed on-device
     /// into a DV-tagged fMP4 playlist and handed to Apple's video pipeline —
@@ -352,20 +374,70 @@ struct PlayerSettings: Codable, Equatable {
         ("Menlo", "Menlo (mono)"),
         ("Verdana", "Verdana"),
     ]
-    /// Preferred-audio-language choices (code, label).
-    static let audioLanguageOptions: [(String, String)] = [
-        ("", "Stream default"), ("en", "English"), ("es", "Spanish"),
-        ("fr", "French"), ("de", "German"), ("it", "Italian"),
-        ("pt", "Portuguese"), ("ja", "Japanese"), ("ko", "Korean"),
-        ("zh", "Chinese"), ("hi", "Hindi"), ("ru", "Russian"), ("ar", "Arabic")
+    /// Language choices for the audio/subtitle preference pickers.
+    ///
+    /// Built from the platform's own ISO 639-1 list rather than a fixed dozen:
+    /// a hardcoded list silently made every language it omitted unselectable
+    /// (Vietnamese, Thai, Turkish, …), so an addon could supply a Vietnamese
+    /// track that no user preference could ever target. `first` is the "no
+    /// preference" entry; the rest are sorted by localized name.
+    ///
+    /// The full list is ~180 entries, which is a punishing dropdown on a TV, so
+    /// a picker shows `commonLanguageCodes` (or the viewer's chosen subset)
+    /// unless they opted into all of them in Settings → Playback → "Subtitle
+    /// languages" / "Audio languages". Dutch is in the common set — it was
+    /// missing from the old hardcoded twelve.
+    private static func languageOptions(
+        first: (String, String), showAll: Bool,
+        enabled: Set<String> = commonLanguageCodes, include: String = ""
+    ) -> [(String, String)] {
+        var seen = Set<String>()
+        var rest: [(String, String)] = []
+        for code in Locale.LanguageCode.isoLanguageCodes {
+            let id = code.identifier
+            guard id.count == 2,
+                  let name = Locale.current.localizedString(forLanguageCode: id),
+                  !name.isEmpty,
+                  seen.insert(name.lowercased()).inserted
+            else { continue }
+            if !showAll, !enabled.contains(id), id != include { continue }
+            rest.append((id, name))
+        }
+        rest.sort { $0.1.localizedCaseInsensitiveCompare($1.1) == .orderedAscending }
+        return [first] + rest
+    }
+
+    /// Languages almost every library actually carries, so a picker starts
+    /// short. Deliberately includes Dutch (and the other big European / Asian
+    /// ones) that the old fixed twelve left out.
+    static let commonLanguageCodes: Set<String> = [
+        "en", "es", "fr", "de", "it", "pt", "nl", "ru", "uk", "pl",
+        "sv", "da", "no", "fi", "tr", "cs", "el", "hu", "ro",
+        "ar", "he", "hi", "bn", "ta", "te", "ur", "fa",
+        "ja", "ko", "zh", "th", "vi", "id", "ms", "tl",
     ]
-    /// Preferred-subtitle-language choices (code, label). "" = first available.
-    static let subtitleLanguageOptions: [(String, String)] = [
-        ("", "First available"), ("en", "English"), ("es", "Spanish"),
-        ("fr", "French"), ("de", "German"), ("it", "Italian"),
-        ("pt", "Portuguese"), ("ja", "Japanese"), ("ko", "Korean"),
-        ("zh", "Chinese"), ("hi", "Hindi"), ("ru", "Russian"), ("ar", "Arabic")
-    ]
+
+    /// EVERY language, for matching a track label back to a code (a picker
+    /// filter must never make a real track unmatchable) and for the language
+    /// selection screens.
+    static let allAudioLanguageOptions: [(String, String)] =
+        languageOptions(first: ("", "Stream default"), showAll: true)
+    static let allSubtitleLanguageOptions: [(String, String)] =
+        languageOptions(first: ("", "First available"), showAll: true)
+
+    /// Picker lists: everything when `showAll`, otherwise the chosen subset.
+    /// `current` is always kept so a previously chosen language never
+    /// disappears from its own dropdown.
+    static func audioLanguageOptions(showAll: Bool, enabled: Set<String>,
+                                     current: String = "") -> [(String, String)] {
+        languageOptions(first: ("", "Stream default"), showAll: showAll,
+                        enabled: enabled, include: current)
+    }
+    static func subtitleLanguageOptions(showAll: Bool, enabled: Set<String>,
+                                        current: String = "") -> [(String, String)] {
+        languageOptions(first: ("", "First available"), showAll: showAll,
+                        enabled: enabled, include: current)
+    }
 
     static let timeoutUnlimited = Int.max
     /// Selectable countdown values, matching STREAM_AUTOPLAY_TIMEOUT_VALUES.
@@ -426,6 +498,7 @@ struct PlayerSettings: Codable, Equatable {
         // MUST be decoded, or the 3 → 10 migration re-runs on every launch and
         // overwrites a viewer who deliberately set it back to 3.
         didMigrateUpNextTimeout = (try? c.decode(Bool.self, forKey: .didMigrateUpNextTimeout)) ?? false
+
         stillWatchingEnabled = (try? c.decode(Bool.self, forKey: .stillWatchingEnabled)) ?? d.stillWatchingEnabled
         stillWatchingEpisodeThreshold = (try? c.decode(Int.self, forKey: .stillWatchingEpisodeThreshold)) ?? d.stillWatchingEpisodeThreshold
         upNextLeadSeconds = (try? c.decode(Int.self, forKey: .upNextLeadSeconds)) ?? d.upNextLeadSeconds
@@ -452,7 +525,12 @@ struct PlayerSettings: Codable, Equatable {
         subtitleBackgroundOpacity = (try? c.decode(Int.self, forKey: .subtitleBackgroundOpacity)) ?? d.subtitleBackgroundOpacity
         subtitleVerticalOffset = (try? c.decode(Int.self, forKey: .subtitleVerticalOffset)) ?? d.subtitleVerticalOffset
         preferredAudioLanguage = (try? c.decode(String.self, forKey: .preferredAudioLanguage)) ?? d.preferredAudioLanguage
+        allAudioLanguages = (try? c.decode(Bool.self, forKey: .allAudioLanguages)) ?? d.allAudioLanguages
+        enabledAudioLanguages = (try? c.decode([String].self, forKey: .enabledAudioLanguages)) ?? d.enabledAudioLanguages
+        allSubtitleLanguages = (try? c.decode(Bool.self, forKey: .allSubtitleLanguages)) ?? d.allSubtitleLanguages
+        enabledSubtitleLanguages = (try? c.decode([String].self, forKey: .enabledSubtitleLanguages)) ?? d.enabledSubtitleLanguages
         playbackMode = (try? c.decode(PlaybackMode.self, forKey: .playbackMode)) ?? d.playbackMode
+        convertProfile7ForBrightness = (try? c.decode(Bool.self, forKey: .convertProfile7ForBrightness)) ?? d.convertProfile7ForBrightness
         playerEngine = (try? c.decode(PlayerEngine.self, forKey: .playerEngine)) ?? d.playerEngine
         bufferProfile = (try? c.decode(BufferProfile.self, forKey: .bufferProfile)) ?? d.bufferProfile
         externalPlayerID = (try? c.decode(String.self, forKey: .externalPlayerID)) ?? d.externalPlayerID
@@ -486,6 +564,7 @@ struct PlayerSettings: Codable, Equatable {
         reuseLastLinkCacheHours = (try? c.decode(Int.self, forKey: .reuseLastLinkCacheHours)) ?? d.reuseLastLinkCacheHours
         matchContentDisplayMode = (try? c.decode(Bool.self, forKey: .matchContentDisplayMode)) ?? d.matchContentDisplayMode
         matchFrameRate = (try? c.decode(Bool.self, forKey: .matchFrameRate)) ?? d.matchFrameRate
+        atmosPassthrough = (try? c.decode(Bool.self, forKey: .atmosPassthrough)) ?? d.atmosPassthrough
         nativeDolbyVision = (try? c.decode(Bool.self, forKey: .nativeDolbyVision)) ?? d.nativeDolbyVision
         hdr10PlusPassthrough = (try? c.decode(Bool.self, forKey: .hdr10PlusPassthrough)) ?? d.hdr10PlusPassthrough
         dolbyVisionProfile7 = (try? c.decode(Bool.self, forKey: .dolbyVisionProfile7)) ?? d.dolbyVisionProfile7
@@ -534,10 +613,32 @@ final class PlayerSettingsStore: ObservableObject {
         settings = Self.load(profile: profileID)
     }
 
+    /// Device-local (NOT synced) one-shot: a brief window of builds defaulted
+    /// frame-rate matching ON, which wedges this panel grey on the 60→24
+    /// switch. Force it off once. Kept out of `PlayerSettings` precisely so an
+    /// account copy can't override it — the settings sync is what kept turning
+    /// it back on.
+    /// v2: the v1 force-off ran before the value was persisted, so it never
+    /// stuck (and the v1 key then blocked a re-run). v2 forces AND saves.
+    private static let forcedFrameRateOffKey = "orivio.player.matchFrameRateForcedOff.v2"
+
     private static func load(profile: Int) -> PlayerSettings {
         if let data = ProfileScopedDefaults.data(key, feature: feature, profile),
            var decoded = try? JSONDecoder().decode(PlayerSettings.self, from: data) {
             decoded.migrateUpNextTimeout()
+            if !UserDefaults.standard.bool(forKey: forcedFrameRateOffKey) {
+                UserDefaults.standard.set(true, forKey: forcedFrameRateOffKey)
+                decoded.matchFrameRate = false
+                // Persist IMMEDIATELY. The store's init assigns `settings`
+                // without triggering its didSet save, so setting only the
+                // in-memory value left the stored `true` to be read back on the
+                // next launch — and the one-shot key then blocked re-forcing.
+                if let encoded = try? JSONEncoder().encode(decoded) {
+                    UserDefaults.standard.set(
+                        encoded,
+                        forKey: ProfileScopedDefaults.writeKey(key, feature: feature, profile))
+                }
+            }
             return decoded
         }
         return .default
@@ -573,6 +674,11 @@ final class PlayerSettingsStore: ObservableObject {
         var merged = new
         merged.dolbyVisionProfile7 = settings.dolbyVisionProfile7
         merged.hdr10PlusPassthrough = settings.hdr10PlusPassthrough
+        // Frame-rate matching is a TV property too — whether THIS panel
+        // hand-shakes a 60→24 switch cleanly. It must not ride in from another
+        // device (which is how an account that had it ON kept re-greying this
+        // one), and the one-time force-off flag rides with it.
+        merged.matchFrameRate = settings.matchFrameRate
         return merged
     }
 

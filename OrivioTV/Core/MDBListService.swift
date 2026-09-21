@@ -15,6 +15,31 @@ struct MDBListSettings: Codable, Equatable {
     var showAudience = true
     var showMetacritic = true
 
+    init() {}
+
+    private enum CodingKeys: String, CodingKey {
+        case enabled, apiKey, showTrakt, showImdb, showTmdb, showLetterboxd
+        case showTomatoes, showAudience, showMetacritic
+    }
+
+    /// Tolerant per-field decode, exactly like `PlayerSettingsStore`: adding a
+    /// field in a future release must not make an existing blob undecodable
+    /// and silently reset the user's API key and source toggles to defaults
+    /// (the store has no unreadable-blob guard).
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = MDBListSettings()
+        enabled = (try? c.decode(Bool.self, forKey: .enabled)) ?? d.enabled
+        apiKey = (try? c.decode(String.self, forKey: .apiKey)) ?? d.apiKey
+        showTrakt = (try? c.decode(Bool.self, forKey: .showTrakt)) ?? d.showTrakt
+        showImdb = (try? c.decode(Bool.self, forKey: .showImdb)) ?? d.showImdb
+        showTmdb = (try? c.decode(Bool.self, forKey: .showTmdb)) ?? d.showTmdb
+        showLetterboxd = (try? c.decode(Bool.self, forKey: .showLetterboxd)) ?? d.showLetterboxd
+        showTomatoes = (try? c.decode(Bool.self, forKey: .showTomatoes)) ?? d.showTomatoes
+        showAudience = (try? c.decode(Bool.self, forKey: .showAudience)) ?? d.showAudience
+        showMetacritic = (try? c.decode(Bool.self, forKey: .showMetacritic)) ?? d.showMetacritic
+    }
+
     static let `default` = MDBListSettings()
 
     var isConfigured: Bool { enabled && !apiKey.trimmingCharacters(in: .whitespaces).isEmpty }
@@ -151,6 +176,7 @@ enum MDBListService {
     // items, and a plain Dictionary is not safe under concurrent mutation.
     private static let cacheLock = NSLock()
     private static var cache: [String: CacheEntry] = [:]
+    private static let cacheLimit = 512
     private static let ttl: TimeInterval = 30 * 60
 
     private static func cachedEntry(_ key: String) -> CacheEntry? {
@@ -159,6 +185,13 @@ enum MDBListService {
     }
     private static func storeEntry(_ entry: CacheEntry, for key: String) {
         cacheLock.lock(); defer { cacheLock.unlock() }
+        // Expired entries were never evicted and there was no cap, so every
+        // distinct (media, id, key) accumulated for the process lifetime.
+        if cache.count > cacheLimit {
+            for key in Array(cache.keys.prefix(cache.count - cacheLimit / 2)) {
+                cache.removeValue(forKey: key)
+            }
+        }
         cache[key] = entry
     }
 
@@ -186,13 +219,16 @@ enum MDBListService {
 
         let providers = enabledProviders(settings)
         var values: [MDBListProvider: Double] = [:]
-        await withTaskGroup(of: (MDBListProvider, Double?).self) { group in
+        var anySucceeded = false
+        await withTaskGroup(of: (MDBListProvider, Double?, Bool).self) { group in
             for provider in providers {
                 group.addTask {
-                    (provider, await fetchProvider(imdbID: imdbID, mediaType: mediaType, provider: provider, apiKey: apiKey))
+                    let result = await fetchProvider(imdbID: imdbID, mediaType: mediaType, provider: provider, apiKey: apiKey)
+                    return (provider, result.rating, result.ok)
                 }
             }
-            for await (provider, value) in group {
+            for await (provider, value, ok) in group {
+                if ok { anySucceeded = true }
                 if let value { values[provider] = value }
             }
         }
@@ -202,7 +238,12 @@ enum MDBListService {
             letterboxd: values[.letterboxd], tomatoes: values[.tomatoes],
             audience: values[.audience], metacritic: values[.metacritic]
         )
-        storeEntry(CacheEntry(ratings: ratings, expiresAt: Date().addingTimeInterval(ttl)), for: cacheKey)
+        // Only a DEFINITIVE answer is cached. If every provider FAILED
+        // (offline, 429), an empty result was cached for 30 minutes and the
+        // title stayed ratings-less long after the network recovered.
+        if anySucceeded {
+            storeEntry(CacheEntry(ratings: ratings, expiresAt: Date().addingTimeInterval(ttl)), for: cacheKey)
+        }
         return ratings.isEmpty ? nil : ratings
     }
 
@@ -218,10 +259,10 @@ enum MDBListService {
         return out
     }
 
-    private static func fetchProvider(imdbID: String, mediaType: String, provider: MDBListProvider, apiKey: String) async -> Double? {
-        guard var comps = URLComponents(string: "\(base)/rating/\(mediaType)/\(provider.rawValue)") else { return nil }
+    private static func fetchProvider(imdbID: String, mediaType: String, provider: MDBListProvider, apiKey: String) async -> (rating: Double?, ok: Bool) {
+        guard var comps = URLComponents(string: "\(base)/rating/\(mediaType)/\(provider.rawValue)") else { return (nil, false) }
         comps.queryItems = [URLQueryItem(name: "apikey", value: apiKey)]
-        guard let url = comps.url else { return nil }
+        guard let url = comps.url else { return (nil, false) }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -232,7 +273,9 @@ enum MDBListService {
         }
         guard let (data, response) = try? await session.data(for: request),
               let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
-              let body = try? JSONDecoder().decode(Response.self, from: data) else { return nil }
-        return body.ratings?.first?.rating
+              let body = try? JSONDecoder().decode(Response.self, from: data) else { return (nil, false) }
+        // `ok` distinguishes "the provider answered, there is no rating" from
+        // "the request failed" — only the former should be cached.
+        return (body.ratings?.first?.rating, true)
     }
 }
