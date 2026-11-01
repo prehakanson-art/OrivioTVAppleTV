@@ -17,7 +17,9 @@ OUT_DIR="ipa_out"
 VERSION=$(grep -m1 'MARKETING_VERSION:' project.yml | sed 's/.*: *"\(.*\)"/\1/' || true)
 [ -n "$VERSION" ] || VERSION="0.0.0"
 
-xcodegen generate >/dev/null
+# XcodeGen is optional here: the project file is checked in and hand-maintained,
+# so a machine without xcodegen still builds exactly what is committed.
+command -v xcodegen >/dev/null && xcodegen generate >/dev/null
 
 # Ask xcodebuild where this configuration's product goes (never guess a DerivedData
 # dir), and delete the old one first: whatever gets packaged is guaranteed fresh.

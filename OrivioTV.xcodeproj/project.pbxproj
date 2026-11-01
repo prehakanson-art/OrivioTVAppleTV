@@ -1287,7 +1287,7 @@
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = "OrivioTopShelf/OrivioTopShelf-Debug.entitlements";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 14;
+				CURRENT_PROJECT_VERSION = 15;
 				DEVELOPMENT_TEAM = CYCSPZ5MTR;
 				INFOPLIST_FILE = OrivioTopShelf/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -1295,7 +1295,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 0.14;
+				MARKETING_VERSION = 0.15;
 				PRODUCT_BUNDLE_IDENTIFIER = com.prestonhakanson.orivio.tv.topshelf;
 				SDKROOT = appletvos;
 				SWIFT_VERSION = 5.9;
@@ -1447,7 +1447,7 @@
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = OrivioTopShelf/OrivioTopShelf.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 14;
+				CURRENT_PROJECT_VERSION = 15;
 				DEVELOPMENT_TEAM = CYCSPZ5MTR;
 				INFOPLIST_FILE = OrivioTopShelf/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -1455,7 +1455,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 0.14;
+				MARKETING_VERSION = 0.15;
 				PRODUCT_BUNDLE_IDENTIFIER = com.orivio.tv.appletv.dev.topshelf;
 				SDKROOT = appletvos;
 				SWIFT_VERSION = 5.9;
@@ -1470,7 +1470,7 @@
 				ASSETCATALOG_COMPILER_LAUNCHIMAGE_NAME = LaunchImage;
 				CODE_SIGN_ENTITLEMENTS = Config/OrivioTV.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 14;
+				CURRENT_PROJECT_VERSION = 15;
 				DEVELOPMENT_TEAM = CYCSPZ5MTR;
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				FRAMEWORK_SEARCH_PATHS = (
@@ -1482,7 +1482,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 0.14;
+				MARKETING_VERSION = 0.15;
 				PRODUCT_BUNDLE_IDENTIFIER = com.orivio.tv.appletv.dev;
 				SDKROOT = appletvos;
 				SWIFT_VERSION = 5.9;
@@ -1497,7 +1497,7 @@
 				ASSETCATALOG_COMPILER_LAUNCHIMAGE_NAME = LaunchImage;
 				CODE_SIGN_ENTITLEMENTS = "Config/OrivioTV-Debug.entitlements";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 14;
+				CURRENT_PROJECT_VERSION = 15;
 				DEVELOPMENT_TEAM = CYCSPZ5MTR;
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				FRAMEWORK_SEARCH_PATHS = (
@@ -1509,7 +1509,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 0.14;
+				MARKETING_VERSION = 0.15;
 				PRODUCT_BUNDLE_IDENTIFIER = com.prestonhakanson.orivio.tv;
 				SDKROOT = appletvos;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
@@ -1523,7 +1523,7 @@
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = "OrivioTopShelf/OrivioTopShelf-Debug.entitlements";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 14;
+				CURRENT_PROJECT_VERSION = 15;
 				DEVELOPMENT_TEAM = CYCSPZ5MTR;
 				INFOPLIST_FILE = OrivioTopShelf/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -1531,7 +1531,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 0.14;
+				MARKETING_VERSION = 0.15;
 				PRODUCT_BUNDLE_IDENTIFIER = com.prestonhakanson.orivio.tv.topshelf;
 				SDKROOT = appletvos;
 				SWIFT_VERSION = 5.9;
@@ -1546,7 +1546,7 @@
 				ASSETCATALOG_COMPILER_LAUNCHIMAGE_NAME = LaunchImage;
 				CODE_SIGN_ENTITLEMENTS = "Config/OrivioTV-Debug.entitlements";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 14;
+				CURRENT_PROJECT_VERSION = 15;
 				DEVELOPMENT_TEAM = CYCSPZ5MTR;
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				FRAMEWORK_SEARCH_PATHS = (
@@ -1558,7 +1558,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 0.14;
+				MARKETING_VERSION = 0.15;
 				PRODUCT_BUNDLE_IDENTIFIER = com.prestonhakanson.orivio.tv;
 				SDKROOT = appletvos;
 				SWIFT_VERSION = 5.9;
