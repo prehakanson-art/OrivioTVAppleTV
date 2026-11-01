@@ -10917,8 +10917,14 @@ final class ClassicPlayerViewModel: ObservableObject {
         // cache never covers anything, so every live request comes back empty.
         // The background pass still runs as the fallback; `thumbnail(at:)`
         // prefers the live frame whenever there is one.
-        if aetherServesPreviews {
-            NSLog("[OrivioPlayer] scrub previews: live from AetherEngine, background pass as fallback")
+        // Open the live grabber's session now, while nobody is waiting on it:
+        // the open (header, stream probe, the MKV index) is most of what made
+        // the first scrub of a session slow to show anything.
+        let grabber = liveGrabberIfPossible()
+        grabber?.prewarm()
+        if aetherServesPreviews || grabber != nil {
+            NSLog("[OrivioPlayer] scrub previews: live (%@), background pass as fallback",
+                  aetherServesPreviews ? "AetherEngine, then origin" : "origin")
             #if DEBUG
             runLivePreviewSelfTestIfRequested()
             #endif
@@ -11699,18 +11705,34 @@ final class ClassicPlayerViewModel: ObservableObject {
         Task { [weak self] in
             // Let playback settle, the engine build a buffer and the
             // background pass lay down its first frames.
-            try? await Task.sleep(nanoseconds: 60_000_000_000)
-            guard let self, self.usingAether, self.duration > 0 else { return }
+            try? await Task.sleep(nanoseconds: 30_000_000_000)
+            guard let self, self.duration > 0 else { return }
             let start = self.position, length = self.duration
             self.beginScrub(pausing: true)
-            var shown = 0
-            for step in 0..<60 {
-                let target = min(start + Double(step) * 10, length - 1)
-                self.publishScrub(target)
-                try? await Task.sleep(nanoseconds: 33_000_000)
-                if self.thumbnail(at: target) != nil { shown += 1 }
+            // A thumb, not a sweep: three swipes of a second each (90 s of
+            // film per second of swipe, 30 Hz samples, the way the pad
+            // reports), each followed by a second and a half held still.
+            var target = start
+            for swipe in 0..<3 {
+                var moving = 0, movingShown = 0
+                for _ in 0..<30 {
+                    target = min(target + 3, length - 1)
+                    self.publishScrub(target)
+                    self.restartScrubTimeout()
+                    try? await Task.sleep(nanoseconds: 33_000_000)
+                    moving += 1
+                    if self.thumbnail(at: target) != nil { movingShown += 1 }
+                }
+                let held = Date()
+                var firstFrame: Double?
+                while Date().timeIntervalSince(held) < 1.5 {
+                    if firstFrame == nil, self.livePreview?.time == target { firstFrame = Date().timeIntervalSince(held) }
+                    try? await Task.sleep(nanoseconds: 20_000_000)
+                }
+                NSLog("[OrivioPreview] self-test swipe %d (to %.0fs): window up %d/%d samples while moving, frame for the stop after %@",
+                      swipe + 1, target, movingShown, moving,
+                      firstFrame.map { String(format: "%.0f ms", $0 * 1000) } ?? "none")
             }
-            NSLog("[OrivioPreview] self-test swipe (10 min in 2 s): a frame under the finger at %d/60 samples", shown)
             for target in [start + 8, start + 120, length * 0.5, length * 0.9] {
                 self.publishScrub(target)
                 self.restartScrubTimeout()   // a held thumb, not an idle remote
@@ -11786,7 +11808,14 @@ final class ClassicPlayerViewModel: ObservableObject {
     func thumbnail(at time: Double) -> UIImage? {
         // AetherEngine's live frame, while it is still for (about) this spot:
         // a moving finger shows the last decode until the next one lands.
-        if let live = livePreview, abs(live.time - time) <= 30 {
+        //
+        // KEPT UP FOR THE WHOLE SCRUB, however far the finger has moved since.
+        // It used to be dropped past 30 seconds from the finger — but a swipe
+        // covers minutes of film in the half second one decode takes, so while
+        // the finger moved the window was almost never up, and it appeared
+        // only well after the finger stopped. The last decode stays on screen
+        // and is replaced as the next lands; scrubbing ends clears it.
+        if let live = livePreview, isScrubbing || abs(live.time - time) <= 30 {
             return live.image
         }
         // Prefer a fine frame when one is genuinely near — within a single

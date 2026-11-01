@@ -60,6 +60,12 @@ final class ClassicLiveFrameGrabber: @unchecked Sendable {
         }
     }
 
+    /// Open the session ahead of the first request, off the caller's thread.
+    func prewarm() {
+        guard !closed, !unavailable else { return }
+        queue.async { [self] in _ = closed ? false : openIfNeeded() }
+    }
+
     /// Abort any blocked read and release the session.
     func close() {
         closed = true
@@ -118,8 +124,10 @@ final class ClassicLiveFrameGrabber: @unchecked Sendable {
         }
         self.codecCtx = codecCtx
         guard avcodec_parameters_to_context(codecCtx, par) >= 0 else { unavailable = true; teardown(); return false }
-        // Playback owns the cores; a preview is one keyframe at a time.
-        codecCtx.pointee.thread_count = PerformanceProfile.isMidPower ? 1 : 2
+        // One keyframe at a time, but while the viewer is waiting on it: a
+        // 4K HEVC keyframe on two threads was most of a request's half second.
+        // The 3 GB box keeps its cores for playback.
+        codecCtx.pointee.thread_count = PerformanceProfile.isMidPower ? 1 : 4
         codecCtx.pointee.skip_loop_filter = AVDISCARD_ALL
         guard avcodec_open2(codecCtx, codec, nil) >= 0 else { unavailable = true; teardown(); return false }
         packet = av_packet_alloc()

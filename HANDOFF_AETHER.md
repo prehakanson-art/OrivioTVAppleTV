@@ -94,7 +94,7 @@ Le routage est dans `PlayerPresenter.present(_:)`, fichier `OrivioTV/App/Navigat
 
 ### 4.1 `Vendor/OrivioAether/` — package SwiftPM local (wrapper)
 
-C'est une **bibliothèque dynamique** qui dépend d'AetherEngine `from: "7.50.0"`, résolu en 7.51.0
+C'est une **bibliothèque dynamique** qui dépend d'AetherEngine `from: "7.53.1"`, résolu en 7.53.1
 au moment de l'écriture.
 
 Ce que fait `Package.swift` :
@@ -128,7 +128,7 @@ Le fichier `Sources/OrivioAether/AetherPlaybackEngine.swift` est la façade publ
 - Callbacks : `onState`, `onBuffering`, `onTime`, `onTracksChanged`, `onSubtitleCues`,
   `onVideoInfoChanged`.
 - **Si AetherEngine change d'API** dans une version mineure, c'est ce fichier qu'il faut adapter.
-  On peut aussi figer la dépendance avec `.upToNextMinor(from: "7.51.0")`.
+  On peut aussi figer la dépendance avec `.upToNextMinor(from: "7.53.1")`.
 
 ### 4.2 libdovi
 
@@ -254,7 +254,7 @@ Problèmes de simulateur déjà rencontrés :
    - un `switch` non exhaustif sur `PlayerEngine` ou `EnginePreference` ailleurs (chercher
      `case .vlc`, `case .external`) ;
    - un nom de propriété qui diffère légèrement entre v0.12 et v0.15.
-3. **L'API d'AetherEngine** : le wrapper a été écrit contre 7.51.0. Si SwiftPM résout une version
+3. **L'API d'AetherEngine** : le wrapper a été écrit contre 7.51.0 et compile contre 7.53.1. Si SwiftPM résout une version
    plus récente et que ça casse, figer la version (§4.1).
 4. **Isolation acteur et concurrence** : le wrapper est en mode Swift 5, l'app en `SWIFT_VERSION 5.9`.
    Des warnings `Sendable` sont possibles. Les callbacks d'Aether doivent arriver sur le main

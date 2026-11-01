@@ -44,6 +44,9 @@ final class MediaCacheServer {
     static let shared = MediaCacheServer()
 
     private let q = DispatchQueue(label: "orivio.hybridcache")
+    /// The listener's state callbacks land here, not on `q`, so a session
+    /// start waiting on `q` can still see whether the bind worked.
+    private let listenerQueue = DispatchQueue(label: "orivio.hybridcache.listener")
     /// A `beginSession` swap is waiting on `q.sync` FROM THE MAIN THREAD.
     /// The queue can hold seconds of multi-megabyte write callbacks and
     /// `F_PUNCHHOLE` evictions ahead of it — all for the session about to be
@@ -1295,65 +1298,130 @@ final class MediaCacheServer {
             noteListenerState("unavailable — playing without the cache for now")
             return false
         }
+        // CONFIRM THE PORT BEFORE HANDING OUT A URL FOR IT.
+        //
+        // `NWListener.start` returns at once and binds later, so this used to
+        // report success before the bind had happened. When the port was still
+        // held — a relaunch moments after the previous process, before the
+        // system let go of it — `.failed(EADDRINUSE)` arrived only after the
+        // session had already handed the player a proxy URL nothing would ever
+        // answer: AetherEngine sat 30 seconds on it ("no first byte") and the
+        // load failed over to another engine. The listener now runs its state
+        // callbacks on a queue of its own, so this one can wait a moment for
+        // the verdict; one retry covers a port that frees up just after.
+        for attempt in 0..<2 {
+            if attempt > 0 { Thread.sleep(forTimeInterval: 0.25) }
+            switch makeListenerLocked() {
+            case .ready, .pending:
+                return true
+            case .failed(let reason):
+                NSLog("[OrivioCache] listener could not bind (%@)%@", reason,
+                      attempt == 0 ? " — retrying once" : " — playing without the cache")
+            }
+        }
+        listenerFailures += 1
+        if listenerFailures >= 2 {
+            listenerRetryAfter = Date().addingTimeInterval(Self.listenerRetryDelay)
+        }
+        noteListenerState("could not bind — playing without the cache")
+        return false
+    }
+
+    private enum ListenerStart { case ready, pending, failed(String) }
+
+    /// Build, start and briefly await one listener. `.pending` is a listener
+    /// that has not answered within the wait but has not failed either: it is
+    /// kept, as before, and the state handler deals with whatever it becomes.
+    private func makeListenerLocked() -> ListenerStart {
+        let params = NWParameters.tcp
+        params.allowLocalEndpointReuse = true
+        // Localhost only — this is a private pipe to the player, not a
+        // LAN service like the phone-paste server.
+        params.requiredInterfaceType = .loopback
+        guard let port = NWEndpoint.Port(rawValue: Self.port) else { return .failed("bad port") }
+        let listener: NWListener
         do {
-            let params = NWParameters.tcp
-            params.allowLocalEndpointReuse = true
-            // Localhost only — this is a private pipe to the player, not a
-            // LAN service like the phone-paste server.
-            params.requiredInterfaceType = .loopback
-            guard let port = NWEndpoint.Port(rawValue: Self.port) else { return false }
-            let listener = try NWListener(using: params, on: port)
-            listener.newConnectionHandler = { [weak self] connection in
-                self?.q.async { self?.accept(connection) }
-            }
-            // `.failed`/`.cancelled` mean the socket is gone underneath us (a
-            // long suspension can do it). Guarded by IDENTITY: an unguarded
-            // handler could nil the listener that REPLACED this one, when this
-            // one's late callback finally arrived — dropping a healthy listener
-            // for no reason. And cancelled, not just dropped, so the port is
-            // released for the rebuild.
-            listener.stateUpdateHandler = { [weak self, weak listener] state in
-                self?.q.async {
-                    guard let self, let listener, self.listener === listener else { return }
-                    switch state {
-                    case .ready:
-                        self.listenerFailures = 0
-                        self.listenerRetryAfter = .distantPast
-                        self.noteListenerState("ready")
-                    case .failed, .cancelled:
-                        NSLog("[OrivioCache] listener %@ — will rebuild on the next session", "\(state)")
-                        listener.stateUpdateHandler = nil
-                        listener.newConnectionHandler = nil
-                        listener.cancel()
-                        self.listener = nil
-                        self.listenerFailures += 1
-                        if self.listenerFailures >= 2 {
-                            self.listenerRetryAfter = Date().addingTimeInterval(Self.listenerRetryDelay)
-                        }
-                        self.noteListenerState("\(state) — will rebuild")
-                    case .waiting(let error):
-                        // Not acted on here: it may recover by itself. The next
-                        // session finds it not live and rebuilds it.
-                        self.noteListenerState("waiting (\(error))")
-                    default:
-                        break
-                    }
-                }
-            }
-            listener.start(queue: q)
-            self.listener = listener
-            listenerBuiltAt = Date()
-            if listenerFailures >= 2 {
-                // A rebuild while failures stand: if this one dies too, back off.
-                listenerRetryAfter = Date().addingTimeInterval(Self.listenerRetryDelay)
-            }
-            return true
+            listener = try NWListener(using: params, on: port)
         } catch {
             NSLog("[OrivioCache] listener failed: %@", "\(error)")
-            listenerFailures += 1
-            noteListenerState("could not be created (\(error))")
-            return false
+            return .failed("\(error)")
         }
+        listener.newConnectionHandler = { [weak self] connection in
+            self?.q.async { self?.accept(connection) }
+        }
+        // The first verdict, read on the listener's own queue while this one
+        // waits; everything after it goes through `q` as before.
+        let verdict = DispatchSemaphore(value: 0)
+        let firstState = ListenerVerdict()
+        // `.failed`/`.cancelled` mean the socket is gone underneath us (a
+        // long suspension can do it). Guarded by IDENTITY: an unguarded
+        // handler could nil the listener that REPLACED this one, when this
+        // one's late callback finally arrived — dropping a healthy listener
+        // for no reason. And cancelled, not just dropped, so the port is
+        // released for the rebuild.
+        listener.stateUpdateHandler = { [weak self, weak listener] state in
+            switch state {
+            case .ready, .failed, .cancelled:
+                if firstState.set(state) { verdict.signal() }
+            default: break
+            }
+            self?.q.async {
+                guard let self, let listener, self.listener === listener else { return }
+                switch state {
+                case .ready:
+                    self.listenerFailures = 0
+                    self.listenerRetryAfter = .distantPast
+                    self.noteListenerState("ready")
+                case .failed, .cancelled:
+                    NSLog("[OrivioCache] listener %@ — will rebuild on the next session", "\(state)")
+                    listener.stateUpdateHandler = nil
+                    listener.newConnectionHandler = nil
+                    listener.cancel()
+                    self.listener = nil
+                    self.listenerFailures += 1
+                    if self.listenerFailures >= 2 {
+                        self.listenerRetryAfter = Date().addingTimeInterval(Self.listenerRetryDelay)
+                    }
+                    self.noteListenerState("\(state) — will rebuild")
+                case .waiting(let error):
+                    // Not acted on here: it may recover by itself. The next
+                    // session finds it not live and rebuilds it.
+                    self.noteListenerState("waiting (\(error))")
+                default:
+                    break
+                }
+            }
+        }
+        listener.start(queue: listenerQueue)
+        // Bounded: `beginSession` holds the main thread in `q.sync`. A
+        // loopback bind answers in milliseconds.
+        _ = verdict.wait(timeout: .now() + 0.4)
+        switch firstState.value {
+        case .failed(let error)?:
+            listener.stateUpdateHandler = nil
+            listener.newConnectionHandler = nil
+            listener.cancel()
+            return .failed("\(error)")
+        case .cancelled?:
+            listener.stateUpdateHandler = nil
+            listener.newConnectionHandler = nil
+            return .failed("cancelled")
+        default:
+            break
+        }
+        self.listener = listener
+        listenerBuiltAt = Date()
+        if listenerFailures >= 2 {
+            // A rebuild while failures stand: if this one dies too, back off.
+            listenerRetryAfter = Date().addingTimeInterval(Self.listenerRetryDelay)
+        }
+        if case .ready? = firstState.value {
+            listenerFailures = 0
+            listenerRetryAfter = .distantPast
+            noteListenerState("ready")
+            return .ready
+        }
+        return .pending
     }
 
     private func accept(_ connection: NWConnection) {
@@ -3737,5 +3805,20 @@ private final class SegmentDownloader: NSObject, URLSessionDataDelegate {
         retries = 0
         self.task = nil
         server.downloaderFinishedSegment(self)
+    }
+}
+
+/// The first terminal-or-ready state a listener reported, set once from its
+/// callback queue and read by the thread waiting on the bind.
+private final class ListenerVerdict: @unchecked Sendable {
+    private let lock = NSLock()
+    private var state: NWListener.State?
+    var value: NWListener.State? { lock.lock(); defer { lock.unlock() }; return state }
+    /// True the first time only.
+    func set(_ new: NWListener.State) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard state == nil else { return false }
+        state = new
+        return true
     }
 }
