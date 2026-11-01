@@ -47,13 +47,15 @@ final class MediaCacheServer {
     /// The listener's state callbacks land here, not on `q`, so a session
     /// start waiting on `q` can still see whether the bind worked.
     private let listenerQueue = DispatchQueue(label: "orivio.hybridcache.listener")
-    /// A `beginSession` swap is waiting on `q.sync` FROM THE MAIN THREAD.
+    /// A `beginSession` swap is waiting on `q` FROM THE MAIN THREAD.
     /// The queue can hold seconds of multi-megabyte write callbacks and
     /// `F_PUNCHHOLE` evictions ahead of it — all for the session about to be
     /// torn down — and the main thread ate that whole backlog at every source
     /// switch, failover and episode advance. While this is set, the heavy
     /// jobs for the OUTGOING session early-out.
     @Atomic private var sessionSwapPending = false
+    /// How long the main thread waits for `q` to start a session.
+    private static let sessionStartTimeout: TimeInterval = 2
     private static let port: UInt16 = 8097
     /// Serving chunk: big enough to saturate a LAN hop, small enough to keep
     /// per-connection memory trivial.
@@ -915,85 +917,109 @@ final class MediaCacheServer {
             return snapshotOrigin
         }()
         if liveOrigin != origin { sessionSwapPending = true }
-        defer { sessionSwapPending = false }
-        return q.sync {
-            // RE-ENTRY FOR THE SAME FILM keeps the live session and hands back
-            // the SAME url. Two reasons, and the first is severe:
-            //
-            // 1. The token is a fresh UUID per session, so restarting here
-            //    minted a NEW proxy url every time — and the player's
-            //    "don't do this again" guards (`dvFirstTried`, `dvFailedURLs`,
-            //    `probedURLs`) are all keyed on the url string. None of them
-            //    could ever match, so a DV-first attempt retried forever. Worse,
-            //    the teardown killed the connection feeding the engine that had
-            //    just been started, which failed it over into another load —
-            //    a self-sustaining reload loop in which nothing ever played.
-            // 2. Even without that, throwing away a partly-downloaded film on
-            //    an engine swap or a failover is pure waste.
-            // The session is kept, but its URL is only worth handing out if
-            // something is actually listening on it — rebuilt in place if not
-            // (the token is session state, so the same URL keeps working).
-            if self.origin == origin, !token.isEmpty,
-               writeHandle != nil, failureReason == nil {
-                // Same film, possibly re-entered with refreshed headers (a
-                // re-signed link keeps the origin). Keep the bytes, but let the
-                // pool use the current headers from here on.
-                sessionHeaders = headers
-                guard startListenerLocked() else { return nil }
-                return proxyURL(for: origin)
+        // BOUNDED, NOT `q.sync`. `q` also does the disk writes, and a write
+        // can stall in the kernel for minutes when the box is short of memory
+        // or storage. Parked on it, the main thread froze the UI, and tvOS
+        // could neither quit the app (watchdog after 5 s) nor open a new copy
+        // until the write came back. Past the deadline the stream plays direct
+        // from the origin, and the queued swap only tears the session down.
+        let pending = PendingSessionStart()
+        q.async { [weak self] in
+            guard let self else { return }
+            // Lowered on `q`, not when the main thread stops waiting: a swap
+            // that timed out still has the backlog ahead of it to skip.
+            self.sessionSwapPending = false
+            guard pending.claim() else { self.teardownSessionLocked(); return }
+            let url = self.beginSessionLocked(origin: origin, headers: headers)
+            if !pending.finish(url) { self.teardownSessionLocked() }
+        }
+        guard let url = pending.wait(timeout: Self.sessionStartTimeout) else {
+            if pending.timedOut {
+                NSLog("[OrivioCache] cache queue busy for %.1fs — playing direct", Self.sessionStartTimeout)
+                PlayerViewModel.colorTrail("cache: queue busy — playing direct from the origin")
             }
-            teardownSessionLocked()
-            guard startListenerLocked() else { return nil }
-            self.origin = origin
-            resolvedOrigin = nil
-            staleResolvedOrigin = nil
-            staleLinkRetries = 0
+            return nil
+        }
+        return url
+    }
+
+    private func beginSessionLocked(origin: URL, headers: [String: String]?) -> URL? {
+        // RE-ENTRY FOR THE SAME FILM keeps the live session and hands back
+        // the SAME url. Two reasons, and the first is severe:
+        //
+        // 1. The token is a fresh UUID per session, so restarting here
+        //    minted a NEW proxy url every time — and the player's
+        //    "don't do this again" guards (`dvFirstTried`, `dvFailedURLs`,
+        //    `probedURLs`) are all keyed on the url string. None of them
+        //    could ever match, so a DV-first attempt retried forever. Worse,
+        //    the teardown killed the connection feeding the engine that had
+        //    just been started, which failed it over into another load —
+        //    a self-sustaining reload loop in which nothing ever played.
+        // 2. Even without that, throwing away a partly-downloaded film on
+        //    an engine swap or a failover is pure waste.
+        // The session is kept, but its URL is only worth handing out if
+        // something is actually listening on it — rebuilt in place if not
+        // (the token is session state, so the same URL keeps working).
+        if self.origin == origin, !token.isEmpty,
+           writeHandle != nil, failureReason == nil {
+            // Same film, possibly re-entered with refreshed headers (a
+            // re-signed link keeps the origin). Keep the bytes, but let the
+            // pool use the current headers from here on.
             sessionHeaders = headers
-            token = UUID().uuidString
-            redirectAll = false
-            rangeCapable = true
-            totalLength = -1
-            ranges = []
-            loggedRequests = 0
-            sideFetchers = [:]
-            sideFetchSpans = [:]
-            budget = 0
-            windowed = false
-            pausedForSpace = false
-            pausedForSpaceSince = nil
-            recoveryAttempts = 0
-            evictionBroken = false
-            evictedTotal = 0
-            readOffsets = [:]
-            readTouchedAt = [:]
-            lastReadOffset = 0
-            lastWriteAt = Date()   // a fresh session starts with a clean heartbeat
-            freeSpaceCheckedAt = .distantPast   // and re-samples storage at once
-            lastKnownFreeBytes = -1
-            let dir = Self.cacheDirectory()
-            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            let file = dir.appendingPathComponent("current.bin")
-            try? FileManager.default.removeItem(at: file)
-            FileManager.default.createFile(atPath: file.path, contents: nil)
-            guard let handle = try? FileHandle(forWritingTo: file) else { return nil }
-            fileURL = file
-            writeHandle = handle
-            fetchCursor = 0
-            archiveOrigin = 0
-            archiveOriginSet = false
-            visitedAnchors = []
-            parallelLimit = Self.initialParallel
-            throttledUntil = .distantPast
-            throttleCeiling = nil
-            lastCeilingProbeAt = .distantPast
-            lastRampAt = .distantPast
-            lastPreemptAt = .distantPast
-            rampInterval = Self.rampIntervalMin
-            durationSeconds = 0
-            ensurePool()
-            publishThumbnailURL()
+            guard startListenerLocked() else { return nil }
             return proxyURL(for: origin)
         }
+        teardownSessionLocked()
+        guard startListenerLocked() else { return nil }
+        self.origin = origin
+        resolvedOrigin = nil
+        staleResolvedOrigin = nil
+        staleLinkRetries = 0
+        sessionHeaders = headers
+        token = UUID().uuidString
+        redirectAll = false
+        rangeCapable = true
+        totalLength = -1
+        ranges = []
+        loggedRequests = 0
+        sideFetchers = [:]
+        sideFetchSpans = [:]
+        budget = 0
+        windowed = false
+        pausedForSpace = false
+        pausedForSpaceSince = nil
+        recoveryAttempts = 0
+        evictionBroken = false
+        evictedTotal = 0
+        readOffsets = [:]
+        readTouchedAt = [:]
+        lastReadOffset = 0
+        lastWriteAt = Date()   // a fresh session starts with a clean heartbeat
+        freeSpaceCheckedAt = .distantPast   // and re-samples storage at once
+        lastKnownFreeBytes = -1
+        let dir = Self.cacheDirectory()
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let file = dir.appendingPathComponent("current.bin")
+        try? FileManager.default.removeItem(at: file)
+        FileManager.default.createFile(atPath: file.path, contents: nil)
+        guard let handle = try? FileHandle(forWritingTo: file) else { return nil }
+        fileURL = file
+        writeHandle = handle
+        fetchCursor = 0
+        archiveOrigin = 0
+        archiveOriginSet = false
+        visitedAnchors = []
+        parallelLimit = Self.initialParallel
+        throttledUntil = .distantPast
+        throttleCeiling = nil
+        lastCeilingProbeAt = .distantPast
+        lastRampAt = .distantPast
+        lastPreemptAt = .distantPast
+        rampInterval = Self.rampIntervalMin
+        durationSeconds = 0
+        ensurePool()
+        publishThumbnailURL()
+        return proxyURL(for: origin)
     }
 
     /// The playback url for the live session. Keeps the origin's extension:
@@ -1063,7 +1089,7 @@ final class MediaCacheServer {
         // real filesystem work — more of it once a windowed session has shredded
         // the file into hundreds of extents with `F_PUNCHHOLE` — and this
         // teardown runs with the main thread waiting on it: `beginSession`
-        // rebuilds the session inside its own `q.sync` whenever the origin
+        // rebuilds the session inside one `q` job, waited on, whenever the origin
         // changes, so every episode advance and every source switch used to pay
         // for the previous film's delete before the switching cover could move
         // again. A rename costs the same whatever the file holds; the extents
@@ -1106,7 +1132,7 @@ final class MediaCacheServer {
         // NOT stop one — the URLSession and the fetcher own each other, so it
         // keeps running and its completion writes into whatever `writeHandle`
         // is open by the time it lands. `beginSession` tears down and re-creates
-        // the cache file inside a single `q.sync`, so on a source switch that
+        // the cache file inside a single `q` job, so on a source switch that
         // handle is the NEW film's: the old link's bytes were written at the old
         // offset and `addRange` recorded the span as valid coverage, so the
         // correct bytes were never fetched again for the life of the session.
@@ -1393,7 +1419,7 @@ final class MediaCacheServer {
             }
         }
         listener.start(queue: listenerQueue)
-        // Bounded: `beginSession` holds the main thread in `q.sync`. A
+        // Bounded: `beginSession` holds the main thread waiting on `q`. A
         // loopback bind answers in milliseconds.
         _ = verdict.wait(timeout: .now() + 0.4)
         switch firstState.value {
@@ -3820,5 +3846,48 @@ private final class ListenerVerdict: @unchecked Sendable {
         guard state == nil else { return false }
         state = new
         return true
+    }
+}
+
+/// One `beginSession` hand-off between the main thread and `q`. Whichever side
+/// moves first wins: the queue claims the start, or the main thread gives up on
+/// it, and a start that finishes after the give-up is undone by the queue.
+private final class PendingSessionStart: @unchecked Sendable {
+    private enum State { case queued, running, done(URL?), abandoned }
+    private let lock = NSLock()
+    private let signal = DispatchSemaphore(value: 0)
+    private var state = State.queued
+
+    var timedOut: Bool {
+        lock.lock(); defer { lock.unlock() }
+        if case .abandoned = state { return true }
+        return false
+    }
+
+    /// On `q`: false when the main thread has already given up.
+    func claim() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard case .queued = state else { return false }
+        state = .running
+        return true
+    }
+
+    /// On `q`: false when the main thread gave up while the start ran.
+    func finish(_ url: URL?) -> Bool {
+        lock.lock()
+        if case .abandoned = state { lock.unlock(); return false }
+        state = .done(url)
+        lock.unlock()
+        signal.signal()
+        return true
+    }
+
+    /// On the main thread.
+    func wait(timeout: TimeInterval) -> URL? {
+        _ = signal.wait(timeout: .now() + timeout)
+        lock.lock(); defer { lock.unlock() }
+        if case .done(let url) = state { return url }
+        state = .abandoned
+        return nil
     }
 }
