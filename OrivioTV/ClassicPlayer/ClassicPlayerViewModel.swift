@@ -2423,7 +2423,7 @@ final class ClassicPlayerViewModel: ObservableObject {
                     // subtitles via the addon search — SubtitleOverlayView
                     // renders from SubtitleModel above any engine.
                     self.audioOptions = engine.audioTracks.map {
-                        TrackOption(id: "dvda-\($0.index)", displayName: $0.label,
+                        TrackOption(id: "dvda-\($0.index)", displayName: $0.displayName,
                                     payload: .dvDirectAudio($0.index))
                     }
                     self.selectedAudioID = "dvda-\(engine.currentAudioIndex)"
@@ -5143,6 +5143,9 @@ final class ClassicPlayerViewModel: ObservableObject {
         thumbnailer = nil
         thumbnailsStarted = false
         scrubThumbnails = []
+        clearLivePreview()
+        liveFrameGrabber?.close()
+        liveFrameGrabber = nil
         // The fine-tune set too: `thumbnail(at:)` prefers it and a stale
         // `fineCenter` blocks regeneration, so a reload mid-fine-tune kept the
         // previous source's frames.
@@ -5394,13 +5397,23 @@ final class ClassicPlayerViewModel: ObservableObject {
     /// Throttles that watch to one count read every couple of seconds.
     private var vlcLastAudioWaveCheck = Date.distantPast
 
+    /// VLC names a track "<title> - [<Language>]" and says nothing else; the
+    /// shared row is built from those two parts, and a name that isn't
+    /// shaped like that is shown as it came.
+    private static func vlcAudioLabel(_ track: ClassicVLCEngine.EngineTrack) -> String {
+        guard let match = track.name.wholeMatch(of: /(.*?)\s*-\s*\[(.+)\]/),
+              let code = ClassicAudioLanguageMatch.code(forName: String(match.2)) else { return track.name }
+        return ClassicAudioTrackLabel.make(title: String(match.1), languageTag: code, codec: nil,
+                                           channels: 0, fallbackID: Int(track.id))
+    }
+
     /// Build the audio/subtitle pickers from VLC's track lists.
     private func loadVLCTracks() {
         guard let engine = vlcEngine else { return }
         let engineAudio = engine.audioTracks
         vlcKnownAudioTrackCount = engineAudio.count
         audioOptions = engineAudio.map {
-            TrackOption(id: "vlc-audio-\($0.id)", displayName: $0.name, payload: .vlcAudio($0.id))
+            TrackOption(id: "vlc-audio-\($0.id)", displayName: Self.vlcAudioLabel($0), payload: .vlcAudio($0.id))
         }
         selectedAudioID = "vlc-audio-\(engine.currentAudioID)"
 
@@ -5879,29 +5892,16 @@ final class ClassicPlayerViewModel: ObservableObject {
         }
     }
 
+    /// The picker row for a KSPlayer track (see `ClassicAudioTrackLabel`).
+    /// Codec, channels and the HONEST output note: a TrueHD Atmos track is
+    /// not "Atmos" on tvOS — the platform can't bitstream it, so it decodes
+    /// to PCM, and the row says so.
     private func trackLabel(_ track: any MediaPlayerTrack) -> String {
-        var label = track.name
-        if let code = track.languageCode,
-           let language = Locale.current.localizedString(forLanguageCode: code),
-           !label.localizedCaseInsensitiveContains(language) {
-            label += " (\(language))"
-        }
-        if label.isEmpty { label = "Track \(track.trackID)" }
-        // Codec + channels + the HONEST output note. A TrueHD Atmos track is
-        // not "Atmos" on tvOS — the platform can't bitstream it, so it decodes
-        // to PCM. Saying so in the picker is the difference between a player
-        // that reports its source and one that reports its marketing.
         let audio = Self.audioFormat(track)
-        var parts: [String] = []
-        if let codec = audio.codec, !label.localizedCaseInsensitiveContains(codec) {
-            parts.append(codec)
-        }
-        let channels = Self.channelCount(track)
-        if channels > 2, !label.contains("\(channels)") {
-            parts.append(Self.channelLabel(channels))
-        }
-        if audio.decodedToPCM { parts.append("→ PCM") }
-        return parts.isEmpty ? label : "\(label) · \(parts.joined(separator: " "))"
+        return ClassicAudioTrackLabel.make(
+            title: track.name, languageTag: track.languageCode, codec: audio.codec,
+            channels: Self.channelCount(track), note: audio.decodedToPCM ? "→ PCM" : nil,
+            fallbackID: Int(track.trackID))
     }
 
     /// What an audio track IS and what tvOS can DO with it.
@@ -6714,6 +6714,7 @@ final class ClassicPlayerViewModel: ObservableObject {
     private var lastScrubPublish = Date.distantPast
     private func publishScrub(_ value: Double) {
         scrubValue = value
+        requestLivePreview(at: value)
         let now = Date()
         guard now.timeIntervalSince(lastScrubPublish) > 0.033 else { return }
         lastScrubPublish = now
@@ -6996,6 +6997,7 @@ final class ClassicPlayerViewModel: ObservableObject {
         scrubAnchor = start
         scrubValue = start
         clock.scrubTarget = start
+        requestLivePreview(at: start)
         // A skip still on its debounce would fire mid-scrub and move the
         // picture out from under the target the viewer is aiming at.
         seekDebounceTask?.cancel()
@@ -7019,6 +7021,7 @@ final class ClassicPlayerViewModel: ObservableObject {
         if let target = scrubValue {
             scrubAnchor = target
             clock.scrubTarget = target
+            requestLivePreview(at: target)
         }
     }
 
@@ -7046,6 +7049,7 @@ final class ClassicPlayerViewModel: ObservableObject {
         isScrubbing = false
         resetWheel()
         clearFineThumbnails()
+        clearLivePreview()
         scrubTimeoutTask?.cancel()
         // Leave the bar up briefly so you see where you landed, Netflix-style.
         showControls()
@@ -7069,6 +7073,7 @@ final class ClassicPlayerViewModel: ObservableObject {
         isScrubbing = false
         resetWheel()
         clearFineThumbnails()
+        clearLivePreview()
         scrubTimeoutTask?.cancel()
     }
 
@@ -10906,6 +10911,18 @@ final class ClassicPlayerViewModel: ObservableObject {
             return
         }
         guard !thumbnailsStarted, let url = currentURL else { return }
+        // AetherEngine draws its own previews live, but only where its packet
+        // cache can answer — and on an MKV whose TrueHD is laced (most UHD
+        // remuxes: one timestamp per block, none on the frames inside it) that
+        // cache never covers anything, so every live request comes back empty.
+        // The background pass still runs as the fallback; `thumbnail(at:)`
+        // prefers the live frame whenever there is one.
+        if aetherServesPreviews {
+            NSLog("[OrivioPlayer] scrub previews: live from AetherEngine, background pass as fallback")
+            #if DEBUG
+            runLivePreviewSelfTestIfRequested()
+            #endif
+        }
         guard url.pathExtension.lowercased() != "m3u8" else {
             NSLog("[OrivioPlayer] scrub previews skipped: HLS source")
             return
@@ -11256,6 +11273,24 @@ final class ClassicPlayerViewModel: ObservableObject {
     /// doesn't restart the pass.
     private var fineCenter: Double?
 
+    /// The live scrub frame: the picture under the scrub target, decoded on
+    /// demand (by AetherEngine or off the origin). `time` is the
+    /// target it was asked for, so `thumbnail(at:)` can tell a frame for this
+    /// spot from one the finger has long left. NOT @Published (see
+    /// `scrubThumbnails`).
+    private var livePreview: ClassicScrubThumbnail? {
+        didSet { clock.previewsRevision &+= 1 }
+    }
+    /// The newest target the scrub asked about; the running fetch picks it up
+    /// when its current decode lands (latest wins, one decode in flight).
+    private var livePreviewWanted: Double? {
+        didSet { livePreviewLatest.wrappedValue = livePreviewWanted }
+    }
+    /// The same, readable from the engine's decode thread, so an exact-frame
+    /// decode the finger has already moved past stops early.
+    private let livePreviewLatest = ClassicAtomic<Double?>(wrappedValue: nil)
+    private var livePreviewTask: Task<Void, Never>?
+
     /// Debounce for the dense pass, so a moving finger doesn't restart it.
     private var fineDebounce: Task<Void, Never>?
 
@@ -11297,6 +11332,10 @@ final class ClassicPlayerViewModel: ObservableObject {
         guard settings.scrubPreviewsEnabled, !PerformanceProfile.isLowPower,
               thumbnailsStarted, duration > 0 else { return }
         guard var url = currentURL, url.pathExtension.lowercased() != "m3u8" else { return }
+        // The live grabber already puts the frame under the finger, cached or
+        // not; a dense pass beside it would only be a second 4K decode
+        // competing with playback.
+        guard liveGrabberIfPossible() == nil else { return }
         // Hybrid cache live: local reads make the dense pass cheap, so cover
         // a much wider stretch around the finger — scrubbing through cached
         // film should feel continuous, not sampled.
@@ -11541,6 +11580,175 @@ final class ClassicPlayerViewModel: ObservableObject {
         if !fineThumbnails.isEmpty { fineThumbnails = [] }
     }
 
+    // MARK: - Live scrub preview
+
+    /// AetherEngine answers previews itself for any position its caches hold,
+    /// with no second connection. On an MKV whose TrueHD is laced (most UHD
+    /// remuxes: one timestamp per block, none on the frames inside it) its
+    /// packet cache never covers anything and every request comes back empty,
+    /// which is what `liveFrameGrabber` is for.
+    private var aetherServesPreviews: Bool {
+        settings.scrubPreviewsEnabled && (aetherEngine?.supportsScrubPreviews ?? false)
+    }
+
+    /// One FFmpeg session on the ORIGIN, kept for the whole load: the keyframe
+    /// under the finger on film that is cached and film that is not. Nil for
+    /// HLS, non-http sources, low-power boxes, and once the origin has refused
+    /// a second reader.
+    private var liveFrameGrabber: ClassicLiveFrameGrabber?
+    private func liveGrabberIfPossible() -> ClassicLiveFrameGrabber? {
+        if let grabber = liveFrameGrabber { return grabber.unavailable ? nil : grabber }
+        guard settings.scrubPreviewsEnabled, !PerformanceProfile.isLowPower,
+              let origin = currentEntry.stream.url.flatMap(URL.init(string:)),
+              origin.scheme?.hasPrefix("http") == true,
+              origin.pathExtension.lowercased() != "m3u8" else { return nil }
+        let grabber = ClassicLiveFrameGrabber(
+            url: origin, headers: currentEntry.stream.behaviorHints?.proxyHeaders?.requestHeaders)
+        liveFrameGrabber = grabber
+        return grabber
+    }
+
+    /// Ask for the picture at `target`. Keyframe first, which keeps up with a
+    /// moving finger: from AetherEngine when it holds the spot, otherwise off
+    /// the origin. Once the target holds still for a moment, AetherEngine's
+    /// exact frame where it can give one.
+    private func requestLivePreview(at target: Double) {
+        guard aetherServesPreviews || liveGrabberIfPossible() != nil else { return }
+        livePreviewWanted = target
+        guard livePreviewTask == nil else { return }
+        livePreviewTask = Task { [weak self] in
+            while let self, !Task.isCancelled, let target = self.livePreviewWanted {
+                let refined = target == self.lastLivePreviewTarget
+                if refined {
+                    // Only AetherEngine decodes past the keyframe; and only if
+                    // the finger stays put.
+                    guard self.lastLivePreviewFromAether else { break }
+                    try? await Task.sleep(nanoseconds: 180_000_000)
+                    guard !Task.isCancelled, self.livePreviewWanted == target else { continue }
+                }
+                let started = Date()
+                var shown: UIImage?
+                var fromAether = false
+                if self.aetherServesPreviews, let engine = self.aetherEngine {
+                    // Only the exact decode is abandoned for a newer target:
+                    // the keyframe is quick, and cancelling it on every
+                    // movement would show nothing while the finger moves.
+                    let latest = self.livePreviewLatest
+                    let frame = await engine.scrubPreview(atSeconds: target, refined: refined,
+                                                          isCancelled: { refined && latest.wrappedValue != target })
+                    if let frame { shown = UIImage(cgImage: frame.image); fromAether = true }
+                }
+                if shown == nil, !refined, let grabber = self.liveGrabberIfPossible() {
+                    shown = await grabber.frame(at: target)?.image
+                }
+                guard !Task.isCancelled else { break }
+                if let shown {
+                    self.livePreview = ClassicScrubThumbnail(image: shown, time: target)
+                    Self.notePreviewLatency(Date().timeIntervalSince(started),
+                                            kind: refined ? "exact" : (fromAether ? "keyframe (engine)" : "keyframe (origin)"))
+                } else {
+                    #if DEBUG
+                    NSLog("[OrivioPreview] no %@ frame at %.1fs (playhead %.1fs) after %.0f ms",
+                          refined ? "exact" : "keyframe", target, self.position,
+                          Date().timeIntervalSince(started) * 1000)
+                    #endif
+                }
+                self.lastLivePreviewTarget = target
+                self.lastLivePreviewFromAether = fromAether
+                // Nothing newer asked for: rest until the next scrub movement
+                // starts a new fetch.
+                if self.livePreviewWanted == target, refined || !fromAether { break }
+            }
+            self?.livePreviewTask = nil
+        }
+    }
+    private var lastLivePreviewTarget: Double?
+    private var lastLivePreviewFromAether = false
+
+    private func clearLivePreview() {
+        livePreviewTask?.cancel()
+        livePreviewTask = nil
+        livePreviewWanted = nil
+        lastLivePreviewTarget = nil
+        if livePreview != nil { livePreview = nil }
+    }
+
+    /// Request-to-picture times, for the performance log: count, mean and
+    /// worst per kind, logged every 20 frames.
+    private static var previewLatencies: [String: [Double]] = [:]
+    private static func notePreviewLatency(_ seconds: Double, kind: String) {
+        previewLatencies[kind, default: []].append(seconds)
+        let all = previewLatencies[kind] ?? []
+        guard all.count % 10 == 0 else { return }
+        NSLog("[OrivioPreview] %@ frames: %d, mean %.0f ms, worst %.0f ms",
+              kind, all.count,
+              all.reduce(0, +) / Double(all.count) * 1000, (all.max() ?? 0) * 1000)
+    }
+
+    #if DEBUG
+    /// Dev-only harness: `-livePreviewSelfTest` drives one scrub over an
+    /// AetherEngine session the way a thumb would (a fast swipe, then holds
+    /// near the playhead and far from it) and logs, under "OrivioPreview",
+    /// how often a frame was under the finger and how long each took. The
+    /// simulator's remote input cannot drive the bar reliably.
+    private var livePreviewSelfTestRan = false
+    private func runLivePreviewSelfTestIfRequested() {
+        guard ProcessInfo.processInfo.arguments.contains("-livePreviewSelfTest"),
+              !livePreviewSelfTestRan else { return }
+        livePreviewSelfTestRan = true
+        Task { [weak self] in
+            // Let playback settle, the engine build a buffer and the
+            // background pass lay down its first frames.
+            try? await Task.sleep(nanoseconds: 60_000_000_000)
+            guard let self, self.usingAether, self.duration > 0 else { return }
+            let start = self.position, length = self.duration
+            self.beginScrub(pausing: true)
+            var shown = 0
+            for step in 0..<60 {
+                let target = min(start + Double(step) * 10, length - 1)
+                self.publishScrub(target)
+                try? await Task.sleep(nanoseconds: 33_000_000)
+                if self.thumbnail(at: target) != nil { shown += 1 }
+            }
+            NSLog("[OrivioPreview] self-test swipe (10 min in 2 s): a frame under the finger at %d/60 samples", shown)
+            for target in [start + 8, start + 120, length * 0.5, length * 0.9] {
+                self.publishScrub(target)
+                self.restartScrubTimeout()   // a held thumb, not an idle remote
+                let began = Date()
+                var anyFrame: Double?
+                var liveFrame: Double?
+                var exactFrame: Double?
+                while Date().timeIntervalSince(began) < 4 {
+                    let elapsed = Date().timeIntervalSince(began)
+                    if anyFrame == nil, self.thumbnail(at: target) != nil { anyFrame = elapsed }
+                    if liveFrame == nil, self.livePreview?.time == target { liveFrame = elapsed }
+                    if exactFrame == nil, self.livePreviewTask == nil, self.livePreview?.time == target {
+                        exactFrame = elapsed
+                    }
+                    try? await Task.sleep(nanoseconds: 20_000_000)
+                }
+                func ms(_ value: Double?) -> String { value.map { String(format: "%.0f ms", $0 * 1000) } ?? "none" }
+                NSLog("[OrivioPreview] self-test hold at %.0fs: any frame %@, live keyframe %@, live exact %@ (background frames: %d coarse, %d fine)",
+                      target, ms(anyFrame), ms(liveFrame), ms(exactFrame),
+                      self.scrubThumbnails.count, self.fineThumbnails.count)
+            }
+            // A real commit to film nothing has fetched yet: how long until
+            // the picture plays there.
+            let seekTarget = length * 0.5
+            self.publishScrub(seekTarget)
+            let seekStarted = Date()
+            self.commitScrub()
+            while Date().timeIntervalSince(seekStarted) < 30,
+                  !(self.isPlaying && abs(self.position - seekTarget) < 3 && self.position > seekTarget) {
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+            NSLog("[OrivioPreview] self-test seek to %.0fs: playing there after %.0f ms",
+                  seekTarget, Date().timeIntervalSince(seekStarted) * 1000)
+            NSLog("[OrivioPreview] self-test done")
+        }
+    }
+    #endif
+
     /// How far a coarse frame may be from the asked-for time and still be
     /// worth showing: one and a half times the spacing the pass has reached so
     /// far, never tighter than three of its target steps.
@@ -11576,6 +11784,11 @@ final class ClassicPlayerViewModel: ObservableObject {
     }
 
     func thumbnail(at time: Double) -> UIImage? {
+        // AetherEngine's live frame, while it is still for (about) this spot:
+        // a moving finger shows the last decode until the next one lands.
+        if let live = livePreview, abs(live.time - time) <= 30 {
+            return live.image
+        }
         // Prefer a fine frame when one is genuinely near — within a single
         // fine step. Past that the coarse set is the better answer than a
         // stale close-up from the edge of the window.
@@ -12859,7 +13072,7 @@ extension ClassicPlayerViewModel {
     private func loadAetherTracks() {
         guard let engine = aetherEngine else { return }
         let audio = engine.audioTracks.map {
-            TrackOption(id: "aether-audio-\($0.id)", displayName: $0.displayName,
+            TrackOption(id: "aether-audio-\($0.id)", displayName: Self.aetherAudioLabel($0),
                         payload: .aetherAudio($0.id))
         }
         // Equality is by id only; a republish can rename (Atmos confirmed).
@@ -12881,6 +13094,14 @@ extension ClassicPlayerViewModel {
         }
         if added { rebuildSubtitleOptions() }
         applyPreferredAetherAudioIfNeeded()
+    }
+
+    /// The audio picker row for an AetherEngine track (see `ClassicAudioTrackLabel`).
+    private static func aetherAudioLabel(_ track: AetherTrack) -> String {
+        ClassicAudioTrackLabel.make(
+            title: track.name, languageTag: track.language, codec: track.codec, profile: track.profile,
+            channels: track.channels, atmos: track.isAtmos, dtsx: track.isDTSX,
+            commentary: track.isCommentary, fallbackID: track.id)
     }
 
     private static func aetherSubtitleLabel(_ track: AetherTrack) -> String {
@@ -12969,6 +13190,7 @@ extension ClassicPlayerViewModel {
         engine.onTracksChanged = nil
         engine.onSubtitleCues = nil
         engine.onVideoInfoChanged = nil
+        clearLivePreview()
         // FINAL, though another engine follows: this instance is being thrown
         // away, and only a final stop unbinds its view, drops its observers
         // and leaves the engine's shared-output registry. The audio session

@@ -205,6 +205,20 @@ enum TestStreamCatalog {
         }
         PlayerPresenter.shared.present(request)
     }
+
+    #if DEBUG
+    /// Dev-only: `-playTestURL` opens the saved custom URL a few seconds after
+    /// launch, so a test session (with `-livePreviewSelfTest`, say) needs no
+    /// trip through Settings — the simulator's remote input is unreliable.
+    @MainActor
+    static func playCustomURLIfRequested() async {
+        guard ProcessInfo.processInfo.arguments.contains("-playTestURL"),
+              let saved = UserDefaults.standard.string(forKey: "orivio.dev.testStreamCustomURL"),
+              !saved.isEmpty else { return }
+        try? await Task.sleep(nanoseconds: 3_000_000_000)
+        play(request(customURL: saved))
+    }
+    #endif
 }
 
 /// The Test streams page, pushed from Settings → Playback → Developer.

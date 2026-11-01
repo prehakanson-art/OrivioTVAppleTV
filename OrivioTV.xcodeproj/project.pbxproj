@@ -36,6 +36,7 @@
 		32AF19C4C6357556EEC17091 /* CastService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F9BA917B20CC514DFDC28EB /* CastService.swift */; };
 		34F43A0B68157219C92569BA /* TopShelfSnapshot.swift in Sources */ = {isa = PBXBuildFile; fileRef = 57915924DC3840A757CD7EE3 /* TopShelfSnapshot.swift */; };
 		A1E7A0B1C2D3E4F5A6B7C801 /* OrivioAether in Frameworks */ = {isa = PBXBuildFile; productRef = A1E7A0B1C2D3E4F5A6B7C802 /* OrivioAether */; };
+		A1E7A0B1C2D3E4F5A6B7C807 /* OrivioAether in Embed Frameworks */ = {isa = PBXBuildFile; productRef = A1E7A0B1C2D3E4F5A6B7C802 /* OrivioAether */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
 		353F4BD65084C884A72125F3 /* KSPlayer in Frameworks */ = {isa = PBXBuildFile; productRef = 4C595A0AAA5873BDB7D3A0FA /* KSPlayer */; };
 		3541638622CA8F0AC3484125 /* VLCEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD62388DABC25F1778365EBD /* VLCEngine.swift */; };
 		374D2C5BB55D62187217177E /* DVSampleEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3D458D84E80222C4CB91415A /* DVSampleEngine.swift */; };
@@ -91,6 +92,7 @@
 		861C9B7FADD0C403F6BFE013 /* Tokens.swift in Sources */ = {isa = PBXBuildFile; fileRef = 326E0569E9932C14EA0E38D6 /* Tokens.swift */; };
 		8C67245F09A96D81349A9CC1 /* DVSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = C91F773C54C9D474219229BE /* DVSupport.swift */; };
 		8ED0A780790CA0CEE10F9811 /* ClassicScrubThumbnailer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 523401DD7974428964C170D9 /* ClassicScrubThumbnailer.swift */; };
+		A1E7A0B1C2D3E4F5A6B7C809 /* ClassicLiveFrameGrabber.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1E7A0B1C2D3E4F5A6B7C80A /* ClassicLiveFrameGrabber.swift */; };
 		8F75108E93AD7D6EBD2375DA /* ExternalPlayers.swift in Sources */ = {isa = PBXBuildFile; fileRef = D6BB1E51C4914348465F2E07 /* ExternalPlayers.swift */; };
 		8FB4026E02A0C4EDBF643AD4 /* MediaServerSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D6432C28A29872BA88D93BE /* MediaServerSettings.swift */; };
 		907533AF9BAF45F3FD373B50 /* RemoteInput.swift in Sources */ = {isa = PBXBuildFile; fileRef = A8DCE70635C3C65E8553BFE1 /* RemoteInput.swift */; };
@@ -194,6 +196,17 @@
 			name = "Embed Foundation Extensions";
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		A1E7A0B1C2D3E4F5A6B7C808 /* Embed Frameworks */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (
+				A1E7A0B1C2D3E4F5A6B7C807 /* OrivioAether in Embed Frameworks */,
+			);
+			name = "Embed Frameworks";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
@@ -246,6 +259,7 @@
 		4E1F8F6754981D61993478D3 /* ClassicAudioLanguageMatch.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClassicAudioLanguageMatch.swift; sourceTree = "<group>"; };
 		4F3C94D1613D7CBF58098FD5 /* PlayerTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerTransport.swift; sourceTree = "<group>"; };
 		523401DD7974428964C170D9 /* ClassicScrubThumbnailer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClassicScrubThumbnailer.swift; sourceTree = "<group>"; };
+		A1E7A0B1C2D3E4F5A6B7C80A /* ClassicLiveFrameGrabber.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClassicLiveFrameGrabber.swift; sourceTree = "<group>"; };
 		543FA4296AACD1F3DEC5C5C4 /* DiscoverTab.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiscoverTab.swift; sourceTree = "<group>"; };
 		55156824021BFDC6AD66821B /* Cards.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Cards.swift; sourceTree = "<group>"; };
 		57915924DC3840A757CD7EE3 /* TopShelfSnapshot.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TopShelfSnapshot.swift; sourceTree = "<group>"; };
@@ -553,6 +567,7 @@
 				AF8DF6C62FDC95C564289A4A /* ClassicRemoteInput.swift */,
 				6064C0DF3100F7E45C6C3A8F /* ClassicScrubberViews.swift */,
 				523401DD7974428964C170D9 /* ClassicScrubThumbnailer.swift */,
+				A1E7A0B1C2D3E4F5A6B7C80A /* ClassicLiveFrameGrabber.swift */,
 				725196219EF492C8AFBAA07C /* ClassicSourceSelection.swift */,
 				F430CEB13E8003F7252064EF /* ClassicSourcesPicker.swift */,
 				DF8CEE193CC445AB7CB06F52 /* ClassicStreamProbe.swift */,
@@ -887,6 +902,7 @@
 				1EE99B4D3BCE8D03835D1A37 /* Sources */,
 				356F53D4489F78AAAD439D45 /* Resources */,
 				4954A52A605F1D7AA6189308 /* Frameworks */,
+				A1E7A0B1C2D3E4F5A6B7C808 /* Embed Frameworks */,
 				E99154B6F70430F1502404F1 /* Embed Foundation Extensions */,
 				BD7B145B1D7996533641D190 /* Sanitize embedded framework bundle IDs */,
 			);
@@ -1062,6 +1078,7 @@
 				A8660F9CAC1DCD4EF1479F39 /* ClassicPlayerViewModel.swift in Sources */,
 				DB44FF1DD8C946245E38C13C /* ClassicRemoteInput.swift in Sources */,
 				8ED0A780790CA0CEE10F9811 /* ClassicScrubThumbnailer.swift in Sources */,
+				A1E7A0B1C2D3E4F5A6B7C809 /* ClassicLiveFrameGrabber.swift in Sources */,
 				7E150B31FBD5A8A5F7E17B67 /* ClassicScrubberViews.swift in Sources */,
 				BC342C81B9276E6A42757453 /* ClassicSourceSelection.swift in Sources */,
 				B3229B61D6736B13FB668C8E /* ClassicSourcesPicker.swift in Sources */,

@@ -77,6 +77,16 @@ public struct AetherChapter: Sendable {
     public let end: Double
 }
 
+/// One live scrub-preview frame. `actualSeconds` is the time of the picture
+/// actually decoded (a keyframe at or before the target unless `refined`), on
+/// the same axis `seek(to:)` takes.
+public struct AetherScrubFrame: @unchecked Sendable {
+    public let image: CGImage
+    public let actualSeconds: Double
+    /// The decode reached the asked-for time, not just the keyframe before it.
+    public let refined: Bool
+}
+
 /// The per-load knobs Orivio sets. Everything not listed keeps the engine's
 /// own default, which is tuned for Apple TV already.
 public struct AetherLoadConfiguration: Sendable {
@@ -271,6 +281,29 @@ public final class AetherPlaybackEngine {
             engine.unbind(view: playerView)
         }
     }
+
+    // MARK: Scrub previews
+
+    /// The session can hand out scrub stills without opening a second
+    /// connection (segment cache, packet cache, or the keyframe ladder it reads
+    /// while the link is idle). False before load, and on Dolby Vision without
+    /// a displayable base layer (Profile 5) where no CGImage can be correct.
+    public var supportsScrubPreviews: Bool { engine.supportsCacheBackedStills }
+
+    /// The picture at `seconds`, decoded from bytes the session already holds.
+    /// Never seeks playback and never opens a connection; nil means "nothing
+    /// resident there yet". `refined: false` returns the keyframe at or before
+    /// the target (fast, cached per segment); `true` decodes up to it.
+    public func scrubPreview(atSeconds seconds: Double, refined: Bool, maxWidth: Int = 480,
+                             isCancelled: @escaping @Sendable () -> Bool) async -> AetherScrubFrame? {
+        guard let frame = await engine.scrubPreviewFrame(atSeconds: seconds, refined: refined,
+                                                         maxWidth: maxWidth, isCancelled: isCancelled)
+        else { return nil }
+        return AetherScrubFrame(image: frame.image, actualSeconds: frame.actualSeconds, refined: frame.refined)
+    }
+
+    /// Drop the decoded stills the engine keeps per segment (memory only).
+    public func clearScrubPreviews() { engine.clearResidentPreviewFrames() }
 
     /// Keep the current AVPlayerItem on screen across the next `load` (episode
     /// → episode), so the swap does not flash black between the two items.

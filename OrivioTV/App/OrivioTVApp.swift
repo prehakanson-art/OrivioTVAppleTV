@@ -36,6 +36,9 @@ struct OrivioTVApp: App {
             RootView()
                 .withAppStores(stores)
                 .preferredColorScheme(.dark)
+                #if DEBUG
+                .task { await TestStreamCatalog.playCustomURLIfRequested() }
+                #endif
         }
     }
 }

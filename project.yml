@@ -72,6 +72,8 @@ targets:
       - package: VLCKit
         product: VLCKitSPM
       - package: OrivioAether
+        # A dynamic library: it must be copied into the app, or tvOS cannot load it.
+        embed: true
       # libdovi (Rust dolby_vision crate, C API): DV Profile 7 → 8.1 RPU conversion.
       # Its headers sit in Headers/libdovi/: AetherEngine's LibDovi (module
       # `Dovi`) also copies a dovi.h and a module.modulemap into the products'
