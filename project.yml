@@ -8,7 +8,8 @@ configs:
   Profile: release
 options:
   deploymentTarget:
-    tvOS: "17.0"
+    # 18.0: AetherEngine (Vendor/OrivioAether) is tvOS 18+.
+    tvOS: "18.0"
   createIntermediateGroups: true
 packages:
   # Vendored with Orivio patches (grep "ORIVIO PATCH"). Re-apply them if re-vendored.
@@ -22,18 +23,59 @@ packages:
   VLCKit:
     url: https://github.com/tylerjonesio/vlckit-spm
     from: 3.6.0
+  # AetherEngine (superuser404notfound/AetherEngine) behind a DYNAMIC wrapper
+  # framework. The app already links a static FFmpeg (KSPlayer's FFmpegKit)
+  # and VLCKit's; AetherEngine must bind to its own AetherLib* FFmpeg, which
+  # only holds when its code lives in a separate image (two-level namespace).
+  # The wrapper is built with library evolution so the app never loads
+  # AetherEngine's FFmpeg modules, and its manifest is where AetherEngine's
+  # package traits are switched on (XcodeGen cannot pass `traits:`).
+  # Needs Xcode 16.3+.
+  OrivioAether:
+    path: Vendor/OrivioAether
 targets:
   OrivioTV:
     type: application
     platform: tvOS
     sources:
       - path: OrivioTV
+        # Files from before the v0.13 restructure that the committed
+        # OrivioTV.xcodeproj does not compile (their types were renamed into
+        # ClassicPlayer/ and Core/*/): left out so `xcodegen generate` builds
+        # the same file set as the checked-in project.
+        excludes:
+          - "OrivioTVApp.swift"
+          - "Components/**"
+          - "Core/*.swift"
+          - "Core/OrivioAccount/**"
+          - "Core/Plugins/**"
+          - "Screens/*.swift"
+          - "Theme/**"
+          - "Player/AtmosHLS.swift"
+          - "Player/Atomic.swift"
+          - "Player/DVSampleEngine.swift"
+          - "Player/DoviConverter.swift"
+          - "Player/FusionPlayerControlsOverlay.swift"
+          - "Player/InfuseInfoPanel.swift"
+          - "Player/PlaybackDecision.swift"
+          - "Player/PlayerDiagnosticsHUD.swift"
+          - "Player/PlayerScreen.swift"
+          - "Player/PlayerTempSweep.swift"
+          - "Player/PlayerVideoView.swift"
+          - "Player/ScrubberViews.swift"
+          - "Player/StreamProbe.swift"
+          - "Player/TrailerPlayer.swift"
+          - "Player/VLCEngine.swift"
     dependencies:
       - package: KSPlayer
       - package: YouTubeKit
       - package: VLCKit
         product: VLCKitSPM
+      - package: OrivioAether
       # libdovi (Rust dolby_vision crate, C API): DV Profile 7 → 8.1 RPU conversion.
+      # Its headers sit in Headers/libdovi/: AetherEngine's LibDovi (module
+      # `Dovi`) also copies a dovi.h and a module.modulemap into the products'
+      # include/, and two files at one path fail the build.
       - framework: Vendor/libdovi.xcframework
         embed: false
       - target: OrivioTopShelf

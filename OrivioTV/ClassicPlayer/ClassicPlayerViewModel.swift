@@ -3,6 +3,7 @@ import AVKit
 import Combine
 import GameController
 import KSPlayer
+import OrivioAether
 import SwiftUI
 
 extension UIApplication {
@@ -236,6 +237,7 @@ struct TrackOption: Identifiable, Equatable {
         case vlcAudio(Int32)      // VLC audio track index
         case vlcSubtitle(Int32)   // VLC subtitle track index (-1 = off)
         case dvDirectAudio(Int32) // ClassicDVSampleEngine audio stream index
+        case aetherAudio(Int)     // AetherEngine audio stream index
     }
 
     let id: String
@@ -1278,6 +1280,31 @@ final class ClassicPlayerViewModel: ObservableObject {
     /// mutually exclusive with `playerLayer`.
     private(set) var vlcEngine: ClassicVLCEngine?
     var usingVLC: Bool { vlcEngine != nil }
+    /// AetherEngine (see Vendor/OrivioAether): the first engine Auto tries
+    /// for every stream. Mutually exclusive with the other engines while
+    /// active; a failure hands the same source to the legacy routing once.
+    private(set) var aetherEngine: AetherPlaybackEngine?
+    var usingAether: Bool { aetherEngine != nil }
+    /// Links AetherEngine already failed on this session: the legacy
+    /// routing plays them from then on (no Aether retry loop).
+    /// Keyed by the LINK, not `StreamEntry.id`: that UUID is minted on every
+    /// init, so a failover or a source refresh handing back the same URL
+    /// would have bought another full watchdog wait on it.
+    private var aetherDeclinedLinks: Set<String> = []
+    /// The first-playback setup ran for THIS load (see `vlcSessionPrepared`
+    /// for why `hasStartedPlayback` cannot stand in for it).
+    private var aetherSessionPrepared = false
+    /// Last presentation time the engine reported, so a tick can be told
+    /// apart from PROGRESS (see the DV tick).
+    private var aetherLastTickTime: Double = -1
+    /// Deduplicates the state probe line.
+    private var lastAetherProbeState = ""
+    /// The preferred-audio second pass already ran for this load.
+    private var aetherAudioAutoApplied = false
+    /// Embedded subtitle tracks the engine decodes, one SubtitleInfo each,
+    /// keyed by stream index; the active one receives the cue window.
+    private var aetherEmbeddedSubs: [Int: AetherEmbeddedSubtitleInfo] = [:]
+    private weak var aetherActiveEmbeddedSub: AetherEmbeddedSubtitleInfo?
     /// The direct Dolby Vision sample-feed engine (no AVPlayer, no HLS, no
     /// CoreMedia retention) — the Infuse architecture. Mutually exclusive
     /// with the other engines while active.
@@ -1322,7 +1349,7 @@ final class ClassicPlayerViewModel: ObservableObject {
     /// The UIView the active engine renders into (KSPlayer's player view,
     /// VLC's drawable, or the DV sample layer), handed to PlayerVideoView.
     var activeVideoView: UIView? {
-        isExiting ? nil : (dvDirectEngine?.videoView ?? vlcEngine?.videoView ?? playerLayer?.player.view)
+        isExiting ? nil : (dvDirectEngine?.videoView ?? aetherEngine?.videoView ?? vlcEngine?.videoView ?? playerLayer?.player.view)
     }
     /// Picture in Picture, when the loaded engine can feed it.
     let pictureInPicture = PictureInPictureController()
@@ -1333,7 +1360,11 @@ final class ClassicPlayerViewModel: ObservableObject {
     /// `AVPlayerLayer` (see the PictureInPicture.swift header), which of the
     /// four engines only the native one has.
     var pictureInPictureLayer: AVPlayerLayer? {
-        guard !isExiting, dvDirectEngine == nil, vlcEngine == nil,
+        guard !isExiting else { return nil }
+        // AetherEngine's AVPlayer routes (direct / loopback HLS) present
+        // through an AVPlayerLayer too; its software route has none.
+        if let aetherEngine { return aetherEngine.nativePlayerLayer }
+        guard dvDirectEngine == nil, vlcEngine == nil,
               let player = playerLayer?.player as? KSAVPlayer else { return nil }
         return player.view?.layer as? AVPlayerLayer
     }
@@ -1379,6 +1410,8 @@ final class ClassicPlayerViewModel: ObservableObject {
     private func setPictureInPictureMuted(_ muted: Bool) {
         if let engine = dvDirectEngine {
             engine.setMuted(muted)
+        } else if let aetherEngine {
+            aetherEngine.setMuted(muted)
         } else if let vlcEngine {
             vlcEngine.setMuted(muted)
         } else if let playerLayer {
@@ -1470,6 +1503,7 @@ final class ClassicPlayerViewModel: ObservableObject {
     /// Which engine is live, for the PiP trail.
     private var engineLabelForPiP: String {
         if dvDirectEngine != nil { return "dvDirect" }
+        if aetherEngine != nil { return "aether" }
         if vlcEngine != nil { return "vlc" }
         if playerLayer?.player is KSMEPlayer { return "ffmpeg" }
         if playerLayer?.player != nil { return "native" }
@@ -1573,6 +1607,7 @@ final class ClassicPlayerViewModel: ObservableObject {
         playRequestedAt = Date()
         if pictureInPicture.isActive { PictureInPictureController.trail("engine play (PiP active)") }
         if let dvDirectEngine { dvDirectEngine.play() }
+        else if let aetherEngine { aetherEngine.play() }
         else if let vlcEngine { vlcEngine.play() } else { playerLayer?.play() }
         atmosTick()   // the Atmos audio follows now, not on the next tick
     }
@@ -1588,6 +1623,7 @@ final class ClassicPlayerViewModel: ObservableObject {
     /// documented trap that pins the transport as paused for the next load.
     private func engineStopForSwitch() {
         if let dvDirectEngine { dvDirectEngine.pause() }
+        else if let aetherEngine { aetherEngine.pause() }
         else if let vlcEngine { vlcEngine.pause() }
         else { playerLayer?.pause() }
         atmosTick()
@@ -1605,6 +1641,7 @@ final class ClassicPlayerViewModel: ObservableObject {
         playRequestedAt = nil
         if pictureInPicture.isActive { PictureInPictureController.trail("engine pause (PiP active)") }
         if let dvDirectEngine { dvDirectEngine.pause() }
+        else if let aetherEngine { aetherEngine.pause() }
         else if let vlcEngine { vlcEngine.pause() } else { playerLayer?.pause() }
         atmosTick()   // stop the Atmos audio with the picture, not a tick later
     }
@@ -1627,6 +1664,13 @@ final class ClassicPlayerViewModel: ObservableObject {
             // the picture back onto wherever the audio had stuck.)
             atmosPassthrough?.pause()
             if autoPlay { dvDirectEngine.play() }
+            return
+        }
+        // AetherEngine: its presentation timeline is the source timeline too
+        // (the engine maps it onto its HLS window itself).
+        if let aetherEngine {
+            aetherEngine.seek(to: seconds)
+            if autoPlay { aetherEngine.play() }
             return
         }
         // (The native-remux window translation that used to sit here went with
@@ -1788,7 +1832,9 @@ final class ClassicPlayerViewModel: ObservableObject {
     /// Atmos is an audio feature and a TV with no DV mode has nothing to do
     /// with it.
     private func shouldTryDVFirst(url: URL) -> Bool {
-        guard effectiveEngine == .auto || effectiveEngine == .ffmpeg,
+        // .aether reaches here only once AetherEngine declined the link, and
+        // from then on it routes exactly like Auto.
+        guard effectiveEngine == .auto || effectiveEngine == .aether || effectiveEngine == .ffmpeg,
               !url.isFileURL,
               Self.memoryFootprintMB() < 850,
               !dvFailedURLs.contains(retryKey(for: url)),
@@ -2477,7 +2523,7 @@ final class ClassicPlayerViewModel: ObservableObject {
     /// engine is not assigned until its header probe completes).
     private var hasDVFirstAttemptInFlight: Bool {
         guard let task = dvFirstTask else { return false }
-        return !task.isCancelled && playerLayer == nil && vlcEngine == nil
+        return !task.isCancelled && playerLayer == nil && vlcEngine == nil && aetherEngine == nil
     }
 
     /// Ask the display for its Dolby Vision mode on behalf of the direct
@@ -2660,6 +2706,7 @@ final class ClassicPlayerViewModel: ObservableObject {
         }
         let phase: String
         if usingDVDirect { phase = "dvDirect" }
+        else if aetherEngine != nil { phase = "aether" }
         else if vlcEngine != nil { phase = "vlc" }
         else { phase = "ffmpeg" }
         guard result == KERN_SUCCESS else {
@@ -2778,7 +2825,7 @@ final class ClassicPlayerViewModel: ObservableObject {
     /// Drop this session's probe samplers. Called from `prepareForExit` so a
     /// dismissed player is never kept alive by the registry.
     private func unregisterProbes() {
-        for name in ["player", "scrub", "previews", "tracks", "dv", "engine", "input"] {
+        for name in ["player", "scrub", "previews", "tracks", "dv", "aether", "engine", "input"] {
             ClassicPlayerProbe.unregister(name)
         }
     }
@@ -3298,6 +3345,23 @@ final class ClassicPlayerViewModel: ObservableObject {
             guard let engine = self?.dvDirectEngine else { return [] }
             return engine.probeLines
         }
+        // AetherEngine's live state, self-skipping like the DV block.
+        ClassicPlayerProbe.register("aether") { [weak self] in
+            guard let engine = self?.aetherEngine else { return [] }
+            let size = engine.naturalSize
+            return [
+                "\(AetherPlaybackEngine.versionDescription)"
+                    + " components=\(AetherPlaybackEngine.builtInComponents.joined(separator: ","))",
+                "route=\(engine.routeLabel) panel=\(engine.videoFormatLabel) source=\(engine.sourceFormatLabel)"
+                    + String(format: " size=%.0fx%.0f", size.width, size.height),
+                "decoders video=\(engine.videoDecoderLabel ?? "-") audio=\(engine.audioDecoderLabel ?? "-")",
+                String(format: "clock current=%.1f source=%.1f buffered=%.1f duration=%.1f firstFrame=%@",
+                       engine.currentTime, engine.sourceTime, engine.bufferedPosition,
+                       engine.duration, engine.hasFirstFrame.probe),
+                "tracks audio=\(engine.audioTracks.count) (active \(engine.activeAudioID.map(String.init) ?? "-"))"
+                    + " subs=\(engine.subtitleTracks.count) (active \(engine.activeSubtitleID.map(String.init) ?? "-"))",
+            ]
+        }
         // The KSPlayer/VLC side of the same question. `seekable` in particular
         // silently decides whether a resume, a scrub commit or a chapter jump
         // does anything at all.
@@ -3535,6 +3599,18 @@ final class ClassicPlayerViewModel: ObservableObject {
                 ? "none (tvOS decodes the bitstream)" : "FFmpeg → LPCM (in-app)"
             let lower = path.codec.lowercased()
             facts.dolbyBitstream = path.passthrough && (lower == "eac3" || lower == "ac3")
+        } else if let aether = aetherEngine {
+            if let track = aether.audioTracks.first(where: { $0.id == aether.activeAudioID }) {
+                let lower = track.codec.lowercased()
+                facts.codec = track.codec
+                facts.channels = track.channels
+                facts.sourceSaysAtmos = track.isAtmos
+                // On its AVPlayer routes the engine stream-copies Dolby
+                // bitstreams into the HLS it serves, so tvOS bitstreams them.
+                facts.passthrough = aether.usesNativeVideoRoute && (lower == "eac3" || lower == "ac3")
+                facts.dolbyBitstream = facts.passthrough
+            }
+            facts.decoder = aether.audioDecoderLabel.map { "AetherEngine (\($0))" } ?? "AetherEngine"
         } else if usingVLC {
             facts.decoder = "VLC (decodes to PCM)"
         } else if let player = playerLayer?.player {
@@ -3595,6 +3671,7 @@ final class ClassicPlayerViewModel: ObservableObject {
     private var fineCentreForProbe: Double? { fineCenter }
     private var engineLabelForProbe: String {
         if usingDVDirect { return "dv-direct" }
+        if usingAether { return "aether" }
         if usingVLC { return "vlc" }
         return "ksplayer"
     }
@@ -3621,12 +3698,16 @@ final class ClassicPlayerViewModel: ObservableObject {
         // reroute would yank a DV session over to VLC and silently lose Dolby
         // Vision.
         guard !usingDVDirect else { return }
+        // Nor under AetherEngine: it has the container open already, renders
+        // its own subtitle cues and carries HDR10+ / Dolby Vision itself, so
+        // neither answer would change anything but a reroute AWAY from it.
+        guard !usingAether else { return }
         // The direct engine is assigned only AFTER the DV-first preflight's
         // async header probe, so the guard above is always false when a load
         // calls this synchronously. A DV-first attempt in flight is the same
         // case: `fallBackFromDirect` runs the probe if the attempt declines.
         guard playerLayer != nil || !hasDVFirstAttemptInFlight else { return }
-        guard effectiveEngine == .auto || effectiveEngine == .ffmpeg,
+        guard effectiveEngine == .auto || effectiveEngine == .aether || effectiveEngine == .ffmpeg,
               let url = currentEntry.stream.url,
               !probedURLs.contains(url) else { return }
         let wantASS = settings.fullAssSubtitles
@@ -4176,6 +4257,10 @@ final class ClassicPlayerViewModel: ObservableObject {
             dvDirectEngine.pause()
             dvDirectEngine.seek(to: target)
             scheduleResyncClear(after: 0.7)
+        } else if let aetherEngine {
+            aetherEngine.pause()
+            aetherEngine.seek(to: target)
+            scheduleResyncClear(after: 0.7)
         } else if let vlcEngine {
             vlcEngine.seek(to: target)
             vlcEngine.pause()
@@ -4365,6 +4450,28 @@ final class ClassicPlayerViewModel: ObservableObject {
         // previous episode (its cues, its previews, its OP timestamps).
         resetPerLoadSessionState()
 
+        // AETHERENGINE FIRST — on Auto, or when picked by name. One engine for
+        // MKV, MP4, HLS and the rest: hardware decode through AVPlayer where
+        // tvOS can, its own Metal route where it cannot, the panel's native
+        // DV / HDR10+ / HLG modes and lossless or object audio. A link it
+        // fails on is reloaded ONCE through the routing below
+        // (`fallBackFromAether`) and stays declined for this session.
+        // Compatibility mode asks for the most forgiving path, which is the
+        // legacy one; a scheme or manifest only FFmpeg opens skips it too.
+        if overrideURL == nil, !forceDemuxerForSession,
+           effectiveEngine == .aether || (effectiveEngine == .auto && activeMode != .compatibility),
+           !aetherDeclinedLinks.contains(Self.aetherLinkKey(entry)) {
+            decisionLog.record("Engine", "AetherEngine",
+                               because: effectiveEngine == .aether
+                                   ? "selected as the playback engine"
+                                   : "Auto opens every stream with AetherEngine first")
+            loadViaAether(url: url, entry: entry)
+            return
+        }
+        // Coming FROM AetherEngine (its fallback, an engine switch, or a
+        // declined link): shut it down or two engines would run at once.
+        retireAetherEngine()
+
         // VLC engine path: self-contained, skips all the KSPlayer/FFmpeg setup.
         // (Never for the DV playlist — that must ride the native pipeline.)
         if effectiveEngine == .vlc, overrideURL == nil {
@@ -4514,7 +4621,8 @@ final class ClassicPlayerViewModel: ObservableObject {
             // .vlc returns before reaching here; .external is intercepted at
             // playback start (OrivioTVApp) — if a session lands here anyway
             // (e.g. no external app installed), route by container like Auto.
-            case .auto, .vlc, .external: needsFFmpeg = !nativeContainers.contains(ext)
+            // .aether lands here only once AetherEngine declined the link.
+            case .auto, .aether, .vlc, .external: needsFFmpeg = !nativeContainers.contains(ext)
             }
         }
         KSOptions.firstPlayerType = needsFFmpeg ? KSMEPlayer.self : KSAVPlayer.self
@@ -6402,7 +6510,7 @@ final class ClassicPlayerViewModel: ObservableObject {
         let connectionLikelyStale = idleSeconds >= staleResumeThreshold && !proxied
         // The DV-direct engine has no KSPlayerLayer, so it was taking the plain
         // play path this reconnect exists to avoid.
-        let canReconnectBySeek = usingVLC || usingDVDirect || (playerLayer?.player.seekable ?? false)
+        let canReconnectBySeek = usingVLC || usingDVDirect || usingAether || (playerLayer?.player.seekable ?? false)
         ClassicPlayerProbe.event("transport", String(
             format: "RESUME idle=%.0fs proxied=%@ stale=%@ canSeek=%@ → %@",
             idleSeconds, proxied.probe, connectionLikelyStale.probe, canReconnectBySeek.probe,
@@ -7605,6 +7713,17 @@ final class ClassicPlayerViewModel: ObservableObject {
                     if !track.lang.isEmpty { $0.audioLanguage = track.lang }
                 }
             }
+        case .aetherAudio(let id):
+            aetherEngine?.selectAudio(id: id)
+            // Settles the session, as on VLC: later track waves (the Atmos
+            // confirmation republishes the list) must not second-guess it.
+            aetherAudioAutoApplied = true
+            if let track = aetherEngine?.audioTracks.first(where: { $0.id == id }) {
+                ClassicPlaybackMemory.update(meta.id) {
+                    $0.audioTrackLabel = track.displayName
+                    if let lang = track.language, !lang.isEmpty { $0.audioLanguage = lang }
+                }
+            }
         default:
             break
         }
@@ -7670,6 +7789,15 @@ final class ClassicPlayerViewModel: ObservableObject {
                 dvActiveEmbeddedSub = nil
                 dvDirectEngine?.selectSubtitle(nil)
             }
+            // AetherEngine decodes the embedded stream it is told to; an
+            // addon track needs nothing from it.
+            if let embedded = info as? AetherEmbeddedSubtitleInfo {
+                aetherActiveEmbeddedSub = embedded
+                aetherEngine?.selectSubtitle(id: embedded.streamIndex)
+            } else if aetherEngine != nil {
+                aetherActiveEmbeddedSub = nil
+                aetherEngine?.clearSubtitle()
+            }
         case .vlcSubtitle(let id):
             // VLC renders its own subtitles; -1 disables them.
             vlcEngine?.selectSubtitle(id)
@@ -7680,6 +7808,8 @@ final class ClassicPlayerViewModel: ObservableObject {
             subtitleModel.selectedSubtitleInfo = nil
             dvActiveEmbeddedSub = nil
             dvDirectEngine?.selectSubtitle(nil)
+            aetherActiveEmbeddedSub = nil
+            aetherEngine?.clearSubtitle()
             dropDisplayedSubtitleCue()
         }
     }
@@ -7727,6 +7857,8 @@ final class ClassicPlayerViewModel: ObservableObject {
         subtitleModel.selectedSubtitleInfo = nil
         dvActiveEmbeddedSub = nil
         dvDirectEngine?.selectSubtitle(nil)
+        aetherActiveEmbeddedSub = nil
+        aetherEngine?.clearSubtitle()
         dropDisplayedSubtitleCue()
         subtitleModel.removeSubtitles { $0 is URLSubtitleInfo }
         // The viewer's choice stands through the reload: nothing here is an
@@ -7755,6 +7887,7 @@ final class ClassicPlayerViewModel: ObservableObject {
         playbackSpeed = speed
         ClassicPlaybackMemory.update(meta.id) { $0.speed = speed == 1 ? nil : speed }
         if let dvDirectEngine { dvDirectEngine.rate = speed }
+        else if let aetherEngine { aetherEngine.rate = speed }
         else if let vlcEngine { vlcEngine.rate = speed }
         else { playerLayer?.player.playbackRate = speed }
         // Atmos passthrough is 1x only (a bitstream can't be time-stretched):
@@ -7804,7 +7937,7 @@ final class ClassicPlayerViewModel: ObservableObject {
     /// The direct-DV engine now has a real knob too (`setAudioDelay`, which
     /// re-stamps the audio it hands to its renderer), so the row is back there.
     var audioSyncAdjustable: Bool {
-        vlcEngine != nil || dvDirectEngine != nil
+        vlcEngine != nil || dvDirectEngine != nil || aetherEngine != nil
             || (!usingDVDirect && playerLayer?.player is KSMEPlayer)
     }
 
@@ -7814,6 +7947,8 @@ final class ClassicPlayerViewModel: ObservableObject {
         // The engine on screen right now (see `applyAudioSync` for why the DV
         // engine is applied here and at creation, never from there).
         dvDirectEngine?.setAudioDelay(offset)
+        // AetherEngine takes the same convention (positive = audio later).
+        aetherEngine?.setAudioDelay(offset)
         ClassicPlaybackMemory.update(meta.id) { $0.audioSyncOffset = offset == 0 ? nil : offset }
         showToast("Audio sync \(Self.audioSyncLabel(offset))")
     }
@@ -8779,12 +8914,19 @@ final class ClassicPlayerViewModel: ObservableObject {
 
     /// Reload the current stream through a different engine, keeping position.
     func switchEngine(_ engine: PlayerEngine) {
-        guard engine != effectiveEngine else {
+        // Picking AetherEngine (or Auto) while it is already the selection but
+        // declined this link is the viewer asking for another try, not a no-op.
+        let retriesAether = (engine == .aether || engine == .auto) && !usingAether
+            && aetherDeclinedLinks.contains(Self.aetherLinkKey(currentEntry))
+        guard engine != effectiveEngine || retriesAether else {
             overlay = .none
             return
         }
         sessionEngine = engine
         enginePickedThisSession = true
+        // Asking for AetherEngine by name is a fresh chance for a link it
+        // declined earlier this session.
+        if engine == .aether || engine == .auto { aetherDeclinedLinks.remove(Self.aetherLinkKey(currentEntry)) }
         ClassicPlaybackMemory.update(meta.id) { $0.engine = engine.rawValue }
         overlay = .none
         let resumeAt = resumeTargetForReload
@@ -8798,6 +8940,9 @@ final class ClassicPlayerViewModel: ObservableObject {
     /// Fetch every stream for the current title from the installed stream
     /// addons. Torrent entries are kept only when a debrid resolver exists.
     private func fetchAvailableSources(forceRefresh: Bool = false) async -> [StreamEntry] {
+        // A dev test stream has no add-on alternates: a failure should end on
+        // the error screen, not sweep every add-on for an id none of them know.
+        guard !TestStreamCatalog.isTestMeta(meta.id) else { return allEntries }
         let id = currentVideo?.id ?? meta.id
         let type = meta.type
         let hasResolver = torrentResolver != nil
@@ -8918,13 +9063,26 @@ final class ClassicPlayerViewModel: ObservableObject {
                 )
                 return
             }
+            // AetherEngine first, the legacy engines second — on the SAME
+            // source, before any source failover: a link AetherEngine could
+            // not open is usually still a good link for FFmpeg or AVPlayer.
+            if self.usingAether {
+                ClassicPlayerProbe.event("watchdog", "LOAD TIMEOUT (Aether) — falling back after \(timeout)s")
+                ClassicPlayerProbe.count("watchdog.aether-timeout")
+                self.fallBackFromAether(entry: self.currentEntry,
+                                        reason: "no playback within \(timeout)s")
+                return
+            }
             // A FORCED engine that never starts is the likelier corpse than
             // the source: a remembered "Native (AVPlayer)" pick dead-ended
             // every MKV link for a title (AVPlayer can't open them), and
             // failing over just marched through sources on the same broken
             // engine. Retry the SAME source on Auto first, and clear the
             // per-title engine memory so the trap doesn't re-arm next time.
-            if self.effectiveEngine != .auto, self.sessionEngine != nil || ClassicPlaybackMemory.memory(for: self.meta.id)?.engine != nil {
+            // (Not for AetherEngine: it already handed this link to the Auto
+            // routing, so "retrying on Auto" would replay the same attempt.)
+            if self.effectiveEngine != .auto, self.effectiveEngine != .aether,
+               self.sessionEngine != nil || ClassicPlaybackMemory.memory(for: self.meta.id)?.engine != nil {
                 self.showToast("\(self.effectiveEngine.label) engine didn't start — retrying on Auto")
                 Self.dvTrail("forced engine \(self.effectiveEngine.label) never started — clearing memory, retrying on Auto")
                 self.sessionEngine = nil
@@ -9151,6 +9309,9 @@ final class ClassicPlayerViewModel: ObservableObject {
         // entry, so a real addon that happens to be NAMED "Demo" keeps its
         // notice protection.
         guard !(PlayerDevFlags.playerDemo && currentEntry.addonName == "Demo") else { return }
+        // The Settings test streams include short clips (a 10 MB DTS sample),
+        // and their ids are not ones a failover could ever re-scrape.
+        guard !TestStreamCatalog.isTestMeta(meta.id) else { return }
         guard !isExiting, isNoticeClip(seconds) else { return }
         // Above the dedup guard, because the suppression is per LOAD while the
         // guard's set is per SESSION: `resetPerLoadSessionState` clears the flag
@@ -9228,6 +9389,21 @@ final class ClassicPlayerViewModel: ObservableObject {
             isFailingOver = false
             isSwitchingSource = false
             fallBackFromDirect(entry: currentEntry, reason: error.localizedDescription)
+            return
+        }
+        // AetherEngine stalled/died/never started → the legacy engines get
+        // the SAME source first, once. Not for a failure of the LINK itself —
+        // an origin that refuses byte ranges, or a debrid notice clip served
+        // instead of the film (whose check only fires once per URL, so a
+        // same-link reload would play the notice to its end): no engine can
+        // play those, so they go straight to source failover.
+        let nsError = error as NSError
+        let linkFailure = nsError.domain == "OrivioCache"
+            || (nsError.domain == "Orivio.Player" && nsError.code == -20)
+        if usingAether, !linkFailure {
+            isFailingOver = false
+            isSwitchingSource = false
+            fallBackFromAether(entry: currentEntry, reason: error.localizedDescription)
             return
         }
         // (The native-remux branch that followed went with its tier. It was a
@@ -10351,6 +10527,9 @@ final class ClassicPlayerViewModel: ObservableObject {
     func prepareForExit() {
         guard !isExiting else { return }
         isExiting = true
+        // Before `exitDisplaySettleDelay` is read: an AetherEngine session may
+        // have moved the panel without ever reaching a first frame.
+        if aetherEngine != nil { noteAetherDisplay() }
         endAdvanceLadder()
         ClassicPlayerProbe.event("player", "exit")
         unregisterProbes()
@@ -10531,6 +10710,11 @@ final class ClassicPlayerViewModel: ObservableObject {
         playerLayer = nil
         vlcEngine?.stop()
         vlcEngine = nil
+        // Final stop: tears down its AVPlayer / renderers and loopback server.
+        // The display criteria it wrote are released by
+        // `releaseDisplayForExit`, never by the engine (see its `stop`).
+        aetherEngine?.stop(final: true)
+        aetherEngine = nil
         stopAtmosPassthrough()
         dvDirectEngine?.stop()
         // Hand the audio session back so whatever the player interrupted (music
@@ -11042,6 +11226,11 @@ final class ClassicPlayerViewModel: ObservableObject {
     func diagnosticsSnapshot() -> DiagnosticsSnapshot {
         var snap = DiagnosticsSnapshot()
         snap.engine = usingVLC ? "VLC" : engineName + (usingDVDirect ? " · direct DV" : "")
+        if let aether = aetherEngine {
+            // Route and the format the PANEL is in (vs. what the source carries).
+            snap.engine = "AetherEngine · \(aether.routeLabel) · \(aether.videoFormatLabel)"
+                + (aether.sourceFormatLabel != aether.videoFormatLabel ? " (source \(aether.sourceFormatLabel))" : "")
+        }
         snap.bufferSeconds = max(buffered - position, 0)
         if let info = playerLayer?.player.dynamicInfo {
             snap.fps = info.displayFPS
@@ -12367,5 +12556,484 @@ extension ClassicPlayerViewModel: WatchPartyPlayer {
                 if overlay == .pauseInfo { overlay = .none }
             }
         }
+    }
+}
+
+// MARK: - AetherEngine path
+
+extension ClassicPlayerViewModel {
+
+    /// Play `url` through AetherEngine. Self-contained like the VLC path: no
+    /// KSPlayer/FFmpeg setup runs, and every failure hands this SAME link back
+    /// to the legacy routing once (`fallBackFromAether`).
+    private func loadViaAether(url: URL, entry: StreamEntry) {
+        // One engine on screen at a time, exactly as `loadViaVLC` does.
+        if let layer = playerLayer {
+            layer.pause()
+            layer.stop()
+            playerLayer = nil
+        }
+        vlcEngine?.stop()
+        vlcEngine = nil
+
+        currentURL = url
+        loadStartedAt = Date()
+        startLoadWatchdog()
+        engineName = "AetherEngine"
+        // Per-LOAD flags, not per session: a failover or a source switch onto
+        // an Aether link arrives mid-movie with `hasStartedPlayback` already
+        // true (the trap `vlcSessionPrepared` / `dvSessionPrepared` document).
+        aetherSessionPrepared = false
+        lastAetherProbeState = ""
+        aetherAudioAutoApplied = false
+        aetherEmbeddedSubs = [:]
+        aetherActiveEmbeddedSub = nil
+        if !hasStartedPlayback {
+            loadPhase = .loading   // the engine owns its own buffering hold
+            cacheProgress = 0
+        }
+        // Embedded subtitle infos are rebuilt from THIS engine's track list.
+        subtitleModel.selectedSubtitleInfo = nil
+        subtitleModel.url = url
+
+        let engine: AetherPlaybackEngine
+        if let existing = aetherEngine {
+            // Episode → episode (or a failover) on the same engine: keep the
+            // outgoing item on screen until the new one has a frame, instead
+            // of a black gap between the two.
+            existing.prepareForItemReplacement()
+            engine = existing
+        } else {
+            do {
+                engine = try AetherPlaybackEngine()
+            } catch {
+                aetherDeclinedLinks.insert(Self.aetherLinkKey(entry))
+                load(entry: entry)
+                // After the reload: `load` resets the decision log.
+                decisionLog.record("Engine", "AetherEngine unavailable",
+                                   because: String(describing: error))
+                return
+            }
+            aetherEngine = engine
+        }
+
+        engine.onState = { [weak self, weak engine] state in
+            guard let self, let engine, self.aetherEngine === engine else { return }
+            self.aetherStateChanged(state, entry: entry)
+        }
+        engine.onBuffering = { [weak self, weak engine] buffering in
+            guard let self, let engine, self.aetherEngine === engine, !self.isExiting else { return }
+            // Same-value dedupe: each @Published assignment re-renders every
+            // VM observer.
+            if self.isBuffering != buffering { self.isBuffering = buffering }
+            let playing = !buffering && engine.isPlaying
+            if self.isPlaying != playing { self.isPlaying = playing }
+        }
+        engine.onTime = { [weak self, weak engine] current, total, ahead, source in
+            guard let self, let engine, self.aetherEngine === engine else { return }
+            self.aetherTimeChanged(current: current, total: total, buffered: ahead, source: source)
+        }
+        engine.onTracksChanged = { [weak self, weak engine] in
+            // The Atmos confirmation and late streams republish the list.
+            guard let self, let engine, self.aetherEngine === engine,
+                  self.aetherSessionPrepared else { return }
+            self.loadAetherTracks()
+        }
+        engine.onSubtitleCues = { [weak self, weak engine] cues in
+            guard let self, let engine, self.aetherEngine === engine,
+                  let active = self.aetherActiveEmbeddedSub else { return }
+            // On the remote-HLS route AVPlayer draws the rendition itself;
+            // feeding the overlay too would double every caption.
+            active.replace(with: engine.subtitlesDrawnByPlayer ? [] : cues)
+        }
+        engine.onVideoInfoChanged = { [weak self, weak engine] in
+            guard let self, let engine, self.aetherEngine === engine else { return }
+            let size = engine.naturalSize
+            if size != .zero, self.videoNaturalSize != size { self.videoNaturalSize = size }
+            self.noteAetherDisplay()
+        }
+
+        let resume = max(pendingResume ?? 0, sessionResumeFloor)
+        // RAISE THE FLOOR BEFORE THE OPEN, as the VLC path does: the clock
+        // reads ~0 until the start position lands, and a failover inside that
+        // window would otherwise reopen the replacement at 00:00.
+        if resume > 5 { sessionResumeFloor = max(sessionResumeFloor, resume) }
+        // Baseline for the progress test in `aetherTimeChanged`: the start
+        // position itself must not count as movement.
+        aetherLastTickTime = resume
+
+        // The engine builds its own renderers, so nothing else puts the audio
+        // session into .moviePlayback (the VLC and DV paths had this gap).
+        ClassicAudioOutputCapability.configureForMoviePlayback()
+        let generation = loadGeneration
+        Task { [weak self, weak engine] in
+            // The route is read for the audio configuration below, and an
+            // inactive session answers "2 channels". Off main: activation is
+            // an IPC round trip to mediaserverd.
+            await Task.detached(priority: .userInitiated) {
+                try? AVAudioSession.sharedInstance().setActive(true)
+            }.value
+            guard let self, let engine, self.isCurrentLoad(generation),
+                  self.aetherEngine === engine else { return }
+            let config = self.aetherLoadConfiguration(url: url, entry: entry)
+            engine.load(url: url, startPosition: resume > 5 ? resume : nil, configuration: config)
+            self.decisionLog.record(
+                "Dolby Audio",
+                config.objectAudioBedChannels > 0
+                    ? "Object audio rendered (\(config.objectAudioBedChannels >= 16 ? "9.1.6" : "7.1.4") bed)"
+                    : (config.losslessAudioBridge ? "Lossless LPCM bridge" : "Surround (E-AC-3) bridge"),
+                because: "route: \(ClassicAudioOutputCapability.routeShortDescription), "
+                    + "\(ClassicAudioOutputCapability.maxOutputChannels) ch; "
+                    + "E-AC-3 / AC-3 keep their bitstream on the AVPlayer route"
+            )
+        }
+        ClassicPlayerProbe.event("load", "aether start host=\(url.host ?? "?") resume=\(Int(resume))")
+        NSLog("[OrivioPlayer] load start engine=AetherEngine url-host=%@", url.host ?? "?")
+        videoRefreshID = UUID()   // attach the engine's view
+    }
+
+    private static func aetherLinkKey(_ entry: StreamEntry) -> String {
+        entry.stream.url ?? entry.rejectionKey
+    }
+
+    /// The per-load engine knobs, from what this Apple TV, its route and the
+    /// source say.
+    private func aetherLoadConfiguration(url: URL, entry: StreamEntry) -> AetherLoadConfiguration {
+        var config = AetherLoadConfiguration()
+        config.httpHeaders = entry.stream.behaviorHints?.proxyHeaders?.requestHeaders ?? [:]
+        config.preferredAudioLanguages = aetherPreferredAudioLanguages
+        // The Apple TV's own Match Content switch, as every other path reads it.
+        config.matchContent = UIApplication.shared.ks_keyWindow?.avDisplayManager
+            .isDisplayCriteriaMatchingEnabled ?? true
+        // LOSSLESS ONLY ON A ROUTE THAT REPORTS 7.1 LPCM. The engine cannot
+        // tell an HDMI receiver from a legacy-ARC soundbar, and on the latter
+        // multichannel LPCM silently folds to stereo — where the E-AC-3 bridge
+        // keeps the surround. An AVR (or eARC) reports 8 output channels.
+        let channels = ClassicAudioOutputCapability.maxOutputChannels
+        let fullRoute = channels >= 8
+        config.losslessAudioBridge = fullRoute
+        // TrueHD Atmos / DTS:X objects rendered into a height bed (tvOS 26+):
+        // over HDMI tvOS wraps it as Dolby MAT for the receiver, over AirPlay
+        // it goes as Apple Positional Audio. 7.1.4 unless the route takes more.
+        config.objectAudioBedChannels = (fullRoute || ClassicAudioOutputCapability.routeIsSpatial)
+            ? max(12, channels) : 0
+        config.confirmAtmos = true
+        // Profile 7 FEL composed for real on the software route, on a panel
+        // that can show Dolby Vision at all.
+        config.preferDualLayerDolbyVision = DynamicRange.availableHDRModes.contains(.dolbyVision)
+        // Disk-backed segments (~4 s each), so a deep window costs storage,
+        // not RAM — the engine caps it at a quarter of the free tmp volume.
+        switch SizeTier(bytes: entry.stream.behaviorHints?.videoSize) {
+        case .small: config.forwardBufferSegments = 15
+        case .medium, .unknown: config.forwardBufferSegments = 30
+        case .large: config.forwardBufferSegments = 45
+        }
+        config.progressiveSegmentDelivery = true
+        config.audioDelaySeconds = audioSyncOffset
+        // Remote HLS goes straight to AVPlayer (its own ABR, its renditions).
+        config.isRemoteHLS = url.pathExtension.lowercased() == "m3u8"
+        return config
+    }
+
+    /// Settings first, the per-title memory second — the order `loadTracks`
+    /// settled on. The engine resolves the synonyms (639-1/2, English names)
+    /// itself, so canonical codes are enough.
+    private var aetherPreferredAudioLanguages: [String] {
+        var out: [String] = []
+        let remembered = ClassicPlaybackMemory.memory(for: meta.id)?.audioLanguage ?? ""
+        for want in [settings.preferredAudioLanguage, remembered] where !want.isEmpty {
+            let code = ClassicAudioLanguageMatch.normalizedCode(want)
+            if !code.isEmpty, code != "und", !out.contains(code) { out.append(code) }
+        }
+        return out
+    }
+
+    private func aetherStateChanged(_ state: AetherPlaybackState, entry: StreamEntry) {
+        // Exiting: swallow only — teardown() stops the engine at dismissal.
+        if isExiting { return }
+        noteAetherDisplay()
+        let tag = "\(state)"
+        if tag != lastAetherProbeState {
+            lastAetherProbeState = tag
+            ClassicPlayerProbe.event("state", String(format: "aether → %@ at %.1f", tag, position))
+        }
+        switch state {
+        case .failed(let message):
+            isPlaying = false
+            fallBackFromAether(entry: entry, reason: message)
+        case .ended:
+            isPlaying = false
+            handlePlayedToEnd()
+        case .playing:
+            pausedAt = nil
+            if !isBuffering, !isPlaying { isPlaying = true }
+        case .paused:
+            if isPlaying { isPlaying = false }
+            if hasStartedPlayback { markPaused() }
+        case .idle, .loading, .seeking:
+            break
+        }
+    }
+
+    private func aetherTimeChanged(current: Double, total: Double, buffered ahead: Double, source: Double) {
+        guard current.isFinite, !isExiting else { return }
+        // BUFFERING IS ABOUT PROGRESS, NOT ABOUT TICKS — see the DV tick.
+        let advanced = current > aetherLastTickTime + 0.01
+        aetherLastTickTime = current
+        if advanced, isBuffering { isBuffering = false }
+        // The engine's own word, as the DV tick does: the buffering callback
+        // may have fired its only `false` before the first `.playing`.
+        if advanced, let engine = aetherEngine, isPlaying != engine.isPlaying {
+            isPlaying = engine.isPlaying
+        }
+        refreshPictureInPictureSource()
+        markPlaybackProgressed(currentTime: current)
+        position = current
+        if abs(clock.position - current) >= 0.4 { clock.position = current }
+        if total > 0, total.isFinite, duration != total {
+            duration = total
+            clock.duration = total
+            MediaCacheServer.shared.noteDuration(total)
+            noteDurationForNoticeCheck(total)
+        }
+        let aheadPosition = max(ahead, current)
+        buffered = aheadPosition
+        if abs(clock.buffered - aheadPosition) >= 1.0 { clock.buffered = aheadPosition }
+        publishBufferHealth()
+        if advanced {
+            // Only an ADVANCING clock proves the load alive (the DV lesson).
+            markLoadStarted()
+            prepareAetherSessionIfNeeded()
+            saveProgressThrottled()
+        }
+        updateSkipIntro()
+        maybeArmAutoNext()
+        // Embedded cues are on the SOURCE timeline; addon subtitles follow the
+        // presentation clock like on every other engine.
+        let subtitleTime = subtitleModel.selectedSubtitleInfo is AetherEmbeddedSubtitleInfo ? source : current
+        _ = subtitleModel.subtitle(currentTime: subtitleTime)
+    }
+
+    /// First real progress of this load: everything the other engines do at
+    /// their first-playback moment.
+    private func prepareAetherSessionIfNeeded() {
+        guard !aetherSessionPrepared, let engine = aetherEngine else { return }
+        aetherSessionPrepared = true
+        loadPhase = nil
+        if !hasStartedPlayback {
+            hasStartedPlayback = true
+            if overlay == .none { showControls() }
+        }
+        let size = engine.naturalSize
+        if size != .zero { videoNaturalSize = size }
+        if playbackSpeed != 1 { engine.rate = playbackSpeed }
+        chapters = engine.chapters.map { Chapter(start: $0.start, end: $0.end, title: $0.title) }
+        loadAetherTracks()
+        fetchAddonSubtitles()
+        startThumbnailsIfNeeded()
+        noteAetherDisplay()
+        trailMem("aether start")
+        decisionLog.record("Video", "\(engine.sourceFormatLabel) → \(engine.videoFormatLabel)",
+                           because: "AetherEngine, \(engine.routeLabel)"
+                               + (engine.videoDecoderLabel.map { ", \($0)" } ?? ""))
+
+        // The start position was handed to the open. If it did not land (a
+        // source that cannot seek at open), ask once more, then release the
+        // target — left set, it floors every later save (the DV tick's trap).
+        guard let resume = pendingResume, resume > 5 else { pendingResume = nil; return }
+        guard abs(position - resume) > 15, duration == 0 || resume < duration - 30 else {
+            pendingResume = nil
+            return
+        }
+        engine.seek(to: resume)
+        let generation = loadGeneration
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            guard let self, self.isCurrentLoad(generation) else { return }
+            self.pendingResume = nil
+        }
+    }
+
+    /// Build the audio picker and the embedded-subtitle infos from the
+    /// engine's track lists. Re-run on every republish.
+    private func loadAetherTracks() {
+        guard let engine = aetherEngine else { return }
+        let audio = engine.audioTracks.map {
+            TrackOption(id: "aether-audio-\($0.id)", displayName: $0.displayName,
+                        payload: .aetherAudio($0.id))
+        }
+        // Equality is by id only; a republish can rename (Atmos confirmed).
+        if audio.map({ $0.id + $0.displayName }) != audioOptions.map({ $0.id + $0.displayName }) {
+            audioOptions = audio
+        }
+        if let active = engine.activeAudioID, selectedAudioID != "aether-audio-\(active)" {
+            selectedAudioID = "aether-audio-\(active)"
+        }
+
+        // Embedded subtitle tracks join the shared SubtitleModel; the picker
+        // and the overlay treat them like any other source (cues stream in).
+        var added = false
+        for track in engine.subtitleTracks where aetherEmbeddedSubs[track.id] == nil {
+            let info = AetherEmbeddedSubtitleInfo(streamIndex: track.id, label: Self.aetherSubtitleLabel(track))
+            aetherEmbeddedSubs[track.id] = info
+            subtitleModel.addSubtitle(info: info)
+            added = true
+        }
+        if added { rebuildSubtitleOptions() }
+        applyPreferredAetherAudioIfNeeded()
+    }
+
+    private static func aetherSubtitleLabel(_ track: AetherTrack) -> String {
+        let language = ClassicAudioLanguageMatch.displayName(for: track.language)
+        var label: String
+        if track.name.isEmpty {
+            label = language ?? "Track \(track.id)"
+        } else if let language, !track.name.localizedCaseInsensitiveContains(language) {
+            label = "\(language) – \(track.name)"
+        } else {
+            label = track.name
+        }
+        if track.isForced, !label.localizedCaseInsensitiveContains("forced") { label += " (Forced)" }
+        if track.isHearingImpaired, !label.localizedCaseInsensitiveContains("sdh") { label += " (SDH)" }
+        return "\(label) · Embedded"
+    }
+
+    /// The engine picked the first-frame track from the language preference
+    /// (and preferred Atmos / DTS:X within it). What it cannot know is the
+    /// exact track remembered for this title — AC-3 5.1 over the TrueHD
+    /// default, say. Same language only, and never written back to memory:
+    /// this is not the viewer's pick.
+    private func applyPreferredAetherAudioIfNeeded() {
+        guard !aetherAudioAutoApplied, let engine = aetherEngine else { return }
+        let tracks = engine.audioTracks
+        guard !tracks.isEmpty, let activeID = engine.activeAudioID else { return }
+        aetherAudioAutoApplied = true
+        guard let label = ClassicPlaybackMemory.memory(for: meta.id)?.audioTrackLabel, !label.isEmpty,
+              let active = tracks.first(where: { $0.id == activeID }),
+              active.displayName != label,
+              let match = tracks.first(where: { $0.displayName == label }),
+              match.language.map(ClassicAudioLanguageMatch.normalizedCode)
+                == active.language.map(ClassicAudioLanguageMatch.normalizedCode)
+        else { return }
+        engine.selectAudio(id: match.id)
+        selectedAudioID = "aether-audio-\(match.id)"
+        decisionLog.record("Audio Track", match.displayName, because: "remembered for this title")
+    }
+
+    /// The engine owns the HDMI handshake; the exit path still has to know
+    /// one happened so it releases the panel behind its cover.
+    ///
+    /// Read off the display manager itself, not off the first frame: the
+    /// engine writes the criteria synchronously BEFORE the item is assigned,
+    /// so a load that fails (or an exit) before any frame has already moved
+    /// the panel. Called at every point an Aether session can end.
+    private func noteAetherDisplay() {
+        guard !displayCriteriaApplied,
+              let manager = UIApplication.shared.ks_keyWindow?.avDisplayManager,
+              manager.isDisplayCriteriaMatchingEnabled,
+              manager.preferredDisplayCriteria != nil
+        else { return }
+        displayCriteriaApplied = true
+    }
+
+    /// AetherEngine could not play this link: reload it ONCE through the
+    /// legacy routing (AVPlayer / FFmpeg), keeping the playhead. Normal source
+    /// failover takes over from there.
+    private func fallBackFromAether(entry: StreamEntry, reason: String) {
+        guard aetherEngine != nil, !isExiting else { return }
+        // CAPTURE THE PLAYHEAD FIRST — see `fallBackFromDirect`.
+        let resumeAt = resumeTargetForReload
+        if resumeAt > 10 {
+            sessionResumeFloor = max(sessionResumeFloor, resumeAt)
+            pendingResume = resumeAt
+        }
+        aetherDeclinedLinks.insert(Self.aetherLinkKey(entry))
+        ClassicPlayerProbe.event("aether", "fallback — \(reason)")
+        retireAetherEngine()
+        load(entry: entry)
+        // After the reload: `load` resets the decision log.
+        decisionLog.record("Engine", "AetherEngine declined this link", because: reason)
+        // On the KSPlayer path now: run the probe the Aether load skipped.
+        runStreamProbe()
+    }
+
+    /// Shut the engine down for a hand-off to another engine.
+    private func retireAetherEngine() {
+        guard let engine = aetherEngine else { return }
+        // Its criteria stay on the panel after the hand-off (the next engine
+        // may never write any), so the exit must still release them.
+        noteAetherDisplay()
+        engine.onState = nil
+        engine.onBuffering = nil
+        engine.onTime = nil
+        engine.onTracksChanged = nil
+        engine.onSubtitleCues = nil
+        engine.onVideoInfoChanged = nil
+        // FINAL, though another engine follows: this instance is being thrown
+        // away, and only a final stop unbinds its view, drops its observers
+        // and leaves the engine's shared-output registry. The audio session
+        // is untouched either way (deactivatesAudioSessionOnStop is off), and
+        // the display criteria are never reset by our stop.
+        engine.stop(final: true)
+        aetherEngine = nil
+        // Its embedded-subtitle infos die with it (the DV path's stale-cue bug).
+        if subtitleModel.selectedSubtitleInfo is AetherEmbeddedSubtitleInfo {
+            subtitleModel.selectedSubtitleInfo = nil
+        }
+        subtitleModel.removeSubtitles { $0 is AetherEmbeddedSubtitleInfo }
+        aetherEmbeddedSubs = [:]
+        aetherActiveEmbeddedSub = nil
+        videoRefreshID = UUID()   // detach the engine's view
+    }
+}
+
+/// One embedded subtitle track of an AetherEngine session, bridged into the
+/// shared SubtitleModel. The engine publishes the whole decoded cue list for
+/// the active track; `replace` mirrors it.
+final class AetherEmbeddedSubtitleInfo: SubtitleInfo {
+    let subtitleID: String
+    let name: String
+    var delay: TimeInterval = 0
+    var isEnabled: Bool = false
+    let streamIndex: Int
+    var parts: [SubtitlePart] = []
+    /// Built parts by cue id, so a republish does not re-wrap every bitmap.
+    private var partsByCue: [Int: SubtitlePart] = [:]
+
+    init(streamIndex: Int, label: String) {
+        self.streamIndex = streamIndex
+        subtitleID = "aethersub-\(streamIndex)"
+        name = label
+    }
+
+    func replace(with cues: [AetherSubtitleCue]) {
+        var next: [Int: SubtitlePart] = [:]
+        next.reserveCapacity(cues.count)
+        for cue in cues {
+            if let part = partsByCue[cue.id], part.start == cue.start {
+                part.end = cue.end
+                next[cue.id] = part
+                continue
+            }
+            let part = SubtitlePart(cue.start, cue.end,
+                                    attributedString: cue.text.map { NSAttributedString(string: $0) })
+            if let image = cue.image {
+                part.image = UIImage(cgImage: image)
+                part.origin = cue.origin
+                part.canvasSize = cue.canvasSize
+            }
+            next[cue.id] = part
+        }
+        partsByCue = next
+        parts = next.values.sorted(by: <)
+    }
+
+    func search(for time: TimeInterval) -> [SubtitlePart] {
+        var result = [SubtitlePart]()
+        for part in parts {
+            if part == time { result.append(part) }
+            else if part.start > time { break }
+        }
+        return result
     }
 }

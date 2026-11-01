@@ -145,12 +145,15 @@ struct HomeSettings: SettingsModel {
 
 // MARK: - Player (per profile)
 
+/// `aether` only drives the classic (VOD) player, which hosts AetherEngine;
+/// the live-TV player treats it like `auto`.
 enum EnginePreference: String, Codable, CaseIterable, Identifiable {
-    case auto, native, ffmpeg, vlc, external
+    case auto, aether, native, ffmpeg, vlc, external
     var id: String { rawValue }
     var label: String {
         switch self {
         case .auto: return "Auto"
+        case .aether: return "AetherEngine"
         case .native: return "Native"
         case .ffmpeg: return "FFmpeg"
         case .vlc: return "VLC"

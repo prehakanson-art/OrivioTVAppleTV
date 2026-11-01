@@ -46,7 +46,8 @@ final class ClassicScrobbler {
     }
 
     func start(_ meta: MetaItem, _ video: MetaVideo?, resume: Double?) {
-        guard enabled else { current = nil; return }
+        // A dev test stream has no title Trakt could know.
+        guard enabled, !TestStreamCatalog.isTestMeta(meta.id) else { current = nil; return }
         if let c = current, c.meta.id == meta.id, c.video?.id == video?.id { return }
         if current != nil { stop() }
         current = (meta, video)
