@@ -45,16 +45,20 @@ enum BufferProfile: String, Codable, CaseIterable {
 }
 
 /// Which playback engine opens a stream first.
-/// - auto: route by container — Apple's hardware AVPlayer for native formats
+/// - auto: AetherEngine first (every container and codec, Dolby Vision /
+///   HDR10+ / HLG, lossless and object audio); when it cannot play a stream,
+///   route by container — Apple's hardware AVPlayer for native formats
 ///   (MP4/HLS), FFmpeg (VideoToolbox-accelerated) for MKV & friends. The
 ///   other engine remains the automatic fallback either way.
+/// - aether: force AetherEngine first (it still falls back to the others).
 /// - native / ffmpeg: force that engine first for every stream.
 enum PlayerEngine: String, Codable, CaseIterable {
-    case auto, native, ffmpeg, vlc, external
+    case auto, aether, native, ffmpeg, vlc, external
 
     var label: String {
         switch self {
         case .auto: return "Auto (recommended)"
+        case .aether: return "AetherEngine"
         case .native: return "Native (AVPlayer)"
         case .ffmpeg: return "FFmpeg (KSPlayer)"
         case .vlc: return "VLC"
@@ -64,12 +68,14 @@ enum PlayerEngine: String, Codable, CaseIterable {
 
     var footnote: String {
         switch self {
+        case .aether:
+            return "AetherEngine plays MKV, MP4, HLS and more with hardware decode, the panel's native Dolby Vision / HDR10+ / HLG modes and lossless or Atmos audio. FFmpeg takes over automatically if a stream fails."
         case .vlc:
             return "VLC buffers internally (no cache bar) and renders its own subtitles. Try it when a file is choppy on the other engines."
         case .external:
             return "Send every stream to another player app installed on this Apple TV (Infuse, VLC, …) instead of playing in Orivio. Pick the app below."
         default:
-            return "Auto picks the hardware AVPlayer for MP4/HLS and FFmpeg for MKV & friends; the other engine stays as automatic fallback."
+            return "Auto opens every stream with AetherEngine; if it cannot play one, the hardware AVPlayer (MP4/HLS) or FFmpeg (MKV & friends) takes over automatically."
         }
     }
 }

@@ -331,7 +331,7 @@ instance on the network.
 
 | Control | Type | What it does | Works? |
 | --- | --- | --- | --- |
-| Playback engine | Dropdown | Which engine opens streams | Wired |
+| Playback engine | Dropdown | Which engine opens streams. Auto and AetherEngine open every movie/episode with AetherEngine first and reload it through AVPlayer / FFmpeg if it fails; Native, FFmpeg and VLC force that engine. Live TV treats AetherEngine as Auto | Wired |
 | Playback mode | Dropdown | Automatic picks the best supported path; Maximum Fidelity never downgrades (native DV, Profile 7 conversion always on, Atmos renderer); Compatibility pins the safe paths | Wired |
 | Buffer ahead | Dropdown | How much video to download ahead. Auto sizes to the file | Wired |
 | Hybrid disk cache | Switch | Downloads the film to storage at full speed while playing so seeking into downloaded parts is instant. Direct-file streams only; the cache is deleted when playback ends | Wired — **see Known interactions** |

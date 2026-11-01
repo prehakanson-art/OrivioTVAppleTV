@@ -105,6 +105,8 @@ extension ProgressStore {
 
     /// The episode was watched to its end: record it finished and mark it watched.
     func markFinished(meta: MetaItem, video: MetaVideo?) {
+        // Dev test streams (Settings → Playback → Test streams) are never watch history.
+        guard !TestStreamCatalog.isTestMeta(meta.id) else { return }
         let key = Self.key(metaID: meta.id, video: video)
         let duration = max(progress(for: key)?.duration ?? 0, 1)
         classicRecord(meta: meta, video: video, position: duration, duration: duration, signature: nil, transient: false)
@@ -114,7 +116,7 @@ extension ProgressStore {
     /// Same record the new player writes (see PlayerViewModel.saveProgress).
     private func classicRecord(meta: MetaItem, video: MetaVideo?, position: Double, duration: Double,
                                signature: StreamSignature?, transient: Bool) {
-        guard duration > 0, position > 5 else { return }
+        guard duration > 0, position > 5, !TestStreamCatalog.isTestMeta(meta.id) else { return }
         let key = Self.key(metaID: meta.id, video: video)
         var p = WatchProgress(id: key, metaID: meta.id, type: meta.type, videoID: video?.id, season: video?.season,
                               episode: video?.episode, position: position, duration: duration, updatedAt: Date(),

@@ -666,7 +666,7 @@ final class ClassicScrubThumbnailer: @unchecked Sendable {
     }
 
     /// Scale one decoded frame into a BGRA CGImage-backed UIImage.
-    private static func image(
+    static func image(
         from frame: UnsafeMutablePointer<AVFrame>,
         scaler: OpaquePointer,
         width: Int32,

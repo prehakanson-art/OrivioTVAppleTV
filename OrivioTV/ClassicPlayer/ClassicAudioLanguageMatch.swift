@@ -97,6 +97,15 @@ enum ClassicAudioLanguageMatch {
     /// Foundation's own identifier parser does the 639-2/B and 639-2/T mapping,
     /// so this works for EVERY language rather than only the alias table above.
     /// Unrecognized tags are returned lowercased and otherwise untouched.
+    /// The code for a language NAME ("Français", "English"), for engines that
+    /// report a display name and no tag (VLC). Nil when it isn't one.
+    static func code(forName name: String) -> String? {
+        let key = name.lowercased().folding(options: .diacriticInsensitive, locale: nil)
+            .trimmingCharacters(in: .whitespaces)
+        for (short, forms) in aliases where forms.contains(key) { return short }
+        return nil
+    }
+
     static func normalizedCode(_ code: String) -> String {
         let bare = code.lowercased()
             .split(whereSeparator: { $0 == "-" || $0 == "_" })
@@ -169,5 +178,125 @@ enum ClassicAudioLanguageMatch {
             return true
         }
         return false
+    }
+}
+
+/// The audio picker's row text, the same on every engine.
+///
+/// Each engine used to build its own (VLC still can't do much better: it
+/// reports a display name only, so its rows get the language and dub, not
+/// the codec): KSPlayer put the language in brackets
+/// after the title ("Surround 7.1 (French)", which the picker's width cut
+/// off), the DV engine joined tag, codec and channel count ("French · AC3 ·
+/// 6ch"), AetherEngine showed the bare title. The row is now always the
+/// language (with the French dub, VFQ / VFF / VFI) first, then the track's
+/// own title, or, when the title only restates what the row already says,
+/// codec and layout: "French (VFQ) – DD+ 5.1".
+enum ClassicAudioTrackLabel {
+
+    /// - Parameters:
+    ///   - title: the container's track title, as the engine reports it.
+    ///   - languageTag: the container's language tag ("fre", "fr-CA").
+    ///   - codec: FFmpeg's codec name ("truehd", "eac3") or an engine's own
+    ///     display name ("Dolby Digital+"); both are shortened alike.
+    ///   - profile: the codec profile ("Dolby TrueHD + Dolby Atmos",
+    ///     "DTS-HD MA"), which names Atmos and DTS-HD before decode does.
+    ///   - note: an engine fact appended last ("→ PCM").
+    static func make(title rawTitle: String?, languageTag: String?, codec rawCodec: String?,
+                     profile: String? = nil, channels: Int, atmos: Bool = false, dtsx: Bool = false,
+                     commentary: Bool = false, note: String? = nil, fallbackID: Int) -> String {
+        var title = rawTitle?.trimmingCharacters(in: .whitespaces) ?? ""
+        // An untitled track comes back as "ENG (eac3)" from AetherEngine and
+        // as the bare tag ("eng") from KSPlayer: the row already says both.
+        if title.caseInsensitiveCompare(languageTag ?? "") == .orderedSame
+            || title.range(of: #"^[a-z]{2,3} \([a-z0-9_]+\)$"#, options: [.regularExpression, .caseInsensitive]) != nil {
+            title = ""
+        }
+        let profileLower = profile?.lowercased() ?? ""
+        let codec = shortCodec(rawCodec, profile: profile)
+        let object: String? = atmos || profileLower.contains("atmos") ? "Atmos"
+            : (dtsx || profileLower.contains("dts:x") ? "DTS:X" : nil)
+
+        var language = ClassicAudioLanguageMatch.displayName(for: languageTag)
+        let dub = frenchDub(languageTag: languageTag, title: title)
+        if dub == nil, let tag = languageTag, tag.contains("-") || tag.contains("_"),
+           let regional = Locale.current.localizedString(forIdentifier: tag.replacingOccurrences(of: "_", with: "-")) {
+            language = regional   // "Portuguese (Brazil)"
+        }
+        if let dub, let name = language { language = "\(name) (\(dub))" }
+
+        // Words a title can hold that the row already shows: the layout, the
+        // language, and the French dub markers.
+        let generic = title.range(
+            of: #"^(surround|stereo|mono|\d\.\d|\d+ ?ch(annels)?|english|anglais|french|fran[cç]ais|vf[fqi2]?|ca|fr|qc|canada|canadien|france|qu[ée]bec|[\s.,·()\[\]_-])*$"#,
+            options: [.regularExpression, .caseInsensitive]) != nil
+        var detail: String
+        if generic {
+            let layout: String? = switch channels {
+            case 1: "Mono"
+            case 2: "2.0"
+            case 3...: "\(channels - 1).1"
+            default: nil
+            }
+            // KSPlayer's codec already reads "TrueHD Atmos".
+            let objectWord = object.flatMap { codec?.localizedCaseInsensitiveContains($0) == true ? nil : $0 }
+            detail = [codec, objectWord, layout].compactMap { $0 }.joined(separator: " ")
+        } else {
+            detail = title
+            if let codec, !detail.localizedCaseInsensitiveContains(codec) { detail += " · \(codec)" }
+            if let object, !detail.localizedCaseInsensitiveContains(object) { detail += " \(object)" }
+        }
+        if commentary, !detail.lowercased().contains("comment") { detail += " (Commentary)" }
+        if let note { detail += " \(note)" }
+
+        var label: String
+        if let language, !detail.localizedCaseInsensitiveContains(language) {
+            label = detail.isEmpty ? language : "\(language) – \(detail)"
+        } else {
+            label = detail
+        }
+        if label.isEmpty { label = "Track \(fallbackID)" }
+        return label
+    }
+
+    /// The codec as the picker spells it: short enough that a row with a
+    /// language and a dub still fits ("DD+", not "Dolby Digital+").
+    static func shortCodec(_ raw: String?, profile: String? = nil) -> String? {
+        guard let raw, !raw.isEmpty else { return nil }
+        let codec = raw.lowercased()
+        let profile = profile ?? ""
+        switch codec {
+        case "truehd", "mlp": return "TrueHD"
+        case "eac3", "e-ac-3", "dolby digital+": return "DD+"
+        case "ac3", "ac-3", "dolby digital": return "DD"
+        case "dts", "dts-hd":
+            return profile.uppercased().contains("HD") ? profile : (codec == "dts-hd" ? "DTS-HD" : "DTS")
+        case "aac": return "AAC"
+        case "flac": return "FLAC"
+        case "opus": return "Opus"
+        default:
+            if codec.hasPrefix("dolby digital+") { return "DD+" + raw.dropFirst("dolby digital+".count) }
+            if codec.hasPrefix("dolby digital") { return "DD" + raw.dropFirst("dolby digital".count) }
+            return codec.hasPrefix("pcm") ? "PCM" : (raw == codec ? raw.uppercased() : raw)
+        }
+    }
+
+    /// Which French dub a track is, from its tag's region or its title: VFQ
+    /// (Quebec), VFF (France) or VFI (international). Nil for any other
+    /// language, and for a French track that says neither.
+    static func frenchDub(languageTag: String?, title: String) -> String? {
+        let tag = languageTag ?? ""
+        let titleSaysFrench = title.range(of: #"\b(fr(ench|an[cç]ais)?|vf[fqi2]?)\b"#,
+                                          options: [.regularExpression, .caseInsensitive]) != nil
+        guard ClassicAudioLanguageMatch.normalizedCode(tag) == "fr" || (tag.isEmpty && titleSaysFrench)
+        else { return nil }
+        let region = tag.lowercased().split(whereSeparator: { $0 == "-" || $0 == "_" }).dropFirst().first
+        func says(_ pattern: String) -> Bool {
+            title.range(of: pattern, options: [.regularExpression, .caseInsensitive]) != nil
+        }
+        if region == "ca" || says(#"\b(vfq|ca|qc|canad\w*|qu[ée]bec\w*)\b"#) { return "VFQ" }
+        if says(#"\bvfi\b"#) { return "VFI" }
+        if region == "fr" || says(#"\b(vff|vf2|france)\b"#) { return "VFF" }
+        return nil
     }
 }

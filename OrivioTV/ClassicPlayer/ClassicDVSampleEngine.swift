@@ -80,7 +80,15 @@ final class ClassicDVSampleEngine {
     private(set) var detectedDVProfile = 0
 
     /// Eligible audio tracks discovered at open, for the picker.
-    struct AudioTrack { let index: Int32; let label: String; let lang: String }
+    struct AudioTrack {
+        let index: Int32
+        /// "French · AC3 · 6ch" — also the KEY a remembered pick is stored
+        /// under and the channel count is read back from, so it stays as is.
+        /// The picker shows `displayName`.
+        let label: String
+        let lang: String
+        var displayName: String = ""
+    }
     private(set) var audioTracks: [AudioTrack] = []
 
     /// What the engine is doing with the SELECTED audio track — the honest
@@ -1418,7 +1426,14 @@ final class ClassicDVSampleEngine {
                 let language = Locale.current.localizedString(forLanguageCode: lang) ?? lang
                 let label = [language, codecName, channels > 0 ? "\(channels)ch" : ""]
                     .filter { !$0.isEmpty }.joined(separator: " · ")
-                audioTracks.append(AudioTrack(index: Int32(i), label: label.isEmpty ? "Track \(i)" : label, lang: lang))
+                let profile = avcodec_profile_name(id, par.pointee.profile).map { String(cString: $0) }
+                let rawTitle = av_dict_get(stream.pointee.metadata, "title", nil, 0)?.pointee.value.map { String(cString: $0) }
+                audioTracks.append(AudioTrack(
+                    index: Int32(i), label: label.isEmpty ? "Track \(i)" : label, lang: lang,
+                    displayName: ClassicAudioTrackLabel.make(
+                        title: rawTitle, languageTag: lang, codec: codecName.lowercased(), profile: profile,
+                        channels: channels, commentary: (stream.pointee.disposition & AV_DISPOSITION_COMMENT) != 0,
+                        fallbackID: i)))
                 // Snapshot what this track IS and what the engine would do
                 // with it, while the context is in hand. See audioPathByStream.
                 var report = AudioPathReport()

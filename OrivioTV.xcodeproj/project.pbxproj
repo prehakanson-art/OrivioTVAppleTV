@@ -35,6 +35,8 @@
 		3171E5E8E4D413547AD88821 /* FocusArtView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FFAB3C2417CA644C7796F720 /* FocusArtView.swift */; };
 		32AF19C4C6357556EEC17091 /* CastService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F9BA917B20CC514DFDC28EB /* CastService.swift */; };
 		34F43A0B68157219C92569BA /* TopShelfSnapshot.swift in Sources */ = {isa = PBXBuildFile; fileRef = 57915924DC3840A757CD7EE3 /* TopShelfSnapshot.swift */; };
+		A1E7A0B1C2D3E4F5A6B7C801 /* OrivioAether in Frameworks */ = {isa = PBXBuildFile; productRef = A1E7A0B1C2D3E4F5A6B7C802 /* OrivioAether */; };
+		A1E7A0B1C2D3E4F5A6B7C807 /* OrivioAether in Embed Frameworks */ = {isa = PBXBuildFile; productRef = A1E7A0B1C2D3E4F5A6B7C802 /* OrivioAether */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
 		353F4BD65084C884A72125F3 /* KSPlayer in Frameworks */ = {isa = PBXBuildFile; productRef = 4C595A0AAA5873BDB7D3A0FA /* KSPlayer */; };
 		3541638622CA8F0AC3484125 /* VLCEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD62388DABC25F1778365EBD /* VLCEngine.swift */; };
 		374D2C5BB55D62187217177E /* DVSampleEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3D458D84E80222C4CB91415A /* DVSampleEngine.swift */; };
@@ -90,6 +92,7 @@
 		861C9B7FADD0C403F6BFE013 /* Tokens.swift in Sources */ = {isa = PBXBuildFile; fileRef = 326E0569E9932C14EA0E38D6 /* Tokens.swift */; };
 		8C67245F09A96D81349A9CC1 /* DVSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = C91F773C54C9D474219229BE /* DVSupport.swift */; };
 		8ED0A780790CA0CEE10F9811 /* ClassicScrubThumbnailer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 523401DD7974428964C170D9 /* ClassicScrubThumbnailer.swift */; };
+		A1E7A0B1C2D3E4F5A6B7C809 /* ClassicLiveFrameGrabber.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1E7A0B1C2D3E4F5A6B7C80A /* ClassicLiveFrameGrabber.swift */; };
 		8F75108E93AD7D6EBD2375DA /* ExternalPlayers.swift in Sources */ = {isa = PBXBuildFile; fileRef = D6BB1E51C4914348465F2E07 /* ExternalPlayers.swift */; };
 		8FB4026E02A0C4EDBF643AD4 /* MediaServerSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D6432C28A29872BA88D93BE /* MediaServerSettings.swift */; };
 		907533AF9BAF45F3FD373B50 /* RemoteInput.swift in Sources */ = {isa = PBXBuildFile; fileRef = A8DCE70635C3C65E8553BFE1 /* RemoteInput.swift */; };
@@ -155,6 +158,7 @@
 		EAE1FF598A30614BA96F4D2C /* PlaybackEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7009E4D14FCAF5B77A1E642A /* PlaybackEngine.swift */; };
 		EBC309FCCED5356BA8B1DBB0 /* SettingsComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = E9D1F1ABD475AF49DF5597EF /* SettingsComponents.swift */; };
 		EC9C125790D1AE2EF90D8729 /* CollectionScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC54ACBD0BF52D002B8B6DC9 /* CollectionScreen.swift */; };
+		A1E7A0B1C2D3E4F5A6B7C806 /* TestStreamsPage.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1E7A0B1C2D3E4F5A6B7C805 /* TestStreamsPage.swift */; };
 		ED3763B077234AA4D910C452 /* SettingsPages.swift in Sources */ = {isa = PBXBuildFile; fileRef = AF7BB5728C5491C9AE395B6C /* SettingsPages.swift */; };
 		F1B72D5FDC47FCFEEC5F2DDF /* ClassicInfuseInfoPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 57FF1DEB110870681472609F /* ClassicInfuseInfoPanel.swift */; };
 		F4B866ED391140B973AF09FD /* PhoneInputServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C3D34D1DC8CE4D519E5D5F0 /* PhoneInputServer.swift */; };
@@ -190,6 +194,17 @@
 				9C31A05CA14B8EFB40C905D6 /* OrivioTopShelf.appex in Embed Foundation Extensions */,
 			);
 			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A1E7A0B1C2D3E4F5A6B7C808 /* Embed Frameworks */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (
+				A1E7A0B1C2D3E4F5A6B7C807 /* OrivioAether in Embed Frameworks */,
+			);
+			name = "Embed Frameworks";
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXCopyFilesBuildPhase section */
@@ -244,6 +259,7 @@
 		4E1F8F6754981D61993478D3 /* ClassicAudioLanguageMatch.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClassicAudioLanguageMatch.swift; sourceTree = "<group>"; };
 		4F3C94D1613D7CBF58098FD5 /* PlayerTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerTransport.swift; sourceTree = "<group>"; };
 		523401DD7974428964C170D9 /* ClassicScrubThumbnailer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClassicScrubThumbnailer.swift; sourceTree = "<group>"; };
+		A1E7A0B1C2D3E4F5A6B7C80A /* ClassicLiveFrameGrabber.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClassicLiveFrameGrabber.swift; sourceTree = "<group>"; };
 		543FA4296AACD1F3DEC5C5C4 /* DiscoverTab.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiscoverTab.swift; sourceTree = "<group>"; };
 		55156824021BFDC6AD66821B /* Cards.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Cards.swift; sourceTree = "<group>"; };
 		57915924DC3840A757CD7EE3 /* TopShelfSnapshot.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TopShelfSnapshot.swift; sourceTree = "<group>"; };
@@ -291,6 +307,7 @@
 		ADDC145608689B3F308108AD /* DetailSections.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DetailSections.swift; sourceTree = "<group>"; };
 		AE6BC9D5A59C5A6DC8A0745E /* LocalBackup.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalBackup.swift; sourceTree = "<group>"; };
 		AF05D5260D2A8E1ACEA05028 /* ClassicDVSampleEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClassicDVSampleEngine.swift; sourceTree = "<group>"; };
+		A1E7A0B1C2D3E4F5A6B7C805 /* TestStreamsPage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TestStreamsPage.swift; sourceTree = "<group>"; };
 		AF7BB5728C5491C9AE395B6C /* SettingsPages.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsPages.swift; sourceTree = "<group>"; };
 		AF8DF6C62FDC95C564289A4A /* ClassicRemoteInput.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClassicRemoteInput.swift; sourceTree = "<group>"; };
 		B20DE55BED1C8AF607748E5C /* LibraryStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryStore.swift; sourceTree = "<group>"; };
@@ -313,6 +330,7 @@
 		CE159BBC1CE7195160E54884 /* PictureInPicture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PictureInPicture.swift; sourceTree = "<group>"; };
 		CEC080E96DB7C14D9B7D634D /* PlayActions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayActions.swift; sourceTree = "<group>"; };
 		CF6B4FE51F082F7219EB76C1 /* AvatarCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AvatarCatalog.swift; sourceTree = "<group>"; };
+		A1E7A0B1C2D3E4F5A6B7C804 /* OrivioAether */ = {isa = PBXFileReference; lastKnownFileType = folder; name = OrivioAether; path = Vendor/OrivioAether; sourceTree = SOURCE_ROOT; };
 		CFA2037D6C200F8E219BD175 /* KSPlayer */ = {isa = PBXFileReference; lastKnownFileType = folder; name = KSPlayer; path = Vendor/KSPlayer; sourceTree = SOURCE_ROOT; };
 		D3F038E20814E48A6575CAD6 /* DetailOverlays.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DetailOverlays.swift; sourceTree = "<group>"; };
 		D40EB8BCDA89F3AF847E394F /* Navigation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Navigation.swift; sourceTree = "<group>"; };
@@ -362,6 +380,7 @@
 				7BD75B51403B5DB50C8F014D /* YouTubeKit in Frameworks */,
 				3A150FCF47AD0E4A092282C7 /* VLCKitSPM in Frameworks */,
 				7FC07C63A9C27A2B7DB00694 /* libdovi.xcframework in Frameworks */,
+				A1E7A0B1C2D3E4F5A6B7C801 /* OrivioAether in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -507,6 +526,7 @@
 			isa = PBXGroup;
 			children = (
 				CFA2037D6C200F8E219BD175 /* KSPlayer */,
+				A1E7A0B1C2D3E4F5A6B7C804 /* OrivioAether */,
 				9CA01E5B5F2B455310635A9A /* YouTubeKit */,
 			);
 			name = Packages;
@@ -547,6 +567,7 @@
 				AF8DF6C62FDC95C564289A4A /* ClassicRemoteInput.swift */,
 				6064C0DF3100F7E45C6C3A8F /* ClassicScrubberViews.swift */,
 				523401DD7974428964C170D9 /* ClassicScrubThumbnailer.swift */,
+				A1E7A0B1C2D3E4F5A6B7C80A /* ClassicLiveFrameGrabber.swift */,
 				725196219EF492C8AFBAA07C /* ClassicSourceSelection.swift */,
 				F430CEB13E8003F7252064EF /* ClassicSourcesPicker.swift */,
 				DF8CEE193CC445AB7CB06F52 /* ClassicStreamProbe.swift */,
@@ -829,6 +850,7 @@
 				8D6432C28A29872BA88D93BE /* MediaServerSettings.swift */,
 				E9D1F1ABD475AF49DF5597EF /* SettingsComponents.swift */,
 				AF7BB5728C5491C9AE395B6C /* SettingsPages.swift */,
+				A1E7A0B1C2D3E4F5A6B7C805 /* TestStreamsPage.swift */,
 				41049A0ABB73B5499DECFC16 /* SettingsView.swift */,
 			);
 			path = Settings;
@@ -880,6 +902,7 @@
 				1EE99B4D3BCE8D03835D1A37 /* Sources */,
 				356F53D4489F78AAAD439D45 /* Resources */,
 				4954A52A605F1D7AA6189308 /* Frameworks */,
+				A1E7A0B1C2D3E4F5A6B7C808 /* Embed Frameworks */,
 				E99154B6F70430F1502404F1 /* Embed Foundation Extensions */,
 				BD7B145B1D7996533641D190 /* Sanitize embedded framework bundle IDs */,
 			);
@@ -893,6 +916,7 @@
 				4C595A0AAA5873BDB7D3A0FA /* KSPlayer */,
 				AF80AB66BCDB4575470C9126 /* YouTubeKit */,
 				5A930D532CFC69BF7F7D70D3 /* VLCKitSPM */,
+				A1E7A0B1C2D3E4F5A6B7C802 /* OrivioAether */,
 			);
 			productName = OrivioTV;
 			productReference = 350FC2130915C0A942D1A624 /* OrivioTV.app */;
@@ -935,6 +959,7 @@
 				F827329C72CFCE56C74FC7FB /* XCRemoteSwiftPackageReference "vlckit-spm" */,
 				DD7B508344E6068A42E32630 /* XCLocalSwiftPackageReference "Vendor/KSPlayer" */,
 				4F81B6EDEB289261CCECC51B /* XCLocalSwiftPackageReference "Vendor/YouTubeKit" */,
+				A1E7A0B1C2D3E4F5A6B7C803 /* XCLocalSwiftPackageReference "Vendor/OrivioAether" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 2A5DF0DB0B55F03ACA9A367B /* Products */;
@@ -1053,6 +1078,7 @@
 				A8660F9CAC1DCD4EF1479F39 /* ClassicPlayerViewModel.swift in Sources */,
 				DB44FF1DD8C946245E38C13C /* ClassicRemoteInput.swift in Sources */,
 				8ED0A780790CA0CEE10F9811 /* ClassicScrubThumbnailer.swift in Sources */,
+				A1E7A0B1C2D3E4F5A6B7C809 /* ClassicLiveFrameGrabber.swift in Sources */,
 				7E150B31FBD5A8A5F7E17B67 /* ClassicScrubberViews.swift in Sources */,
 				BC342C81B9276E6A42757453 /* ClassicSourceSelection.swift in Sources */,
 				B3229B61D6736B13FB668C8E /* ClassicSourcesPicker.swift in Sources */,
@@ -1135,6 +1161,7 @@
 				EBC309FCCED5356BA8B1DBB0 /* SettingsComponents.swift in Sources */,
 				3894DC495E23309B25253793 /* SettingsModels.swift in Sources */,
 				ED3763B077234AA4D910C452 /* SettingsPages.swift in Sources */,
+				A1E7A0B1C2D3E4F5A6B7C806 /* TestStreamsPage.swift in Sources */,
 				0BDB51695664A4C5917B06B2 /* SettingsStore.swift in Sources */,
 				CE4BF1B4E2BD71AC1B24A344 /* SettingsStores.swift in Sources */,
 				0B57C41D678639D028F9142E /* SettingsView.swift in Sources */,
@@ -1238,7 +1265,7 @@
 				SWIFT_COMPILATION_MODE = wholemodule;
 				SWIFT_OPTIMIZATION_LEVEL = "-O";
 				SWIFT_VERSION = 5.0;
-				TVOS_DEPLOYMENT_TARGET = 17.0;
+				TVOS_DEPLOYMENT_TARGET = 18.0;
 			};
 			name = Profile;
 		};
@@ -1375,7 +1402,7 @@
 				SWIFT_COMPILATION_MODE = wholemodule;
 				SWIFT_OPTIMIZATION_LEVEL = "-O";
 				SWIFT_VERSION = 5.0;
-				TVOS_DEPLOYMENT_TARGET = 17.0;
+				TVOS_DEPLOYMENT_TARGET = 18.0;
 			};
 			name = Release;
 		};
@@ -1438,7 +1465,7 @@
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 				SWIFT_VERSION = 5.0;
-				TVOS_DEPLOYMENT_TARGET = 17.0;
+				TVOS_DEPLOYMENT_TARGET = 18.0;
 			};
 			name = Debug;
 		};
@@ -1620,6 +1647,10 @@
 			isa = XCLocalSwiftPackageReference;
 			relativePath = Vendor/KSPlayer;
 		};
+		A1E7A0B1C2D3E4F5A6B7C803 /* XCLocalSwiftPackageReference "Vendor/OrivioAether" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = Vendor/OrivioAether;
+		};
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCRemoteSwiftPackageReference section */
@@ -1646,6 +1677,10 @@
 		AF80AB66BCDB4575470C9126 /* YouTubeKit */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = YouTubeKit;
+		};
+		A1E7A0B1C2D3E4F5A6B7C802 /* OrivioAether */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = OrivioAether;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

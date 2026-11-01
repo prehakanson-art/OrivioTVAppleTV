@@ -232,7 +232,8 @@ final class PlayerViewModel: ObservableObject {
         case .native: decisions.log("engine", "Native", "preference"); return .native
         case .ffmpeg: decisions.log("engine", "FFmpeg", "preference"); return .ffmpeg
         case .vlc: decisions.log("engine", "VLC", "preference"); return .vlc
-        case .auto, .external: break
+        // `.aether` is a classic-player (VOD) engine; live TV routes like Auto.
+        case .auto, .aether, .external: break
         }
         if ["mp4", "m4v", "mov", "m3u8"].contains(ext) {
             decisions.log("engine", "Native", "container .\(ext)")
@@ -256,7 +257,7 @@ final class PlayerViewModel: ObservableObject {
     /// hint is about audio only (shorter probe budget, stricter acceptance).
     func dvPreflightHint() -> (audioOnly: Bool, reason: String)? {
         let pref = settings.value.engine
-        guard pref == .auto || pref == .ffmpeg, request.url.scheme?.hasPrefix("http") == true else { return nil }
+        guard pref == .auto || pref == .aether || pref == .ffmpeg, request.url.scheme?.hasPrefix("http") == true else { return nil }
         guard settings.value.playbackMode != .compatibility, !failedEngines.contains(.dvDirect), !isLive else { return nil }
         guard !["mp4", "m4v", "mov", "m3u8"].contains(containerExtension), !request.forceDemuxer else { return nil }
         let footprint = Self.memoryFootprintMB()
@@ -504,7 +505,7 @@ final class PlayerViewModel: ObservableObject {
         case .dvDirect: order = [.ffmpeg, .vlc]
         case .vlc: order = []
         }
-        if settings.value.engine == .auto || settings.value.engine == .external,
+        if [.auto, .aether, .external].contains(settings.value.engine),
            let next = order.first(where: { !failedEngines.contains($0) && !(($0 == .native) && !["mp4", "m4v", "mov", "m3u8", ""].contains(containerExtension)) }) {
             decisions.log("fallback", next.label, "\(engineKind.label) failed: \(message)")
             loadingStatus = "Trying \(next.label)…"

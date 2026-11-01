@@ -528,6 +528,7 @@ final class DeviceFlow: ObservableObject, Identifiable {
 
 private struct PlaybackSettings: View {
     @EnvironmentObject private var player: PlayerSettingsStore
+    @EnvironmentObject private var nav: SettingsNav
 
     var body: some View {
         SettingsGroup(header: "Auto-play", footer: "A credits chapter in the file shows Up Next earlier than this.") {
@@ -572,7 +573,7 @@ private struct PlaybackSettings: View {
                 }
             }
         }
-        SettingsGroup(header: "Player", footer: "Auto uses the Native engine for MP4/HLS and FFmpeg for everything else, falling back automatically.") {
+        SettingsGroup(header: "Player", footer: "Auto opens movies and episodes with AetherEngine first (every container, Dolby Vision / HDR10+ / HLG, lossless and Atmos audio); if it cannot play a stream, Native takes MP4/HLS and FFmpeg everything else. Live TV skips AetherEngine.") {
             PickerRow(label: "Playback engine", options: EnginePreference.allCases, selection: $player.value.engine, title: \.label)
             PickerRow(label: "Playback mode", options: PlaybackMode.allCases, selection: $player.value.playbackMode, title: \.label)
             ToggleRow(label: "Hybrid disk cache", isOn: $player.value.hybridCache)
@@ -588,6 +589,11 @@ private struct PlaybackSettings: View {
             ToggleRow(label: "Parental guide", isOn: $player.value.parentalGuide)
             PickerRow(label: "Auto-play trailer on Detail", options: [-1, 0, 1, 2, 3, 5], selection: $player.value.detailTrailerDelay) {
                 $0 < 0 ? "Off" : ($0 == 0 ? "Immediately" : "After \($0) s")
+            }
+        }
+        SettingsGroup(header: "Developer", footer: "Public sample files for every playback path (Dolby Vision, HDR10, TrueHD Atmos, DTS-HD MA, PGS/ASS…) and a custom URL field.") {
+            SettingsRow(label: "Test streams", chevron: true, icon: "testtube.2") {
+                nav.push("Test streams") { TestStreamsPage() }
             }
         }
     }
