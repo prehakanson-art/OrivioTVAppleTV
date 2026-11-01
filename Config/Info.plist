@@ -56,12 +56,8 @@
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
 	</dict>
-	<key>UIAppFonts</key>
-	<array>
-		<string>PlusJakartaSans-Regular.ttf</string>
-		<string>PlusJakartaSans-Medium.ttf</string>
-		<string>PlusJakartaSans-Bold.ttf</string>
-	</array>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Orivio runs a small page on your network so you can add add-ons and keys from your phone.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>

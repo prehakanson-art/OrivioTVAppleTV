@@ -1,11 +1,11 @@
 import Foundation
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  TEMPLATE — copy this file to `NuvioTV/Secrets.swift` and fill in your keys.
+//  TEMPLATE — copy this file to `OrivioTV/Secrets.swift` and fill in your keys.
 //
-//      cp Secrets.example.swift NuvioTV/Secrets.swift
+//      cp Secrets.example.swift OrivioTV/Secrets.swift
 //
-//  `NuvioTV/Secrets.swift` is gitignored, so your keys never enter the repo
+//  `OrivioTV/Secrets.swift` is gitignored, so your keys never enter the repo
 //  (same pattern as the official Orivio app's `local.properties`). This template
 //  lives at the repo root so it is NOT compiled into the app.
 //

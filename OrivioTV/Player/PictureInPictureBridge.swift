@@ -163,11 +163,11 @@ final class PiPPlaybackBridge: NSObject {
 
     @objc func isPlaying() -> Bool { playingState }
     @objc func setPlaying(_ playing: Bool) {
-        PictureInPictureController.trail("bridge: setPlaying \(playing)")
+        PlayerProbe.event("pip", "bridge: setPlaying \(playing)")
         onMain { [self] in onSetPlaying?(playing) }
     }
     @objc func togglePlaybackEvenWhenInBackground(_ flag: Bool) {
-        PictureInPictureController.trail("bridge: togglePlayback (background=\(flag))")
+        PlayerProbe.event("pip", "bridge: togglePlayback (background=\(flag))")
         let next = !playingState
         onMain { [self] in onSetPlaying?(next) }
     }
@@ -184,12 +184,12 @@ final class PiPPlaybackBridge: NSObject {
     @objc func minTime() -> Double { 0 }
     @objc func maxTime() -> Double { durationState }
     @objc func seekToTime(_ time: Double) {
-        PictureInPictureController.trail("bridge: seekToTime \(time)")
+        PlayerProbe.event("pip", "bridge: seekToTime \(time)")
         onMain { [self] in onSeek?(time) }
     }
     @objc func isMuted() -> Bool { mutedState }
     @objc func setMuted(_ muted: Bool) {
-        PictureInPictureController.trail("bridge: setMuted \(muted)")
+        PlayerProbe.event("pip", "bridge: setMuted \(muted)")
         mutedState = muted
         onMain { [self] in onSetMuted?(muted) }
     }
@@ -198,7 +198,7 @@ final class PiPPlaybackBridge: NSObject {
 
     @objc func isPictureInPictureInterrupted() -> Bool { interrupted }
     @objc func setPictureInPictureInterrupted(_ flag: Bool) {
-        PictureInPictureController.trail("bridge: interrupted \(flag)")
+        PlayerProbe.event("pip", "bridge: interrupted \(flag)")
         interrupted = flag
     }
     @objc func wasPlayingWhenPictureInPictureInterruptionBegan() -> Bool { wasPlayingBeforeInterruption }
@@ -213,7 +213,7 @@ final class PiPPlaybackBridge: NSObject {
     @objc func setCanTogglePictureInPicture(_ flag: Bool) { canToggle = flag }
     @objc func pipActivitySessionIdentifier() -> String? { activitySessionIdentifier }
     @objc func setPipActivitySessionIdentifier(_ id: String?) {
-        PictureInPictureController.trail("bridge: activity session \(id ?? "nil")")
+        PlayerProbe.event("pip", "bridge: activity session \(id ?? "nil")")
         activitySessionIdentifier = id
     }
     @objc func setHandlesAudioSessionInterruptions(_ flag: Bool) {}
@@ -234,23 +234,23 @@ final class PiPPlaybackBridge: NSObject {
     override class func resolveInstanceMethod(_ sel: Selector!) -> Bool {
         let name = NSStringFromSelector(sel)
         if !name.hasPrefix("_"), !PiPUnknownSink.isKVOAccessorProbe(name) {
-            PictureInPictureController.trail("bridge: asked for \(name)")
+            PlayerProbe.event("pip", "bridge: asked for \(name)")
         }
         return super.resolveInstanceMethod(sel)
     }
 
     override func forwardingTarget(for aSelector: Selector!) -> Any? {
-        PictureInPictureController.trail("bridge: forwarding \(NSStringFromSelector(aSelector))")
+        PlayerProbe.event("pip", "bridge: forwarding \(NSStringFromSelector(aSelector))")
         return PiPUnknownSink.shared
     }
 
     override func value(forUndefinedKey key: String) -> Any? {
-        PictureInPictureController.trail("bridge: unknown key \(key)")
+        PlayerProbe.event("pip", "bridge: unknown key \(key)")
         return nil
     }
 
     override func setValue(_ value: Any?, forUndefinedKey key: String) {
-        PictureInPictureController.trail("bridge: unknown key set \(key)")
+        PlayerProbe.event("pip", "bridge: unknown key set \(key)")
     }
 }
 

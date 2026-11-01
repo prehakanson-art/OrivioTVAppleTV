@@ -1,239 +1,209 @@
-import SwiftUI
 import UIKit
+import SwiftUI
+import GameController
 
-/// Window-level Siri-remote TRACKPAD capture. Two recognizers on the window,
-/// both restricted to `.indirect` touches (REQUIRED on tvOS or the focus engine
-/// eats every touch):
-/// - a `UIPanGestureRecognizer` for drags/swipes — its `translation(in:)` is in
-///   well-defined points (this is what the app's original working scrubbing
-///   used; raw indirect-touch `location` has an undefined scale), reported as
-///   began/changed(tx,ty)/ended.
-/// (Light taps are NOT captured — tvOS doesn't reliably surface a touch-only tap
-/// to a recognizer, and a click already opens the controls.)
-/// Gated by `isActive` so it never affects browsing UI.
-struct RemoteTouchCatcher: UIViewRepresentable {
-    let isActive: () -> Bool
-    let onBegan: () -> Void
-    let onMoved: (CGFloat, CGFloat) -> Void   // translation tx, ty (points)
-    let onEnded: (CGFloat, CGFloat) -> Void    // final translation tx, ty
+/// Window-level remote catchers (§7.8 layer 5). Menu and ⏯ always go through
+/// here so they can't be lost; Select/arrows are captured only on bare video,
+/// the bar and in scrub mode (elsewhere real buttons need them). The touch
+/// surface is read two ways: pan translation (swipes, scrub) and the
+/// GameController's absolute dpad position (edge clicks, the jog wheel ring).
+final class RemoteInputView: UIView, UIGestureRecognizerDelegate {
+    var onPress: ((RemotePress) -> Void)?
+    var onSwipe: ((CGFloat, CGFloat) -> Void)?
+    var onPanDelta: ((CGFloat) -> Void)?
+    var onLightTap: (() -> Void)?
+    var onWheel: ((Double) -> Void)?
+    var onWheelEnd: (() -> Void)?
+    var isScrubbing: () -> Bool = { false }
 
-    func makeUIView(context: Context) -> TouchHostView {
-        let view = TouchHostView()
-        view.configure(isActive: isActive, onBegan: onBegan, onMoved: onMoved, onEnded: onEnded)
-        return view
-    }
-    func updateUIView(_ uiView: TouchHostView, context: Context) {
-        uiView.configure(isActive: isActive, onBegan: onBegan, onMoved: onMoved, onEnded: onEnded)
-    }
-    static func dismantleUIView(_ uiView: TouchHostView, coordinator: ()) {
-        uiView.removeRecognizers()
-    }
-}
+    var capturesSelect = true { didSet { selectTap.isEnabled = capturesSelect } }
+    var capturesArrows = true { didSet { arrowRecognizers.forEach { $0.isEnabled = capturesArrows } } }
 
-final class TouchHostView: UIView, UIGestureRecognizerDelegate {
-    private var pan: UIPanGestureRecognizer?
+    private let selectTap = UITapGestureRecognizer()
+    private let playPauseTap = UITapGestureRecognizer()
+    private let menuTap = UITapGestureRecognizer()
+    private var arrowRecognizers: [UITapGestureRecognizer] = []
+    private let lightTap = UITapGestureRecognizer()
+    private let pan = UIPanGestureRecognizer()
     private weak var attachedWindow: UIWindow?
 
-    private var isActive: () -> Bool = { false }
-    private var onBegan: () -> Void = {}
-    private var onMoved: (CGFloat, CGFloat) -> Void = { _, _ in }
-    private var onEnded: (CGFloat, CGFloat) -> Void = { _, _ in }
+    private var lastPan = CGPoint.zero
+    private var lastPressAt = Date.distantPast
+    private var touchStartedAt: Date?
+    private var dpad = CGPoint.zero
+    private var dpadAt = Date.distantPast
+    private var ringSince: Date?
+    private var wheelAngle: Double?
+    private var gcObserver: NSObjectProtocol?
 
-    func configure(isActive: @escaping () -> Bool, onBegan: @escaping () -> Void,
-                   onMoved: @escaping (CGFloat, CGFloat) -> Void,
-                   onEnded: @escaping (CGFloat, CGFloat) -> Void) {
-        self.isActive = isActive
-        self.onBegan = onBegan
-        self.onMoved = onMoved
-        self.onEnded = onEnded
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isUserInteractionEnabled = false
+        backgroundColor = .clear
+
+        selectTap.allowedPressTypes = [NSNumber(value: UIPress.PressType.select.rawValue)]
+        selectTap.addTarget(self, action: #selector(selectPressed))
+        playPauseTap.allowedPressTypes = [NSNumber(value: UIPress.PressType.playPause.rawValue)]
+        playPauseTap.addTarget(self, action: #selector(playPausePressed))
+        menuTap.allowedPressTypes = [NSNumber(value: UIPress.PressType.menu.rawValue)]
+        menuTap.addTarget(self, action: #selector(menuPressed))
+        for (type, sel) in [(UIPress.PressType.leftArrow, #selector(leftPressed)), (.rightArrow, #selector(rightPressed)),
+                            (.upArrow, #selector(upPressed)), (.downArrow, #selector(downPressed))] {
+            let r = UITapGestureRecognizer(target: self, action: sel)
+            r.allowedPressTypes = [NSNumber(value: type.rawValue)]
+            arrowRecognizers.append(r)
+        }
+        lightTap.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirect.rawValue)]
+        lightTap.allowedPressTypes = []
+        lightTap.addTarget(self, action: #selector(lightTapped))
+        lightTap.cancelsTouchesInView = false
+        pan.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirect.rawValue)]
+        pan.cancelsTouchesInView = false
+        pan.addTarget(self, action: #selector(panned(_:)))
+        for r in [lightTap, pan] as [UIGestureRecognizer] { r.delegate = self }
+        selectTap.delegate = self
+        arrowRecognizers.forEach { $0.delegate = self }
+
+        gcObserver = NotificationCenter.default.addObserver(forName: .GCControllerDidConnect, object: nil, queue: .main) { [weak self] _ in
+            self?.configureControllers()
+        }
+        configureControllers()
     }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    deinit {
+        if let gcObserver { NotificationCenter.default.removeObserver(gcObserver) }
+    }
+
+    private var all: [UIGestureRecognizer] { [selectTap, playPauseTap, menuTap, lightTap, pan] + arrowRecognizers }
 
     override func didMoveToWindow() {
         super.didMoveToWindow()
-        removeRecognizers()
-        guard let window else { return }
-        let p = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
-        p.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirect.rawValue)]
-        p.cancelsTouchesInView = false
-        p.delegate = self
-        window.addGestureRecognizer(p)
-        pan = p
-        attachedWindow = window
+        detach()
+        guard let w = window else { return }
+        all.forEach { w.addGestureRecognizer($0) }
+        attachedWindow = w
     }
 
-    func removeRecognizers() {
-        if let attachedWindow, let pan {
-            attachedWindow.removeGestureRecognizer(pan)
+    func detach() {
+        guard let w = attachedWindow else { return }
+        all.forEach { w.removeGestureRecognizer($0) }
+        attachedWindow = nil
+    }
+
+    func gestureRecognizer(_ g: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool { true }
+
+    // MARK: GameController (absolute touch position)
+
+    private func configureControllers() {
+        for c in GCController.controllers() {
+            guard let pad = c.microGamepad else { continue }
+            pad.reportsAbsoluteDpadValues = true
+            pad.allowsRotation = false
+            pad.dpad.valueChangedHandler = { [weak self] _, x, y in
+                self?.dpadChanged(CGPoint(x: CGFloat(x), y: CGFloat(y)))
+            }
         }
-        pan = nil; attachedWindow = nil
     }
 
-    @objc private func handlePan(_ g: UIPanGestureRecognizer) {
-        let t = g.translation(in: g.view)
+    private func dpadChanged(_ p: CGPoint) {
+        let touching = p != .zero
+        dpad = p
+        dpadAt = Date()
+        if touching, touchStartedAt == nil { touchStartedAt = Date() }
+        if !touching { touchStartedAt = nil }
+        guard isScrubbing() else { ringSince = nil; wheelAngle = nil; return }
+        // Rest on the outer ring (> 0.72 radius) for 0.15 s → fine-tune wheel.
+        let r = hypot(p.x, p.y)
+        if touching, r > 0.72 {
+            if ringSince == nil { ringSince = Date() }
+            if let since = ringSince, Date().timeIntervalSince(since) > 0.15 {
+                let angle = atan2(Double(p.y), Double(p.x))
+                if let last = wheelAngle {
+                    var d = angle - last
+                    if d > .pi { d -= 2 * .pi }
+                    if d < -.pi { d += 2 * .pi }
+                    // Clockwise (negative atan2 delta) moves forward.
+                    onWheel?(-d)
+                }
+                wheelAngle = angle
+            }
+        } else {
+            if wheelAngle != nil { onWheelEnd?() }
+            ringSince = nil
+            wheelAngle = nil
+        }
+    }
+
+    // MARK: Presses
+
+    @objc private func selectPressed() {
+        lastPressAt = Date()
+        // A click on the clickpad's edge (1st-gen remote) reports as Select; read where the finger was.
+        if Date().timeIntervalSince(dpadAt) < 0.4 {
+            if dpad.x < -0.6 { onPress?(.edge(.leading)); return }
+            if dpad.x > 0.6 { onPress?(.edge(.trailing)); return }
+            if dpad.y > 0.6 { onPress?(.edge(.top)); return }
+            if dpad.y < -0.6 { onPress?(.edge(.bottom)); return }
+        }
+        onPress?(.select)
+    }
+
+    @objc private func playPausePressed() { lastPressAt = Date(); onPress?(.playPause(source: "window")) }
+    @objc private func menuPressed() { lastPressAt = Date(); onPress?(.menu) }
+    @objc private func leftPressed() { lastPressAt = Date(); onPress?(.edge(.leading)) }
+    @objc private func rightPressed() { lastPressAt = Date(); onPress?(.edge(.trailing)) }
+    @objc private func upPressed() { lastPressAt = Date(); onPress?(.edge(.top)) }
+    @objc private func downPressed() { lastPressAt = Date(); onPress?(.edge(.bottom)) }
+
+    /// Touch < 0.6 s, no click, no swipe.
+    @objc private func lightTapped() {
+        guard Date().timeIntervalSince(lastPressAt) > 0.35 else { return }
+        if let start = touchStartedAt, Date().timeIntervalSince(start) > 0.6 { return }
+        onLightTap?()
+    }
+
+    @objc private func panned(_ g: UIPanGestureRecognizer) {
+        let t = g.translation(in: self)
         switch g.state {
         case .began:
-            // Probe the GATE, not just the delivery. "I swiped and nothing
-            // happened" has two completely different causes — the recognizer
-            // never fired, or it fired and `isActive` refused it because some
-            // overlay was up — and they are indistinguishable downstream.
-            PlayerProbe.event("remote", "pad DOWN (active=\(isActive().probe))")
-            if isActive() { onBegan() } else { PlayerProbe.count("input.pan-rejected") }
-        case .changed: if isActive() { onMoved(t.x, t.y) }
-        // The END is delivered UNCONDITIONALLY. `isActive` reads the live
-        // overlay, so a gesture that began over active UI and ended after an
-        // overlay opened mid-swipe (Up Next arriving, a glyph popover) had its
-        // `.ended` swallowed — `panInFlight` then stayed true for the rest of
-        // the session, and everything keyed on "a drag is in flight" (the
-        // scrub commit-click, gesture adoption) misread every later press.
-        case .ended, .cancelled, .failed:
-            PlayerProbe.event("remote", String(format: "pad UP %@ (%+.0f,%+.0f)",
-                                               g.state == .ended ? "ended" : "cancelled",
-                                               t.x, t.y))
-            onEnded(t.x, t.y)
-        default: break
+            lastPan = .zero
+        case .changed:
+            if isScrubbing(), wheelAngle == nil {
+                onPanDelta?(t.x - lastPan.x)
+            }
+            lastPan = t
+        case .ended:
+            if !isScrubbing() { onSwipe?(t.x, t.y) }
+            lastPan = .zero
+        default:
+            lastPan = .zero
         }
     }
-
-    // Coexist with the focus engine's own recognizers (clicks/move commands).
-    func gestureRecognizer(_ g: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool { true }
-    func gestureRecognizer(_ g: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool { isActive() }
 }
 
-/// Captures Menu/Back presses at the WINDOW level so Back can never fall
-/// through to the system (which dismisses the whole player). SwiftUI's
-/// `onExitCommand` only fires when focus happens to sit inside the modifier's
-/// hierarchy — a side panel mid-transition, or one with no focusable rows,
-/// leaves focus nowhere and the press bypassed every handler. A window
-/// recognizer sees the press regardless of focus.
-struct RemoteMenuCatcher: UIViewRepresentable {
-    let onMenu: () -> Void
+struct RemoteInputLayer: UIViewRepresentable {
+    @ObservedObject var vm: PlayerViewModel
 
-    func makeUIView(context: Context) -> MenuHostView {
-        let view = MenuHostView()
-        view.onMenu = onMenu
-        return view
+    func makeUIView(context: Context) -> RemoteInputView {
+        let v = RemoteInputView()
+        v.onPress = { [weak vm] p in vm?.handle(p) }
+        v.onSwipe = { [weak vm] dx, dy in vm?.handleSwipe(dx: dx, dy: dy) }
+        v.onPanDelta = { [weak vm] dx in vm?.scrubPan(dx: dx) }
+        v.onLightTap = { [weak vm] in vm?.handleLightTap() }
+        v.onWheel = { [weak vm] a in vm?.scrubWheel(angleDelta: a) }
+        v.onWheelEnd = { [weak vm] in vm?.endWheel() }
+        v.isScrubbing = { [weak vm] in vm?.scrub != nil }
+        return v
     }
 
-    func updateUIView(_ uiView: MenuHostView, context: Context) {
-        uiView.onMenu = onMenu
+    func updateUIView(_ v: RemoteInputView, context: Context) {
+        v.capturesSelect = vm.capturesSelect
+        v.capturesArrows = vm.capturesArrows
     }
 
-    static func dismantleUIView(_ uiView: MenuHostView, coordinator: ()) {
-        uiView.removeRecognizer()
-    }
-}
-
-final class MenuHostView: UIView, UIGestureRecognizerDelegate {
-    var onMenu: () -> Void = {}
-
-    private var recognizer: UITapGestureRecognizer?
-    private weak var attachedWindow: UIWindow?
-
-    override func didMoveToWindow() {
-        super.didMoveToWindow()
-        removeRecognizer()
-        guard let window else { return }
-        let tap = UITapGestureRecognizer(target: self, action: #selector(handleMenu))
-        tap.allowedPressTypes = [NSNumber(value: UIPress.PressType.menu.rawValue)]
-        tap.delegate = self
-        window.addGestureRecognizer(tap)
-        recognizer = tap
-        attachedWindow = window
-    }
-
-    /// Every other recognizer (including UIKit's own menu handling) must wait
-    /// for ours to fail — and ours never fails on a Menu press, so the
-    /// system's "pop the presentation" behavior can never win the race.
-    func gestureRecognizer(
-        _ gestureRecognizer: UIGestureRecognizer,
-        shouldBeRequiredToFailBy otherGestureRecognizer: UIGestureRecognizer
-    ) -> Bool {
-        true
-    }
-
-    func removeRecognizer() {
-        if let recognizer, let attachedWindow {
-            attachedWindow.removeGestureRecognizer(recognizer)
-        }
-        recognizer = nil
-        attachedWindow = nil
-    }
-
-    @objc private func handleMenu() {
-        PlayerProbe.event("remote", "MENU (window recognizer)")
-        PlayerProbe.count("input.menu")
-        onMenu()
-    }
-}
-
-/// Captures Play/Pause at the WINDOW level, for the same reason
-/// `RemoteMenuCatcher` exists: SwiftUI's `onPlayPauseCommand` only fires while
-/// focus sits inside the player's hierarchy, and every overlay change hands
-/// focus over through a moment where it sits NOWHERE — measured on the device
-/// at 50-850ms each time the transport comes up after a pause. A press in that
-/// gap reached no handler at all, which is "pause sometimes takes two presses".
-///
-/// Unlike the Menu catcher this one does not make other recognizers wait for
-/// it and does not cancel the press, so `onPlayPauseCommand` still sees every
-/// press it saw before; `PlayerViewModel.playPausePressed(from:)` folds the
-/// two deliveries of one press back into one.
-struct RemotePlayPauseCatcher: UIViewRepresentable {
-    let onPlayPause: () -> Void
-
-    func makeUIView(context: Context) -> PlayPauseHostView {
-        let view = PlayPauseHostView()
-        view.onPlayPause = onPlayPause
-        return view
-    }
-
-    func updateUIView(_ uiView: PlayPauseHostView, context: Context) {
-        uiView.onPlayPause = onPlayPause
-    }
-
-    static func dismantleUIView(_ uiView: PlayPauseHostView, coordinator: ()) {
-        uiView.removeRecognizer()
-    }
-}
-
-final class PlayPauseHostView: UIView, UIGestureRecognizerDelegate {
-    var onPlayPause: () -> Void = {}
-
-    private var recognizer: UITapGestureRecognizer?
-    private weak var attachedWindow: UIWindow?
-
-    override func didMoveToWindow() {
-        super.didMoveToWindow()
-        removeRecognizer()
-        guard let window else { return }
-        let tap = UITapGestureRecognizer(target: self, action: #selector(handlePlayPause))
-        tap.allowedPressTypes = [NSNumber(value: UIPress.PressType.playPause.rawValue)]
-        // Observe, never intercept: the press still reaches the focused view.
-        tap.cancelsTouchesInView = false
-        tap.delaysTouchesBegan = false
-        tap.delaysTouchesEnded = false
-        tap.delegate = self
-        window.addGestureRecognizer(tap)
-        recognizer = tap
-        attachedWindow = window
-    }
-
-    func gestureRecognizer(
-        _ gestureRecognizer: UIGestureRecognizer,
-        shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
-    ) -> Bool {
-        true
-    }
-
-    func removeRecognizer() {
-        if let recognizer, let attachedWindow {
-            attachedWindow.removeGestureRecognizer(recognizer)
-        }
-        recognizer = nil
-        attachedWindow = nil
-    }
-
-    @objc private func handlePlayPause() {
-        PlayerProbe.event("remote", "⏯ (window recognizer)")
-        onPlayPause()
+    static func dismantleUIView(_ v: RemoteInputView, coordinator: ()) {
+        v.detach()
     }
 }

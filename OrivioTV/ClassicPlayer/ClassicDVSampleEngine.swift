@@ -1,0 +1,3730 @@
+import AVFoundation
+import AVKit
+import CoreMedia
+import Foundation
+import KSPlayer
+import Libavcodec
+import Libavformat
+import Libavutil
+import UIKit
+import VideoToolbox
+
+/// Diagnostic instrumentation logger. The probe suite (vsync frame
+/// progression, PTS censuses, clock/queue/feed telemetry, phase steering)
+/// is what found the decode-burst stutter and stays in the source — but it
+/// is noise in a shipping build, so it compiles to nothing in Release.
+// (`dvDiag` is shared with the new engine: Player/Engine/DV/DVSampleEngine.swift.)
+
+/// Direct Dolby Vision sample feed — the Infuse/SenPlayer architecture.
+///
+/// The remux→loopback-HLS→AVPlayer pipeline produces true DV output, but it
+/// rents Apple's HLS machinery, and CoreMedia retains every byte it fetches
+/// over that path — process-scoped, unreleasable, measured live at the fetch
+/// rate until jetsam. This engine bypasses all of it: demux the source with
+/// FFmpeg, convert the RPU when the file is Profile 7, wrap each compressed
+/// HEVC access unit in a CMSampleBuffer tagged with a Dolby Vision format
+/// description, and enqueue it straight into AVSampleBufferDisplayLayer.
+/// tvOS decodes via VideoToolbox and drives the display into genuine DV mode
+/// — and the only buffer in the app is OUR bounded queue, which clears
+/// behind the playhead by construction. No server, no playlist, no AVPlayer,
+/// no retention.
+///
+/// v1 scope: video + one audio track (E-AC3/AC3/AAC), play/pause/seek/rate,
+/// position callbacks. Track menus and embedded subtitles are not wired —
+/// any failure to start reports out so the caller can fall back to the
+/// remux path (which stays intact behind this).
+final class ClassicDVSampleEngine {
+    // MARK: Public surface
+
+    /// Hosts the AVSampleBufferDisplayLayer; hand this to PlayerVideoView.
+    /// Created in `init` from a local so the layer can be captured without
+    /// touching `self` before every stored property is set.
+    let videoView: ClassicDVSampleLayerView
+
+    /// The panel's refresh rate, read ONCE here on the constructing (main)
+    /// thread. `UIScreen` is main-thread-only, and the demux thread's 2s probe
+    /// used to read it directly — a Main Thread Checker violation and
+    /// undefined behaviour.
+    private let panelRefreshHz: Int
+
+    /// Fired on main ~2×/s with the current position (absolute source secs).
+    var onTime: ((Double) -> Void)?
+    /// The demuxer reached EOF and both renderers drained — see
+    /// `signalEndOnce` for how the renderers' own residue is waited out.
+    var onEnded: (() -> Void)?
+    /// Terminal failure after a successful start (decode/enqueue/network).
+    var onError: ((String) -> Void)?
+    /// Underrun state: true while the network can't keep the queue fed and
+    /// playback is held; false when refilled and rolling again.
+    var onBuffering: ((Bool) -> Void)?
+
+    private(set) var duration: Double = 0
+    private(set) var videoFPS: Float = 0
+    private(set) var videoWidth: Int = 0
+    private(set) var videoHeight: Int = 0
+    private(set) var containerMbps: Double = 0
+    /// "HEVC" or "H.264" — what the video track actually is, for the info
+    /// panel and the decision log. The engine was HEVC-only for so long that
+    /// several labels hardcoded the word; they read this now.
+    private(set) var videoCodecName = "HEVC"
+    /// The selected video track is H.264. Routes it to the COMPRESSED feed
+    /// (the display layer decodes it) rather than the VideoToolbox decode-
+    /// ahead path — see `decodeAheadActive`.
+    private var videoIsAVC = false
+    /// Container chapters (MKVs usually carry them) — feeds Skip Intro and
+    /// the timeline tick marks, same as the FFmpeg engine's list.
+    private(set) var chapters: [Chapter] = []
+    /// The SOURCE's DV profile as read from its own dvcC/dvvC (0 = none) —
+    /// the decision panel must report what the file is, not what the probe
+    /// guessed or what the conversion outputs.
+    private(set) var detectedDVProfile = 0
+
+    /// Eligible audio tracks discovered at open, for the picker.
+    struct AudioTrack { let index: Int32; let label: String; let lang: String }
+    private(set) var audioTracks: [AudioTrack] = []
+
+    /// What the engine is doing with the SELECTED audio track — the honest
+    /// answer to "is this really Atmos, or multichannel PCM?". Read by the
+    /// player's `[atmos]` diagnostics; never used to make a decision.
+    struct AudioPathReport {
+        /// FFmpeg's name for the source codec ("eac3", "truehd", …).
+        var codec = "-"
+        /// Source channel count, before anything this engine does.
+        var channels = 0
+        var sampleRate = 0
+        /// Compressed samples handed to AVSampleBufferAudioRenderer (the only
+        /// way a Dolby bitstream leaves this app) vs decoded here to LPCM.
+        var passthrough = false
+        /// The container/codec says Atmos (E-AC-3 JOC, or TrueHD Atmos). NOT a
+        /// claim that Atmos is reaching the receiver — `passthrough` is.
+        var sourceSaysAtmos = false
+        /// Multichannel folded to 2ch in this engine (decode path only).
+        var downmixed = false
+
+        /// One line, deliberately blunt about the PCM case.
+        var summary: String {
+            if passthrough {
+                return "\(codec.uppercased()) \(channels)ch bitstream → tvOS"
+                    + (sourceSaysAtmos ? " (source tagged Atmos)" : "")
+            }
+            return "\(codec.uppercased()) \(channels)ch decoded here → "
+                + (downmixed ? "2ch LPCM" : "\(channels)ch LPCM")
+                + (sourceSaysAtmos ? " (Atmos objects lost — tvOS cannot bitstream this codec)" : "")
+        }
+    }
+    ///
+    /// `@ClassicAtomic`: written on the demux/worker thread when the file is opened
+    /// and read on the main actor by the player's diagnostics. The struct holds
+    /// a String, so a torn read here is not a wrong digit in a log line — it is
+    /// a reference count going through a half-written pointer.
+    @ClassicAtomic private(set) var audioPath = AudioPathReport()
+
+    /// One report per audio stream, built at open while the format context is
+    /// alive and owned by the demux thread. `selectAudio` reads it on the main
+    /// actor, which is the whole reason it exists as a snapshot.
+    @ClassicAtomic private var audioPathByStream: [Int32: AudioPathReport] = [:]
+
+    struct SubtitleTrack { let index: Int32; let label: String; let isBitmap: Bool }
+    private(set) var subtitleTracks: [SubtitleTrack] = []
+    /// Which embedded subtitle stream to demux+decode (-1 = none). Set from
+    /// the main thread via selectSubtitle; read on the demux thread.
+    @ClassicAtomic private var activeSubtitleIndex: Int32 = -1
+    func selectSubtitle(_ index: Int32?) { activeSubtitleIndex = index ?? -1 }
+    /// One decoded subtitle event, delivered on MAIN:
+    /// (start, end, text, image, image origin on its canvas, canvas size).
+    /// text==nil && image==nil is a CLEAR marker (PGS emits explicit
+    /// clears): end every part still open at `start`.
+    var onSubtitleEvent: ((Double, Double, String?, UIImage?, CGPoint, CGSize) -> Void)?
+    private var subDecoder: UnsafeMutablePointer<AVCodecContext>?
+    private var subDecoderIndex: Int32 = -1
+    /// Rolling raw-packet buffer for EVERY subtitle stream (demux thread
+    /// only). The demuxer runs ~10s ahead of the playhead, so a track
+    /// selected mid-play would otherwise stay silent until the read head's
+    /// next cue. Replaying this backlog on selection makes subs immediate.
+    private struct StoredSubPacket {
+        let stream: Int32
+        let pts: Int64
+        let duration: Int64
+        let ptsSeconds: Double
+        let bytes: [UInt8]
+    }
+    private var subPacketBuffer: [StoredSubPacket] = []
+    private var subStreamSet: Set<Int32> = []
+    private var lastServedSubIndex: Int32 = -1
+
+    /// Decode one stored packet by rebuilding a real AVPacket around it.
+    private func replayStoredSubPacket(_ stored: StoredSubPacket, tb: AVRational) {
+        guard let pkt = av_packet_alloc() else { return }
+        defer { var pp: UnsafeMutablePointer<AVPacket>? = pkt; av_packet_free(&pp) }
+        guard av_new_packet(pkt, Int32(stored.bytes.count)) >= 0 else { return }
+        stored.bytes.withUnsafeBufferPointer { src in
+            pkt.pointee.data.update(from: src.baseAddress!, count: src.count)
+        }
+        pkt.pointee.pts = stored.pts
+        pkt.pointee.duration = stored.duration
+        pkt.pointee.stream_index = stored.stream
+        decodeSubtitlePacket(pkt, streamIndex: stored.stream, tb: tb, ptsSeconds: stored.ptsSeconds)
+    }
+    var currentAudioIndex: Int32 { desiredAudioIndex }
+
+    /// Mute/unmute the audio renderer (the Picture in Picture window's
+    /// control). Decoding continues; only the output is silenced.
+    func setMuted(_ muted: Bool) {
+        audioRenderer.isMuted = muted
+    }
+
+    /// Align the video clock to an external audio clock (source seconds). Used
+    /// when an `AVPlayer` owns the audio (Atmos passthrough): the synchronizer
+    /// keeps running at its rate, but its time is nudged onto the audio clock
+    /// so the picture follows the sound.
+    func alignClock(to seconds: Double) {
+        guard seconds.isFinite, seconds >= 0 else { return }
+        synchronizer.setRate(synchronizer.rate,
+                             time: CMTime(seconds: seconds, preferredTimescale: 90_000))
+    }
+
+    /// The video clock in source seconds (the AVPlayer-alignment reference).
+    var currentClockSeconds: Double { CMTimeGetSeconds(synchronizer.currentTime()) }
+
+    /// Switch audio live, then RE-DEMUX FROM THE PLAYHEAD.
+    ///
+    /// Flushing the renderer and letting the demux loop forward the new stream
+    /// from wherever its read head happens to be is not enough: that head runs
+    /// a full buffer (~10s) ahead of the picture, so the first samples of the
+    /// new track carry presentation times ten seconds in the future. The
+    /// synchronizer is timed off the audio renderer, so it sat waiting for
+    /// them — the picture froze on the current frame until playback caught up,
+    /// and seeking back ten seconds "fixed" it because that is exactly what a
+    /// seek does. The subtitle path already solves this by replaying its
+    /// buffered backlog; audio packets are far too big to hold that way, so it
+    /// takes the seek instead — sub-second, and it lands on the frame you were
+    /// watching (the loop trims the keyframe lead-in).
+    func selectAudio(index: Int32) {
+        guard audioFormats[index] != nil || decodeAudioIndices.contains(index) else { return }
+        guard index != desiredAudioIndex else { return }
+        desiredAudioIndex = index
+        // Re-state the audio path for the track being switched TO. Without
+        // this the report stays whatever the open decided, so a viewer who
+        // picked the TrueHD track by hand would still be told the session was
+        // bitstreaming Dolby — the exact mislabel this report exists to
+        // prevent, just arriving later.
+        //
+        // From the SNAPSHOT, never from `liveFormatCtx`. That pointer belongs
+        // to the demux thread's `run()`, which frees it on return and does not
+        // nil it — and this method runs on the main actor, so reading codec
+        // parameters through it would race `av_read_frame` at best and
+        // dereference freed memory after teardown at worst. For a diagnostic.
+        if let report = audioPathByStream[index] {
+            audioPath = report
+            ClassicPlayerProbe.event("audio", "track switched to stream \(index): \(report.summary)")
+        }
+        seek(to: position)
+    }
+
+    /// Lip-sync offset in seconds — POSITIVE puts the voices LATER. Zero is the
+    /// engine's natural timing, untouched.
+    ///
+    /// Applied to the AUDIO timestamps as samples are handed to the audio
+    /// renderer (see `retimedAudio`). Both renderers run on one synchronizer
+    /// clock, so re-stamping only the sound moves it against an unchanged
+    /// picture, in either direction, with no video lookahead needed.
+    @ClassicAtomic private var audioDelaySeconds: Double = 0
+
+    /// Change the lip-sync offset. Before any audio has reached the renderer it
+    /// simply applies to what comes next. After that the renderer is already
+    /// holding seconds of audio stamped with the OLD offset, so re-anchor at the
+    /// current position — exactly what an audio-track change does — and every
+    /// sample is fed again with the new timing.
+    func setAudioDelay(_ seconds: Double) {
+        guard seconds.isFinite, seconds != audioDelaySeconds else { return }
+        audioDelaySeconds = seconds
+        guard !cancelled, lastAudioHandedEnd > 0 else { return }
+        seek(to: position)
+    }
+
+    var position: Double {
+        CMTimeGetSeconds(synchronizer.currentTime())
+    }
+
+    var isPlaying: Bool { synchronizer.rate > 0 }
+
+    /// How far ahead this engine has read — its answer to KSPlayer's
+    /// `playableTime`.
+    ///
+    /// Not cosmetic. `ClassicPlayerViewModel.buffered` was only ever written from
+    /// `layer.player.playableTime`, so on a DV-direct session it stayed at
+    /// ZERO for the whole film, and everything gated on buffer health silently
+    /// never ran — including the scrub-preview thumbnailer, whose
+    /// `shouldProceed` asks for eight seconds of buffer before decoding a
+    /// frame. Measured on the device: `coarse=0 fine=0` for an entire session
+    /// with the cache gate PASSING and 541 seconds of road ahead. The preview
+    /// window "not showing up" was this, and it was invisible because it only
+    /// happens on one engine.
+    ///
+    /// MEASURED AT THE DEMUXER, not at the renderer. The first version of this
+    /// returned `lastRenderedEnd` — what has been handed to
+    /// `AVSampleBufferDisplayLayer` — which reports about two seconds and never
+    /// more, because the layer stops asking once it is satisfied. Against an
+    /// eight-second gate that is just a slower way of never passing, and the
+    /// probe said so: `engineBuffer=2s ahead (gate 8s → BLOCKED)` with the disk
+    /// cache SIX MINUTES in front. `playableTime` means "how much have you
+    /// read", and the demuxer's own queue is the honest equivalent.
+    var bufferedUpTo: Double { max(lastQueuedVideoPTS, lastRenderedEnd) }
+
+    /// Live state for the `/live` probe's `[dv]` block.
+    ///
+    /// Everything this engine knows about itself already existed — queue
+    /// depths, renderer readiness, the vsync census, the demux feed rate — and
+    /// all of it went to `dvDiag`, i.e. NSLog, i.e. a console-attached device.
+    /// That is precisely the setup the live probe exists to avoid, so a DV
+    /// session was the one engine you could not watch over the network. These
+    /// are the numbers that distinguish the failures that all look identical
+    /// from the sofa: a frozen picture with the clock running (renderer
+    /// wedged), a frozen picture with the clock stopped (demuxer starved), and
+    /// a stutter (vsync damage).
+    var probeLines: [String] {
+        queueLock.lock()
+        let vq = videoQueue.count
+        let aq = audioQueue.count
+        let eof = demuxEOF
+        queueLock.unlock()
+        let clock = CMTimeGetSeconds(synchronizer.currentTime())
+        let layerStatus: String
+        switch displayLayer.status {
+        case .failed: layerStatus = "FAILED(\(displayLayer.error?.localizedDescription ?? "?"))"
+        case .rendering: layerStatus = "rendering"
+        case .unknown: layerStatus = "unknown"
+        @unknown default: layerStatus = "?"
+        }
+        return [
+            String(format: "clock=%.1f rate=%.2f queues v=%d/%d a=%d/%d eof=%@",
+                   clock, synchronizer.rate, vq, videoQueueCap, aq, audioQueueCap, eof.probe),
+            "layer=\(layerStatus)"
+                + " vReady=\(displayLayer.isReadyForMoreMediaData.probe)"
+                + " aReady=\(audioRenderer.isReadyForMoreMediaData.probe)"
+                + String(format: " demuxed=%.0fMB", Double(bytesDemuxed) / 1_048_576),
+            String(format: "queuedV=%.1f queuedA=%.1f rendered=%.1f (lead %.1fs)",
+                   lastQueuedVideoPTS, lastQueuedAudioPTS, lastRenderedEnd,
+                   max(lastQueuedVideoPTS - clock, 0)),
+            lastVsyncCensus.isEmpty ? "vsync: no census yet (needs 10s of playback)" : lastVsyncCensus,
+            "audioTrack=\(desiredAudioIndex) subTrack=\(activeSubtitleIndex)"
+                + " seekGen=\(seekGeneration)"
+                + " pendingSeek=\(pendingSeekTo < 0 ? "-" : String(format: "%.1f", pendingSeekTo))",
+        ]
+    }
+
+    // MARK: Internals
+
+    private let inputURLString: String
+    private let startAt: Double
+    private let preferredAudioLanguage: String
+    private let convertProfile7: Bool
+    /// Addon-declared request headers (Referer/User-Agent) — sources that
+    /// need them 403 a bare open.
+    private let requestHeaders: [String: String]?
+
+    private let synchronizer = AVSampleBufferRenderSynchronizer()
+    /// The view's backing layer, CACHED. `ClassicDVSampleLayerView.displayLayer` reads
+    /// `UIView.layer`, which is main-thread-only, and everything that drives
+    /// the renderers (`installFeeders`, `feed`, `vtFeedVideo`, `signalEndOnce`)
+    /// runs on `feedQueue`. Reading it through the view from there tripped the
+    /// Main Thread Checker and is undefined behaviour besides. The layer is
+    /// fixed for the view's lifetime (`layerClass`), so one main-thread read at
+    /// init is the whole fix.
+    private let displayLayer: AVSampleBufferDisplayLayer
+    private let audioRenderer = AVSampleBufferAudioRenderer()
+
+    private var videoFormat: CMFormatDescription?
+    /// Passthrough format descriptions per audio stream index (E-AC3/AC3/AAC
+    /// — codecs AVSampleBufferAudioRenderer decodes itself).
+    private var audioFormats: [Int32: CMFormatDescription] = [:]
+    /// Streams that need the FFmpeg decode→LPCM path (TrueHD, DTS, FLAC,
+    /// Opus, PCM variants — anything the renderer can't take compressed).
+    private var decodeAudioIndices: Set<Int32> = []
+    @ClassicAtomic private var desiredAudioIndex: Int32 = -1
+
+    // ---- FFmpeg audio decoder (worker thread only) ----
+    private var audioDecoder: UnsafeMutablePointer<AVCodecContext>?
+    private var audioDecoderIndex: Int32 = -1
+    private var decodedFrame: UnsafeMutablePointer<AVFrame>?
+    /// LPCM format cache, rebuilt when rate/channel layout changes.
+    private var pcmFormat: CMFormatDescription?
+    private var pcmRate: Int32 = 0
+    private var pcmChannels: Int32 = 0
+    private var loggedAudioDecodeFailure = false
+    private var loggedFirstPCM = false
+
+    // ---- PCM batching (worker thread) ----
+    // TrueHD decodes in ~40-sample crumbs: unbatched, that is 1,200 sample
+    // buffers PER SECOND at the renderer — it chokes, and the 96-deep queue
+    // holds 80ms. Accumulate into ~quarter-second chunks instead.
+    private var pcmBatch: [Float] = []
+    private var pcmBatchStartPTS: Double = -1
+    private var pcmBatchFrames = 0
+
+    private func flushPCMBatch(into out: inout [CMSampleBuffer]) {
+        guard pcmBatchFrames > 0, let format = pcmFormat, pcmChannels > 0 else {
+            pcmBatch.removeAll(keepingCapacity: true); pcmBatchFrames = 0; pcmBatchStartPTS = -1
+            return
+        }
+        if let sample = Self.makePCMSample(
+            pcm: pcmBatch, format: format, frames: pcmBatchFrames,
+            bytesPerFrame: Int(pcmChannels) * 4, ptsSeconds: pcmBatchStartPTS,
+            rate: pcmRate
+        ) { out.append(sample) }
+        pcmBatch.removeAll(keepingCapacity: true)
+        pcmBatchFrames = 0
+        pcmBatchStartPTS = -1
+    }
+
+    /// Bounded sample queues — the "buffer that clears used stuff". The
+    /// demux thread blocks when they're full; the renderers drain them.
+    /// ~48 video AUs ≈ 2s at 24fps ≈ ≤40 MB at heavy-remux bitrates.
+    private let queueLock = NSCondition()
+    private var videoQueue: [CMSampleBuffer] = []
+    private var audioQueue: [CMSampleBuffer] = []
+    /// Compressed access units are cheap (~bitrate-sized, no decoded frames):
+    /// 240 AUs ≈ 10s of 24fps video ≈ 40-100MB at 4K DV bitrates — the
+    /// cushion that rides out debrid/HTTP throughput oscillation. The old cap
+    /// of 48 (two seconds!) made every multi-second network dip an underrun,
+    /// and the live probe showed exactly that: vq sawtoothing 48→0 with the
+    /// clock flapping 0.22↔1.00 (the reported stop-go).
+    /// Tiered: a 4K DV AU is ~0.3-0.7 MB, so 120 of them is 31-80 MB of
+    /// compressed video held at once — on a 3 GB Apple TV that is a large
+    /// slice of the budget, and NONE of these caps had a performance-tier
+    /// branch even though the KSPlayer path budgets the same resource by tier.
+    private var videoQueueCap: Int {
+        let full = vtDecodeAhead ? 120 : 240
+        if PerformanceProfile.isLowPower { return full / 3 }
+        if PerformanceProfile.isMidPower { return full / 2 }
+        return full
+    }
+    /// Post-PCM-batching each buffer is ~0.25s, so 96 is ~24s of audio — far
+    /// past the cushion this was sized for, and it blocks the demux thread
+    /// before the video queue can fill (which is what made the deeper underrun
+    /// cushions unreachable on E-AC3/AAC titles).
+    private var audioQueueCap: Int {
+        PerformanceProfile.isLowPower || PerformanceProfile.isMidPower ? 48 : 96
+    }
+
+    /// Audio buffers the underrun hold insists on before it will restart the
+    /// clock. Named because `enqueueBounded` has to guarantee this number is
+    /// REACHABLE — a cushion the demuxer has parked itself out of reach of is
+    /// a hold that never lifts.
+    static let audioResumeCushion = 4
+
+    /// The audio depth the demuxer is allowed to push VIDEO past its cap to
+    /// reach. Bigger than `audioResumeCushion` on purpose: 4 compressed E-AC-3
+    /// frames is ~130ms, which is not a cushion — the live probe caught the
+    /// queue parked there (`v=60/60 a=4/48`) with the video side full, so the
+    /// demuxer was blocked and the audio drained to the resume threshold before
+    /// the exemption let it read on. 24 ≈ 0.8s of runway.
+    static let audioFeedTarget = 24
+
+    /// Seconds of audio the RENDERER must still hold for an empty audio queue
+    /// NOT to count as starvation. The hold is re-evaluated every 0.5s, so one
+    /// second leaves a full tick of margin before the renderer could run dry.
+    static let audioHoldLead: Double = 1.0
+
+    /// MKV timestamps are in MILLISECONDS; a 23.976fps frame lasts 41.708ms.
+    /// Stamped raw, every frame's PTS lands up to 0.5ms off the panel's frame
+    /// grid, so the display periodically repeats one frame and skips the next
+    /// — visible cadence judder with a perfectly healthy clock and full
+    /// queues (the live probe proved the rest of the pipeline clean). Snap
+    /// each video PTS to the exact NTSC grid, anchored at the first frame:
+    /// only sub-2ms corrections are applied (rounding noise), so true-24.000
+    /// or PAL material never gets re-timed, and the result is clamped to DTS
+    /// so sample creation can never fail (the old jitter-chase regression).
+    private var ptsGridAnchor: Double = -1   // demux-thread only
+
+    /// 23.976 AND 24.000 ARE DIFFERENT CADENCES AND THIS USED TO CONFLATE THEM.
+    ///
+    /// Every rate in 23.5...24.2 was folded onto the NTSC grid (1001/24000),
+    /// so a true-24.000 film was measured against a frame duration 0.042ms too
+    /// long. The snap index rounds, so the residual walks: it reaches half a
+    /// frame (20.8ms) after ~500 frames, wraps, and walks again. Frames more
+    /// than 2ms out are passed through raw by `snapVideoPTS` while the ones
+    /// inside 2ms are pulled onto the WRONG grid — so the engine alternated
+    /// between re-timing and not, and every crossing of that boundary handed
+    /// the synchronizer a step change.
+    ///
+    /// Measured on a 24.000 DV title (`avg_fps=24/1`, panel settled at 24Hz):
+    ///   pts census: 480 frames, 432 off-grid (worst 20.3ms)
+    ///   vsync probe: 237 refreshes, 4 repeats, 3 skips, decodeStalls=0
+    /// 90% off-grid is exactly the 48-in-500 duty cycle that drift predicts,
+    /// 20.3ms is exactly half a frame at 24fps, and `decodeStalls=0` rules out
+    /// decode, buffering and the cache. Those repeats and skips ARE the
+    /// reported micro-jumps.
+    ///
+    /// `videoFPS` comes from `av_q2d` of the stream's own rational, so 24/1
+    /// arrives as 24.0 and 24000/1001 as 23.976025 — the engine can tell them
+    /// apart and now does, at the midpoint of each NTSC/integer pair. Genuine
+    /// 23.976 / 29.97 / 59.94 content keeps the grid it always had; only rates
+    /// that really are integer stop being re-timed onto a cadence they do not
+    /// have. (`SessionDisplayMode.snapToBroadcastRate` draws the same
+    /// distinction for the display request, and for the same reason.)
+    private var gridFrameDuration: Double {
+        let fps = Double(videoFPS)
+        guard fps > 10 else { return 0 }
+        switch fps {
+        case 23.5 ..< 23.988:  return 1001.0 / 24000.0
+        case 23.988 ... 24.2:  return 1.0 / 24.0
+        case 29.5 ..< 29.985:  return 1001.0 / 30000.0
+        case 29.985 ... 30.2:  return 1.0 / 30.0
+        case 59.5 ..< 59.97:   return 1001.0 / 60000.0
+        case 59.97 ... 60.2:   return 1.0 / 60.0
+        default: return 1.0 / fps
+        }
+    }
+
+    // PTS regularity census (demux thread): how many frames land off the
+    // grid — the snap declines them silently, and irregular timestamps
+    // display raggedly. The census makes a dirty-muxed file visible.
+    private var ptsSeen = 0
+    private var ptsIrregular = 0
+    private var ptsWorstOff: Double = 0
+    // Decode-cost profile per census window: AU sizes reveal complexity
+    // spikes (a frame that busts the 41.7ms decode budget repeats on
+    // screen with every other metric clean).
+    private var auBytesWindow = 0
+    private var auMaxWindow = 0
+
+    private func snapVideoPTS(_ pts: Double, dts: Double) -> Double {
+        let frameDur = gridFrameDuration
+        guard frameDur > 0 else { return pts }
+        if ptsGridAnchor < 0 { ptsGridAnchor = pts; return pts }
+        let idx = ((pts - ptsGridAnchor) / frameDur).rounded()
+        let snapped = ptsGridAnchor + idx * frameDur
+        let off = abs(snapped - pts)
+        ptsSeen += 1
+        if off >= 0.002 {
+            ptsIrregular += 1
+            if off > ptsWorstOff { ptsWorstOff = off }
+        }
+        if ptsSeen % 480 == 0 {
+            dvDiag("pts census: %d frames, %d off-grid (worst %.1fms) | AU avg=%dKB max=%dKB",
+                  ptsSeen, ptsIrregular, ptsWorstOff * 1000,
+                  auBytesWindow / 480 / 1024, auMaxWindow / 1024)
+            auBytesWindow = 0
+            auMaxWindow = 0
+        }
+        guard off < 0.002 else { return pts }
+        return max(snapped, dts)
+    }
+
+    // Vsync-level ground truth: a CADisplayLink at the panel's native rate
+    // samples the synchronizer each refresh. Per ~10s window it reports how
+    // many refreshes REPEATED a frame (media index unchanged) or SKIPPED
+    // one (index advanced by 2+), plus the playback-vs-display clock ratio
+    // in ppm and the queued A/V PTS skew. If the stutter is real, it must
+    // appear here as repeats+skips.
+    private var displayLink: CADisplayLink?
+    private var dlLastIndex: Int64 = -1
+    private var dlWindowStartMedia: Double = -1
+    private var dlWindowStartWall: Double = -1
+    private var dlTicks = 0
+    private var dlRepeats = 0
+    private var dlSkips = 0
+    /// Repeats+skips from the last completed vsync window — the servo's
+    /// evidence gate (never steer a healthy presentation).
+    private var dlLastWindowDamage = 0
+    /// Phase telemetry for the census (main only): the closest the synchronizer
+    /// clock came to a frame boundary this window, and the latest median phase.
+    /// Near a boundary, clock jitter alone can show one frame twice and skip the
+    /// next — a lone repeat/skip pair the servo below never answers, because it
+    /// waits for three.
+    private var dlWindowMinEdgeMs = Double.infinity
+    private var dlLastMedianPhaseMs = -1.0
+    private var dlWindowSteers = 0
+    /// The last vsync census, in the same words `dvDiag` logs it.
+    ///
+    /// The census is the only direct measurement of whether frames are
+    /// actually reaching the glass on cadence, and it was DEBUG-only NSLog —
+    /// invisible once the moment has passed. Judder reported after the fact
+    /// could not be attributed to repeats, to clock drift or to decode stalls,
+    /// because none of it survived. Mirrored here so the periodic trail entry
+    /// can carry it into `dev.dvTrail`, which is readable off the device.
+    private(set) var lastVsyncCensus = ""
+
+    // Phase steering: slo-mo footage of the panel proved real repeat+catch-up
+    // pairs (~3/s) with a mathematically perfect clock — the signature of
+    // frame PTS riding the refresh boundary, so the layer flips a hair early
+    // or late, alternating. The boundary phase is a per-session lottery
+    // (wherever the clock got anchored), which is why the same file played
+    // smooth one session and stuttered the next. Measure the phase at each
+    // refresh; if the median sits within 6ms of the boundary, shift the
+    // anchor a quarter-frame once — invisible, and every flip moves to
+    // mid-cycle.
+    private var phaseSamples: [Double] = []
+    private var lastPhaseNudgeAt = Date.distantPast
+
+    @objc private func displayLinkTick(_ link: CADisplayLink) {
+        guard synchronizer.rate > 0 else {
+            dlLastIndex = -1
+            dlWindowStartWall = -1
+            return
+        }
+        let media = CMTimeGetSeconds(synchronizer.currentTime())
+        let frameDur = gridFrameDuration
+        guard frameDur > 0 else { return }
+        let phase = media.truncatingRemainder(dividingBy: frameDur)
+        phaseSamples.append(phase)
+        if phaseSamples.count >= 48 {   // ~2s of refreshes
+            let sorted = phaseSamples.sorted()
+            let medianPhase = sorted[sorted.count / 2]
+            phaseSamples.removeAll()
+            let edge = min(medianPhase, frameDur - medianPhase)
+            dlWindowMinEdgeMs = min(dlWindowMinEdgeMs, edge * 1000)
+            dlLastMedianPhaseMs = medianPhase * 1000
+            // Continuous servo, not a one-shot: every hold/resume/seek
+            // re-anchors the clock and re-rolls the phase lottery, so keep
+            // measuring forever and steer back to MID-CYCLE whenever the
+            // median strays toward an edge. Exact correction (error to
+            // mid), rate-limited so the ≤21ms clock step stays rare.
+            let mid = frameDur / 2
+            var error = medianPhase - mid
+            if error > mid { error -= frameDur }
+            // STEER ONLY ON PROVEN DAMAGE. The correction is itself a clock
+            // discontinuity (~14-21ms, a third of a frame), so steering just
+            // because the phase sits near a boundary traded a hypothetical
+            // stutter for a guaranteed one every ~30s — on a title the VT
+            // renderer was already presenting flawlessly. With decode-ahead
+            // the layer flips finished frames and boundary phase rarely
+            // matters, so require measured repeats/skips first.
+            if dlLastWindowDamage >= 3, edge < 0.008,
+               Date().timeIntervalSince(lastPhaseNudgeAt) > 15,
+               !autoPaused, synchronizer.rate > 0 {
+                lastPhaseNudgeAt = Date()
+                let t = CMTimeGetSeconds(synchronizer.currentTime())
+                synchronizer.setRate(synchronizer.rate,
+                                     time: CMTime(seconds: t - error,
+                                                  preferredTimescale: 90000))
+                dlWindowSteers += 1
+                ClassicPlayerProbe.event("dv", String(format: "phase steered %+.1fms to mid-cycle (edge was %.1fms)",
+                                               -error * 1000, edge * 1000))
+                dvDiag("phase %.1fms (edge %.1fms) — steered %+.1fms to mid-cycle",
+                      medianPhase * 1000, edge * 1000, -error * 1000)
+            } else if edge < 0.010 {
+                dvDiag("frame-boundary phase: median %.1fms (edge %.1fms, damage %d)",
+                       medianPhase * 1000, edge * 1000, dlLastWindowDamage)
+            }
+        }
+        let index = Int64((media / frameDur).rounded(.down))
+        if dlLastIndex >= 0 {
+            let advance = index - dlLastIndex
+            dlTicks += 1
+            if advance == 0 { dlRepeats += 1 }
+            else if advance >= 2 { dlSkips += Int(advance - 1) }
+        }
+        dlLastIndex = index
+        if dlWindowStartWall < 0 {
+            dlWindowStartWall = link.timestamp
+            dlWindowStartMedia = media
+        }
+        let wall = link.timestamp - dlWindowStartWall
+        if wall >= 10 {
+            let mediaAdv = media - dlWindowStartMedia
+            let ppm = (mediaAdv / wall - 1) * 1_000_000
+            // Take-and-reset in ONE locked hold each: reading and then zeroing
+            // as two separate locked accesses dropped every gap the feed queue
+            // recorded in between.
+            var gapCount = 0
+            var gapWorst = 0
+            $pullGapCount.mutate { gapCount = $0; $0 = 0 }
+            $pullGapWorstMs.mutate { gapWorst = $0; $0 = 0 }
+            dvDiag("vsync probe: %d refreshes, %d repeats, %d skips, clock %+.0fppm, avSkew=%.2fs, decodeStalls=%d (worst %dms)",
+                  dlTicks, dlRepeats, dlSkips, ppm, lastQueuedVideoPTS - lastQueuedAudioPTS,
+                  gapCount, gapWorst)
+            var tight = 0
+            var minLead = Int.max
+            var slow = 0
+            var worstDecode = 0
+            $tightHandoffs.mutate { tight = $0; $0 = 0 }
+            $minHandoffLeadMs.mutate { minLead = $0; $0 = Int.max }
+            $slowDecodes.mutate { slow = $0; $0 = 0 }
+            $worstDecodeMs.mutate { worstDecode = $0; $0 = 0 }
+            lastVsyncCensus = String(
+                format: "vsync %d/%dr/%ds clk%+.0fppm skew%.2f stalls%d(%dms) hand tight=%d minLead=%@ dec slow=%d worst=%dms phase=%@ minEdge=%@ steers=%d",
+                dlTicks, dlRepeats, dlSkips, ppm,
+                lastQueuedVideoPTS - lastQueuedAudioPTS, gapCount, gapWorst,
+                tight, minLead == Int.max ? "-" : "\(minLead)ms", slow, worstDecode,
+                dlLastMedianPhaseMs < 0 ? "-" : String(format: "%.1fms", dlLastMedianPhaseMs),
+                dlWindowMinEdgeMs.isFinite ? String(format: "%.1fms", dlWindowMinEdgeMs) : "-",
+                dlWindowSteers
+            )
+            dlWindowMinEdgeMs = .infinity
+            dlWindowSteers = 0
+            dlLastWindowDamage = dlRepeats + dlSkips
+            dlTicks = 0; dlRepeats = 0; dlSkips = 0
+            dlWindowStartWall = link.timestamp
+            dlWindowStartMedia = media
+        }
+    }
+
+    // Live jitter probe (diagnostic): clock ratio + queue depths every 2s.
+    private var probeTick = 0
+    private var lastProbeWall: CFAbsoluteTime = 0
+    private var lastProbeMedia: Double = 0
+    private var demuxEOF = false
+    /// End-of-stream is reported exactly ONCE per playback.
+    ///
+    /// Both drain paths below compute `ended` inside a
+    /// `requestMediaDataWhenReady` block, which AVFoundation re-invokes for as
+    /// long as the layer wants media. With the queues empty and EOF set, every
+    /// one of those invocations fired `onEnded` again — and on the other end
+    /// that is `handlePlayedToEnd`, which saves progress (a published store
+    /// write) and re-assigns the post-play overlay. Dozens of times a second,
+    /// for as long as the movie sat at its end. That is the app locking up when
+    /// a film finishes: not a missing case, a repeating one.
+    private var didSignalEnd = false
+    /// Bumped by every seek/re-arm, so an end signal already scheduled on its
+    /// drain delay can tell it has been overtaken and stay silent.
+    @ClassicAtomic private var endSignalGeneration = 0
+
+    /// End (PTS + duration) of the last sample handed to a RENDERER, on the
+    /// synchronizer's timeline. Written on `feedQueue`, read on `feedQueue`
+    /// when the end is signalled and reset on main by `seek` — hence atomic.
+    @ClassicAtomic private var lastRenderedEnd: Double = 0
+
+    /// Note a sample as handed off, so `signalEndOnce` knows how much media the
+    /// renderers are still sitting on.
+    private func noteHandedToRenderer(pts: CMTime, duration: CMTime) {
+        let start = CMTimeGetSeconds(pts)
+        guard start.isFinite else { return }
+        let dur = CMTimeGetSeconds(duration)
+        let end = start + (dur.isFinite && dur > 0 ? dur : 0)
+        $lastRenderedEnd.mutate { $0 = max($0, end) }
+    }
+
+    /// VIDEO-only twin of `lastRenderedEnd`.
+    ///
+    /// `lastRenderedEnd` is fed by BOTH feeders, and audio is routinely handed
+    /// to its renderer seconds ahead of the picture. The decode-pacing probe
+    /// gated "the layer is nearly dry" on it, so it was reading the AUDIO lead:
+    /// the gate was essentially never true, the counter could not fire, and the
+    /// census printed `stalls0(0ms)` in every window whatever the picture was
+    /// doing. This tracks what the display layer alone has been given.
+    @ClassicAtomic private var lastVideoHandedEnd: Double = 0
+
+    /// AUDIO-only twin of `lastRenderedEnd`: how far the audio RENDERER has
+    /// been fed. What the underrun hold must look at before it stops the clock
+    /// for "no audio" — see `audioHoldLead`.
+    @ClassicAtomic private var lastAudioHandedEnd: Double = 0
+
+    private func noteAudioHandoff(pts: CMTime, duration: CMTime) {
+        let start = CMTimeGetSeconds(pts)
+        guard start.isFinite else { return }
+        let dur = CMTimeGetSeconds(duration)
+        let end = start + (dur.isFinite && dur > 0 ? dur : 0)
+        $lastAudioHandedEnd.mutate { $0 = max($0, end) }
+    }
+
+    /// Per-census-window picture health, written on `feedQueue`, taken and
+    /// reset on main when the vsync window closes. These look where the vsync
+    /// census cannot: the census follows the SYNCHRONIZER CLOCK, which ticks
+    /// smoothly even while the layer is short of frames and repeating one.
+    ///   tightHandoffs — frames given to the layer with under one frame of
+    ///                   margin before they were due (at risk of showing late)
+    ///   minHandoffLeadMs — the smallest margin any frame had this window
+    ///   slowDecodes / worstDecodeMs — VideoToolbox decodes slower than a frame
+    @ClassicAtomic private var tightHandoffs = 0
+    @ClassicAtomic private var minHandoffLeadMs = Int.max
+    @ClassicAtomic private var slowDecodes = 0
+    @ClassicAtomic private var worstDecodeMs = 0
+
+    private func noteVideoHandoff(pts: CMTime, duration: CMTime) {
+        let start = CMTimeGetSeconds(pts)
+        guard start.isFinite else { return }
+        let dur = CMTimeGetSeconds(duration)
+        let end = start + (dur.isFinite && dur > 0 ? dur : 0)
+        $lastVideoHandedEnd.mutate { $0 = max($0, end) }
+        // A margin only means something while the clock is running.
+        guard synchronizer.rate > 0 else { return }
+        let leadMs = Int((start - CMTimeGetSeconds(synchronizer.currentTime())) * 1000)
+        $minHandoffLeadMs.mutate { $0 = min($0, leadMs) }
+        let frameMs = dur.isFinite && dur > 0 ? Int(dur * 1000) : 42
+        if leadMs < frameMs { $tightHandoffs.mutate { $0 += 1 } }
+    }
+
+    /// Report the end once, and stop asking for media. Without the stop, the
+    /// display layer keeps re-invoking the feed block against an empty queue —
+    /// a spin on the feed queue for the whole time the finished movie is on
+    /// screen, on top of the repeated callbacks.
+    private func signalEndOnce() {
+        guard !didSignalEnd else { return }
+        didSignalEnd = true
+        displayLayer.stopRequestingMediaData()
+        audioRenderer.stopRequestingMediaData()
+        // OUR queues running dry is not the end of playback: the display layer
+        // and the audio renderer still hold everything already handed to them —
+        // roughly a second of it — so reporting here raised the post-play / Up
+        // Next card over the last second of the film, and made the "both
+        // renderers drained" contract above a lie.
+        //
+        // Neither renderer exposes a drained callback, so measure the residue
+        // instead: the renderers consume what they hold in real time at the
+        // synchronizer's rate, so how far the last handed-off sample's END sits
+        // ahead of the synchronizer's clock IS the remaining play time. Clamped
+        // so a bad PTS can never strand the end of a movie behind a long wait.
+        // Use the SYNCHRONIZER's rate, not `userRate`: the renderers only
+        // consume while the clock is running. Reading `userRate` meant that
+        // reaching the end during an underrun hold or a pause — clock stopped,
+        // `userRate` still 1 — computed a residue as though playback were
+        // rolling, so the title was recorded finished from a stopped clock and
+        // the tail was never rendered. A stopped clock has no residue to wait
+        // out: whatever the renderers hold will play when it runs again.
+        let liveRate = Double(synchronizer.rate)
+        var remaining = 0.0
+        if liveRate > 0 {
+            let clock = CMTimeGetSeconds(synchronizer.currentTime())
+            remaining = (lastRenderedEnd - clock) / liveRate
+            if !remaining.isFinite { remaining = 0 }
+            remaining = min(max(remaining, 0), 5)
+        }
+        // The drain wait is not cancellable, so it carries a generation: a
+        // seek inside the window (rewinding to rewatch an ending) used to let
+        // the stale block fire anyway — the title was marked ended and Up
+        // Next counted down mid-rewind.
+        let generation = endSignalGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + remaining) { [weak self] in
+            guard let self, self.endSignalGeneration == generation else { return }
+            self.onEnded?()
+        }
+    }
+
+    /// Demux thread only. Park at EOF until a seek moves the playhead (returns
+    /// true) or `stop()` cancels the session (returns false).
+    ///
+    /// Timed waits rather than an open-ended one: `seek()` and `stop()` both
+    /// broadcast, but a wake-up that lands between the generation check and the
+    /// wait would otherwise strand a finished title forever — a quarter-second
+    /// poll costs nothing on a thread that is doing no work at all, and is the
+    /// same belt-and-braces `enqueueBounded` already uses.
+    private func waitForSeekAfterEOF(currentGeneration: Int) -> Bool {
+        queueLock.lock()
+        defer { queueLock.unlock() }
+        while !cancelled, seekGeneration == currentGeneration {
+            queueLock.wait(until: Date().addingTimeInterval(0.25))
+        }
+        return !cancelled
+    }
+
+    /// Demux thread only. Undo the end-of-stream state so the seek we just woke
+    /// for actually plays: clear EOF for the feed blocks, forget that the end
+    /// was reported, and re-arm the renderers `signalEndOnce` stopped.
+    ///
+    /// The end-state reset runs on `feedQueue` because that is where
+    /// `didSignalEnd` and `signalEndOnce` live — dispatching it there serialises
+    /// it against an in-flight feed block, which could otherwise observe the
+    /// cleared flag, re-signal the end and immediately stop the media requests
+    /// we had just re-installed.
+    private func rearmAfterEOF() {
+        queueLock.lock()
+        demuxEOF = false
+        queueLock.broadcast()
+        queueLock.unlock()
+        feedQueue.async { [weak self] in
+            guard let self, !self.cancelled else { return }
+            self.didSignalEnd = false
+            self.$endSignalGeneration.mutate { $0 += 1 }
+            // Nothing the renderers held survives the seek's flush.
+            self.lastRenderedEnd = 0
+            self.lastVideoHandedEnd = 0
+            self.lastAudioHandedEnd = 0
+            self.installFeeders()
+        }
+    }
+
+    @ClassicAtomic private var cancelled = false
+    /// willEnterForeground observer, installed by `start()` and removed by `stop()`.
+    private var foregroundObserver: NSObjectProtocol?
+    /// True once a decode session has died: decoding resumes only at the next
+    /// KEYFRAME. A replacement session fed a frame that references a picture it
+    /// never decoded paints garbage — the green screen seen after a return from
+    /// the background. Holding the last good frame for a moment is far better.
+    @ClassicAtomic private var vtAwaitingKeyframe = false
+    /// One probe event per engine for decode errors (feedQueue only).
+    private var vtDecodeErrorReported = false
+    /// DEBUG: the first decoded frame's attachments have been reported (feedQueue only).
+    private var vtAttachmentsReported = false
+    /// Total stream bytes demuxed (packet payloads) — probe reads the delta
+    /// to report live ingest throughput.
+    @ClassicAtomic private var bytesDemuxed: Int64 = 0
+    private var lastProbeBytes: Int64 = 0
+    /// Seek generation: bumping it makes the demux thread restart its read
+    /// loop at `pendingSeekTo` and the feeders drop stale samples.
+    @ClassicAtomic private var seekGeneration = 0
+    @ClassicAtomic private var pendingSeekTo: Double = -1
+    /// Post-seek trim point (worker thread): video before this decodes
+    /// without displaying; audio before it is dropped.
+    private var trimBefore: Double = -1
+
+    /// The open input, for the audio decoder's stream lookups (worker only).
+    private var liveFormatCtx: UnsafeMutablePointer<AVFormatContext>?
+    private var demuxThread: Thread?
+    private var timeTimer: Timer?
+    private let feedQueue = DispatchQueue(label: "dv-sample-feed")
+
+    /// Fold decoded multichannel down to stereo IN THE ENGINE. tvOS cannot
+    /// bitstream TrueHD/DTS — they always decode to PCM — and on a route that
+    /// can only take two channels the renderer must live-downmix 8ch→2ch on
+    /// every buffer, on an A10X. That real-time mixer load is the prime
+    /// suspect for the crackly TrueHD sound AND the video judder (the
+    /// synchronizer slaves video to the audio renderer's clock). On a
+    /// stereo route this fold is what the listener would hear anyway.
+    ///
+    /// SET FROM THE ROUTE'S REAL CHANNEL CAPABILITY, not from
+    /// `isSpatialAudioEnabled` as it used to be — see
+    /// `ClassicAudioOutputCapability.supportsMultichannel`. An HDMI receiver that
+    /// decodes Dolby itself reports no spatial audio, so every 5.1/7.1 AVR was
+    /// being treated as a stereo route and folded here. With the capability
+    /// test the fold happens only on genuinely stereo routes, which is also
+    /// where it is cheapest: a multichannel route now gets its 8 channels
+    /// passed straight through with NO mixing anywhere, so this change removes
+    /// the very mixer load the paragraph above is about rather than adding it.
+    let downmixToStereo: Bool
+
+    /// The fold actually in force, worker-thread only. Starts as
+    /// `downmixToStereo` and is re-checked once against the live route at the
+    /// first decoded frame — see the note there. Separate from the `let` so the
+    /// caller's decision stays readable next to the one that was acted on.
+    ///
+    /// A plain `var` set in `init`, not `lazy`: only the decode loop touches it,
+    /// but a lazy initializer that first runs on a worker thread is a hazard
+    /// with nothing to gain.
+    private var foldToStereo: Bool
+
+    /// Play the HDR10 base layer only: strip every DV NAL (EL and RPU) and
+    /// publish a plain HEVC format description. The FEL policy — a full
+    /// enhancement layer can't ride the converted-8.1 path honestly, and its
+    /// approximate per-frame metadata is the prime suspect for composer-level
+    /// judder no pipeline probe can see.
+    let forceHDR10: Bool
+
+    /// Exact-label track memory ("English · AC3 · 6ch"): outranks language.
+    let preferredAudioLabel: String?
+
+    /// The release/stream NAME says "Atmos". MKV rarely tags the audio track
+    /// with "Atmos"/"JOC", so the container metadata alone reads "not tagged"
+    /// even for links named Atmos — this is the second, honest signal used to
+    /// decide whether the track is worth the Atmos passthrough path. It never
+    /// claims OUTPUT is Atmos; only the passthrough path can do that.
+    let streamNameSaysAtmos: Bool
+
+    init(input: String, startAt: Double,
+         preferredAudioLanguage: String, convertProfile7: Bool,
+         requestHeaders: [String: String]? = nil,
+         downmixToStereo: Bool = false,
+         forceHDR10: Bool = false,
+         preferredAudioLabel: String? = nil,
+         streamNameSaysAtmos: Bool = false) {
+        // Read `UIView.layer` HERE, on the constructing (main) actor, and hand
+        // the layer to the feed queue as a plain reference — see `displayLayer`.
+        let view = ClassicDVSampleLayerView()
+        videoView = view
+        displayLayer = view.displayLayer
+        panelRefreshHz = Thread.isMainThread
+            ? Int(UIScreen.main.maximumFramesPerSecond) : 0
+        inputURLString = input
+        self.startAt = max(startAt, 0)
+        self.preferredAudioLanguage = preferredAudioLanguage
+        self.convertProfile7 = convertProfile7
+        self.requestHeaders = requestHeaders
+        self.downmixToStereo = downmixToStereo
+        foldToStereo = downmixToStereo
+        self.forceHDR10 = forceHDR10
+        self.preferredAudioLabel = preferredAudioLabel
+        self.streamNameSaysAtmos = streamNameSaysAtmos
+    }
+
+    // MARK: Lifecycle
+
+    /// Ask the session to open a wide enough output for this track.
+    ///
+    /// The engine never did this. `AudioRendererPlayer` (KSPlayer's own
+    /// sample-buffer output) always has — without it tvOS is free to open the
+    /// route at two channels and everything downstream is a fold, no matter
+    /// what the renderer is handed.
+    ///
+    /// DECODE PATH ONLY, and that restraint is the point.
+    ///
+    /// `preferredOutputNumberOfChannels` describes the PCM rendering format the
+    /// session should open. For a track we decode here that is exactly right:
+    /// we are about to produce N channels of LPCM and the route has to be open
+    /// wide enough to take them.
+    ///
+    /// For a BITSTREAM it is at best meaningless and at worst harmful: the
+    /// channel count of an E-AC-3 JOC stream is not what Atmos comes out as
+    /// (the receiver renders the objects), and asking the session to open an
+    /// N-channel PCM output is an invitation to decode the very stream we are
+    /// trying to pass through. tvOS negotiates passthrough with the receiver
+    /// on its own, and that negotiation is verified working — so this leaves it
+    /// alone. Untouched behaviour beats a plausible-sounding hint.
+    private static func requestOutputChannels(for report: AudioPathReport) {
+        guard !report.passthrough, !report.downmixed, report.channels > 2 else { return }
+        let session = AVAudioSession.sharedInstance()
+        let maximum = session.maximumOutputNumberOfChannels
+        guard maximum > 2 else { return }
+        let wanted = min(report.channels, maximum)
+        guard session.preferredOutputNumberOfChannels != wanted else { return }
+        try? session.setPreferredOutputNumberOfChannels(wanted)
+        ClassicPlayerProbe.event("audio", "decode path: asked the route for \(wanted)ch (max \(maximum))")
+    }
+
+    /// Does the CONTAINER say this track is Atmos?
+    ///
+    /// Deliberately metadata-only. Proving E-AC-3 JOC (or TrueHD Atmos)
+    /// properly means parsing the bitstream's substream headers, which is real
+    /// work at exactly the moment startup is most sensitive — and it would not
+    /// change a single decision here: what the engine does with a track is
+    /// decided by its CODEC (can tvOS bitstream it?), never by whether it
+    /// carries objects. So this is used for the diagnostics line only, and it
+    /// is phrased as "the source says" everywhere it surfaces. A file that
+    /// carries Atmos and says nothing about it simply reads as plain E-AC-3;
+    /// it still bitstreams, and the receiver still decodes the objects.
+    static func streamSaysAtmos(stream: UnsafeMutablePointer<AVStream>?,
+                                par: AVCodecParameters) -> Bool {
+        guard par.codec_id == AV_CODEC_ID_EAC3 || par.codec_id == AV_CODEC_ID_TRUEHD else {
+            return false
+        }
+        // THE PARSED PROFILE IS THE SIGNAL A MATROSKA REMUX ACTUALLY CARRIES.
+        //
+        // FFmpeg 6.1 flags Atmos in `AVCodecParameters.profile`:
+        // `FF_PROFILE_EAC3_DDP_ATMOS` when the E-AC-3 bitstream carries the JOC
+        // extension (`ec3_extension_type_a`), and `FF_PROFILE_TRUEHD_ATMOS` for
+        // TrueHD Atmos — both 30 (the macros are `#define`s Swift cannot
+        // import, hence the literal). `avformat_find_stream_info` populates it.
+        //
+        // Checking only the track metadata missed almost every real Atmos file:
+        // a remux tags the track "English · EAC3 · 5.1", never "atmos". With
+        // the flag false, the AVPlayer Atmos passthrough never started and the
+        // receiver got the sample renderer's PCM — the "E-AC-3 Atmos plays as
+        // 2.0/5.1/7.1 PCM" report. The bitstream is authoritative; the tag is
+        // not.
+        if par.profile == Self.atmosProfile { return true }
+        guard let stream else { return false }
+        for key in ["title", "handler_name", "comment"] {
+            guard let value = av_dict_get(stream.pointee.metadata, key, nil, 0)?.pointee.value
+            else { continue }
+            let text = String(cString: value).lowercased()
+            if text.contains("atmos") || text.contains("joc") { return true }
+        }
+        return false
+    }
+
+    /// `FF_PROFILE_EAC3_DDP_ATMOS` / `FF_PROFILE_TRUEHD_ATMOS` — both 30 in the
+    /// FFmpeg headers, and both `#define`s the Swift importer does not surface.
+    private static let atmosProfile: Int32 = 30
+
+
+    /// Open the source and start feeding. Returns false (with a reason via
+    /// the completion) when the file can't ride this pipeline — the caller
+    /// falls back to the remux path. Runs its blocking probe OFF the caller.
+    func start(completion: @escaping (Bool, String) -> Void) {
+        Self.elNalCount = 0
+        Self.elNalBytes = 0
+        // MULTICHANNEL HAS TO BE ALLOWED EXPLICITLY, AND THIS IS THE ENGINE
+        // THAT BITSTREAMS DOLBY. `allowedAudioSpatializationFormats` defaults
+        // to `.monoAndStereo`, so the renderer carrying compressed E-AC-3 (JOC
+        // Atmos included) straight to tvOS was told multichannel was not
+        // wanted — the one place in the app where an Atmos bitstream could
+        // reach the receiver, configured to fold it. KSPlayer's own
+        // `AudioRendererPlayer` has always set this; this engine never did.
+        if #available(tvOS 15.0, *) {
+            audioRenderer.allowedAudioSpatializationFormats = .monoStereoAndMultichannel
+        }
+        synchronizer.addRenderer(displayLayer)
+        synchronizer.addRenderer(audioRenderer)
+        // A SUSPENSION CAN KILL THE HARDWARE DECODER WITHOUT SAYING SO.
+        // Measured on device (2026-09-16): back from 60s in the background, the
+        // engine reconnected and decoded, and the screen showed GREEN — the
+        // decode session had not survived, and whatever it produced was not a
+        // picture. Relying on `kVTInvalidSessionErr` alone throws away the one
+        // frame everything else depends on (see `vtDecodeOne`). So rebuild it
+        // as the app comes back, before anything is decoded, and restart
+        // decoding at a keyframe — which the resume's resync seek delivers.
+        #if DEBUG
+        // A/B (`-dvCompressedFeed`): hand the display layer the compressed dvh1
+        // samples and let tvOS decode them — the engine's original pipeline,
+        // still used whenever VideoToolbox refuses a session.
+        if ProcessInfo.processInfo.arguments.contains("-dvCompressedFeed") {
+            vtUnavailable = true
+            ClassicPlayerProbe.event("dv", "DEBUG -dvCompressedFeed: the display layer decodes (no decode-ahead)")
+        }
+        #endif
+        foregroundObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self, !self.cancelled else { return }
+            ClassicPlayerProbe.event("dv", "rebuilding the video decoder after a suspension")
+            self.vtAwaitingKeyframe = true
+            self.vtTearDown()
+        }
+        let thread = Thread { [weak self] in
+            guard let self else { return }
+            let failReason = self.run()
+            if let failReason {
+                DispatchQueue.main.async { [weak self] in
+                    // Release the stored copy BEFORE reporting: the caller's
+                    // closure captures this engine strongly (its
+                    // `dvDirectEngine === engine` identity check needs it), and
+                    // `startCompletion` was only ever cleared on the SUCCESS
+                    // path — so every declined DV attempt left engine → closure
+                    // → engine alive with its synchronizer, both renderers and
+                    // the display view, for the life of the process.
+                    self?.startCompletion = nil
+                    completion(false, failReason)
+                }
+            }
+        }
+        thread.name = "ClassicDVSampleEngine"
+        thread.qualityOfService = .userInitiated
+        demuxThread = thread
+        startCompletion = completion
+        thread.start()
+    }
+    private var startCompletion: ((Bool, String) -> Void)?
+    private var reportedLayerFailure = false
+    private var reportedAudioFailure = false
+    private var lastLayerRecoveryAt = Date.distantPast
+    private var layerRecoveryCount = 0
+
+    /// The rate the USER wants — underrun auto-pause must not overwrite a
+    /// deliberate pause, and refill must not resume one.
+    private var userRate: Float = 1
+    private var autoPaused = false
+    private var playbackClockStarted = false
+    private let startupVideoPreroll = 18
+    /// A SEEK's preroll, and deliberately shorter than a cold start's: the
+    /// decoders, the renderers and the connection are all already warm, so the
+    /// only thing being waited for is enough decoded video that the clock
+    /// won't underrun the moment it starts.
+    private let seekVideoPreroll = 10
+
+    /// Cushion required before resuming from an underrun. The old flat 16
+    /// (0.7s) meant each resume ran dry again within seconds on a feed
+    /// that's oscillating — pause/play machine-gunning. Prefer a real
+    /// runway (~5s of AUs), but TIME-BOX the hold: on a feed that refills
+    /// slowly (the heavy-file case) waiting for the full cushion reads as
+    /// "frozen after rewind", so after a few seconds take a 1s cushion and
+    /// go. Near EOF take whatever remains so the tail still plays.
+    private var autoPausedAt = Date.distantPast
+    private var recentUnderruns = 0
+    private var lastUnderrunAt = Date.distantPast
+    /// True between a seek and the moment its refill has visibly landed: the
+    /// refill after a seek is a fresh start, not a stalled feed — take a 1s
+    /// cushion and go. Cleared either by the underrun resume or (the common
+    /// case — most seeks never underrun) by the healthy-queue check in the
+    /// tick timer.
+    private var seekRefill = false
+
+    /// FFmpeg's `AVERROR_EOF` / `AVERROR_EXIT`, which are macros and so do not
+    /// import into Swift. Both are FFERRTAG values: the negated four-character
+    /// code, i.e. -MKTAG('E','O','F',' ') and -MKTAG('E','X','I','T').
+    private static let averrorEOF: Int32 = -541_478_725
+    private static let averrorExit: Int32 = -1_414_092_869
+    /// `AVERROR(EAGAIN)` on Darwin (EAGAIN is 35): a non-blocking read with
+    /// nothing ready yet, not a failure.
+    private static let averrorEAGAIN: Int32 = -35
+
+    private static func describeAVError(_ code: Int32) -> String {
+        var buf = [CChar](repeating: 0, count: 256)
+        if av_strerror(code, &buf, 256) == 0 {
+            return String(cString: buf)
+        }
+        return "error \(code)"
+    }
+
+    private func underrunResumeDepth(eof: Bool) -> Int {
+        if eof { return 1 }
+        if seekRefill { return 24 }
+        // A one-off hiccup resumes fast (time-boxed small cushion). REPEATED
+        // underruns mean the feed is genuinely slower than the movie right
+        // now (a debrid link warming up) — each one demands a deeper cushion,
+        // up to the full buffer, so a cold link produces one honest buffering
+        // pause instead of a minute of stop-go machine-gunning.
+        // Every value here is compared against `videoQueue.count`, which stays
+        // at or near `videoQueueCap` (`enqueueBounded` allows a small fixed
+        // overshoot when the audio queue is starving, never more) — so a
+        // cushion at or above the cap is arithmetically unreachable and the
+        // hold becomes PERMANENT: the queues sit full, the demuxer blocks,
+        // `onBuffering(true)` is never cleared, and the stall watchdog
+        // abandons a perfectly good link.
+        // With decode-ahead on (always) the cap is 120, so the old 192/240
+        // rungs could never be met. Clamp to what the queue can actually hold,
+        // leaving headroom for the audio queue to block the demuxer first.
+        let ceiling = max(24, videoQueueCap - 8)
+        if recentUnderruns <= 1 {
+            return Date().timeIntervalSince(autoPausedAt) > 4 ? 24 : min(120, ceiling)
+        }
+        // A hold that has already lasted a while stops escalating — the point
+        // is one honest pause, not an unreachable target. `recentUnderruns` is
+        // only reset on ENTERING a hold, so without this a long hold keeps the
+        // deepest cushion forever.
+        if Date().timeIntervalSince(autoPausedAt) > 20 { return min(48, ceiling) }
+        return min(24 << min(recentUnderruns, 4), ceiling)
+    }
+
+    func play() {
+        if userRate <= 0 { userRate = 1 }
+        if playbackClockStarted, !autoPaused {
+            synchronizer.setRate(userRate, time: synchronizer.currentTime())
+        }
+    }
+
+    func pause() {
+        userRate = 0
+        synchronizer.setRate(0, time: synchronizer.currentTime())
+    }
+
+    var rate: Float {
+        get { synchronizer.rate }
+        set {
+            // Changing speed while PAUSED must not start playback. `pause()`
+            // leaves `playbackClockStarted` true, so pushing the new rate
+            // unconditionally restarted the synchronizer and the video resumed
+            // the instant the speed picker was used on a paused DV session.
+            // The new speed is still remembered in `userRate`, so a later
+            // `play()` uses it.
+            let wasRunning = synchronizer.rate > 0
+            userRate = newValue
+            if playbackClockStarted, !autoPaused, wasRunning || newValue == 0 {
+                synchronizer.setRate(newValue, time: synchronizer.currentTime())
+            }
+        }
+    }
+
+    /// Seek: flush the renderers, point the demuxer at the target, restart
+    /// the clock there. The demux thread notices the generation bump at its
+    /// next loop iteration (or wakes from a full-queue wait).
+    func seek(to seconds: Double) {
+        let target = max(0, min(seconds, duration > 1 ? duration - 2 : seconds))
+        pendingSeekTo = target
+        seekGeneration += 1
+        // A seek's refill is a fresh start, NOT a stalled feed. Without this,
+        // every scan-seek emptied the queues, registered as an "underrun",
+        // and stacked the escalation cushion until landing demanded a 10s
+        // refill — the "doesn't load when I get there" report. Reset the
+        // escalation and resume on a 1s cushion.
+        recentUnderruns = 0
+        lastUnderrunAt = .distantPast
+        seekRefill = true
+        // An end signal waiting out its drain delay belongs to the position
+        // this seek is leaving.
+        $endSignalGeneration.mutate { $0 += 1 }
+        // The renderers are about to be flushed, so nothing they held counts
+        // towards the end-of-stream drain wait any more — and neither does the
+        // DEMUXER's old read-ahead: `bufferedUpTo` kept reporting the pre-seek
+        // frontier (an hour of "buffer" after a long rewind), which opened the
+        // preview passes' health gates during exactly the post-seek refill
+        // they exist to stand down for.
+        lastRenderedEnd = 0
+        lastVideoHandedEnd = 0
+        lastAudioHandedEnd = 0
+        lastQueuedVideoPTS = target
+        queueLock.lock()
+        videoQueue.removeAll()
+        audioQueue.removeAll()
+        // Clear the end flag HERE, in the same lock hold that empties the
+        // queues. Both feed paths test `demuxEOF && queues empty` to mean "the
+        // movie is over", and leaving the flag set until the parked demux thread
+        // gets scheduled left that window open with the queues already emptied:
+        // a feed block running in between reported the end, so rewinding inside
+        // the final ten seconds raised Up Next and saved the title as complete
+        // while the seek was still landing underneath it.
+        demuxEOF = false
+        // BROADCAST, not signal: the demux thread may be parked at EOF
+        // (`waitForSeekAfterEOF`) rather than waiting for queue room, and a
+        // seek that failed to wake it would leave the rewind unserved — the
+        // stuck-at-the-end symptom this whole path exists to cure.
+        queueLock.broadcast()
+        queueLock.unlock()
+        vtFlush()
+        displayLayer.flush()
+        audioRenderer.flush()
+        // HOLD THE CLOCK AT THE TARGET until the refill actually arrives —
+        // the cold-start preroll gate, re-armed.
+        //
+        // This used to start the rate right here, which ran the clock over
+        // queues that were emptied three lines above while the demux thread
+        // was still doing an `av_seek_frame` across the network and then
+        // decoding the keyframe LEAD-IN. Every millisecond of that is clock
+        // drift past the target, and it is worst on a BACKWARD seek, where
+        // the run from the preceding keyframe is longest. The frames that
+        // finally arrive carry PTS at the target — by then in the clock's
+        // PAST — so the display layer burns through them to catch up: the
+        // picture lands where you aimed and then fast-forwards away from it.
+        //
+        // The underrun watchdog could not rescue this either. It holds at
+        // `currentTime()`, which is already target-plus-drift, so the clock
+        // never came back to where the seek aimed.
+        //
+        // At rate 0 the clock cannot drift, so when the gate finally starts
+        // it `currentTime()` is still exactly the target.
+        playbackClockStarted = false
+        autoPaused = false
+        synchronizer.setRate(0, time: CMTime(seconds: target, preferredTimescale: 90000))
+        onBuffering?(true)
+    }
+
+    func stop() {
+        cancelled = true
+        if let foregroundObserver {
+            NotificationCenter.default.removeObserver(foregroundObserver)
+            self.foregroundObserver = nil
+        }
+        queueLock.lock(); queueLock.broadcast(); queueLock.unlock()
+        displayLayer.stopRequestingMediaData()
+        audioRenderer.stopRequestingMediaData()
+        displayLayer.flushAndRemoveImage()
+        audioRenderer.flush()
+        synchronizer.setRate(0, time: .zero)
+        // Detach the renderers: the synchronizer retains them, and a video
+        // renderer holds its hardware decode session (tens of MB of
+        // compressed-memory decoder state) for as long as it's attached.
+        synchronizer.removeRenderer(displayLayer, at: .invalid)
+        synchronizer.removeRenderer(audioRenderer, at: .invalid)
+        timeTimer?.invalidate()
+        timeTimer = nil
+        displayLink?.invalidate()
+        displayLink = nil
+        vtTearDown()
+        // Drop the queued samples NOW. The queues held up to 240 compressed
+        // AUs (~80MB at UHD-remux bitrates) and stop() never cleared them —
+        // combined with the callback retain cycle below, that WAS the
+        // ~80MB-per-session creep that ended in jetsam.
+        queueLock.lock()
+        videoQueue.removeAll()
+        audioQueue.removeAll()
+        queueLock.unlock()
+        // Break the self-retain cycle: the VM's callbacks capture this engine
+        // strongly (for their `dvDirectEngine === engine` identity checks)
+        // and the engine stores those closures — engine → closure → engine
+        // kept every retired engine alive forever.
+        onTime = nil
+        onBuffering = nil
+        onEnded = nil
+        onError = nil
+        // Same cycle, same fix, one more owner: a start that is ABANDONED —
+        // stopped while the open was still in flight — never reaches either
+        // path that clears this, and the start closure captures the engine
+        // strongly. Clearing the other four callbacks but not this one left the
+        // engine (and its renderers and display view) alive anyway.
+        startCompletion = nil
+    }
+
+    deinit {
+        NSLog("[DVSample] engine deinit")
+    }
+
+    // MARK: Demux worker
+
+    /// Returns a failure reason for a PRE-start failure, nil once streaming.
+    private func run() -> String? {
+        var ictx: UnsafeMutablePointer<AVFormatContext>? = avformat_alloc_context()
+        guard let inCtx = ictx else { return "alloc failed" }
+        var interruptCB = AVIOInterruptCB()
+        interruptCB.opaque = Unmanaged.passUnretained(self).toOpaque()
+        interruptCB.callback = { opaque -> Int32 in
+            guard let opaque else { return 0 }
+            return Unmanaged<ClassicDVSampleEngine>.fromOpaque(opaque).takeUnretainedValue().cancelled ? 1 : 0
+        }
+        inCtx.pointee.interrupt_callback = interruptCB
+        var opts: OpaquePointer?
+        av_dict_set(&opts, "rw_timeout", "20000000", 0)
+        av_dict_set(&opts, "reconnect", "1", 0)
+        av_dict_set(&opts, "reconnect_streamed", "1", 0)
+        if let headers = requestHeaders, !headers.isEmpty {
+            let blob = headers.map { "\($0.key): \($0.value)" }.joined(separator: "\r\n") + "\r\n"
+            av_dict_set(&opts, "headers", blob, 0)
+        }
+        defer { av_dict_free(&opts) }
+        guard avformat_open_input(&ictx, inputURLString, nil, &opts) == 0, ictx != nil else {
+            return "couldn't open source"
+        }
+        defer { avformat_close_input(&ictx) }
+        ictx!.pointee.probesize = 2 << 20
+        ictx!.pointee.max_analyze_duration = 1_000_000
+        guard avformat_find_stream_info(ictx, nil) >= 0 else { return "couldn't probe source" }
+        liveFormatCtx = ictx
+
+        // ---- Stream selection ----
+        var videoIndex: Int32 = -1
+        var audioIndex: Int32 = -1
+        var bestAudioScore = Int.min
+        var dvProfile = 0
+        var dvLevel = 0
+        var dvCompatibilityID = 1
+        var nalLengthSize = 4
+        for i in 0 ..< Int(ictx!.pointee.nb_streams) {
+            guard let stream = ictx!.pointee.streams[i], let par = stream.pointee.codecpar else { continue }
+            if par.pointee.codec_type == AVMEDIA_TYPE_VIDEO, videoIndex < 0,
+               par.pointee.codec_id == AV_CODEC_ID_HEVC,
+               (stream.pointee.disposition & AV_DISPOSITION_ATTACHED_PIC) == 0 {
+                videoIndex = Int32(i)
+                if par.pointee.nb_coded_side_data > 0, let sideDatas = par.pointee.coded_side_data {
+                    for j in 0 ..< Int(par.pointee.nb_coded_side_data) {
+                        let sd = sideDatas[j]
+                        if sd.type == AV_PKT_DATA_DOVI_CONF, let data = sd.data {
+                            // Load INSIDE the rebinding — the pointer must not
+                            // escape the closure (undefined once it returns).
+                            let record = data.withMemoryRebound(
+                                to: AVDOVIDecoderConfigurationRecord.self, capacity: 1
+                            ) { $0.pointee }
+                            dvProfile = Int(record.dv_profile)
+                            dvLevel = Int(record.dv_level)
+                            dvCompatibilityID = Int(record.dv_bl_signal_compatibility_id)
+                            detectedDVProfile = dvProfile
+                            dvDiag("dovi conf: profile %d.%d level %d (bl compat %d)",
+                                  dvProfile, dvCompatibilityID, dvLevel, dvCompatibilityID)
+                        }
+                    }
+                }
+                if let extra = par.pointee.extradata, par.pointee.extradata_size > 22, extra[0] == 1 {
+                    nalLengthSize = Int(extra[21] & 0x03) + 1
+                }
+                let fr = stream.pointee.avg_frame_rate
+                if fr.den > 0 { videoFPS = Float(av_q2d(fr)) }
+                videoWidth = Int(par.pointee.width)
+                videoHeight = Int(par.pointee.height)
+                containerMbps = Double(inCtx.pointee.bit_rate) / 1_000_000
+                // The A/B datum the jitter hunt needs: exact rate + bitrate.
+                let rfr = stream.pointee.r_frame_rate
+                dvDiag("video: %dx%d avg_fps=%d/%d (%.5f) r_fps=%d/%d container_bitrate=%.1f Mbps",
+                      par.pointee.width, par.pointee.height,
+                      fr.num, fr.den, fr.den > 0 ? av_q2d(fr) : 0,
+                      rfr.num, rfr.den,
+                      Double(inCtx.pointee.bit_rate) / 1_000_000)
+            }
+            if par.pointee.codec_type == AVMEDIA_TYPE_AUDIO {
+                let id = par.pointee.codec_id
+                // Passthrough for what the renderer decodes itself; the
+                // FFmpeg decode→LPCM path for EVERYTHING else (TrueHD, DTS,
+                // FLAC, Opus…) — every audio track is eligible now.
+                let passthrough = id == AV_CODEC_ID_EAC3 || id == AV_CODEC_ID_AC3 || id == AV_CODEC_ID_AAC
+                if passthrough, let format = Self.makeAudioFormat(par: par.pointee) {
+                    audioFormats[Int32(i)] = format
+                } else if avcodec_find_decoder(id) != nil {
+                    decodeAudioIndices.insert(Int32(i))
+                } else {
+                    continue   // no decoder for this codec — skip the track
+                }
+                var lang = ""
+                if let tag = av_dict_get(stream.pointee.metadata, "language", nil, 0)?.pointee.value {
+                    lang = String(cString: tag)
+                }
+                let codecName = avcodec_get_name(id).map { String(cString: $0).uppercased() } ?? "?"
+                let channels = Int(par.pointee.ch_layout.nb_channels)
+                let language = Locale.current.localizedString(forLanguageCode: lang) ?? lang
+                let label = [language, codecName, channels > 0 ? "\(channels)ch" : ""]
+                    .filter { !$0.isEmpty }.joined(separator: " · ")
+                audioTracks.append(AudioTrack(index: Int32(i), label: label.isEmpty ? "Track \(i)" : label, lang: lang))
+                // Snapshot what this track IS and what the engine would do
+                // with it, while the context is in hand. See audioPathByStream.
+                var report = AudioPathReport()
+                report.codec = codecName.lowercased()
+                report.channels = channels
+                report.sampleRate = Int(par.pointee.sample_rate)
+                report.passthrough = passthrough
+                report.sourceSaysAtmos = Self.streamSaysAtmos(stream: stream, par: par.pointee)
+                    || streamNameSaysAtmos
+                report.downmixed = !passthrough && downmixToStereo && channels > 2
+                audioPathByStream[Int32(i)] = report
+                // RANKED default, not first-wins: remuxes routinely put a 2ch
+                // commentary first, and taking it made "native" sessions open
+                // on the director track. Same policy as the FFmpeg engine:
+                // language match dominates, then channel count; commentary /
+                // described-video tracks sink to the bottom no matter what.
+                var title = ""
+                if let t = av_dict_get(stream.pointee.metadata, "title", nil, 0)?.pointee.value {
+                    title = String(cString: t).lowercased()
+                }
+                let disposition = stream.pointee.disposition
+                var score = channels * 10
+                // WHAT tvOS CAN ACTUALLY BITSTREAM COMES FIRST, above raw
+                // channel count.
+                //
+                // A UHD remux carries TrueHD Atmos 8ch AND an E-AC-3 (JOC)
+                // compatibility track. Ranked by `channels * 10` alone the
+                // TrueHD track won every time — and tvOS cannot bitstream
+                // TrueHD, so it went down the FFmpeg decode→LPCM branch below
+                // and lost its Atmos objects (and got folded to stereo on a
+                // route we thought was stereo). The E-AC-3 track sitting
+                // beside it is the one the receiver can decode as Atmos.
+                //
+                // The bonus is MULTICHANNEL-ONLY on purpose: a 2ch E-AC-3
+                // commentary-grade track must not outrank 8ch TrueHD, and a
+                // stereo anything stays last as the priority list says.
+                // AC-3 gets a tie-break nudge rather than a flip — 5.1 AC-3
+                // bitstream is not worth losing 7.1 of lossless PCM over.
+                if channels > 2 {
+                    switch id {
+                    case AV_CODEC_ID_EAC3: score += 60
+                    case AV_CODEC_ID_AC3: score += 5
+                    default: break
+                    }
+                }
+                if (disposition & AV_DISPOSITION_DEFAULT) != 0 { score += 5 }
+                // Alias-aware and label-aware (see ClassicAudioLanguageMatch): a file
+                // tagged "ger" satisfies a "de" preference, and a file that
+                // tags nothing but titles the track "English" still counts.
+                if !preferredAudioLanguage.isEmpty,
+                   ClassicAudioLanguageMatch.matches(code: lang, label: label,
+                                              preferred: preferredAudioLanguage) {
+                    score += 200
+                }
+                // The user's remembered pick for THIS title wins outright.
+                if let want = preferredAudioLabel, !want.isEmpty,
+                   audioTracks.last?.label == want { score += 100_000 }
+                if (disposition & (AV_DISPOSITION_COMMENT | AV_DISPOSITION_VISUAL_IMPAIRED
+                                   | AV_DISPOSITION_HEARING_IMPAIRED)) != 0
+                    || title.contains("commentary") || title.contains("description") {
+                    score -= 10_000
+                }
+                if score > bestAudioScore {
+                    bestAudioScore = score
+                    audioIndex = Int32(i)
+                }
+            }
+        }
+        // ---- H.264, as a SECOND pass ----
+        //
+        // Deliberately not merged into the loop above: the HEVC arm stays
+        // byte-identical (a dual-codec file keeps today's behaviour, HEVC
+        // first-wins), and nothing H.264 ever assigns any DV state — the whole
+        // Dolby Vision pipeline stays unreachable for it by construction.
+        //
+        // H.264 rides this engine for exactly one reason: it is the only path
+        // that can hand an MKV's E-AC-3/AC-3 to tvOS as a BITSTREAM. So it is
+        // taken only in the shapes known safe, and anything else declines with
+        // its reason and falls back to the FFmpeg engine — which is where
+        // every one of these files plays today.
+        var videoIsH264 = false
+        var h264Decline: String?
+        if videoIndex < 0 {
+            for i in 0 ..< Int(ictx!.pointee.nb_streams) {
+                guard let stream = ictx!.pointee.streams[i], let par = stream.pointee.codecpar,
+                      par.pointee.codec_type == AVMEDIA_TYPE_VIDEO,
+                      par.pointee.codec_id == AV_CODEC_ID_H264,
+                      (stream.pointee.disposition & AV_DISPOSITION_ATTACHED_PIC) == 0
+                else { continue }
+                // First H.264 track wins or declines — same first-wins rule as
+                // the HEVC arm; a second H.264 track is not a case worth code.
+                // DV Profile 9 is AVC-based, and a mis-tagged container can
+                // carry a DOVI config on an H.264 track. Building a dvh1
+                // format description around avcC bytes SUCCEEDS (CoreMedia
+                // does not validate atom contents) and then fails black at
+                // decode — so any DV config here is an immediate decline.
+                var carriesDOVI = false
+                if par.pointee.nb_coded_side_data > 0, let sideDatas = par.pointee.coded_side_data {
+                    for j in 0 ..< Int(par.pointee.nb_coded_side_data)
+                    where sideDatas[j].type == AV_PKT_DATA_DOVI_CONF { carriesDOVI = true }
+                }
+                if carriesDOVI {
+                    h264Decline = "Dolby Vision on an H.264 track — not supported here"
+                    break
+                }
+                // avcC only. Annex-B extradata (broadcast TS remuxes) means
+                // Annex-B packets, and nothing in this engine converts start
+                // codes to length prefixes — the display layer would be fed
+                // garbage. avcC byte 0 is configurationVersion == 1; a start
+                // code begins 0x00.
+                guard let extra = par.pointee.extradata, par.pointee.extradata_size >= 7,
+                      extra[0] == 1 else {
+                    h264Decline = "H.264 track is Annex B, not avcC"
+                    break
+                }
+                // Progressive only: nothing here deinterlaces, and a woven
+                // buffer goes to the display layer verbatim.
+                guard par.pointee.field_order == AV_FIELD_UNKNOWN
+                        || par.pointee.field_order == AV_FIELD_PROGRESSIVE else {
+                    h264Decline = "interlaced H.264"
+                    break
+                }
+                // Square pixels only: the format description carries no
+                // PixelAspectRatio, so anamorphic (DVD/HDV/broadcast) would
+                // render stretched on the compressed-feed fallback path.
+                let sar = par.pointee.sample_aspect_ratio
+                guard sar.num == 0 || sar.num == sar.den else {
+                    h264Decline = "anamorphic H.264 (SAR \(sar.num):\(sar.den))"
+                    break
+                }
+                videoIndex = Int32(i)
+                videoIsH264 = true
+                videoIsAVC = true
+                videoCodecName = "H.264"
+                // avcC: lengthSizeMinusOne lives in byte 4's low two bits —
+                // NOT byte 21, which is hvcC's home for the same field and is
+                // arbitrary SPS payload in an avcC.
+                nalLengthSize = Int(extra[4] & 0x03) + 1
+                let fr = stream.pointee.avg_frame_rate
+                if fr.den > 0 { videoFPS = Float(av_q2d(fr)) }
+                videoWidth = Int(par.pointee.width)
+                videoHeight = Int(par.pointee.height)
+                containerMbps = Double(inCtx.pointee.bit_rate) / 1_000_000
+                dvDiag("video: H.264 %dx%d avg_fps=%d/%d nalLen=%d container_bitrate=%.1f Mbps",
+                      par.pointee.width, par.pointee.height, fr.num, fr.den,
+                      nalLengthSize, containerMbps)
+                break
+            }
+        }
+        guard videoIndex >= 0 else { return h264Decline ?? "no playable video track" }
+        guard audioIndex >= 0 else { return "no playable audio track" }
+        // The audio half of the H.264 gate, on the track actually SELECTED —
+        // "the file carries E-AC-3" is not the same thing: the language and
+        // remembered-label bonuses can hand `audioIndex` to a TrueHD/DTS/FLAC
+        // track, and an H.264 session decoding its audio to PCM has no reason
+        // to exist. The FFmpeg engine does that identically, with none of the
+        // new-path risk.
+        if videoIsH264 {
+            let aID = ictx!.pointee.streams[Int(audioIndex)]?.pointee.codecpar?.pointee.codec_id
+            guard aID == AV_CODEC_ID_EAC3 || aID == AV_CODEC_ID_AC3 else {
+                return "H.264 rides this engine only for a Dolby bitstream — the selected track isn't one"
+            }
+        }
+        // DV files must be a profile this pipeline can tag; a file with NO
+        // DV config plays as plain HEVC (HDR10/HDR10+/SDR — the static and
+        // dynamic metadata ride the bitstream untouched, which IS HDR10+
+        // passthrough on capable boxes).
+        if dvProfile > 0 {
+            // `forceHDR10` is a third way to accept Profile 7: it does not tag
+            // the stream as DV at all, it strips the DV NALs and plays the
+            // HDR10 base layer — so the conversion this guard is really asking
+            // about never happens. Without this clause a caller that asked for
+            // the base layer (see `p7BaseLayerForAudio`) was refused here and
+            // the file fell back, which is the opposite of the intent.
+            guard dvProfile == 5 || dvProfile == 8
+                    || (dvProfile == 7 && (convertProfile7 || forceHDR10)) else {
+                return "Dolby Vision profile \(dvProfile) not supported here"
+            }
+        }
+        let needsP7 = dvProfile == 7
+        if ictx!.pointee.duration > 0 {
+            duration = Double(ictx!.pointee.duration) / Double(AV_TIME_BASE)
+        }
+        if ictx!.pointee.nb_chapters > 0, let list = ictx!.pointee.chapters {
+            var found: [Chapter] = []
+            for c in 0 ..< Int(ictx!.pointee.nb_chapters) {
+                guard let chapter = list[c] else { continue }
+                let tb = chapter.pointee.time_base
+                let start = Double(chapter.pointee.start) * av_q2d(tb)
+                let end = Double(chapter.pointee.end) * av_q2d(tb)
+                var title = ""
+                if let tag = av_dict_get(chapter.pointee.metadata, "title", nil, 0)?.pointee.value {
+                    title = String(cString: tag)
+                }
+                found.append(Chapter(start: start, end: end, title: title))
+            }
+            chapters = found
+        }
+
+        // ---- Embedded subtitle tracks (second pass; text + PGS bitmap) ----
+        for i in 0 ..< Int(inCtx.pointee.nb_streams) {
+            guard let stream = inCtx.pointee.streams[i],
+                  let par = stream.pointee.codecpar,
+                  par.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE else { continue }
+            let id = par.pointee.codec_id
+            let textCodec = id == AV_CODEC_ID_SUBRIP || id == AV_CODEC_ID_ASS
+                || id == AV_CODEC_ID_SSA || id == AV_CODEC_ID_MOV_TEXT || id == AV_CODEC_ID_TEXT
+            let bitmapCodec = id == AV_CODEC_ID_HDMV_PGS_SUBTITLE || id == AV_CODEC_ID_DVD_SUBTITLE
+            guard textCodec || bitmapCodec, avcodec_find_decoder(id) != nil else { continue }
+            var lang = ""
+            if let tag = av_dict_get(stream.pointee.metadata, "language", nil, 0)?.pointee.value {
+                lang = String(cString: tag)
+            }
+            var title = ""
+            if let tag = av_dict_get(stream.pointee.metadata, "title", nil, 0)?.pointee.value {
+                title = String(cString: tag)
+            }
+            let language = Locale.current.localizedString(forLanguageCode: lang) ?? lang
+            let kind = bitmapCodec ? "PGS" : (avcodec_get_name(id).map { String(cString: $0).uppercased() } ?? "SUB")
+            var label = [language, title, kind].filter { !$0.isEmpty }.joined(separator: " · ")
+            if label.isEmpty { label = "Track \(i)" }
+            if (stream.pointee.disposition & AV_DISPOSITION_FORCED) != 0 { label += " · Forced" }
+            subtitleTracks.append(SubtitleTrack(index: Int32(i), label: label, isBitmap: bitmapCodec))
+            subStreamSet.insert(Int32(i))
+        }
+        if !subtitleTracks.isEmpty {
+            NSLog("[DVSample] embedded subtitles: %@",
+                  subtitleTracks.map { "\($0.index):\($0.label)" }.joined(separator: ", "))
+        }
+
+        // ---- Format descriptions ----
+        guard let vStream = ictx!.pointee.streams[Int(videoIndex)],
+              let vPar = vStream.pointee.codecpar,
+              let extra = vPar.pointee.extradata, vPar.pointee.extradata_size > 0 else {
+            return "video track carries no codec configuration"
+        }
+        // For HEVC this is the hvcC; for H.264 it is the avcC (the shape gate
+        // above has already proven that). The local keeps its historical name
+        // so the two Dolby Vision / HEVC arms below stay byte-identical.
+        let hvcC = Data(bytes: extra, count: Int(vPar.pointee.extradata_size))
+        let vFormat: CMFormatDescription?
+        if videoIsH264 {
+            // Never the DV arm, by construction: the H.264 pass assigns no DV
+            // state, so `dvProfile` is 0 here — but route on the explicit flag
+            // anyway, so this cannot silently change if that ever drifts.
+            vFormat = Self.makeAVCVideoFormat(
+                width: Int32(vPar.pointee.width), height: Int32(vPar.pointee.height),
+                avcC: hvcC
+            )
+        } else if dvProfile > 0, !forceHDR10 {
+            // The dvvC the display pipeline sees: a converted P7 declares
+            // itself 8.1 single-layer (the remux path's exact contract).
+            let outProfile = needsP7 ? 8 : dvProfile
+            // The base-layer compatibility id comes from the FILE's own dovi
+            // config, not an assumption: Profile 8 exists as 8.1 (HDR10 base)
+            // AND 8.4 (HLG base) — hardcoding 1 told the display to decode
+            // PQ math against HLG pixels on 8.4 files: washed, wrong colors.
+            // P5 is its own IPT-PQ world (compat 0); a converted P7 emits an
+            // HDR10-base 8.1 by construction.
+            let compatID = outProfile == 5 ? 0 : (needsP7 ? 1 : dvCompatibilityID)
+            let dvvC = Self.doviConfigurationBox(
+                profile: outProfile, level: max(dvLevel, 1), compatibilityID: compatID
+            )
+            #if DEBUG
+            // What the FILE declares about its colour, straight from FFmpeg.
+            ClassicPlayerProbe.event("dv", "stream colour: primaries=\(vPar.pointee.color_primaries.rawValue)"
+                + " trc=\(vPar.pointee.color_trc.rawValue) matrix=\(vPar.pointee.color_space.rawValue)"
+                + " range=\(vPar.pointee.color_range.rawValue) dvProfile=\(outProfile) compat=\(compatID)")
+            // A/B (`-dvTagColor`): state the colour space explicitly instead of
+            // leaving VideoToolbox to find it in the bitstream — the repair that
+            // fixed washed-out HDR on the FFmpeg engine.
+            let tagColor = ProcessInfo.processInfo.arguments.contains("-dvTagColor")
+            if tagColor { ClassicPlayerProbe.event("dv", "DEBUG -dvTagColor: explicit BT.2020 colour tags on the format") }
+            // Resolved HERE, inside the guard, not at the call below. `#if` runs
+            // before type checking, not after it: a `tagColor ? Self.debugColourTags(…) : nil`
+            // ternary outside this block is still type-checked in Release even
+            // though the condition is a compile-time `false` there, and
+            // `debugColourTags` is DEBUG-only — which is what broke the Release
+            // build while Debug stayed green.
+            let colourTags: [String: Any]? = tagColor
+                ? Self.debugColourTags(compatibilityID: compatID,
+                                       fullRange: vPar.pointee.color_range.rawValue == 2)
+                : nil
+            #else
+            let colourTags: [String: Any]? = nil
+            #endif
+            vFormat = Self.makeDVVideoFormat(
+                width: Int32(vPar.pointee.width), height: Int32(vPar.pointee.height),
+                hvcC: hvcC, dvvC: dvvC,
+                colourTags: colourTags
+            )
+        } else {
+            vFormat = Self.makeHEVCVideoFormat(
+                width: Int32(vPar.pointee.width), height: Int32(vPar.pointee.height),
+                hvcC: hvcC
+            )
+        }
+        guard let vFormat else { return "couldn't build the video format description" }
+        videoFormat = vFormat
+
+        guard audioFormats[audioIndex] != nil || decodeAudioIndices.contains(audioIndex) else {
+            return "no playable audio track"
+        }
+        desiredAudioIndex = audioIndex
+        let passthrough = !decodeAudioIndices.contains(audioIndex)
+        if let report = audioPathByStream[audioIndex] {
+            audioPath = report
+            ClassicPlayerProbe.event("audio", "engine picked stream \(audioIndex): \(report.summary)")
+            Self.requestOutputChannels(for: report)
+        }
+        NSLog("[DVSample] audio: picked stream %d (%@ path); tracks=%@",
+              audioIndex,
+              passthrough ? "passthrough" : "decode",
+              audioTracks.map { "\($0.index):\($0.label)" }.joined(separator: ", "))
+
+        // ---- Start position + clock ----
+        if startAt > 1 {
+            let ts = Int64(startAt * Double(AV_TIME_BASE))
+            av_seek_frame(ictx, -1, ts, 1 /* BACKWARD */)
+            // Trim to the target, exactly as every mid-session seek does. The
+            // seek lands on the keyframe BEFORE `startAt`, and without this the
+            // whole lead-in GOP was decoded by VideoToolbox and its audio
+            // enqueued — 1-5s of content, tens of MB on a remux — purely to be
+            // discarded.
+            trimBefore = startAt - 0.05
+            // AND COUNT THE PREROLL LIKE A SEEK, because that is what this is.
+            // The trim alone still let every lead-in AU satisfy the startup
+            // preroll gate — "count only what can actually be shown" was wired
+            // to `seekRefill`, which only `seek(to:)` set — so a resume could
+            // start the clock on a queue that was entirely invisible lead-in
+            // and freeze at the target while the real refill arrived. Invisible
+            // on 1-2s HEVC-remux GOPs; guaranteed on x264's keyint=250, where
+            // the lead-in can be ten seconds long.
+            //
+            // Only these two fields, deliberately: the rest of `seek(to:)`
+            // (generation bump, renderer flush, underrun reset) belongs to a
+            // LIVE session, and the demux loop reacts to `seekGeneration`
+            // alone, so a pending target set before the thread starts cannot
+            // trigger a second reposition. Both are cleared by the same refill
+            // completion every mid-session seek uses.
+            pendingSeekTo = startAt
+            seekRefill = true
+        }
+        // Allocated BEFORE the success report below: every `return "…"` in
+        // this function is a start failure, and one that came after the hop
+        // had reported success fired the completion twice (true, then false).
+        guard let packet = av_packet_alloc() else { return "packet alloc failed" }
+        var pkt: UnsafeMutablePointer<AVPacket>? = packet
+        defer { av_packet_free(&pkt) }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            // `stop()` can land between avformat_find_stream_info and this hop.
+            // Without the check we installed feeders, spun the synchronizer up
+            // and created a CADisplayLink(target: self) plus a repeating Timer
+            // on an engine nothing will ever invalidate — stop() already ran,
+            // so both retained the engine and ticked for the app's lifetime.
+            guard !self.cancelled else {
+                self.startCompletion = nil   // and release the caller's closure
+                return
+            }
+            self.startCompletion?(true, "")
+            self.startCompletion = nil
+            self.synchronizer.setRate(0, time: CMTime(seconds: self.startAt, preferredTimescale: 90000))
+            self.installFeeders()
+            self.onBuffering?(true)
+            let link = CADisplayLink(target: self, selector: #selector(self.displayLinkTick(_:)))
+            link.add(to: .main, forMode: .common)
+            self.displayLink = link
+            // Built unscheduled and added in `.common`, like the display link
+            // above: `scheduledTimer` goes into `.default` only, which the main
+            // run loop LEAVES while the touch surface pans a scroll view — and
+            // this block is the engine's whole watchdog (underrun hold/resume,
+            // display-layer recovery, the position publish).
+            let clockTimer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+                guard let self else { return }
+                self.onTime?(self.position)
+                // Jitter probe: if the synchronizer's clock ratio wanders off
+                // 1.000 the whole presentation timeline is breathing (both
+                // renderers follow this clock); if the ratio is clean but the
+                // picture stutters, the fault is per-frame (decode/enqueue).
+                self.probeTick += 1
+                if self.probeTick % 4 == 0 {
+                    let wall = CFAbsoluteTimeGetCurrent()
+                    let media = CMTimeGetSeconds(self.synchronizer.currentTime())
+                    if self.lastProbeWall > 0, self.synchronizer.rate > 0 {
+                        let ratio = (media - self.lastProbeMedia) / max(wall - self.lastProbeWall, 0.001)
+                        self.queueLock.lock()
+                        let vq = self.videoQueue.count
+                        let aq = self.audioQueue.count
+                        self.queueLock.unlock()
+                        let nowBytes = self.bytesDemuxed
+                        let feedMbps = Double(nowBytes - self.lastProbeBytes) * 8
+                            / max(wall - self.lastProbeWall, 0.001) / 1_000_000
+                        self.lastProbeBytes = nowBytes
+                        dvDiag("probe clock=%.4f vq=%d aq=%d vReady=%d aReady=%d rate=%.2f panel=%ldHz feed=%.1fMbps",
+                              ratio, vq, aq,
+                              self.displayLayer.isReadyForMoreMediaData ? 1 : 0,
+                              self.audioRenderer.isReadyForMoreMediaData ? 1 : 0,
+                              self.synchronizer.rate,
+                              self.panelRefreshHz,
+                              feedMbps)
+                    }
+                    self.lastProbeWall = wall
+                    self.lastProbeMedia = media
+                }
+                // The layer fails SILENTLY — the clock keeps running while
+                // nothing renders. Ask it, and report the real reason out.
+                if self.displayLayer.status == .failed {
+                    // -11847 "Operation Interrupted" and friends are decode-
+                    // session interruptions, not verdicts — the documented
+                    // recovery is flush + re-prime from a keyframe, which is
+                    // exactly what a seek to the current position does. Only
+                    // repeated failures in quick succession fall back.
+                    let now = Date()
+                    if now.timeIntervalSince(self.lastLayerRecoveryAt) > 8,
+                       self.layerRecoveryCount < 3 {
+                        self.lastLayerRecoveryAt = now
+                        self.layerRecoveryCount += 1
+                        NSLog("[DVSample] display layer interrupted — recovering in place (attempt %d)",
+                              self.layerRecoveryCount)
+                        let resumeAt = self.position
+                        self.displayLayer.flush()
+                        self.seek(to: resumeAt)
+                        self.installFeeders(rearm: true)
+                    } else if !self.reportedLayerFailure {
+                        self.reportedLayerFailure = true
+                        let detail = self.displayLayer.error.map(String.init(describing:)) ?? "unknown"
+                        self.onError?("display layer failed: \(detail)")
+                    }
+                }
+                // Underrun watch: an empty video queue mid-stream means the
+                // network fell behind — HOLD the clock (or audio keeps going
+                // and A/V drifts across the gap) and show buffering; resume
+                // when a real cushion is back. Hysteresis (enter at empty,
+                // exit at 16 AUs ≈ two-thirds of a second) prevents flapping.
+                self.queueLock.lock()
+                // COUNT ONLY WHAT CAN ACTUALLY BE SHOWN.
+                //
+                // A seek lands on the keyframe BEFORE the target, and that
+                // lead-in is decoded and flagged do-not-display so playback
+                // resumes exactly where it was aimed. Those frames still sit in
+                // the queue though, and counting them satisfied the preroll gate
+                // on content that will never reach the screen: the clock started
+                // with a queue that was mostly lead-in, ran out within a frame or
+                // two of the target, and the picture froze while the refill it
+                // was supposed to have waited for arrived. That is the "+/-10s
+                // freezes while it loads" report, and it is worst on a backward
+                // skip, where the run from the preceding keyframe is longest.
+                let seekTarget = self.pendingSeekTo
+                let depth = self.seekRefill && seekTarget >= 0
+                    ? self.videoQueue.count(where: {
+                        CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp($0)) >= seekTarget - 0.05
+                      })
+                    : self.videoQueue.count
+                let aqDepth = self.audioQueue.count
+                // The WHOLE video queue, lead-in included (`depth` may count only
+                // post-seek frames) — read under the same lock hold.
+                let videoQueued = self.videoQueue.count
+                let eof = self.demuxEOF
+                self.queueLock.unlock()
+                // COUNT DECODED VIDEO ON THE DECODE-AHEAD PATH.
+                //
+                // `depth` above is the COMPRESSED queue. `vtFeedVideo` drains it
+                // into the decoded heap as fast as VideoToolbox will decode —
+                // which for light content (360p/1080p H.264 decodes at thousands
+                // of fps) is instantly, so the compressed queue sits near empty
+                // and this gate never reached `preroll`: the clock never started
+                // and the first-frame watchdog failed the session over after 25s.
+                // HEVC only escaped it by accident — 4K HEVC decode is heavy
+                // enough to back the compressed queue up past the threshold. What
+                // the gate actually wants to know is how much DECODED video is
+                // ready, which is the heap plus whatever already reached the
+                // layer. `max` so a session where the compressed queue DOES back
+                // up (every HEVC case that works today) is unchanged.
+                //
+                // STRICTLY OUTSIDE THE `queueLock` HOLD ABOVE. `vtFeedVideo`
+                // takes decodedLock → queueLock; taking them in the opposite
+                // order here is a lock-order inversion, and the only thing
+                // preventing the deadlock today is that both feeders happen to
+                // share one serial queue. That is an accident to rely on, not a
+                // design, so this reads decodedLock with no other lock held.
+                //
+                // A SEPARATE VALUE, NOT `depth`. `framesToLayerSinceFlush` counts
+                // every frame handed to the layer since the last flush, so it
+                // climbs for as long as playback runs — 9,526 of them six
+                // minutes in, caught live on the device. Folding that into
+                // `depth` answered the preroll question and then silently broke
+                // every decision below it, all of which mean the COMPRESSED
+                // QUEUE: `depth == 0` (video ran dry → hold) could never be
+                // true again, and `depth >= underrunResumeDepth` (enough video
+                // to resume) was true the moment a hold began — so a hold lifted
+                // instantly, ran out of pictures, and held again. That is
+                // stop-go buffering, manufactured by the diagnostic.
+                var prerollReady = depth
+                if self.decodeAheadActive {
+                    self.decodedLock.lock()
+                    let decodedReady = self.decodedHeap.count + self.framesToLayerSinceFlush
+                    self.decodedLock.unlock()
+                    prerollReady = max(depth, decodedReady)
+                }
+                if !self.playbackClockStarted {
+                    let preroll = self.seekRefill ? self.seekVideoPreroll : self.startupVideoPreroll
+                    // START ON BOTH TRACKS, NOT JUST THE PICTURE.
+                    //
+                    // This gate counted VIDEO access units only. 18 of them is
+                    // ~0.75s at 24fps, and one demux thread fills both queues,
+                    // so the clock routinely started with a single audio buffer
+                    // behind it — whereupon the very next 0.5s tick found
+                    // `aqDepth == 0`, took the underrun hold below, and stopped
+                    // the clock again. Start, hold, start: that is the stutter
+                    // in the first seconds of every title, and it is structural
+                    // rather than a slow link, because the synchronizer slaves
+                    // the whole presentation to the AUDIO renderer.
+                    //
+                    // The cushion asked for here is exactly the one the hold's
+                    // own exit demands (`audioResumeCushion`), so the engine can
+                    // no longer start from a position it would immediately
+                    // refuse to resume from. A file with no playable audio
+                    // track never reaches this engine at all — `openInput`
+                    // rejects it with "no playable audio track" — so this
+                    // cannot deadlock a silent file, and EOF still waives it
+                    // for the handful of packets at the end of a stream.
+                    //
+                    // ...EXCEPT when waiting for audio cannot succeed. A full video
+                    // queue parks the one demux thread, and parked it reads no
+                    // audio at all. A resume or seek that lands mid-GOP fills the
+                    // queue with lead-in frames from before the target while the
+                    // audio for that same stretch is trimmed away, so the audio
+                    // cushion never arrives and the clock never starts (seen on
+                    // device: v=60 a=0, first-frame watchdog after 25s). With the
+                    // queue at its cap, start as this gate always used to; the
+                    // queue drains, the demuxer moves on, and audio follows.
+                    let audioReady = aqDepth >= Self.audioResumeCushion
+                        || videoQueued >= self.videoQueueCap
+                    if (prerollReady >= preroll && audioReady) || eof {
+                        self.playbackClockStarted = true
+                        self.autoPaused = false
+                        if self.userRate > 0 {
+                            self.synchronizer.setRate(self.userRate, time: self.synchronizer.currentTime())
+                        }
+                        self.onBuffering?(false)
+                    }
+                    return
+                }
+                // Entering a hold only makes sense while more data is coming.
+                //
+                // AN EMPTY AUDIO QUEUE IS NOT AN EMPTY AUDIO RENDERER. This
+                // queue is only what the demuxer has produced and the renderer
+                // has not yet taken, and the renderer takes greedily: measured
+                // on 4K DV with E-AC3, it was holding ~3.9 SECONDS of audio past
+                // the clock (`rendered` − `clock`) at the moment each hold fired.
+                // The queue reaches zero routinely — the single demux thread
+                // parks on a full video queue (v=70-80/60 at both events) and
+                // stops producing audio for a moment — and every time the 2Hz
+                // tick happened to catch it there, the clock was stopped for a
+                // tick: a 0.5s freeze in the middle of perfectly healthy
+                // playback, at 0:11 and 2:34 in one ten-minute session. Those
+                // are the "jumps" that happen with nobody touching the remote.
+                //
+                // Hold for audio only when the renderer itself is about to run
+                // out. Genuine starvation — a stalled link, the start of a
+                // title, just after a seek (both reset the mark to zero) —
+                // still holds exactly as before, with a tick of margin left.
+                let audioLead = self.lastAudioHandedEnd
+                    - CMTimeGetSeconds(self.synchronizer.currentTime())
+                //
+                // And NEVER while the video queue is full. A full video queue parks
+                // the single demux thread, so no audio can be read, and a hold
+                // stops the one thing that would drain the queue — the clock. That
+                // is a guaranteed deadlock, not a wait: measured on device on a
+                // resume at 46:26, `underrun HOLD vq=92 aq=0` six milliseconds after
+                // the first frame, stuck for 32s until the stall watchdog failed the
+                // session over. Play on instead; the queue drains, the demuxer
+                // moves on, and the audio joins a moment later.
+                //
+                // And only once the renderer has actually HAD audio this run (the mark
+                // is reset to zero at open and on every seek). A hold keeps a fed
+                // renderer from running dry; before the first audio buffer has been
+                // handed over there is nothing to run dry, and all a hold does is
+                // stop the lead-in from draining — which is exactly what delays that
+                // first audio. Without this, a start or seek into a long GOP could
+                // cycle hold/release while the lead-in video still sat under the cap.
+                let audioStarving = aqDepth == 0 && audioLead < Self.audioHoldLead
+                    && videoQueued < self.videoQueueCap
+                    && self.lastAudioHandedEnd > 0
+                if !eof, (depth == 0 || audioStarving), !self.autoPaused,
+                   self.userRate > 0, self.synchronizer.rate > 0 {
+                    ClassicPlayerProbe.event("dv", String(format: "underrun HOLD vq=%d aq=%d audioLead=%.2fs",
+                                                   depth, aqDepth, audioLead))
+                    // EITHER queue running dry means a hold: the vsync probe
+                    // caught the audio renderer starving (aq=0 while vq>0)
+                    // during feed micro-dips — its clock lurched ±1800ppm and
+                    // dragged video into visible repeats/skips, because the
+                    // synchronizer slaves everything to the audio clock. The
+                    // old check watched only video.
+                    self.autoPaused = true
+                    self.autoPausedAt = Date()
+                    if Date().timeIntervalSince(self.lastUnderrunAt) > 90 { self.recentUnderruns = 0 }
+                    self.recentUnderruns += 1
+                    self.lastUnderrunAt = Date()
+                    NSLog("[DVSample] underrun #%d — holding clock (vq=%d aq=%d)",
+                          self.recentUnderruns, depth, aqDepth)
+                    self.synchronizer.setRate(0, time: self.synchronizer.currentTime())
+                    self.onBuffering?(true)
+                } else if self.autoPaused {
+                    // LEAVING a hold has to be evaluated at EOF too. This used to
+                    // sit inside the `!eof` branch, so an underrun still holding
+                    // when the demuxer reached the end of the file could never be
+                    // lifted: rate stayed 0, the buffering spinner stayed up, the
+                    // tail never played, and `onEnded` never fired because the
+                    // queues were not empty. `underrunResumeDepth(eof:)` already
+                    // returns 1 for the EOF case — dead code until now, and the
+                    // giveaway that this was always meant to run.
+                    //
+                    // At EOF the audio cushion is waived: the last packets of a
+                    // file routinely number fewer than four, and demanding them
+                    // would strand the ending.
+                    // At EOF there is nothing left to wait FOR: the demuxer has
+                    // exited and the queues can never refill, so requiring a
+                    // video AU here left the hold in place forever whenever the
+                    // queues drained before the tick observed them — which is
+                    // the stuck spinner at the end of a film this branch exists
+                    // to prevent.
+                    // A full video queue lifts the audio requirement here too, for
+                    // the same reason as above: waiting for audio behind a parked
+                    // demuxer can never succeed.
+                    let cushionMet = eof
+                        || (depth >= self.underrunResumeDepth(eof: eof)
+                            && (aqDepth >= Self.audioResumeCushion
+                                || videoQueued >= self.videoQueueCap))
+                    if cushionMet {
+                        self.autoPaused = false
+                        self.seekRefill = false
+                        NSLog("[DVSample] underrun over — resuming with vq=%d (eof=%@)",
+                              depth, eof ? "true" : "false")
+                        if self.userRate > 0 {
+                            self.synchronizer.setRate(self.userRate, time: self.synchronizer.currentTime())
+                        }
+                        self.onBuffering?(false)
+                    }
+                }
+                // The post-seek refill is OVER once playback is rolling again
+                // on a healthy queue. Clearing it only on the underrun-resume
+                // path left the flag stuck true after any seek that never
+                // underran, so the next GENUINE underrun resumed on the small
+                // 24-AU seek cushion instead of escalating — exactly the
+                // machine-gun stop/go the escalation exists to prevent.
+                //
+                // The `rate > 0` term is gone: pausing shortly after a seek
+                // pinned the rate at 0 forever, so the flag never cleared and
+                // the NEXT genuine underrun resumed on the shallow 24-AU seek
+                // cushion instead of escalating — the machine-gun stop/go this
+                // is meant to prevent, arrived at by a different road. Being
+                // out of the hold (`!autoPaused`) on a healthy queue is what
+                // "the refill is over" actually means; whether the viewer has
+                // the film paused at that moment is beside the point.
+                if self.seekRefill, !self.autoPaused, depth >= 24 {
+                    self.seekRefill = false
+                    // Retire the target with the refill it belongs to. Nothing
+                    // reset this, so it kept reporting the last COMPLETED seek
+                    // as if one were still pending — a permanently armed-looking
+                    // seek in the probe. Safe here: `seek()` writes the target
+                    // before it bumps the generation, so a later seek always
+                    // publishes its own value before the demuxer can read it.
+                    self.pendingSeekTo = -1
+                }
+                if self.audioRenderer.status == .failed, !self.reportedAudioFailure {
+                    self.reportedAudioFailure = true
+                    let detail = self.audioRenderer.error.map(String.init(describing:)) ?? "unknown"
+                    NSLog("[DVSample] audio renderer failed: %@", detail)
+                }
+            }
+            RunLoop.main.add(clockTimer, forMode: .common)
+            self.timeTimer = clockTimer
+        }
+
+        // ---- Read loop ----
+        let vTB = vStream.pointee.time_base
+        // Audio timebase resolved per-packet (the active track can change).
+        let aTB = AVRational(num: 1, den: 1000)
+        var myGeneration = seekGeneration
+        // Consecutive AVERROR(EAGAIN) reads; reset by any successful read.
+        var eagainRetries = 0
+
+        while !cancelled {
+            // A seek moved the goalposts: reposition and keep reading.
+            if seekGeneration != myGeneration {
+                myGeneration = seekGeneration
+                let target = pendingSeekTo
+                if target >= 0 {
+                    let ts = Int64(target * Double(AV_TIME_BASE))
+                    av_seek_frame(ictx, -1, ts, 1)
+                    // Clear the AVIO end-of-file latch with the seek. Now that
+                    // the loop PARKS at EOF instead of exiting, this branch can
+                    // run on a context that already reported the end, and a
+                    // still-latched `eof_reached` makes the very next
+                    // av_read_frame return EOF again — the rewind would appear
+                    // to take and then re-end the title on the spot. A no-op on
+                    // the ordinary mid-stream seek, where the latch is clear.
+                    ictx?.pointee.pb?.pointee.eof_reached = 0
+                    // Seeks land on the KEYFRAME BEFORE the target, so left
+                    // alone every skip jumped back a few seconds. Trim: the
+                    // lead-in video is decoded but flagged do-not-display,
+                    // and lead-in audio is dropped outright, so playback
+                    // resumes exactly where the viewer aimed.
+                    trimBefore = target - 0.05
+                    ptsGridAnchor = -1   // re-anchor the PTS grid at the seek target
+                }
+                if let decoder = audioDecoder { avcodec_flush_buffers(decoder) }
+                if let sdec = subDecoder { avcodec_flush_buffers(sdec) }
+                subPacketBuffer.removeAll(keepingCapacity: true)
+                lastAudioEndPTS = -1
+                pcmBatch.removeAll(keepingCapacity: true)
+                pcmBatchFrames = 0
+                pcmBatchStartPTS = -1
+            }
+            let readResult = av_read_frame(ictx, packet)
+            if readResult < 0 {
+                if cancelled { break }
+                // Nothing ready on a non-blocking read: not an error, not the
+                // end. Yield briefly and keep going — but BOUNDED, so a demuxer
+                // that never becomes ready cannot spin this thread forever.
+                // Past the bound it falls through and is reported as a failure.
+                if readResult == Self.averrorEAGAIN, eagainRetries < 2_000 {
+                    eagainRetries += 1
+                    // Report it as buffering first (~2s) and only treat it as
+                    // terminal after ~20s. Falling straight through to `onError`
+                    // tore the session down and restarted the source on the
+                    // FFmpeg path for what is usually a passing stall.
+                    if eagainRetries == 200 {
+                        DispatchQueue.main.async { [weak self] in self?.onBuffering?(true) }
+                    }
+                    usleep(10_000)
+                    continue
+                }
+                // A genuine end of stream is the ONLY case that may set
+                // `demuxEOF`. Treating every negative result as EOF meant a
+                // network stall or a failed reconnect (rw_timeout is 20s)
+                // drained the pipeline and reported "played to the end": the app
+                // saved the title as finished, armed Up Next and auto-advanced
+                // to the next episode — because the connection dropped. Route
+                // real failures to `onError`, which tears the direct engine down
+                // and reloads the same source on the normal FFmpeg path.
+                if readResult != Self.averrorEOF, readResult != Self.averrorExit {
+                    let detail = Self.describeAVError(readResult)
+                    NSLog("[DVSample] demux read failed (%d): %@", readResult, detail)
+                    DispatchQueue.main.async { [weak self] in
+                        self?.onError?("stream read failed: \(detail)")
+                    }
+                    break
+                }
+                // GENUINE END OF STREAM — and NOT the end of this thread.
+                //
+                // This used to `break`, which made the end of a film terminal:
+                // nothing was left to serve a seek, `demuxEOF`/`didSignalEnd`
+                // were never cleared and the feeders were never re-armed. So a
+                // rewind inside the last ten seconds could not recover — the
+                // queues drained, the feed block saw EOF with empty queues and
+                // reported the end (progress saved as complete, Up Next armed),
+                // or, if the end had already been reported, the picture froze on
+                // the last frame with the clock still running. Replay from the
+                // post-play overlay died the same way.
+                //
+                // Instead: mark EOF, then PARK on the queue condition until a
+                // seek arrives (or `stop()` cancels us). A seek wakes us, the
+                // end state is cleared, the renderers are re-armed and the loop
+                // top repositions to `pendingSeekTo` — the same code path every
+                // ordinary seek takes. One thread, always exactly one: parking
+                // rather than exiting is what keeps `start()` from ever needing
+                // to spawn a second demuxer.
+                queueLock.lock()
+                // Only if no seek landed while this read was in flight — a seek
+                // clears the flag, and setting it again here would re-open the
+                // same spurious-end window from the other side.
+                if seekGeneration == myGeneration { demuxEOF = true }
+                queueLock.broadcast()
+                queueLock.unlock()
+                guard waitForSeekAfterEOF(currentGeneration: myGeneration) else { break }
+                rearmAfterEOF()
+                eagainRetries = 0   // the post-seek reads are a fresh budget
+                continue   // the loop top does the reposition + decoder flush
+            }
+            eagainRetries = 0
+            defer { av_packet_unref(packet) }
+            // STALE-READ GUARD. `seek()` flushes the queues and moves the
+            // synchronizer's clock on the MAIN thread, but this thread can be
+            // parked inside `av_read_frame` for as long as a network read
+            // takes — so the packet in hand was read from the OLD position and
+            // is only noticed to be stale at the top of the next iteration.
+            //
+            // Enqueuing it anyway put pre-seek samples into freshly emptied
+            // queues, ahead of the post-seek ones that follow. On a BACKWARD
+            // seek their timestamps are in the clock's future, so they survive
+            // the `trimBefore` filter, and the renderers then receive
+            // non-monotonic PTS: the picture lands back where playback was
+            // rather than where the viewer aimed, and the clock — already
+            // moved to the target — races the frames to catch up, which is the
+            // "it jumps back and then fast-forwards" report.
+            //
+            // Dropping it costs one packet and the loop top repositions.
+            guard seekGeneration == myGeneration else { continue }
+            let index = packet.pointee.stream_index
+            let activeAudio = desiredAudioIndex
+            let activeSub = activeSubtitleIndex
+            // Selection changed since the last loop: serve the buffered
+            // backlog so the track starts NOW, not when the read head (which
+            // runs a full buffer ahead) reaches its next cue.
+            if activeSub != lastServedSubIndex {
+                lastServedSubIndex = activeSub
+                if activeSub >= 0, let ictxL = liveFormatCtx,
+                   let stream = ictxL.pointee.streams[Int(activeSub)] {
+                    let stb = stream.pointee.time_base
+                    // Only cues that can still reach the screen. The backlog
+                    // holds ~90s of every subtitle stream, and this loop is the
+                    // one feeding the picture: decoding every expired cue of a
+                    // bitmap track here — each one a PGS bitmap — stalled the
+                    // demux for long enough that the picture dropped out on a
+                    // track switch. A cue whose end is already behind the
+                    // playhead has nothing to show.
+                    let playhead = position
+                    for stored in subPacketBuffer where stored.stream == activeSub {
+                        let length = stored.duration > 0
+                            ? Double(stored.duration) * av_q2d(stb) : 6
+                        guard stored.ptsSeconds + length >= playhead - 1 else { continue }
+                        replayStoredSubPacket(stored, tb: stb)
+                    }
+                }
+            }
+            guard index == videoIndex || index == activeAudio || subStreamSet.contains(index) else { continue }
+            guard packet.pointee.pts != Int64.min, let data = packet.pointee.data,
+                  packet.pointee.size > 0 else { continue }
+
+            let isVideo = index == videoIndex
+            let tb = isVideo ? vTB
+                : (ictx!.pointee.streams[Int(index)]?.pointee.time_base ?? aTB)
+            let pts = Double(packet.pointee.pts) * av_q2d(tb)
+            let dts = packet.pointee.dts != Int64.min
+                ? Double(packet.pointee.dts) * av_q2d(tb) : pts
+            let dur = packet.pointee.duration > 0
+                ? Double(packet.pointee.duration) * av_q2d(tb) : 0
+
+            bytesDemuxed += Int64(packet.pointee.size)
+            if isVideo {
+                auBytesWindow += Int(packet.pointee.size)
+                auMaxWindow = max(auMaxWindow, Int(packet.pointee.size))
+            }
+            var bytes = [UInt8](UnsafeBufferPointer(start: data, count: Int(packet.pointee.size)))
+            if isVideo, forceHDR10, dvProfile > 0 {
+                if let stripped = Self.stripDVAccessUnit(bytes, nalLengthSize: nalLengthSize) {
+                    if stripped.isEmpty { continue }   // pure-DV packet: drop
+                    bytes = stripped
+                }
+            } else if isVideo, needsP7 {
+                if let converted = Self.convertP7AccessUnit(bytes, nalLengthSize: nalLengthSize) {
+                    if converted.isEmpty { continue }   // pure-EL packet: drop
+                    bytes = converted
+                }
+            }
+            // Post-seek trim (see the seek branch above).
+            if trimBefore > 0 {
+                if !isVideo, pts < trimBefore { continue }
+                if isVideo, pts >= trimBefore { trimBefore = -1 }
+            }
+            let displaySuppressed = isVideo && trimBefore > 0 && pts < trimBefore
+
+            if !isVideo, subStreamSet.contains(index) {
+                subPacketBuffer.append(StoredSubPacket(
+                    stream: index,
+                    pts: packet.pointee.pts,
+                    duration: packet.pointee.duration,
+                    ptsSeconds: pts,
+                    bytes: [UInt8](UnsafeBufferPointer(start: packet.pointee.data,
+                                                       count: Int(packet.pointee.size)))
+                ))
+                // Bound the backlog: keep ~90s of events (subtitle packets are
+                // tiny; even 20 PGS tracks stay a few MB).
+                if subPacketBuffer.count > 800 {
+                    subPacketBuffer.removeFirst(subPacketBuffer.count - 800)
+                }
+                let cutoff = pts - 90
+                if let first = subPacketBuffer.first, first.ptsSeconds < cutoff - 30 {
+                    subPacketBuffer.removeAll { $0.ptsSeconds < cutoff }
+                }
+                if index == activeSub {
+                    decodeSubtitlePacket(packet, streamIndex: index, tb: tb, ptsSeconds: pts)
+                }
+                continue
+            }
+            // Non-passthrough audio: FFmpeg-decode to interleaved Float32 PCM
+            // and enqueue the LPCM samples — this is what makes TrueHD, DTS,
+            // FLAC and friends playable on this engine.
+            if !isVideo, decodeAudioIndices.contains(index) {
+                for pcm in decodeAudioPacket(packet, streamIndex: index, tb: tb) {
+                    enqueueBounded(pcm, isVideo: false, generation: myGeneration)
+                }
+                continue
+            }
+            // Duration rides the same grid as the PTS: the container's
+            // ms-rounded 41/42ms durations feed straight into the display
+            // layer's scheduling; hand it the exact cadence instead.
+            var sampleDur = dur
+            if isVideo {
+                let frameDur = gridFrameDuration
+                if frameDur > 0, abs(dur - frameDur) < 0.002 { sampleDur = frameDur }
+            }
+            guard let sample = Self.makeSample(
+                bytes: bytes,
+                format: isVideo ? vFormat : audioFormats[index],
+                ptsSeconds: isVideo ? snapVideoPTS(pts, dts: dts) : pts,
+                dtsSeconds: dts, durationSeconds: sampleDur,
+                keyframe: (packet.pointee.flags & 0x0001) != 0
+            ) else { continue }
+            if displaySuppressed { Self.markDoNotDisplay(sample) }
+
+            enqueueBounded(sample, isVideo: isVideo, generation: myGeneration)
+        }
+        closeAudioDecoder()
+        if subDecoder != nil { avcodec_free_context(&subDecoder) }
+        subDecoderIndex = -1
+        return nil
+    }
+
+    /// Bounded enqueue — blocks (self-clearing buffer) until the renderers
+    /// have consumed room, a seek clears the queues, or stop.
+    // Audio PTS continuity census: the synchronizer slaves VIDEO to the
+    // AUDIO renderer's clock, so a gap or overlap in audio timestamps makes
+    // the whole presentation lurch — visible stutter with every other probe
+    // clean. Expected next PTS = last PTS + last duration; any mismatch
+    // beyond 2ms is counted and the worst offender kept.
+    private var lastAudioEndPTS: Double = -1
+    private var audioPTSSeen = 0
+    private var audioPTSGaps = 0
+    private var audioPTSWorstGap: Double = 0
+    /// Read from the display-link thread and from main as well as written on
+    /// the demux thread — it was already crossing threads before either of
+    /// those readers existed.
+    @ClassicAtomic private var lastQueuedVideoPTS: Double = 0
+    @ClassicAtomic private var lastQueuedAudioPTS: Double = 0
+
+    private func censusAudioPTS(_ sample: CMSampleBuffer) {
+        let pts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample))
+        let dur = CMTimeGetSeconds(CMSampleBufferGetDuration(sample))
+        lastQueuedAudioPTS = pts
+        if lastAudioEndPTS >= 0 {
+            let gap = pts - lastAudioEndPTS
+            audioPTSSeen += 1
+            if abs(gap) > 0.002 {
+                audioPTSGaps += 1
+                if abs(gap) > abs(audioPTSWorstGap) { audioPTSWorstGap = gap }
+            }
+            if audioPTSSeen % 120 == 0 {   // ~30s of quarter-second batches
+                dvDiag("audio pts census: %d buffers, %d discontinuities (worst %+.1fms)",
+                      audioPTSSeen, audioPTSGaps, audioPTSWorstGap * 1000)
+            }
+        }
+        lastAudioEndPTS = dur.isFinite && dur > 0 ? pts + dur : pts
+    }
+
+    private func enqueueBounded(_ sample: CMSampleBuffer, isVideo: Bool, generation: Int) {
+        if isVideo {
+            lastQueuedVideoPTS = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample))
+        } else {
+            censusAudioPTS(sample)
+        }
+        queueLock.lock()
+        // NEVER PARK THIS THREAD ON A FULL QUEUE WHILE THE OTHER ONE IS
+        // STARVING.
+        //
+        // One demux thread feeds both queues, so a wait here stops BOTH. That
+        // is a livelock whenever the queue being waited on can only drain once
+        // the other queue is fed, and after a seek it is the normal case:
+        //
+        //   1. audio runs dry → the underrun hold stops the clock
+        //   2. nothing consumes video, so the video queue stays full
+        //   3. this loop parks the demux thread on the full video queue
+        //   4. no audio is produced, so the hold's exit cushion
+        //      (`aqDepth >= audioResumeCushion`) can never be met
+        //   5. never recovers
+        //
+        // Caught on a 4K DV seek: v=60/60, a=0/48, rate=0.00, pendingSeek
+        // unresolved — frozen until the 20s stall watchdog gave up, and
+        // because `attemptFailover` routes a DV session into
+        // `fallBackFromDirect`, the film finished on FFmpeg with Dolby Vision
+        // gone for good. The link and the cache were both healthy throughout
+        // (84s of read-ahead on disk, still writing).
+        //
+        // `underrunResumeDepth` already clamps the VIDEO cushion to keep it
+        // reachable, noting it leaves "headroom for the audio queue to block
+        // the demuxer first". That holds while audio fills first; a seek with
+        // video decode-ahead fills video first and inverts it. This closes the
+        // other half.
+        //
+        // Bounded twice: the exemption only applies while the other queue is
+        // actually below what the restart needs, and a hard ceiling stops a
+        // degenerate stream (no audio track at all, a renderer that has
+        // genuinely stopped) from growing the queue without limit.
+        //
+        // The ceiling is a FIXED overshoot rather than a multiple of the cap.
+        // The job is to walk far enough through an interleaved stream to reach
+        // the other track's next packets — a handful of samples — and a
+        // multiplier would have meant another 120 compressed 4K access units
+        // on the full-power tier, on the box that is already the one being
+        // jetsammed.
+        let cap = isVideo ? videoQueueCap : audioQueueCap
+        // Video may overshoot FURTHER than audio: the demuxer reads in file
+        // order, so the only way to reach the (small, frequent) audio packets
+        // is to keep pulling video. A +32 margin parked it just past the cap
+        // and the audio still drained; +96 gives it room to fetch a real audio
+        // cushion. Bounded, and only while the other side is starving.
+        let hardCeiling = cap + (isVideo ? 96 : 32)
+        while !cancelled, seekGeneration == generation {
+            let count = isVideo ? videoQueue.count : audioQueue.count
+            guard count >= cap else { break }
+            // Feeding the starved side is worth going over cap for; it is the
+            // only thing that can unblock this side.
+            let otherStarving = isVideo
+                ? audioQueue.count < Self.audioFeedTarget
+                : videoQueue.isEmpty
+            if otherStarving, count < hardCeiling {
+                // Only on the FIRST overshoot of an episode — this is the
+                // demux hot path, and the interesting fact is that the
+                // exemption engaged at all, not each of the ~32 samples it
+                // then lets through.
+                if count == cap {
+                    ClassicPlayerProbe.event("dv", "queue exemption — \(isVideo ? "video" : "audio")"
+                        + " at cap \(cap) while the other side is starving"
+                        + " (v=\(videoQueue.count) a=\(audioQueue.count)); feeding past cap"
+                        + " so the underrun hold can lift")
+                    ClassicPlayerProbe.count("dv.queue-exempt")
+                }
+                break
+            }
+            queueLock.wait(until: Date().addingTimeInterval(0.25))
+        }
+        if !cancelled, seekGeneration == generation {
+            if isVideo { videoQueue.append(sample) } else { audioQueue.append(sample) }
+            queueLock.broadcast()
+        }
+        queueLock.unlock()
+    }
+
+    // MARK: FFmpeg subtitle decode (text + PGS bitmap)
+
+    /// Worker thread only. Lazily (re)opens the decoder when the active
+    /// stream changes, decodes one packet, and posts the resulting cue (or
+    /// clear marker) to main via onSubtitleEvent.
+    private func decodeSubtitlePacket(
+        _ packet: UnsafeMutablePointer<AVPacket>, streamIndex: Int32, tb: AVRational,
+        ptsSeconds: Double
+    ) {
+        if subDecoderIndex != streamIndex {
+            if subDecoder != nil { avcodec_free_context(&subDecoder) }
+            subDecoderIndex = -1
+            guard let ictxLocal = liveFormatCtx,
+                  let stream = ictxLocal.pointee.streams[Int(streamIndex)],
+                  let par = stream.pointee.codecpar,
+                  let codec = avcodec_find_decoder(par.pointee.codec_id),
+                  let ctx = avcodec_alloc_context3(codec) else { return }
+            avcodec_parameters_to_context(ctx, par)
+            guard avcodec_open2(ctx, codec, nil) >= 0 else {
+                var dead: UnsafeMutablePointer<AVCodecContext>? = ctx
+                avcodec_free_context(&dead)
+                return
+            }
+            subDecoder = ctx
+            subDecoderIndex = streamIndex
+            NSLog("[DVSample] subtitle decoder opened for stream %d (%@)",
+                  streamIndex,
+                  avcodec_get_name(ctx.pointee.codec_id).map { String(cString: $0) } ?? "?")
+        }
+        guard let decoder = subDecoder else { return }
+        var sub = AVSubtitle()
+        var got: Int32 = 0
+        let rc = avcodec_decode_subtitle2(decoder, &sub, &got, packet)
+        guard rc >= 0, got != 0 else { return }
+        defer { avsubtitle_free(&sub) }
+        var start = ptsSeconds + Double(sub.start_display_time) / 1000
+        // PGS timestamps ride the AVSubtitle itself in AV_TIME_BASE.
+        if sub.pts != Int64.min {
+            start = Double(sub.pts) / Double(AV_TIME_BASE) + Double(sub.start_display_time) / 1000
+        }
+        var end = start + 6   // open-ended default; a later cue/clear truncates
+        if sub.end_display_time > sub.start_display_time, sub.end_display_time != UInt32.max {
+            end = start + Double(sub.end_display_time - sub.start_display_time) / 1000
+        } else if packet.pointee.duration > 0 {
+            end = start + Double(packet.pointee.duration) * av_q2d(tb)
+        }
+        guard start >= 0 else { return }
+        if sub.num_rects == 0 {   // explicit clear (PGS)
+            DispatchQueue.main.async { [weak self] in self?.onSubtitleEvent?(start, start, nil, nil, .zero, .zero) }
+            return
+        }
+        var texts: [String] = []
+        var image: UIImage?
+        // Where the bitmap sits on its authoring canvas, and that canvas — the
+        // overlay needs both to draw a cropped PGS caption at its real size.
+        var imageOrigin = CGPoint.zero
+        // EVERY bitmap rect, not the first: a PGS event routinely carries two
+        // (a caption line and a sign, or two lines placed apart), and keeping
+        // only the first silently dropped the rest.
+        var bitmaps: [(rect: CGRect, image: CGImage)] = []
+        let canvas = decoder.pointee.width > 0 && decoder.pointee.height > 0
+            ? CGSize(width: Int(decoder.pointee.width), height: Int(decoder.pointee.height))
+            : .zero
+        for i in 0 ..< Int(sub.num_rects) {
+            guard let rect = sub.rects[i]?.pointee else { continue }
+            switch rect.type {
+            case SUBTITLE_ASS:
+                if let ass = rect.ass {
+                    let line = Self.assEventText(String(cString: ass))
+                    if !line.isEmpty { texts.append(line) }
+                }
+            case SUBTITLE_TEXT:
+                if let t = rect.text {
+                    let line = String(cString: t).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !line.isEmpty { texts.append(line) }
+                }
+            case SUBTITLE_BITMAP:
+                if let cg = Self.imageFromSubtitleRect(rect)?.cgImage {
+                    bitmaps.append((CGRect(x: Int(rect.x), y: Int(rect.y),
+                                           width: Int(rect.w), height: Int(rect.h)), cg))
+                }
+            default:
+                break
+            }
+        }
+        if bitmaps.count == 1 {
+            image = UIImage(cgImage: bitmaps[0].image)
+            imageOrigin = bitmaps[0].rect.origin
+        } else if bitmaps.count > 1 {
+            // One image over the union of the rects, origin at its corner — the
+            // overlay places it on the canvas exactly like a single rect.
+            let union = bitmaps.dropFirst().reduce(bitmaps[0].rect) { $0.union($1.rect) }
+            if let ctx = CGContext(data: nil, width: Int(union.width), height: Int(union.height),
+                                   bitsPerComponent: 8, bytesPerRow: 0,
+                                   space: CGColorSpaceCreateDeviceRGB(),
+                                   bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
+                for bitmap in bitmaps {
+                    // CoreGraphics' origin is bottom-left; the rects are top-left.
+                    ctx.draw(bitmap.image, in: CGRect(
+                        x: bitmap.rect.minX - union.minX,
+                        y: union.maxY - bitmap.rect.maxY,
+                        width: bitmap.rect.width, height: bitmap.rect.height))
+                }
+                if let composite = ctx.makeImage() {
+                    image = UIImage(cgImage: composite)
+                    imageOrigin = union.origin
+                }
+            }
+        }
+        let text = texts.isEmpty ? nil : texts.joined(separator: "\n")
+        guard text != nil || image != nil else { return }
+        let img = image
+        let origin = imageOrigin
+        DispatchQueue.main.async { [weak self] in self?.onSubtitleEvent?(start, end, text, img, origin, canvas) }
+    }
+
+    /// FFmpeg's decoded ASS event: "ReadOrder,Layer,Style,Name,MarginL,
+    /// MarginR,MarginV,Effect,Text" — the dialogue text is everything after
+    /// the 8th comma, with override tags stripped and \N line breaks kept.
+    private static func assEventText(_ event: String) -> String {
+        var text = event
+        var commas = 0
+        if let idx = text.indices.first(where: { i in
+            if text[i] == "," { commas += 1 }
+            return commas == 8
+        }) {
+            text = String(text[text.index(after: idx)...])
+        }
+        // Strip {\...} override blocks.
+        while let open = text.firstIndex(of: "{"), let close = text[open...].firstIndex(of: "}") {
+            text.removeSubrange(open ... close)
+        }
+        return text
+            .replacingOccurrences(of: "\\N", with: "\n")
+            .replacingOccurrences(of: "\\n", with: "\n")
+            .replacingOccurrences(of: "\\h", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// PAL8 bitmap rect (PGS/DVD) → RGBA UIImage.
+    private static func imageFromSubtitleRect(_ rect: AVSubtitleRect) -> UIImage? {
+        let w = Int(rect.w), h = Int(rect.h)
+        guard w > 0, h > 0,
+              let indices = rect.data.0,
+              let paletteBytes = rect.data.1 else { return nil }
+        let stride = Int(rect.linesize.0)
+        let palette = paletteBytes.withMemoryRebound(to: UInt32.self, capacity: 256) { pal in
+            (0 ..< 256).map { pal[$0] }
+        }
+        var rgba = [UInt8](repeating: 0, count: w * h * 4)
+        for y in 0 ..< h {
+            for x in 0 ..< w {
+                // FFmpeg subtitle palettes are 0xAARRGGBB.
+                let entry = palette[Int(indices[y * stride + x])]
+                let o = (y * w + x) * 4
+                rgba[o] = UInt8((entry >> 16) & 0xFF)
+                rgba[o + 1] = UInt8((entry >> 8) & 0xFF)
+                rgba[o + 2] = UInt8(entry & 0xFF)
+                rgba[o + 3] = UInt8((entry >> 24) & 0xFF)
+            }
+        }
+        guard let provider = CGDataProvider(data: Data(rgba) as CFData),
+              let cg = CGImage(
+                width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32,
+                bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue),
+                provider: provider, decode: nil, shouldInterpolate: true,
+                intent: .defaultIntent
+              ) else { return nil }
+        return UIImage(cgImage: cg)
+    }
+
+    // MARK: FFmpeg audio decode → LPCM
+
+    private func closeAudioDecoder() {
+        pcmBatch.removeAll(keepingCapacity: true)
+        pcmBatchFrames = 0
+        pcmBatchStartPTS = -1
+        if audioDecoder != nil { avcodec_free_context(&audioDecoder) }
+        if decodedFrame != nil { av_frame_free(&decodedFrame) }
+        audioDecoderIndex = -1
+    }
+
+    /// Decode one compressed packet into zero or more LPCM sample buffers.
+    /// Worker thread only. The decoder is (re)built when the active stream
+    /// changes; a seek flushes it via `flushAudioDecoderOnSeek`.
+    private func decodeAudioPacket(
+        _ packet: UnsafeMutablePointer<AVPacket>, streamIndex: Int32, tb: AVRational
+    ) -> [CMSampleBuffer] {
+        if audioDecoderIndex != streamIndex {
+            closeAudioDecoder()
+            guard let ictxLocal = liveFormatCtx,
+                  let stream = ictxLocal.pointee.streams[Int(streamIndex)],
+                  let par = stream.pointee.codecpar,
+                  let codec = avcodec_find_decoder(par.pointee.codec_id),
+                  let ctx = avcodec_alloc_context3(codec) else { return [] }
+            avcodec_parameters_to_context(ctx, par)
+            guard avcodec_open2(ctx, codec, nil) >= 0 else {
+                var dead: UnsafeMutablePointer<AVCodecContext>? = ctx
+                avcodec_free_context(&dead)
+                return []
+            }
+            audioDecoder = ctx
+            audioDecoderIndex = streamIndex
+            decodedFrame = av_frame_alloc()
+            NSLog("[DVSample] audio decoder opened for stream %d (%@)",
+                  streamIndex,
+                  avcodec_get_name(ctx.pointee.codec_id).map { String(cString: $0) } ?? "?")
+        }
+        guard let decoder = audioDecoder, let frame = decodedFrame else { return [] }
+        let sendResult = avcodec_send_packet(decoder, packet)
+        guard sendResult >= 0 else {
+            if !loggedAudioDecodeFailure {
+                loggedAudioDecodeFailure = true
+                NSLog("[DVSample] audio decode send failed (%d) for stream %d", sendResult, streamIndex)
+            }
+            return []
+        }
+
+        var out: [CMSampleBuffer] = []
+        while avcodec_receive_frame(decoder, frame) >= 0 {
+            defer { av_frame_unref(frame) }
+            let channels = Int(frame.pointee.ch_layout.nb_channels)
+            let samples = Int(frame.pointee.nb_samples)
+            let rate = frame.pointee.sample_rate
+            guard channels > 0, samples > 0, rate > 0 else { continue }
+            guard var pcm = Self.interleaveToFloat32(frame: frame.pointee,
+                                                    channels: channels, samples: samples)
+            else {
+                if !loggedAudioDecodeFailure {
+                    loggedAudioDecodeFailure = true
+                    NSLog("[DVSample] PCM interleave failed: fmt=%d ch=%d", frame.pointee.format, channels)
+                }
+                continue
+            }
+            if !loggedFirstPCM {
+                loggedFirstPCM = true
+                NSLog("[DVSample] first PCM out: %dch %dHz %d samples fmt=%d",
+                      channels, rate, samples, frame.pointee.format)
+                // THE ROUTE RENEGOTIATES WHEN THE ASSET LOADS, so the capability
+                // read before this session opened can be stale — it is taken
+                // while the session is active but before anything is playing,
+                // and an HDMI sink that later comes up 7.1 can still answer 2
+                // at that moment. Folding on that answer costs the viewer six
+                // channels for a poll that was simply early.
+                //
+                // Re-read once, here, where the audio is genuinely flowing.
+                // ONE-WAY on purpose: this can only RELAX a fold, never
+                // introduce one. Turning a fold ON mid-session would change the
+                // PCM format under a live renderer to no benefit — a route that
+                // really is stereo downmixes anyway, which is the whole premise
+                // of `downmixToStereo`.
+                if foldToStereo, channels > 2,
+                   AVAudioSession.sharedInstance().maximumOutputNumberOfChannels > 2 {
+                    foldToStereo = false
+                    $audioPath.mutate { $0.downmixed = false }
+                    ClassicPlayerProbe.event("audio", "route came up multichannel after load — not folding \(channels)ch to stereo")
+                    NSLog("[DVSample] downmix stood down: route reports %d channels once playing",
+                          AVAudioSession.sharedInstance().maximumOutputNumberOfChannels)
+                }
+            }
+            var outChannels = channels
+            // Downmix reads FFmpeg's native order, so remap only when the
+            // multichannel PCM is going out as-is.
+            if !foldToStereo || channels <= 2 {
+                Self.remapToCoreAudioOrder(&pcm, channels: channels, samples: samples)
+            }
+            if foldToStereo, channels > 2 {
+                pcm = Self.downmix(pcm, channels: channels, samples: samples)
+                outChannels = 2
+            }
+            if pcmFormat == nil || pcmRate != rate || pcmChannels != Int32(outChannels) {
+                pcmFormat = Self.makeLPCMFormat(rate: rate, channels: Int32(outChannels))
+                pcmRate = rate
+                pcmChannels = Int32(outChannels)
+            }
+            guard pcmFormat != nil else { continue }
+            let pts = frame.pointee.pts != Int64.min
+                ? Double(frame.pointee.pts) * av_q2d(tb)
+                : Double(packet.pointee.pts) * av_q2d(tb)
+            if pcmBatchStartPTS < 0 { pcmBatchStartPTS = pts }
+            pcmBatch.append(contentsOf: pcm)
+            pcmBatchFrames += samples
+            // ~a quarter second per buffer: 4 buffers/s instead of 1,200.
+            if pcmBatchFrames >= Int(rate) / 4 {
+                flushPCMBatch(into: &out)
+            }
+        }
+        return out
+    }
+
+    /// ITU-style stereo fold for FFmpeg's native channel order
+    /// (FL FR FC LFE BL BR [SL SR]): center/surrounds at -3 dB, LFE -6 dB,
+    /// the sum scaled to keep peaks out of clipping.
+    private static func downmix(_ pcm: [Float], channels: Int, samples: Int) -> [Float] {
+        var out = [Float](repeating: 0, count: samples * 2)
+        let c: Float = 0.7071
+        for i in 0 ..< samples {
+            let base = i * channels
+            var left = pcm[base]
+            var right = pcm[base + 1]
+            if channels > 2 { left += c * pcm[base + 2]; right += c * pcm[base + 2] }        // FC
+            if channels > 3 { left += 0.5 * pcm[base + 3]; right += 0.5 * pcm[base + 3] }    // LFE
+            if channels > 5 { left += c * pcm[base + 4]; right += c * pcm[base + 5] }        // BL/BR
+            if channels > 7 { left += c * pcm[base + 6]; right += c * pcm[base + 7] }        // SL/SR
+            out[i * 2] = left * 0.5
+            out[i * 2 + 1] = right * 0.5
+        }
+        return out
+    }
+
+    /// FFmpeg channel order → the order the CoreAudio layout tag describes.
+    ///
+    /// FFmpeg 7.1 is FL FR FC LFE BL BR SL SR (back pair BEFORE side pair);
+    /// kAudioChannelLayoutTag_MPEG_7_1_C is L R C LFE Ls Rs Rls Rrs (side
+    /// pair BEFORE rear pair). Tagged without reordering, every 7.1 track
+    /// played its rear content out of the side speakers and vice versa —
+    /// audible as a rotated soundstage on a real surround system. 6.1 has
+    /// the same problem: FFmpeg FL FR FC LFE BC SL SR vs MPEG_6_1_A's
+    /// L R C LFE Ls Rs Cs. Stereo/mono/5.1 orders already match.
+    private static func remapToCoreAudioOrder(_ pcm: inout [Float], channels: Int, samples: Int) {
+        guard channels == 7 || channels == 8 else { return }
+        for i in 0 ..< samples {
+            let base = i * channels
+            if channels == 8 {
+                // BL BR SL SR  ->  SL SR BL BR
+                let bl = pcm[base + 4], br = pcm[base + 5]
+                pcm[base + 4] = pcm[base + 6]
+                pcm[base + 5] = pcm[base + 7]
+                pcm[base + 6] = bl
+                pcm[base + 7] = br
+            } else {
+                // BC SL SR  ->  SL SR BC
+                let bc = pcm[base + 4]
+                pcm[base + 4] = pcm[base + 5]
+                pcm[base + 5] = pcm[base + 6]
+                pcm[base + 6] = bc
+            }
+        }
+    }
+
+    /// Any planar/packed float or integer layout → packed interleaved Float32.
+    private static func interleaveToFloat32(
+        frame: AVFrame, channels: Int, samples: Int
+    ) -> [Float]? {
+        var out = [Float](repeating: 0, count: channels * samples)
+        let fmt = AVSampleFormat(rawValue: frame.format)
+        func planar<T>(_: T.Type, _ convert: (T) -> Float) -> Bool {
+            var data = frame.data
+            return withUnsafeBytes(of: &data) { raw -> Bool in
+                let planes = raw.bindMemory(to: UnsafeMutablePointer<UInt8>?.self)
+                for ch in 0 ..< channels {
+                    guard ch < 8, let plane = planes[ch] else { return false }
+                    let typed = UnsafeRawPointer(plane).bindMemory(to: T.self, capacity: samples)
+                    for i in 0 ..< samples { out[i * channels + ch] = convert(typed[i]) }
+                }
+                return true
+            }
+        }
+        func packed<T>(_: T.Type, _ convert: (T) -> Float) -> Bool {
+            guard let base = frame.data.0 else { return false }
+            let typed = UnsafeRawPointer(base).bindMemory(to: T.self, capacity: channels * samples)
+            for i in 0 ..< channels * samples { out[i] = convert(typed[i]) }
+            return true
+        }
+        let ok: Bool
+        switch fmt {
+        case AV_SAMPLE_FMT_FLTP: ok = planar(Float.self) { $0 }
+        case AV_SAMPLE_FMT_FLT: ok = packed(Float.self) { $0 }
+        case AV_SAMPLE_FMT_S16P: ok = planar(Int16.self) { Float($0) / 32768 }
+        case AV_SAMPLE_FMT_S16: ok = packed(Int16.self) { Float($0) / 32768 }
+        case AV_SAMPLE_FMT_S32P: ok = planar(Int32.self) { Float($0) / 2147483648 }
+        case AV_SAMPLE_FMT_S32: ok = packed(Int32.self) { Float($0) / 2147483648 }
+        case AV_SAMPLE_FMT_DBLP: ok = planar(Double.self) { Float($0) }
+        case AV_SAMPLE_FMT_DBL: ok = packed(Double.self) { Float($0) }
+        default: ok = false
+        }
+        return ok ? out : nil
+    }
+
+    private static func makeLPCMFormat(rate: Int32, channels: Int32) -> CMFormatDescription? {
+        var asbd = AudioStreamBasicDescription(
+            mSampleRate: Float64(rate),
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: UInt32(channels * 4),
+            mFramesPerPacket: 1,
+            mBytesPerFrame: UInt32(channels * 4),
+            mChannelsPerFrame: UInt32(channels),
+            mBitsPerChannel: 32,
+            mReserved: 0
+        )
+        // Multichannel LPCM is SILENT without a channel layout — the ASBD
+        // alone doesn't tell the renderer what the channels mean. This was
+        // "TrueHD doesn't work": stereo decode paths played (2ch needs no
+        // layout in practice) while every 5.1/7.1 lossless track sat mute.
+        // Tags follow FFmpeg's native channel order closely enough; exotic
+        // counts fall back to discrete-in-order, which always plays.
+        var layout = AudioChannelLayout()
+        switch channels {
+        case 1: layout.mChannelLayoutTag = kAudioChannelLayoutTag_Mono
+        case 2: layout.mChannelLayoutTag = kAudioChannelLayoutTag_Stereo
+        case 3: layout.mChannelLayoutTag = kAudioChannelLayoutTag_MPEG_3_0_A
+        case 4: layout.mChannelLayoutTag = kAudioChannelLayoutTag_Quadraphonic
+        case 5: layout.mChannelLayoutTag = kAudioChannelLayoutTag_MPEG_5_0_A
+        case 6: layout.mChannelLayoutTag = kAudioChannelLayoutTag_MPEG_5_1_A
+        // 6.1/7.1 need a REORDER as well as a tag (see remapToCoreAudioOrder):
+        // FFmpeg emits back-surrounds before side-surrounds, these tags
+        // expect the opposite, so the pairs are swapped before this point.
+        case 7: layout.mChannelLayoutTag = kAudioChannelLayoutTag_MPEG_6_1_A
+        case 8: layout.mChannelLayoutTag = kAudioChannelLayoutTag_MPEG_7_1_C
+        default:
+            layout.mChannelLayoutTag =
+                kAudioChannelLayoutTag_DiscreteInOrder | UInt32(channels)
+        }
+        var format: CMFormatDescription?
+        let status = CMAudioFormatDescriptionCreate(
+            allocator: kCFAllocatorDefault, asbd: &asbd,
+            layoutSize: MemoryLayout<AudioChannelLayout>.size, layout: &layout,
+            magicCookieSize: 0, magicCookie: nil,
+            extensions: nil, formatDescriptionOut: &format
+        )
+        return status == noErr ? format : nil
+    }
+
+    private static func makePCMSample(
+        pcm: [Float], format: CMFormatDescription, frames: Int,
+        bytesPerFrame: Int, ptsSeconds: Double, rate: Int32
+    ) -> CMSampleBuffer? {
+        let byteCount = pcm.count * 4
+        var block: CMBlockBuffer?
+        guard CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault, memoryBlock: nil,
+            blockLength: byteCount, blockAllocator: kCFAllocatorDefault,
+            customBlockSource: nil, offsetToData: 0, dataLength: byteCount,
+            flags: 0, blockBufferOut: &block
+        ) == noErr, let block else { return nil }
+        guard pcm.withUnsafeBytes({ raw in
+            CMBlockBufferReplaceDataBytes(
+                with: raw.baseAddress!, blockBuffer: block,
+                offsetIntoDestination: 0, dataLength: byteCount
+            )
+        }) == noErr else { return nil }
+        var sample: CMSampleBuffer?
+        guard CMAudioSampleBufferCreateReadyWithPacketDescriptions(
+            allocator: kCFAllocatorDefault, dataBuffer: block,
+            formatDescription: format, sampleCount: frames,
+            presentationTimeStamp: CMTime(seconds: ptsSeconds, preferredTimescale: CMTimeScale(rate)),
+            packetDescriptions: nil, sampleBufferOut: &sample
+        ) == noErr else { return nil }
+        return sample
+    }
+
+    // MARK: VT decode-ahead renderer
+    //
+    // WHY THIS EXISTS. Obsession-class encodes use runs of 7 consecutive
+    // B-frames (83% B, reorder depth ~8) where Michel-class encodes use
+    // shallow IPBPB structure. On the A10X the display layer's just-in-time
+    // decoder emits such groups in BURSTS — ~3 group boundaries per second —
+    // and 240fps slo-mo of the panel proved exactly ~3 repeat/catch-up pairs
+    // per second while every clock/queue probe read perfect. So the engine
+    // decodes AHEAD itself: compressed samples go through a
+    // VTDecompressionSession, decoded frames wait in a display-order heap,
+    // and the layer receives finished, ordered pixel buffers it merely
+    // flips — burst decoding can never reach the glass again.
+    private let vtDecodeAhead = true
+    /// Latched when VideoToolbox refuses to create a session. Until this
+    /// existed the "falling back to compressed feed" log was a lie: the video
+    /// feeder still popped every AU into `vtDecodeOne`, which dropped it —
+    /// black picture, audio playing, no error, and a fresh session-create
+    /// attempt plus a log line per access unit. With the latch set, both
+    /// feeders route the compressed samples straight to the display layer,
+    /// which decodes them itself (the pre-decode-ahead pipeline).
+    @ClassicAtomic private var vtUnavailable = false
+    /// The decode-ahead path exists to hide the display layer's BURST decoding
+    /// of deep-B HEVC (see the block above), and to give the DV pipeline
+    /// frame-level control. Plain H.264 needs neither: `AVSampleBufferDisplay‑
+    /// Layer` decodes H.264 natively and in order, which is both simpler and
+    /// the "let tvOS handle what tvOS supports" path — and the decode-ahead
+    /// heap does NOT render H.264's decoded buffers correctly (black picture,
+    /// audio fine; proven in the sim against a working compressed feed). So
+    /// H.264 always rides the compressed feed. HEVC/DV is unchanged.
+    private var decodeAheadActive: Bool { vtDecodeAhead && !vtUnavailable && !videoIsAVC }
+    /// GUARDED BY `decodedLock`, like the heap. Main releases it (`seek` →
+    /// `vtFlush`, `stop` → `vtTearDown`) while `feedQueue` reads/creates it —
+    /// an unsynchronised strong CF slot shared by two threads is an over-
+    /// release crash waiting for an exit-during-playback. Never hold the lock
+    /// across `VTDecompressionSessionDecodeFrame` (its callback takes it).
+    private var vtSession: VTDecompressionSession?
+    private struct DecodedFrame {
+        let pts: CMTime
+        let duration: CMTime
+        let image: CVImageBuffer
+        /// The seek generation the frame was decoded under: a frame from the
+        /// pre-seek position that lands after `seek()` emptied the heap must
+        /// not reach the flushed layer.
+        let generation: Int
+    }
+    private var decodedHeap: [DecodedFrame] = []   // sorted by pts, small (≤12)
+    private let decodedLock = NSLock()
+    /// Display-order safety margin: never release a frame until this many
+    /// are decoded and waiting (covers reorder depth 8) — except at EOF.
+    private let reorderHoldback = 8
+    /// Each entry retains a decoded `CVImageBuffer`: ~25 MB for 4K 10-bit
+    /// 4:2:0. Twelve of those is ~300 MB held for the whole session, which is
+    /// most of what jetsams a 3 GB Apple TV mid-film. Tiered to sit just above
+    /// `reorderHoldback` on the constrained boxes (the KSPlayer path already
+    /// budgets its frame pool this way; this engine never did).
+    private var decodedCap: Int {
+        PerformanceProfile.isLowPower || PerformanceProfile.isMidPower ? reorderHoldback + 2 : 12
+    }
+    /// Guarded by `decodedLock` (see `vtSession`).
+    private var displayFormatCache: CMFormatDescription?
+
+    /// Decode-ahead only: frames handed to the display layer since the last
+    /// flush. With the heap, this is how much DECODED video exists — the
+    /// startup preroll needs that, not the compressed-queue depth, on a codec
+    /// VideoToolbox drains faster than the demuxer fills (see the gate in
+    /// `run`). Guarded by `decodedLock`; reset on flush and at open.
+    private var framesToLayerSinceFlush = 0
+
+    private func ensureVTSession() -> VTDecompressionSession? {
+        decodedLock.lock()
+        if let existing = vtSession { decodedLock.unlock(); return existing }
+        // A late feed block on a STOPPED engine must never resurrect a
+        // session nothing will invalidate — that was a leaked hardware HEVC
+        // decoder (and its pixel-buffer pool) per exit-during-playback.
+        let stopped = cancelled
+        decodedLock.unlock()
+        guard !stopped, let format = videoFormat else { return nil }
+        var session: VTDecompressionSession?
+        let status = VTDecompressionSessionCreate(
+            allocator: kCFAllocatorDefault,
+            formatDescription: format,
+            decoderSpecification: nil,
+            imageBufferAttributes: nil,
+            outputCallback: nil,
+            decompressionSessionOut: &session
+        )
+        guard status == noErr, let session else {
+            NSLog("[DVSample] VT session create failed (%d) — falling back to compressed feed", status)
+            vtUnavailable = true
+            return nil
+        }
+        decodedLock.lock()
+        if cancelled || vtSession != nil {
+            // Lost the race with stop() or another creator: discard ours.
+            let winner = vtSession
+            decodedLock.unlock()
+            VTDecompressionSessionInvalidate(session)
+            return winner
+        }
+        vtSession = session
+        decodedLock.unlock()
+        NSLog("[DVSample] VT decode-ahead session created")
+        return session
+    }
+
+    /// Drop every decoded-ahead frame. The wait for in-flight frames happens
+    /// on `feedQueue` — the only thread that talks to the session — rather
+    /// than blocking main inside VideoToolbox on every scrub step; the
+    /// generation stamp on each frame keeps anything that lands late out of
+    /// the flushed layer.
+    private func vtFlush() {
+        decodedLock.lock()
+        decodedHeap.removeAll(keepingCapacity: true)
+        framesToLayerSinceFlush = 0
+        let session = vtSession
+        decodedLock.unlock()
+        guard let session else { return }
+        feedQueue.async { [weak self] in
+            VTDecompressionSessionWaitForAsynchronousFrames(session)
+            guard let self else { return }
+            self.decodedLock.lock()
+            self.decodedHeap.removeAll(keepingCapacity: true)
+            self.decodedLock.unlock()
+        }
+    }
+
+    private func vtTearDown() {
+        decodedLock.lock()
+        let session = vtSession
+        vtSession = nil
+        decodedHeap.removeAll()
+        displayFormatCache = nil
+        decodedLock.unlock()
+        guard let session else { return }
+        // Invalidate on `feedQueue` (serial): any decode already inside the
+        // session finishes first, and main never blocks in VideoToolbox.
+        feedQueue.async {
+            VTDecompressionSessionWaitForAsynchronousFrames(session)
+            VTDecompressionSessionInvalidate(session)
+        }
+    }
+
+    private static func isDoNotDisplay(_ sample: CMSampleBuffer) -> Bool {
+        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(
+            sample, createIfNecessary: false
+        ) as? [CFDictionary], let first = attachments.first else { return false }
+        let key = Unmanaged.passUnretained(kCMSampleAttachmentKey_DoNotDisplay).toOpaque()
+        return CFDictionaryContainsKey(first, key)
+    }
+
+    /// Decode ONE compressed sample synchronously into the heap (display
+    /// suppressed frames decode for their references but are not kept).
+    private func vtDecodeOne(_ sample: CMSampleBuffer) {
+        // After a decoder death, only a keyframe can start a session cleanly;
+        // anything else would decode against references the session never had.
+        if vtAwaitingKeyframe {
+            guard Self.isSync(sample) else { return }
+            vtAwaitingKeyframe = false
+        }
+        guard let session = ensureVTSession() else { return }
+        let suppress = Self.isDoNotDisplay(sample)
+        let generation = seekGeneration
+        let status = VTDecompressionSessionDecodeFrame(
+            session, sampleBuffer: sample, flags: [], infoFlagsOut: nil
+        ) { [weak self] st, _, image, pts, duration in
+            guard let self, st == noErr, let image, !suppress else { return }
+            #if DEBUG
+            // What actually leaves the decoder. If no Dolby Vision per-scene
+            // metadata rides on these buffers, the display layer — which only
+            // ever sees the pixels on the decode-ahead path — cannot drive the
+            // TV's DV mode with it.
+            if !self.vtAttachmentsReported {
+                self.vtAttachmentsReported = true
+                let attachments = (CVBufferCopyAttachments(image, .shouldPropagate) as? [String: Any]) ?? [:]
+                let hidden = (CVBufferCopyAttachments(image, .shouldNotPropagate) as? [String: Any]) ?? [:]
+                let keys = attachments.keys.sorted().joined(separator: ", ")
+                let format = CVPixelBufferGetPixelFormatType(image)
+                func tag(_ key: CFString) -> String {
+                    (attachments[key as String] ?? hidden[key as String]).map { "\($0)" } ?? "-"
+                }
+                let fourCC = String(bytes: [24, 16, 8, 0].map { UInt8((format >> $0) & 0xFF) }, encoding: .ascii) ?? "\(format)"
+                ClassicPlayerProbe.event("dv", "decoded frame: format=\(fourCC) attachments=[\(keys)]"
+                    + " notPropagated=[\(hidden.keys.sorted().joined(separator: ", "))]")
+                ClassicPlayerProbe.event("dv", "decoded colour: trc=\(tag(kCVImageBufferTransferFunctionKey))"
+                    + " primaries=\(tag(kCVImageBufferColorPrimariesKey))"
+                    + " matrix=\(tag(kCVImageBufferYCbCrMatrixKey))"
+                    + " mastering=\(attachments[kCVImageBufferMasteringDisplayColorVolumeKey as String] != nil ? "yes" : "no")"
+                    + " cll=\(attachments[kCVImageBufferContentLightLevelInfoKey as String] != nil ? "yes" : "no")")
+            }
+            #endif
+            // Decoded under a superseded generation: the seek that bumped it
+            // already emptied the heap and flushed the layer.
+            guard generation == self.seekGeneration else { return }
+            self.decodedLock.lock()
+            let frame = DecodedFrame(pts: pts, duration: duration, image: image, generation: generation)
+            let idx = self.decodedHeap.firstIndex { CMTimeCompare($0.pts, pts) > 0 } ?? self.decodedHeap.count
+            self.decodedHeap.insert(frame, at: idx)
+            self.decodedLock.unlock()
+        }
+        if status != noErr, !vtDecodeErrorReported {
+            vtDecodeErrorReported = true
+            ClassicPlayerProbe.event("dv", "VideoToolbox decode error \(status)"
+                + (status == kVTInvalidSessionErr ? " (session died) — rebuilding at the next keyframe" : ""))
+        }
+        if status == kVTInvalidSessionErr {
+            // Session died (backgrounding etc.) — rebuild, but only from the
+            // next keyframe: the frame that just failed may have been the one
+            // the following frames reference.
+            vtTearDown()
+            vtAwaitingKeyframe = true
+        }
+    }
+
+    /// A sample with no `NotSync` attachment is a sync sample (keyframe) — the
+    /// demuxer marks every non-keyframe it builds.
+    private static func isSync(_ sample: CMSampleBuffer) -> Bool {
+        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(
+            sample, createIfNecessary: false
+        ) as? [CFDictionary], let first = attachments.first else { return true }
+        let key = Unmanaged.passUnretained(kCMSampleAttachmentKey_NotSync).toOpaque()
+        guard let value = CFDictionaryGetValue(first, key) else { return true }
+        // `makeSample` stores kCFBooleanTrue, but check the type rather than
+        // assume it: a bad cast here would be a crash in the decode path.
+        let object = Unmanaged<AnyObject>.fromOpaque(value).takeUnretainedValue()
+        guard CFGetTypeID(object) == CFBooleanGetTypeID() else { return false }
+        return !CFBooleanGetValue((object as! CFBoolean))
+    }
+
+    /// Wrap a decoded image buffer as a display-order sample for the layer.
+    private func makeDisplaySample(_ frame: DecodedFrame) -> CMSampleBuffer? {
+        decodedLock.lock()
+        var cached = displayFormatCache
+        decodedLock.unlock()
+        if cached == nil || !CMVideoFormatDescriptionMatchesImageBuffer(cached!, imageBuffer: frame.image) {
+            var fmt: CMFormatDescription?
+            CMVideoFormatDescriptionCreateForImageBuffer(
+                allocator: kCFAllocatorDefault, imageBuffer: frame.image, formatDescriptionOut: &fmt
+            )
+            cached = fmt
+            decodedLock.lock()
+            displayFormatCache = fmt
+            decodedLock.unlock()
+        }
+        guard let fmt = cached else { return nil }
+        var timing = CMSampleTimingInfo(
+            duration: frame.duration, presentationTimeStamp: frame.pts, decodeTimeStamp: .invalid
+        )
+        var out: CMSampleBuffer?
+        CMSampleBufferCreateReadyWithImageBuffer(
+            allocator: kCFAllocatorDefault, imageBuffer: frame.image,
+            formatDescription: fmt, sampleTiming: &timing, sampleBufferOut: &out
+        )
+        return out
+    }
+
+    /// The decode-ahead video feeder: keep the heap topped up from the
+    /// compressed queue, release the lowest-PTS frame to the layer only when
+    /// the reorder holdback is satisfied (or the stream is draining).
+    private func vtFeedVideo() {
+        while !cancelled, displayLayer.isReadyForMoreMediaData {
+            // Top up the heap.
+            while true {
+                decodedLock.lock()
+                let depth = decodedHeap.count
+                decodedLock.unlock()
+                if depth >= decodedCap { break }
+                queueLock.lock()
+                let sample = videoQueue.isEmpty ? nil : videoQueue.removeFirst()
+                queueLock.broadcast()
+                queueLock.unlock()
+                guard let sample else { break }
+                let decodeStart = CACurrentMediaTime()
+                vtDecodeOne(sample)
+                let decodeMs = Int((CACurrentMediaTime() - decodeStart) * 1000)
+                if decodeMs > 41 { $slowDecodes.mutate { $0 += 1 } }
+                $worstDecodeMs.mutate { $0 = max($0, decodeMs) }
+            }
+            decodedLock.lock()
+            let depth = decodedHeap.count
+            queueLock.lock()
+            let compressedEmpty = videoQueue.isEmpty
+            let ended = demuxEOF && compressedEmpty && audioQueue.isEmpty && depth == 0
+            // Inside the lock: `demuxEOF` is written under `queueLock`, and an
+            // unlocked read here decided whether the reorder holdback was
+            // bypassed.
+            let draining = demuxEOF && compressedEmpty
+            queueLock.unlock()
+            guard depth > 0, draining || depth > reorderHoldback else {
+                decodedLock.unlock()
+                if ended { signalEndOnce() }
+                return
+            }
+            let frame = decodedHeap.removeFirst()
+            decodedLock.unlock()
+            // A frame decoded before the last seek that slipped into the heap
+            // after it was emptied: never hand it to the flushed layer.
+            guard frame.generation == seekGeneration else { continue }
+            if let display = makeDisplaySample(frame) {
+                displayLayer.enqueue(display)
+                decodedLock.lock(); framesToLayerSinceFlush += 1; decodedLock.unlock()
+                noteHandedToRenderer(pts: frame.pts, duration: frame.duration)
+                noteVideoHandoff(pts: frame.pts, duration: frame.duration)
+            }
+        }
+    }
+
+    // MARK: Feeders
+
+    /// (Re)install the media-request blocks. ALWAYS stops first.
+    ///
+    /// `requestMediaDataWhenReady(on:using:)` is documented as an error to call
+    /// a second time without an intervening `stopRequestingMediaData()`, and
+    /// the display-layer recovery path did exactly that (flush + seek +
+    /// installFeeders on a layer that already had a live block). The observable
+    /// damage was two feed blocks per renderer: the single
+    /// `stopRequestingMediaData()` in `signalEndOnce` then stopped only one of
+    /// them, so the survivor kept pulling against an empty queue and the
+    /// end-of-movie feed spin came back — the very spin `signalEndOnce` exists
+    /// to end. Stopping unconditionally here makes every call site (start,
+    /// layer recovery, and the post-EOF re-arm) correctly paired by
+    /// construction; stopping a renderer that has no block installed is a
+    /// no-op.
+    ///
+    /// Runs ON `feedQueue`: stopping and re-requesting from main could
+    /// straddle a feed block already executing there. `rearm` clears the
+    /// end-signalled latch for the display-layer recovery path — re-installed
+    /// feeders would otherwise be stopped again by the next `ended` test.
+    private func installFeeders(rearm: Bool = false) {
+        feedQueue.async { [weak self] in
+            guard let self, !self.cancelled else { return }
+            if rearm { self.didSignalEnd = false }
+            self.displayLayer.stopRequestingMediaData()
+            self.audioRenderer.stopRequestingMediaData()
+            self.displayLayer.requestMediaDataWhenReady(on: self.feedQueue) { [weak self] in
+                self?.feed(video: true)
+            }
+            self.audioRenderer.requestMediaDataWhenReady(on: self.feedQueue) { [weak self] in
+                self?.feed(video: false)
+            }
+            // `stop()` may have landed between the check above and the
+            // requests: it stopped nothing, so undo them here rather than
+            // leave a stopped engine's renderers polling an empty queue.
+            if self.cancelled {
+                self.displayLayer.stopRequestingMediaData()
+                self.audioRenderer.stopRequestingMediaData()
+            }
+        }
+    }
+
+    // Decode-pacing probe (feedQueue thread): the display layer pulls a new
+    // sample only when its internal decoder has room, so the pull cadence IS
+    // the decoder's pacing — but ONLY while the layer is nearly dry. A layer
+    // holding two seconds of video is *supposed* to go quiet for two seconds,
+    // and counting that recorded 15 "stalls" with a worst of 1525ms on a
+    // session whose picture was perfect, which is worse than no metric at all:
+    // it reads as a fault and sent a whole diagnostic session down the wrong
+    // path. Gated on the renderer being within `pullGapDryAhead` of empty, it
+    // means what the rest of this comment claims — the decoder fell behind and
+    // the layer repeated a frame on screen. Reported per ~10s in the vsync
+    // line.
+    /// A renderer holding more than this much video is entitled to go quiet;
+    /// only a gap below it says the decoder is behind.
+    private static let pullGapDryAhead: Double = 0.5
+    private var lastVideoPullAt: CFAbsoluteTime = 0
+    @ClassicAtomic private var pullGapCount = 0        // gaps > 100ms this window
+    @ClassicAtomic private var pullGapWorstMs = 0      // worst gap this window
+
+    private func feed(video: Bool) {
+        if video, decodeAheadActive {
+            let now = CFAbsoluteTimeGetCurrent()
+            if lastVideoPullAt > 0, synchronizer.rate > 0 {
+                let gapMs = Int((now - lastVideoPullAt) * 1000)
+                let dry = lastVideoHandedEnd - CMTimeGetSeconds(synchronizer.currentTime())
+                if gapMs > 100, dry < Self.pullGapDryAhead {
+                    // Locked read-modify-write: `+=` on an @ClassicAtomic is two
+                    // separate locked accesses, so main's 10s reset could land
+                    // between them and swallow this gap.
+                    $pullGapCount.mutate { $0 += 1 }
+                    $pullGapWorstMs.mutate { $0 = max($0, gapMs) }
+                }
+            }
+            lastVideoPullAt = now
+            vtFeedVideo()
+            return
+        }
+        if video {
+            let now = CFAbsoluteTimeGetCurrent()
+            if lastVideoPullAt > 0, synchronizer.rate > 0 {
+                let gapMs = Int((now - lastVideoPullAt) * 1000)
+                let dry = lastVideoHandedEnd - CMTimeGetSeconds(synchronizer.currentTime())
+                if gapMs > 100, dry < Self.pullGapDryAhead {
+                    // Locked read-modify-write: `+=` on an @ClassicAtomic is two
+                    // separate locked accesses, so main's 10s reset could land
+                    // between them and swallow this gap.
+                    $pullGapCount.mutate { $0 += 1 }
+                    $pullGapWorstMs.mutate { $0 = max($0, gapMs) }
+                }
+            }
+            lastVideoPullAt = now
+        }
+        while !cancelled,
+              video ? displayLayer.isReadyForMoreMediaData
+                    : audioRenderer.isReadyForMoreMediaData {
+            // The decode-ahead heap counts as undelivered video. The audio
+            // feeder's end test ignored it, so whichever feeder observed the
+            // empty compressed queues first could declare the end while up to
+            // twelve decoded frames were still waiting — `signalEndOnce`
+            // stops the display layer's requests and they never reached the
+            // glass: the last half-second of every film was cut.
+            var heapDepth = 0
+            if decodeAheadActive {
+                decodedLock.lock()
+                heapDepth = decodedHeap.count
+                decodedLock.unlock()
+            }
+            queueLock.lock()
+            let sample: CMSampleBuffer?
+            if video {
+                sample = videoQueue.isEmpty ? nil : videoQueue.removeFirst()
+            } else {
+                sample = audioQueue.isEmpty ? nil : audioQueue.removeFirst()
+            }
+            let ended = demuxEOF && videoQueue.isEmpty && audioQueue.isEmpty && heapDepth == 0
+            queueLock.broadcast()
+            queueLock.unlock()
+            guard let sample else {
+                if ended { signalEndOnce() }
+                return
+            }
+            // Audio carries the lip-sync offset from here on; everything below
+            // accounts in the timing the renderer will actually play.
+            let handed = video ? sample : Self.retimedAudio(sample, by: audioDelaySeconds)
+            if video { displayLayer.enqueue(handed) } else { audioRenderer.enqueue(handed) }
+            noteHandedToRenderer(pts: CMSampleBufferGetPresentationTimeStamp(handed),
+                                 duration: CMSampleBufferGetDuration(handed))
+            if video {
+                noteVideoHandoff(pts: CMSampleBufferGetPresentationTimeStamp(handed),
+                                 duration: CMSampleBufferGetDuration(handed))
+            } else {
+                noteAudioHandoff(pts: CMSampleBufferGetPresentationTimeStamp(handed),
+                                 duration: CMSampleBufferGetDuration(handed))
+            }
+        }
+    }
+
+    // MARK: Sample construction
+
+    private static func makeSample(
+        bytes: [UInt8], format: CMFormatDescription?,
+        ptsSeconds: Double, dtsSeconds: Double, durationSeconds: Double, keyframe: Bool
+    ) -> CMSampleBuffer? {
+        guard let format else { return nil }
+        var block: CMBlockBuffer?
+        guard CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault, memoryBlock: nil,
+            blockLength: bytes.count, blockAllocator: kCFAllocatorDefault,
+            customBlockSource: nil, offsetToData: 0, dataLength: bytes.count,
+            flags: 0, blockBufferOut: &block
+        ) == noErr, let block else { return nil }
+        guard bytes.withUnsafeBytes({ raw in
+            CMBlockBufferReplaceDataBytes(
+                with: raw.baseAddress!, blockBuffer: block,
+                offsetIntoDestination: 0, dataLength: bytes.count
+            )
+        }) == noErr else { return nil }
+
+        var timing = CMSampleTimingInfo(
+            duration: durationSeconds > 0
+                ? CMTime(seconds: durationSeconds, preferredTimescale: 90000) : .invalid,
+            presentationTimeStamp: CMTime(seconds: ptsSeconds, preferredTimescale: 90000),
+            decodeTimeStamp: CMTime(seconds: dtsSeconds, preferredTimescale: 90000)
+        )
+        var size = bytes.count
+        var sample: CMSampleBuffer?
+        guard CMSampleBufferCreateReady(
+            allocator: kCFAllocatorDefault, dataBuffer: block,
+            formatDescription: format, sampleCount: 1,
+            sampleTimingEntryCount: 1, sampleTimingArray: &timing,
+            sampleSizeEntryCount: 1, sampleSizeArray: &size,
+            sampleBufferOut: &sample
+        ) == noErr, let sample else { return nil }
+        if !keyframe, CMFormatDescriptionGetMediaType(format) == kCMMediaType_Video,
+           let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true) as? [CFMutableDictionary],
+           let first = attachments.first {
+            CFDictionarySetValue(
+                first,
+                Unmanaged.passUnretained(kCMSampleAttachmentKey_NotSync).toOpaque(),
+                Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
+            )
+        }
+        return sample
+    }
+
+    /// DV format description: HEVC dimensions + hvcC, tagged 'dvh1' with the
+    /// dvvC atom so VideoToolbox and the display pipeline treat the stream as
+    /// Dolby Vision rather than plain HEVC.
+    private static func makeDVVideoFormat(
+        width: Int32, height: Int32, hvcC: Data, dvvC: Data,
+        colourTags: [String: Any]? = nil
+    ) -> CMFormatDescription? {
+        let atoms: [String: Any] = ["hvcC": hvcC, "dvvC": dvvC]
+        var extensions: [String: Any] = [
+            kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms as String: atoms
+        ]
+        if let colourTags { extensions.merge(colourTags) { _, new in new } }
+        var format: CMFormatDescription?
+        let status = CMVideoFormatDescriptionCreate(
+            allocator: kCFAllocatorDefault,
+            codecType: kCMVideoCodecType_DolbyVisionHEVC,
+            width: width, height: height,
+            extensions: extensions as CFDictionary,
+            formatDescriptionOut: &format
+        )
+        ClassicPlayerViewModel.colorTrail(
+            "direct engine format = dvh1 (Dolby Vision) \(width)x\(height)"
+                + " dvvC=\(dvvC.count)B hvcC=\(hvcC.count)B status=\(status)"
+                + " — colour comes from the bitstream, no CV tags attached"
+        )
+        return status == noErr ? format : nil
+    }
+
+    #if DEBUG
+    /// Explicit colour extensions for a DV base layer, from its compatibility
+    /// id: 1 = HDR10 (BT.2020 + PQ), 4 = HLG, 2 = SDR (BT.709). DEBUG A/B only.
+    static func debugColourTags(compatibilityID: Int, fullRange: Bool) -> [String: Any]? {
+        let transfer: CFString
+        let primaries: CFString
+        let matrix: CFString
+        switch compatibilityID {
+        case 1:
+            transfer = kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ
+            primaries = kCMFormatDescriptionColorPrimaries_ITU_R_2020
+            matrix = kCMFormatDescriptionYCbCrMatrix_ITU_R_2020
+        case 4:
+            transfer = kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG
+            primaries = kCMFormatDescriptionColorPrimaries_ITU_R_2020
+            matrix = kCMFormatDescriptionYCbCrMatrix_ITU_R_2020
+        case 2:
+            transfer = kCMFormatDescriptionTransferFunction_ITU_R_709_2
+            primaries = kCMFormatDescriptionColorPrimaries_ITU_R_709_2
+            matrix = kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2
+        default:
+            return nil
+        }
+        return [
+            kCMFormatDescriptionExtension_TransferFunction as String: transfer,
+            kCMFormatDescriptionExtension_ColorPrimaries as String: primaries,
+            kCMFormatDescriptionExtension_YCbCrMatrix as String: matrix,
+            kCMFormatDescriptionExtension_FullRangeVideo as String: fullRange,
+        ]
+    }
+    #endif
+
+    /// `sample` with every presentation (and decode) timestamp moved by
+    /// `seconds`. Zero returns the sample itself. On any failure the ORIGINAL is
+    /// returned: a sample played with no offset is a far smaller fault than a
+    /// sample dropped.
+    private static func retimedAudio(_ sample: CMSampleBuffer, by seconds: Double) -> CMSampleBuffer {
+        guard seconds != 0, seconds.isFinite else { return sample }
+        var count: CMItemCount = 0
+        guard CMSampleBufferGetSampleTimingInfoArray(
+            sample, entryCount: 0, arrayToFill: nil, entriesNeededOut: &count
+        ) == noErr, count > 0 else { return sample }
+        var timing = [CMSampleTimingInfo](repeating: CMSampleTimingInfo(), count: count)
+        guard CMSampleBufferGetSampleTimingInfoArray(
+            sample, entryCount: count, arrayToFill: &timing, entriesNeededOut: &count
+        ) == noErr else { return sample }
+        for i in 0 ..< count {
+            // In each timestamp's own timescale (90kHz for compressed audio, the
+            // sample rate for PCM) so nothing is rounded onto a coarser grid.
+            if timing[i].presentationTimeStamp.isValid {
+                let pts = timing[i].presentationTimeStamp
+                timing[i].presentationTimeStamp = CMTimeAdd(
+                    pts, CMTime(seconds: seconds, preferredTimescale: max(pts.timescale, 1)))
+            }
+            if timing[i].decodeTimeStamp.isValid {
+                let dts = timing[i].decodeTimeStamp
+                timing[i].decodeTimeStamp = CMTimeAdd(
+                    dts, CMTime(seconds: seconds, preferredTimescale: max(dts.timescale, 1)))
+            }
+        }
+        var out: CMSampleBuffer?
+        guard CMSampleBufferCreateCopyWithNewTiming(
+            allocator: kCFAllocatorDefault, sampleBuffer: sample,
+            sampleTimingEntryCount: count, sampleTimingArray: &timing, sampleBufferOut: &out
+        ) == noErr, let out else { return sample }
+        return out
+    }
+
+    /// Decode-but-don't-display, for post-seek lead-in frames.
+    private static func markDoNotDisplay(_ sample: CMSampleBuffer) {
+        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(
+            sample, createIfNecessary: true
+        ) as? [CFMutableDictionary], let first = attachments.first else { return }
+        CFDictionarySetValue(
+            first,
+            Unmanaged.passUnretained(kCMSampleAttachmentKey_DoNotDisplay).toOpaque(),
+            Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
+        )
+    }
+
+    /// Plain HEVC (HDR10/HDR10+/SDR): hvc1 + hvcC, nothing else — every SEI
+    /// in the bitstream (static mastering metadata, HDR10+ dynamic metadata)
+    /// reaches the display pipeline untouched.
+    /// H.264 sibling of `makeHEVCVideoFormat`: an `avcC` sample-description
+    /// atom and the H.264 codec type. VideoToolbox builds the decoder from the
+    /// format description alone (`ensureVTSession` passes no decoder spec), so
+    /// this one description is the entire codec switch.
+    private static func makeAVCVideoFormat(
+        width: Int32, height: Int32, avcC: Data
+    ) -> CMFormatDescription? {
+        let atoms: [String: Any] = ["avcC": avcC]
+        let extensions: [String: Any] = [
+            kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms as String: atoms
+        ]
+        var format: CMFormatDescription?
+        let status = CMVideoFormatDescriptionCreate(
+            allocator: kCFAllocatorDefault,
+            codecType: kCMVideoCodecType_H264,
+            width: width, height: height,
+            extensions: extensions as CFDictionary,
+            formatDescriptionOut: &format
+        )
+        ClassicPlayerViewModel.colorTrail(
+            "direct engine format = avc1 (H.264) \(width)x\(height)"
+                + " avcC=\(avcC.count)B status=\(status)"
+                + " — colour comes from the bitstream VUI, no CV tags attached"
+        )
+        return status == noErr ? format : nil
+    }
+
+    private static func makeHEVCVideoFormat(
+        width: Int32, height: Int32, hvcC: Data
+    ) -> CMFormatDescription? {
+        let atoms: [String: Any] = ["hvcC": hvcC]
+        let extensions: [String: Any] = [
+            kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms as String: atoms
+        ]
+        var format: CMFormatDescription?
+        let status = CMVideoFormatDescriptionCreate(
+            allocator: kCFAllocatorDefault,
+            codecType: kCMVideoCodecType_HEVC,
+            width: width, height: height,
+            extensions: extensions as CFDictionary,
+            formatDescriptionOut: &format
+        )
+        ClassicPlayerViewModel.colorTrail(
+            "direct engine format = hvc1 (plain HEVC) \(width)x\(height)"
+                + " hvcC=\(hvcC.count)B status=\(status)"
+                + " — colour comes from the bitstream VUI/SEI, no CV tags attached"
+        )
+        return status == noErr ? format : nil
+    }
+
+    /// The 24-byte dv decoder configuration record (ISO/IEC layout) —
+    /// version 1.0, single layer, RPU+BL present.
+    private static func doviConfigurationBox(
+        profile: Int, level: Int, compatibilityID: Int
+    ) -> Data {
+        var b = [UInt8](repeating: 0, count: 24)
+        b[0] = 1   // version major
+        b[1] = 0   // version minor
+        b[2] = UInt8((profile << 1) | ((level >> 5) & 0x01))
+        b[3] = UInt8(((level & 0x1F) << 3) | (1 << 2) /* rpu */ | (0 << 1) /* el */ | 1 /* bl */)
+        b[4] = UInt8((compatibilityID & 0x0F) << 4)
+        return Data(b)
+    }
+
+    private static func makeAudioFormat(par: AVCodecParameters) -> CMFormatDescription? {
+        var asbd = AudioStreamBasicDescription()
+        switch par.codec_id {
+        case AV_CODEC_ID_EAC3: asbd.mFormatID = kAudioFormatEnhancedAC3
+        case AV_CODEC_ID_AC3: asbd.mFormatID = kAudioFormatAC3
+        case AV_CODEC_ID_AAC: asbd.mFormatID = kAudioFormatMPEG4AAC
+        default: return nil
+        }
+        asbd.mSampleRate = Float64(par.sample_rate)
+        asbd.mChannelsPerFrame = UInt32(max(par.ch_layout.nb_channels, 2))
+        asbd.mFramesPerPacket = par.codec_id == AV_CODEC_ID_AAC ? 1024 : 1536
+        var format: CMFormatDescription?
+        // AAC cannot decode without its AudioSpecificConfig — the codec
+        // extradata IS that cookie. AC3/E-AC3 are self-describing.
+        var cookie: UnsafeRawPointer?
+        var cookieSize = 0
+        if par.codec_id == AV_CODEC_ID_AAC, let extra = par.extradata, par.extradata_size > 0 {
+            cookie = UnsafeRawPointer(extra)
+            cookieSize = Int(par.extradata_size)
+        }
+        let status = CMAudioFormatDescriptionCreate(
+            allocator: kCFAllocatorDefault, asbd: &asbd,
+            layoutSize: 0, layout: nil,
+            magicCookieSize: cookieSize, magicCookie: cookie,
+            extensions: nil, formatDescriptionOut: &format
+        )
+        return status == noErr ? format : nil
+    }
+
+    // MARK: P7 → 8.1 access-unit conversion
+
+    /// Walk length-prefixed NALs: drop EL carriage (type 63), convert RPUs
+    /// (type 62) via libdovi. Returns nil to keep the original packet, an
+    /// empty array when the whole AU was enhancement layer.
+    nonisolated(unsafe) private static var rpuConversionFailures = 0
+    nonisolated(unsafe) private static var elNalCount = 0
+    nonisolated(unsafe) private static var elNalBytes = 0
+    /// Fired once (on main) when the P7 layer type is measured — surfaces
+    /// FEL/MEL in the player's decision panel. Single active DV engine at a
+    /// time, so static state is safe; counters reset per engine start.
+    nonisolated(unsafe) static var onELVerdict: ((String) -> Void)?
+
+    /// forceHDR10: drop every DV NAL (EL type 63 and RPU type 62), keep the
+    /// plain HEVC base layer untouched.
+    private static func stripDVAccessUnit(_ au: [UInt8], nalLengthSize: Int) -> [UInt8]? {
+        var out = [UInt8]()
+        out.reserveCapacity(au.count)
+        var i = 0
+        var changed = false
+        var kept = 0
+        while i + nalLengthSize <= au.count {
+            var len = 0
+            for k in 0 ..< nalLengthSize { len = (len << 8) | Int(au[i + k]) }
+            let start = i + nalLengthSize
+            guard len > 0, start + len <= au.count else { return nil }
+            let nalType = (au[start] >> 1) & 0x3F
+            if nalType == 63 || nalType == 62 {
+                changed = true
+            } else {
+                appendPrefixed(&out, Array(au[start ..< start + len]), nalLengthSize)
+                kept += 1
+            }
+            i = start + len
+        }
+        if kept == 0 { return [] }
+        return changed ? out : nil
+    }
+
+    private static func convertP7AccessUnit(_ au: [UInt8], nalLengthSize: Int) -> [UInt8]? {
+        var out = [UInt8]()
+        out.reserveCapacity(au.count)
+        var i = 0
+        var changed = false
+        var kept = 0
+        while i + nalLengthSize <= au.count {
+            var len = 0
+            for k in 0 ..< nalLengthSize { len = (len << 8) | Int(au[i + k]) }
+            let start = i + nalLengthSize
+            guard len > 0, start + len <= au.count else { return nil }
+            let nalType = (au[start] >> 1) & 0x3F
+            let nal = Array(au[start ..< start + len])
+            if nalType == 63 {
+                changed = true   // EL: drop
+                // FEL-vs-MEL diagnosis: MEL enhancement layers are ~100-byte
+                // shells (lossless to drop); FEL ELs are a real 12-bit
+                // residual stream, and converted-8.1 metadata over a dropped
+                // FEL is an approximation the composer may stumble on.
+                elNalCount += 1
+                elNalBytes += len
+                if elNalCount == 240 {
+                    let avg = elNalBytes / elNalCount
+                    let fel = avg > 1000
+                    dvDiag("P7 enhancement layer: avg %d bytes/NAL over %d NALs — %@",
+                          avg, elNalCount, fel ? "FEL (full residual layer)" : "MEL (empty shell)")
+                    let verdict = fel
+                        ? "FEL — full enhancement layer (dropped; converted 8.1 metadata is approximate)"
+                        : "MEL — minimal enhancement layer (lossless 8.1 conversion)"
+                    DispatchQueue.main.async { onELVerdict?(verdict) }
+                }
+            } else if nalType == 62 {
+                if let converted = ClassicDoviConverter.convertRPU7to81(Data(nal)) {
+                    appendPrefixed(&out, [UInt8](converted), nalLengthSize)
+                    kept += 1
+                } else {
+                    // NEVER let a raw P7 RPU into the 8.1-tagged stream: it
+                    // references the enhancement layer we just deleted, and
+                    // the DV composer glitching on it per affected frame is
+                    // visible stutter no pipeline probe can see. A frame
+                    // with no DV metadata is benign; corrupt metadata isn't.
+                    rpuConversionFailures += 1
+                    if rpuConversionFailures == 1 || rpuConversionFailures % 100 == 0 {
+                        NSLog("[DVSample] P7 RPU conversion failed (%d so far) — dropping the frame's RPU",
+                              rpuConversionFailures)
+                    }
+                }
+                changed = true
+            } else {
+                appendPrefixed(&out, nal, nalLengthSize)
+                kept += 1
+            }
+            i = start + len
+        }
+        if kept == 0 { return [] }
+        return changed ? out : nil
+    }
+
+    private static func appendPrefixed(_ out: inout [UInt8], _ nal: [UInt8], _ lengthSize: Int) {
+        let len = nal.count
+        for shift in stride(from: (lengthSize - 1) * 8, through: 0, by: -8) {
+            out.append(UInt8((len >> shift) & 0xFF))
+        }
+        out.append(contentsOf: nal)
+    }
+}
+
+/// UIView whose backing layer IS the sample display layer, so the video
+/// scales with the view like every other engine's output.
+final class ClassicDVSampleLayerView: UIView {
+    override class var layerClass: AnyClass { AVSampleBufferDisplayLayer.self }
+    var displayLayer: AVSampleBufferDisplayLayer { layer as! AVSampleBufferDisplayLayer }
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        displayLayer.videoGravity = .resizeAspect
+        backgroundColor = .black
+    }
+    required init?(coder: NSCoder) { fatalError("unavailable") }
+}

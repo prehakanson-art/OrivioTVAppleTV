@@ -1,30 +1,24 @@
 name: OrivioTV
+# Profile = Release optimisation + the DEBUG launch switches, installed under the
+# Debug ids (keeps the test TV's data): what to measure performance with —
+# an unoptimised Debug build is several times slower in SwiftUI.
+configs:
+  Debug: debug
+  Release: release
+  Profile: release
 options:
   deploymentTarget:
     tvOS: "17.0"
   createIntermediateGroups: true
 packages:
-  # VENDORED with two Orivio patches (see "ORIVIO PATCH" comments): a
-  # lost-wakeup fix in MEPlayerItem's reader teardown and a display-link
-  # invalidation on engine swap in KSPlayerLayer — together they stop a dead
-  # engine leaking ~400-500 MB per swap (jetsam killer on the 3 GB boxes).
-  # Base revision: 10a40a1c0001d75307ad5922d1d1bc0cb01c89b4.
+  # Vendored with Orivio patches (grep "ORIVIO PATCH"). Re-apply them if re-vendored.
   KSPlayer:
     path: Vendor/KSPlayer
-  # Pure-Swift YouTube stream extractor — the only way to play trailer
-  # YouTube keys on tvOS (no WebKit/WKWebView, so no iframe embed).
-  #
-  # VENDORED with one Orivio patch (see the "ORIVIO PATCH" comment in
-  # YouTube.swift): `streams` used to abort on an unreadable watch page before
-  # it had tried a single extraction method, which took the remote extractor
-  # down with it even though that one never touches the watch page. An
-  # unreadable page is what YouTube serves an address it distrusts, so this is
-  # what made trailers stop working the moment a VPN was switched on.
-  # Base revision: e5b7d0396ce12bf3444f0d209e8436c83373b7af (tag 0.4.9).
+  # Vendored with one patch: the availability pre-check must not throw on a
+  # bot-check page (VPN users lost every trailer otherwise).
   YouTubeKit:
     path: Vendor/YouTubeKit
-  # VLCKit as a binary xcframework; the tvOS slice vends module `TVVLCKit`.
-  # Adds the VLC playback engine alongside KSPlayer.
+  # Binary xcframework; the tvOS slice vends module `TVVLCKit`.
   VLCKit:
     url: https://github.com/tylerjonesio/vlckit-spm
     from: 3.6.0
@@ -33,167 +27,71 @@ targets:
     type: application
     platform: tvOS
     sources:
-      - OrivioTV
+      - path: OrivioTV
     dependencies:
       - package: KSPlayer
       - package: YouTubeKit
       - package: VLCKit
         product: VLCKitSPM
-      # libdovi (quietvoid/dovi_tool's dolby_vision crate, C API) —
-      # cross-compiled Rust static lib for tvOS. Powers Dolby Vision
-      # Profile 7 (dual-layer) → 8.1 RPU conversion so DV7 remuxes get
-      # native DV output instead of the HDR10 base-layer tone-map.
+      # libdovi (Rust dolby_vision crate, C API): DV Profile 7 → 8.1 RPU conversion.
       - framework: Vendor/libdovi.xcframework
         embed: false
-      # ─── Top Shelf (Continue Watching on the tvOS home screen) ───
-      # ON. Needs an App Group, which needs a team that can provision one.
-      # Team CYCSPZ5MTR has group.com.innerapns.pubtest.CYCSPZ5MTR (the id
-      # ends in the team id, so it was issued to this team) — which is why
-      # this is switched back on. AppGroupResolver reads the group from the
-      # LIVE entitlement at runtime, so a re-signing tool that swaps in its
-      # own group still works; if a signer strips the entitlement entirely,
-      # the container is nil and the shelf stays empty without affecting
-      # the app. Three spots, all marked TOP SHELF, move together.
       - target: OrivioTopShelf
     info:
       path: Config/Info.plist
       properties:
         CFBundleDisplayName: "Orivio TV"
-        # tvOS apps omit this by default, but Sideloadly's iOS-derived IPA
-        # validator (Cydia Impactor lineage) rejects a bundle without it as
-        # "not a valid iOS app". Harmless on tvOS (ignored); the binary stays a
-        # real AppleTVOS/arm64 app and installs to the Apple TV normally.
+        # tvOS ignores it; Sideloadly's validator rejects the IPA without it.
         LSRequiresIPhoneOS: true
-        # Version, from the build settings below rather than xcodegen's "1.0"/"1"
-        # defaults — those literals landed in Config/Info.plist and MARKETING_VERSION
-        # was never used, so About reported "Version 1.0 (1)" on every build.
-        # Same place the (disabled) Top Shelf target sets its version.
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         UIUserInterfaceStyle: Dark
-        # Picture in Picture keeps rendering while the app is not frontmost, and
-        # AVKit refuses to start PiP at all without the audio background mode.
+        # Required or AVKit refuses to start Picture in Picture at all.
         UIBackgroundModes:
           - audio
-        # Plus Jakarta Sans — bundled for the Stremio theme's chrome typography.
-        UIAppFonts:
-          - PlusJakartaSans-Regular.ttf
-          - PlusJakartaSans-Medium.ttf
-          - PlusJakartaSans-Bold.ttf
-        # Lets canOpenURL detect external players for handoff (Infuse etc.).
         LSApplicationQueriesSchemes:
           - infuse
           - infuse-x-callback
           - vlc-x-callback
           - nplayer-http
           - open-vidhub
-          # SenPlayer: converts dual-layer Dolby Vision Profile 7 to 8.1 on the
-          # fly, which the Apple TV cannot decode natively — handing a P7 remux
-          # to it is the alternative to this app's own libdovi conversion (see
-          # PlayerSettings.dolbyVisionProfile7) or the HDR10 fallback.
           - senplayer
-        # Deep links: orivio:// (open a title) + stremio:// (install an addon).
         CFBundleURLTypes:
           - CFBundleURLName: tv.orivio.deeplink
             CFBundleURLSchemes:
               - orivio
               - stremio
-          # Install-unique callback scheme (the bundle id). `orivio` is
-          # claimed by every sideload of this app on the box, so Infuse's
-          # x-success and the Top Shelf deep links used to land in whichever
-          # one tvOS preferred. AppCallbackScheme reads this back at runtime;
-          # DeepLinkService accepts it alongside `orivio`.
+          # Install-unique callback scheme so Infuse x-success and Top Shelf
+          # links land in *this* install when several sideloads exist.
           - CFBundleURLName: tv.orivio.callback
             CFBundleURLSchemes:
               - "$(PRODUCT_BUNDLE_IDENTIFIER)"
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
+        NSLocalNetworkUsageDescription: "Orivio runs a small page on your network so you can add add-ons and keys from your phone."
     settings:
       base:
-        # RELEASE identity — owned by this machine's Personal Team so
-        # archiving/signing works straight from Xcode. The original
-        # com.orivio.tv.appletv belongs to a DIFFERENT team and cannot be
-        # registered here — every archive failed on it. An archive under
-        # this id installs as its own app, separate from historical
-        # sideloads of the original id.
         PRODUCT_BUNDLE_IDENTIFIER: com.orivio.tv.appletv.dev
-        # Signing team for device builds, HERE rather than only in the
-        # generated pbxproj: Xcode's GUI writes the team into project.pbxproj,
-        # where any xcodegen regeneration (or a git checkout of the file)
-        # silently drops it — and a device build then dies with "Signing for
-        # 'OrivioTV' requires a development team".
         DEVELOPMENT_TEAM: CYCSPZ5MTR
         CODE_SIGN_STYLE: Automatic
         SWIFT_VERSION: "5.9"
         TARGETED_DEVICE_FAMILY: "3"
-        # Tracks the Android APK release this port mirrors (v0.7.15-beta).
-        MARKETING_VERSION: "0.12"
-        CURRENT_PROJECT_VERSION: "1"
-        # The sanitize script below writes into the built .app, so user
-        # script sandboxing must be off or the phase is denied file access.
+        MARKETING_VERSION: "0.14"
+        CURRENT_PROJECT_VERSION: "14"
         ENABLE_USER_SCRIPT_SANDBOXING: false
         ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
-        # ─── TOP SHELF (2 of 3) ─── App group entitlement, shared with the
-        # extension. Both sides must name the SAME group or the container
-        # they each resolve is a different directory and the shelf is empty.
         CODE_SIGN_ENTITLEMENTS: Config/OrivioTV.entitlements
       configs:
-        # DEVELOPMENT identity — used when you Run onto a real Apple TV from
-        # Xcode. Building to a device REGISTERS the bundle id against your
-        # team, and `com.orivio.tv.appletv` is already registered to another
-        # team, so a Personal Team gets:
-        #   "Failed Registering Bundle Identifier … cannot be registered to
-        #    your development team because it is not available"
-        # A distinct Debug id sidesteps that without touching the release
-        # identity above (which the published IPAs keep, so sideloaded users
-        # don't lose their data on update). It only has to be unique across
-        # Apple's registry — if this one is taken too, put anything of your own
-        # here. Note the dev build installs ALONGSIDE a sideloaded Orivio
-        # rather than replacing it: two icons, separate local data.
-        # `com.orivio.tv.appletv.dev` itself became unregisterable — a free
-        # Personal Team's App IDs are provisional, and Xcode now answers
-        # "cannot be registered to your development team because it is not
-        # available" for it, so device builds stopped dead. This id is a fresh
-        # one; if it is ever taken too, put anything unique here. Debug-only:
-        # the Release identity above is what the published IPAs sign with and
-        # must not move. The Top Shelf id below follows this one.
         Debug:
-          # NO bundle-id override any more — Debug signs with the same
-          # `com.orivio.tv.appletv.dev` as Release. That is not cosmetic: an
-          # app EXTENSION cannot be signed with a wildcard profile, so the Top
-          # Shelf needs an explicit App ID of its own, prefixed by whatever the
-          # app uses. `…devbuild` was registered but `…devbuild.topshelf` never
-          # was, and a free Personal Team may create only ten App IDs every
-          # seven days — with that quota spent, Debug device builds died at
-          # signing and there was no way to create the id. The `.dev` pair
-          # (app AND topshelf) is already registered and provisioned, so it
-          # builds today and needs nothing from Apple.
-          #
-          # This does NOT collide with a sideloaded Orivio: the published IPAs
-          # carry `com.orivio.tv.appletv` (scripts/make-ipa.sh swaps it in
-          # after the build), so a Debug run still installs alongside them —
-          # two icons, separate data — exactly as before.
-          #
-          # 2026-09-26: `.dev` lapsed too — no profile left on this Mac and
-          # Apple answers "not available" for it, so device runs died at
-          # signing again. Debug now has an id of its own, Top Shelf below
-          # following it. Release keeps `.dev`: the Sideload IPA ships it
-          # as built and existing installs are keyed on it.
           PRODUCT_BUNDLE_IDENTIFIER: com.prestonhakanson.orivio.tv
           CODE_SIGN_ENTITLEMENTS: Config/OrivioTV-Debug.entitlements
+        Profile:
+          PRODUCT_BUNDLE_IDENTIFIER: com.prestonhakanson.orivio.tv
+          CODE_SIGN_ENTITLEMENTS: Config/OrivioTV-Debug.entitlements
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG
     preBuildScripts:
-      # FFmpegKit (pulled in transitively by KSPlayer) ships
-      # libshaderc_combined.framework with an underscore in its
-      # CFBundleIdentifier (com.kintan.ksplayer.libshaderc_combined) —
-      # illegal, and Xcode's embed validation rejects it. The post-build
-      # sanitize phase below loses that race whenever the embed step
-      # actually re-copies the framework (any clean build, or a build
-      # setting change dirtying the embed): validation fails the build
-      # before any post-build script runs. So fix the id at the SOURCE —
-      # the SPM checkout — before anything is compiled or embedded. Runs
-      # every build, so it also self-heals after a package re-resolve
-      # recreates the checkout with the bad id. Needs
-      # ENABLE_USER_SCRIPT_SANDBOXING=false (already set project-wide).
+      # FFmpegKit ships libshaderc_combined.framework with an underscore in its
+      # bundle id; embed validation rejects it. Fix it in the SPM checkout.
       - name: "Fix vendor framework bundle IDs at the source"
         basedOnDependencyAnalysis: false
         script: |
@@ -213,10 +111,6 @@ targets:
             esac
           done
     postBuildScripts:
-      # Belt to the pre-build phase's suspenders: if a framework with an
-      # underscore id still reaches the app bundle (a non-SPM framework,
-      # or a package layout the source fix doesn't cover), rewrite and
-      # re-sign the embedded copy too.
       - name: "Sanitize embedded framework bundle IDs"
         basedOnDependencyAnalysis: false
         script: |
@@ -237,23 +131,19 @@ targets:
                 ;;
             esac
           done
-  # ─── TOP SHELF (3 of 3) ─── The extension target itself. Renders
-  # Continue Watching on the tvOS home screen (Android's "Watch Next"
-  # equivalent); reads a JSON snapshot from the shared app group written
-  # by TopShelfExporter. Moves together with the other two TOP SHELF spots.
   OrivioTopShelf:
     type: app-extension
     platform: tvOS
     sources:
       - OrivioTopShelf
-      - path: OrivioTV/Core/AppGroupResolver.swift
+      - path: OrivioTV/Core/Shared/AppGroup.swift
+        buildPhase: sources
+      - path: OrivioTV/Core/Shared/TopShelfSnapshot.swift
         buildPhase: sources
     info:
       path: OrivioTopShelf/Info.plist
       properties:
-        CFBundleDisplayName: OrivioTV
-        # From the build setting, not a literal: the app's own version keys
-        # were hardcoded here once and went stale silently.
+        CFBundleDisplayName: Orivio TV
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         NSExtension:
@@ -261,30 +151,22 @@ targets:
           NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).TopShelfProvider
     settings:
       base:
-        # MUST stay prefixed by the app's id or the build fails validation
-        # with "embedded binary's bundle identifier is not prefixed with the
-        # parent app's". Release keeps the .dev id; Debug follows the app's
-        # Debug id, and the two MOVE TOGETHER — a per-config override here is
-        # only safe as long as it mirrors the app's, which is what a lone
-        # override once got wrong (Debug passed, the Release archive failed).
+        # Must stay prefixed by the app's id; moves with it.
         PRODUCT_BUNDLE_IDENTIFIER: com.orivio.tv.appletv.dev.topshelf
         DEVELOPMENT_TEAM: CYCSPZ5MTR
         CODE_SIGN_STYLE: Automatic
         SWIFT_VERSION: "5.9"
         TARGETED_DEVICE_FAMILY: "3"
-        MARKETING_VERSION: "0.12"
-        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "0.14"
+        CURRENT_PROJECT_VERSION: "14"
         CODE_SIGN_ENTITLEMENTS: OrivioTopShelf/OrivioTopShelf.entitlements
       configs:
         Debug:
-          # Follows the app, which no longer overrides its id either — so this
-          # is `com.orivio.tv.appletv.dev.topshelf`, which IS registered. See
-          # the app target's Debug note for why that matters.
-          # Must mirror the app's Debug id (see the app target's note).
           PRODUCT_BUNDLE_IDENTIFIER: com.prestonhakanson.orivio.tv.topshelf
           CODE_SIGN_ENTITLEMENTS: OrivioTopShelf/OrivioTopShelf-Debug.entitlements
-  # UI-test target: drives the tvOS remote (XCUIRemote) to verify focus/menu
-  # behavior, which osascript keystroke automation can't do. Simulator only.
+        Profile:
+          PRODUCT_BUNDLE_IDENTIFIER: com.prestonhakanson.orivio.tv.topshelf
+          CODE_SIGN_ENTITLEMENTS: OrivioTopShelf/OrivioTopShelf-Debug.entitlements
   OrivioTVUITests:
     type: bundle.ui-testing
     platform: tvOS
@@ -298,7 +180,10 @@ targets:
         SWIFT_VERSION: "5.9"
         TARGETED_DEVICE_FAMILY: "3"
         TEST_TARGET_NAME: OrivioTV
-        CODE_SIGNING_ALLOWED: "NO"
+        # Signed so the remote-script test can drive a real Apple TV too.
+        DEVELOPMENT_TEAM: CYCSPZ5MTR
+        CODE_SIGN_STYLE: Automatic
+        GENERATE_INFOPLIST_FILE: "YES"
 schemes:
   OrivioTV:
     build:
@@ -310,12 +195,7 @@ schemes:
         - OrivioTVUITests
     run:
       config: Debug
-      # KSPlayer's Metal renderer (MetalRender.textures) calls makeTexture and
-      # tolerates a nil result via compactMap — fine on device. But the SIMULATOR
-      # Debug run enables Metal API Validation, which ASSERTS (SIGABRT) on the
-      # same texture instead of returning nil, crashing the app whenever a video
-      # plays in the sim. Turn the validation layers off so the sim behaves like
-      # the device (drop the frame, don't abort). No effect on real hardware.
+      # KSPlayer tolerates a nil Metal texture on device; sim validation SIGABRTs on it.
       environmentVariables:
         - variable: MTL_DEBUG_LAYER
           value: "0"
