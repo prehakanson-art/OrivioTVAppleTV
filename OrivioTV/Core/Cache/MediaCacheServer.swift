@@ -2802,8 +2802,45 @@ final class MediaCacheServer {
         // it must wait — 512 MB of that is longer than the stall timeout on
         // any ordinary link, and the wait ended in a dropped connection and a
         // failover rather than a slow start.
-        let size = parallelLimit <= 1 ? Int64(64) * 1_048_576 : Self.chunkBytes
+        let size: Int64
+        if parallelLimit <= 1 {
+            size = Int64(64) * 1_048_576
+        } else if frontierIsThin(near: gap.start) {
+            size = Self.frontierChunkBytes
+        } else {
+            size = Self.chunkBytes
+        }
         return (gap.start, min(gap.start + size, gap.end))
+    }
+
+    /// Chunk size right in front of a playhead whose cushion is thin.
+    ///
+    /// THE PLAYER CAN ONLY USE BYTES CONTIGUOUS WITH WHERE IT IS READING. With
+    /// 16 MB chunks the opening burst tiles the pool 0-16, 16-32, 32-48 … in
+    /// front of the reader, so the usable edge grows at ONE connection's share
+    /// while the rest fill chunks the player cannot touch yet. Measured live on
+    /// a 1st-gen Apple TV 4K over Wi-Fi: six workers pulling ~1.7-2.5 MB/s in
+    /// total, the contiguous head growing ~0.3-0.4 MB/s, a 0.73-0.84 MB/s film
+    /// stalling every few seconds for its first half-minute with twice the
+    /// bandwidth it needed. Small chunks at the frontier put every connection
+    /// on the next few MB, so the edge grows at close to the pool's rate.
+    /// Only while the cushion is thin — once there is road ahead, 16 MB chunks
+    /// go back to keeping the request rate low.
+    private static let frontierChunkBytes: Int64 = 2 * 1_048_576
+    /// Seconds of film in front of the reader below which the frontier counts
+    /// as thin.
+    private static let thinFrontierSeconds: Double = 30
+    /// How far past the reader a chunk still counts as "at the frontier".
+    private static let frontierZoneBytes: Int64 = 32 * 1_048_576
+
+    private func frontierIsThin(near start: Int64) -> Bool {
+        let reader = liveReadAnchor()
+        guard start >= reader, start - reader < Self.frontierZoneBytes else { return false }
+        let lead = coverageEnd(from: reader) - reader
+        let thinBytes: Int64 = (totalLength > 0 && durationSeconds > 0)
+            ? Int64(Double(totalLength) / durationSeconds * Self.thinFrontierSeconds)
+            : Self.frontierZoneBytes
+        return lead < thinBytes
     }
 
     /// First byte at or after `cursor` that is neither on disk NOR already

@@ -978,8 +978,13 @@ This is the streaming-app standard and should not be "improved" again without ca
 > **Do NOT add a display release to `teardown()`** — it runs for retired sessions while
 > another plays, with no black cover.
 
-**`OrivioPlayerOptions.matchFrameRate` is dead code** — declared, assigned from settings,
-read nowhere. The rate request is unconditional. Left in place deliberately.
+**The Classic player (every non-live title) sends the content rate via
+`ClassicPlayerSettings.matchFrameRate = true`.** It was read again in v0.13–v0.15 to make the
+request range-only (panel's current rate) unless that flag was on, but the shipping
+Settings had no row for it, so it was permanently `false`: 23.976 film requested 60 Hz,
+**overriding tvOS Match Frame Rate**, and played in 3:2 pulldown (the "movie stutters"
+report of 2026-11-16, trail: `matchContentSetting=Y` → `panel settled at 60fps (requested
+60.000)`). Keep it `true`; tvOS's own Match Frame Rate is the switch.
 
 **Capability rule:** `p7ok = activeMode == .fidelity || PerformanceProfile.recommendsDolbyVisionProfile7`;
 `wantHDR10Plus = PerformanceProfile.supportsHDR10Plus && activeMode != .compatibility`;

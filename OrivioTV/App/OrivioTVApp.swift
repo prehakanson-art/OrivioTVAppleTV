@@ -25,6 +25,12 @@ struct OrivioTVApp: App {
         #if DEBUG
         DebugLog.launchMark("scratch", since: t0)
         #endif
+        // 3. Diagnostics capture (Settings → About → Advanced). Resolved before
+        // any probe runs: DEBUG defaults on, Release off, the stored choice
+        // wins. Without this the gate stays off for the whole launch and the
+        // :8123 LAN log server never comes back after a relaunch.
+        ProbeGate.configureFromDefaults()
+        ColorProbeServer.shared.start()
         stores = AppStores.shared
         #if DEBUG
         DebugLog.launchMark("stores", since: t0)

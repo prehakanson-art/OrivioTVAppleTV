@@ -702,14 +702,11 @@ final class OrivioPlayerOptions: KSOptions {
         // over; this one was missed, and it is the one every FFmpeg and native
         // session goes through.
         let contentRate = SessionDisplayMode.snapToBroadcastRate(refreshRate)
-        // RATE: only ask for the content's rate when the viewer opted in. With
-        // `matchFrameRate` OFF (the default) we pass the rate the panel is
-        // ALREADY running, so the request changes only the dynamic range — the
-        // 60↔24 renegotiation is the heavy HDMI mode switch that wedges some
-        // panels into a solid grey screen, while a range-only change is
-        // handled in-band. This is exactly what the setting's own doc always
-        // said ("off = keep the current rate, only vary dynamic range"); it was
-        // simply read nowhere and the content rate was always sent.
+        // RATE: the content's, so tvOS's Match Frame Rate can act on it.
+        // `matchFrameRate` is ON (see `ClassicPlayerSettings.matchFrameRate`);
+        // OFF passes the rate the panel is ALREADY running, which makes the
+        // request range-only and keeps 24p film in 60 Hz pulldown even when
+        // the viewer enabled Match Frame Rate on the Apple TV.
         let rate = matchFrameRate ? contentRate : Float(UIScreen.main.maximumFramesPerSecond)
         // (The pin may already hold this content's cadence — a previous title
         // at the same rate in this foreground stint. `refreshPulldownPolicy`
@@ -2286,7 +2283,7 @@ final class ClassicPlayerViewModel: ObservableObject {
                     ClassicPlayerViewModel.colorTrail(
                         "display gate (direct) profile=\(profile) isPQ=\(probe.isPQ)"
                             + " forceHDR10=\(engine.forceHDR10) fps=\(engine.videoFPS)"
-                            + " will request=\(profile > 0 && !engine.forceHDR10 ? "DolbyVision" : (probe.isPQ ? "HDR10" : "NOTHING"))"
+                            + " will request=\(profile > 0 && !engine.forceHDR10 ? "DolbyVision" : (probe.isPQ ? "HDR10" : "SDR rate only"))"
                             + " panelNow=\(UIScreen.main.maximumFramesPerSecond)fps"
                             + " pin=\(SessionDisplayMode.pinDescription)"
                             + " panelSupports=[\(DynamicRange.availableHDRModes.map(\.description).joined(separator: ","))]"
@@ -2308,6 +2305,8 @@ final class ClassicPlayerViewModel: ObservableObject {
                         switching = self.requestDVDisplayMode(fps: engine.videoFPS)
                     } else if probe.isPQ {
                         switching = self.requestHDR10DisplayMode(fps: engine.videoFPS)
+                    } else {
+                        switching = self.requestSDRRateDisplayMode(fps: engine.videoFPS)
                     }
                     if switching {
                         engine.pause()
@@ -2554,6 +2553,29 @@ final class ClassicPlayerViewModel: ObservableObject {
         return false
     }
 
+    /// SDR direct sessions: a RATE-only request, so tvOS's Match Frame Rate
+    /// can take 23.976 film out of 60 Hz pulldown. This engine used to ask for
+    /// nothing on SDR (`will request=NOTHING`), which left every SDR film it
+    /// played in 3:2 judder — the same stutter the KSPlayer path had, through
+    /// the other door. Skipped when the content already matches the panel.
+    @discardableResult
+    private func requestSDRRateDisplayMode(fps: Float) -> Bool {
+        guard self.settings.matchFrameRate, SessionDisplayMode.isPlausibleRate(fps),
+              let displayManager = UIApplication.shared.ks_keyWindow?.avDisplayManager,
+              displayManager.isDisplayCriteriaMatchingEnabled else { return false }
+        let rate = SessionDisplayMode.snapToBroadcastRate(fps)
+        guard abs(rate - Float(UIScreen.main.maximumFramesPerSecond)) > 0.5,
+              let criteria = AVDisplayCriteria(
+                refreshRate: rate, videoDynamicRange: DynamicRange.sdr.rawValue
+              ) else { return false }
+        if SessionDisplayMode.applyOnce(criteria, via: displayManager, rate: rate,
+                                        range: DynamicRange.sdr.rawValue) {
+            displayCriteriaApplied = true
+            return true
+        }
+        return false
+    }
+
     /// Where a native remux must START so it covers what the viewer is
     /// actually about to watch.
     ///
@@ -2746,7 +2768,7 @@ final class ClassicPlayerViewModel: ObservableObject {
         colorTrail(header)
     }
 
-    static func dvTrail(_ line: String) {
+    nonisolated static func dvTrail(_ line: String) {
         // …and to the live probe. The trail holds every DV / engine-tier
         // DECISION — which path was chosen, why a fallback fired, what the
         // display handshake did — and until now the only way to read it during
@@ -6692,6 +6714,7 @@ final class ClassicPlayerViewModel: ObservableObject {
 
     func remoteTouchBegan() {
         debug("touch ↓")
+        wheelRestPanDx = 0; wheelRestPanDy = 0
         infoTabsAtTouchStart = infoFocusOnTabs
         scrubLastDx = 0            // translation resets per gesture
         panInFlight = true
@@ -6714,6 +6737,14 @@ final class ClassicPlayerViewModel: ObservableObject {
     /// `dx`/`dy` = pan translation in points from the gesture start.
     func remoteTouchMoved(dx: CGFloat, dy: CGFloat) {
         suppressMoveBriefly()      // keep the swipe's move command suppressed
+        // MOVING IS NOT RESTING. The pad-position slop alone let a slow drag
+        // finish the beat mid-move, so fine-tune popped up while the thumb was
+        // travelling ("only comes up by moving"). Real pan travel restarts it.
+        if isScrubbing, !wheelEngaged, wheelHoldPending,
+           hypot(dx - wheelRestPanDx, dy - wheelRestPanDy) > 12 {
+            wheelRestPanDx = dx; wheelRestPanDy = dy
+            armWheelHold()
+        }
         lastPanDx = dx
         switch touchIntent {
         case .scrub:
@@ -6809,6 +6840,9 @@ final class ClassicPlayerViewModel: ObservableObject {
         panInFlight = false
         scrubDragInContact = false   // the contact is over; presses now hop
         if touchIntent == .scrub { endScrubGesture() }
+        // The pan ends when the thumb STOPS, not only when it lifts. If it is
+        // still down, this is the start of a rest.
+        armWheelHoldForRestingFinger()
         touchIntent = .undecided
     }
 
@@ -6853,7 +6887,13 @@ final class ClassicPlayerViewModel: ObservableObject {
         guard acceptsTransportInput else { return }
         guard overlay == .none || overlay == .controls || overlay == .pauseInfo else { return }
         var start = position
-        if pausing, isPlaying {
+        // Not just `isPlaying`: a scrub opened while the last seek is still
+        // BUFFERING reads as stopped, but that seek carries autoplay — the
+        // film started under the open scrub the moment the stall ended
+        // (probe: `BEGIN … resume=n`, then `STALL ended`, picture moving).
+        // `!pauseIntent` is "the viewer has not paused": playing, or about to.
+        if pausing, isPlaying || !pauseIntent {
+            seekPlayWatchdog?.cancel()
             enginePause("bar click opening a scrub")
             markPaused()
             saveProgress()
@@ -6901,6 +6941,7 @@ final class ClassicPlayerViewModel: ObservableObject {
                                           start, pausing ? "bar click" : "swipe",
                                           resumeAfterScrub.probe))
         resetWheel()
+        armWheelHoldForRestingFinger()
         restartScrubTimeout()
     }
 
@@ -7015,12 +7056,45 @@ final class ClassicPlayerViewModel: ObservableObject {
     /// Where the current stationary contact landed, so the knob can appear
     /// under the finger rather than at some default angle.
     private var wheelHoldOrigin: (x: Double, y: Double)?
-    /// How long a finger has to sit on the outer ring before the wheel takes
-    /// over. A beat, not a wait — long enough that swiping THROUGH the rim
-    /// during a side-to-side scrub doesn't trigger it.
-    private let wheelHoldSeconds: TimeInterval = 0.15
-    /// How far out counts as the outer ring (the pad reports -1…1 from centre).
-    private let wheelRingRadius: Double = 0.72
+    /// How long a finger has to sit STILL before the wheel takes over. Not
+    /// 0.15s: a left/right PRESS is also a resting finger, and that short a
+    /// beat engaged before the click landed. Not a full second either — the
+    /// thumb settling adds to it and it felt like holding did nothing. A press
+    /// always wins over an unturned wheel anyway (`wheelYieldsToPress`).
+    private let wheelHoldSeconds: TimeInterval = 0.4
+    /// The engaged wheel has actually been turned. Until it has, a press still
+    /// wins (`wheelYieldsToPress`) — the viewer meant the click.
+    private var wheelTurned = false
+    /// The rest-to-engage beat is running (the task alone can't say: a fired
+    /// one stays non-nil).
+    private var wheelHoldPending = false
+    /// Pan translation at the last beat restart (see `remoteTouchMoved`).
+    private var wheelRestPanDx: CGFloat = 0
+    private var wheelRestPanDy: CGFloat = 0
+    /// Latest GameController finger position, kept in every state — a still
+    /// finger sends nothing more, so a scrub opened or a drag ended under a
+    /// resting thumb must start the beat from here.
+    private var gcLastSample: (x: Double, y: Double) = (0, 0)
+
+    /// Start the rest beat for a finger already down and not moving (scrub
+    /// opened under it, or the pan that was moving it just ended).
+    private func armWheelHoldForRestingFinger() {
+        let (x, y) = gcLastSample
+        guard isScrubbing, !wheelEngaged, (x * x + y * y).squareRoot() > 0.02 else { return }
+        wheelTouching = true
+        wheelHoldOrigin = (x, y)
+        armWheelHold()
+    }
+
+    /// Rotation since the wheel engaged. A CLICK wiggles the thumb a few
+    /// degrees, and counting that as a turn locked the pad and swallowed the
+    /// very press that caused it — the first press after resting on the rim
+    /// stayed in fine-tune. Only a deliberate turn (~20°) counts.
+    private var wheelTurnAccum: Double = 0
+    private static let wheelTurnCommitRadians: Double = 0.35
+    /// How far (pad units, -1…1) a resting thumb may drift and still count as
+    /// still for the engage beat.
+    private static let wheelRestSlop: Double = 0.15
     /// Fires the engage. The hold CANNOT be measured from the sample stream:
     /// `microGamepad.dpad.valueChangedHandler` only fires when the value
     /// CHANGES, so a finger held perfectly still produces no further samples at
@@ -7066,6 +7140,7 @@ final class ClassicPlayerViewModel: ObservableObject {
             scrubDragInContact = false   // lift: the next press is a hop
             wheelHoldTask?.cancel()
             wheelHoldTask = nil
+            wheelHoldPending = false
             wheelEngaged = false
             wheelLastAngle = nil
             wheelHoldOrigin = nil
@@ -7083,7 +7158,11 @@ final class ClassicPlayerViewModel: ObservableObject {
             // decode pass every single time.
             return
         }
-        if !wheelTouching { restartScrubTimeout() }   // a new touch is activity
+        if !wheelTouching {
+            restartScrubTimeout()   // a new touch is activity
+            ClassicPlayerProbe.event("scrub", String(format: "wheel touch at r=%.2f — rest %.1fs to fine-tune",
+                                                     radius, wheelHoldSeconds))
+        }
         wheelTouching = true
         // ENGAGE by putting a finger on the OUTER RING and leaving it there for
         // a beat. Side-to-side anywhere else stays a plain scrub.
@@ -7102,7 +7181,15 @@ final class ClassicPlayerViewModel: ObservableObject {
         // disqualified, and the finger that was already down when the bar was
         // pressed counts like any other (no lift needed first).
         if !wheelEngaged {
-            if radius > wheelRingRadius {
+            if radius > 0.02 {
+                // A RESTING THUMB IS NOT SILENT. It jitters a hair, and every
+                // jitter is a value change; re-arming on each one meant a 1s
+                // beat never completed ("holding no longer opens fine
+                // tuning"). Only real movement off the rest point restarts it.
+                if let o = wheelHoldOrigin, wheelHoldPending,
+                   ((x - o.x) * (x - o.x) + (y - o.y) * (y - o.y)).squareRoot() < Self.wheelRestSlop {
+                    return
+                }
                 wheelHoldOrigin = (x, y)
                 armWheelHold()
             } else {
@@ -7128,7 +7215,11 @@ final class ClassicPlayerViewModel: ObservableObject {
         let seconds = -delta / (2 * .pi) * wheelSecondsPerRevolution
         let proposed = target + seconds
         let clamped = max(0, min(proposed, duration > 0 ? duration - 1 : proposed))
-        scrubDragInContact = true
+        wheelTurnAccum += abs(delta)
+        if wheelTurnAccum >= Self.wheelTurnCommitRadians {
+            wheelTurned = true
+            scrubDragInContact = true
+        }
         publishScrub(clamped)
         // Follow the finger out of the covered window, exactly as the pan does.
         // The dense pass was started ONCE, when the wheel engaged, and never
@@ -7142,18 +7233,20 @@ final class ClassicPlayerViewModel: ObservableObject {
     /// Arm the rest-to-engage timer for the touch that just landed.
     private func armWheelHold() {
         wheelHoldTask?.cancel()
+        wheelHoldPending = true
         wheelHoldTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64((self?.wheelHoldSeconds ?? 0.5) * 1_000_000_000))
             guard !Task.isCancelled, let self else { return }
+            self.wheelHoldPending = false
             guard self.isScrubbing, self.wheelTouching, !self.wheelEngaged else { return }
-            // Only a FRESH rest takes the wheel. A drag that pauses on the rim
-            // — stopping to read the preview frame, thumb still down at the
-            // pad's edge where drags naturally end — used to engage it after
-            // 0.15s: pan scrубbing then went dead (the wheel owns the pad) and
-            // horizontal motion turned into slow angle deltas, which read as
-            // "scrubbing stopped working". Lift and rest again to fine-tune.
-            guard !self.scrubDragInContact else { return }
+            // A rest right after a drag takes the wheel too. The old 0.15s
+            // beat needed the "fresh rest only" rule because a drag that
+            // merely paused on the rim engaged by accident; a full still
+            // second is deliberate — and that rule plus "a still thumb sends
+            // no samples" meant drag-then-hold never fine-tuned at all.
             self.wheelEngaged = true
+            self.wheelTurned = false
+            self.wheelTurnAccum = 0
             ClassicPlayerProbe.event("scrub", "WHEEL engaged")
             self.wheelLastAngle = nil
             // The knob appears under the finger, not at some default angle.
@@ -7162,7 +7255,32 @@ final class ClassicPlayerViewModel: ObservableObject {
         }
     }
 
+    /// A directional press while scrubbing: the PRESS is favoured over the
+    /// wheel. Returns false only when the wheel is genuinely in use (engaged
+    /// and turned), where edge presses are a circling thumb's noise. Otherwise
+    /// an idle wheel is released and the rest timer restarts from the press,
+    /// so only a finger that then stays still for the full beat fine-tunes.
+    func wheelYieldsToPress() -> Bool {
+        if wheelEngaged && wheelTurned { return false }
+        if wheelEngaged {
+            ClassicPlayerProbe.event("scrub", "WHEEL released for a press")
+            wheelEngaged = false
+            wheelLastAngle = nil
+            wheelTurnAccum = 0
+            // The engage gate guarantees no drag preceded the wheel on this
+            // contact, so nothing here is a drag to commit — the press hops.
+            scrubDragInContact = false
+        }
+        wheelHoldTask?.cancel()
+        wheelHoldTask = nil
+        if wheelTouching, wheelHoldOrigin != nil { armWheelHold() }
+        return true
+    }
+
     private func resetWheel() {
+        wheelHoldPending = false
+        wheelTurned = false
+        wheelTurnAccum = 0
         wheelHoldTask?.cancel()
         wheelHoldTask = nil
         wheelLastAngle = nil
@@ -7202,6 +7320,7 @@ final class ClassicPlayerViewModel: ObservableObject {
     func noteSelectPressed() { gcClickFiredThisTouch = true }
 
     private func dpadSample(x: Double, y: Double) {
+        gcLastSample = (x, y)
         if isScrubbing { wheelSample(x: x, y: y); return }
 
         let touching = abs(x) > 0.001 || abs(y) > 0.001
@@ -9005,6 +9124,11 @@ final class ClassicPlayerViewModel: ObservableObject {
             ClassicPlayerProbe.event("watchdog", "FIRST-FRAME TIMEOUT — open for 25s, never played")
             ClassicPlayerProbe.count("watchdog.first-frame")
             Self.dvTrail("first-frame watchdog: opened but never played — failing over")
+            // Which start condition never came true (clock, queue depths,
+            // renderer readiness) — persisted, so it survives without the probe.
+            if let engine = self.dvDirectEngine {
+                Self.dvTrail("  direct engine at timeout: " + engine.probeLines.prefix(3).joined(separator: " | "))
+            }
             self.showToast("Source opened but never played — trying another")
             self.attemptFailover(
                 afterError: NSError(

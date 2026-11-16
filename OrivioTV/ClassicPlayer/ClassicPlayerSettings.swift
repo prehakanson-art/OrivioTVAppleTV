@@ -316,14 +316,22 @@ struct ClassicPlayerSettings: Codable, Equatable {
     /// content's native mode — some TVs mis-handshake the switch back and
     /// wedge on a grey screen until power-cycled, hence the default.
     var matchContentDisplayMode: Bool = false
-    /// Also switch the panel's REFRESH RATE to the content's (e.g. 60→23.976
-    /// for film) when matching display mode / playing native DV. OFF by
-    /// default: it removes 3:2 pulldown (24p film at its true cadence), but the
-    /// rate change is a much heavier HDMI renegotiation than a range-only
-    /// switch, and the target panel mis-handshakes it into a grey screen —
-    /// recovering from that then flashes through several more mode changes.
-    /// Turn ON only on a TV that handles 24p switches cleanly.
-    var matchFrameRate: Bool = false
+    /// Put the content's REFRESH RATE (e.g. 23.976 for film) in the display
+    /// request instead of the panel's current rate.
+    ///
+    /// ON, and deliberately not user-facing: the gate is tvOS's own Settings →
+    /// Video and Audio → Match Content → Match Frame Rate (handoff §7.6). tvOS
+    /// applies only the halves of the request the viewer enabled there, so
+    /// sending the real rate costs nothing when Match Frame Rate is off.
+    ///
+    /// It used to be OFF with no way to turn it on — the new app's settings
+    /// have no row for it and `init(_ s: PlayerSettings)` never mapped one — so
+    /// every request carried the panel's 60 Hz. That OVERRODE the viewer's
+    /// Match Frame Rate: 23.976 film stayed in 3:2 pulldown on a TV set up to
+    /// switch to 24 Hz, and played with a steady stutter. Measured on the
+    /// device trail: `rate=23.976025 … matchContentSetting=Y` followed by
+    /// `display: panel settled at 60fps (requested 60.000)`.
+    var matchFrameRate: Bool = true
     /// True Dolby Atmos passthrough from MKV sources. The sample engine hands
     /// compressed E-AC-3 to a renderer that DECODES it (PCM, no Atmos), so this
     /// re-muxes the E-AC-3 into a loopback HLS playlist and plays it with

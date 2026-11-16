@@ -394,6 +394,13 @@ final class ClassicDVSampleEngine {
     /// slice of the budget, and NONE of these caps had a performance-tier
     /// branch even though the KSPlayer path budgets the same resource by tier.
     private var videoQueueCap: Int {
+        // Compressed H.264 feed: AUs are tens of KB (1080p web-dl ~35 KB), so
+        // ten seconds is a few MB — no tier needs to ration it. The decode-ahead
+        // cap of 60 on the A10X was 2.5s, too shallow to ride out a segmented
+        // download whose contiguous edge arrives in bursts (live probe:
+        // `queues v=0/60 a=0/48` with the cache head advancing ~0.4 MB/s on a
+        // 0.84 MB/s film while six workers pulled 1.9 MB/s between them).
+        if videoIsAVC { return 240 }
         let full = vtDecodeAhead ? 120 : 240
         if PerformanceProfile.isLowPower { return full / 3 }
         if PerformanceProfile.isMidPower { return full / 2 }
@@ -404,8 +411,23 @@ final class ClassicDVSampleEngine {
     /// before the video queue can fill (which is what made the deeper underrun
     /// cushions unreachable on E-AC3/AAC titles).
     private var audioQueueCap: Int {
-        PerformanceProfile.isLowPower || PerformanceProfile.isMidPower ? 48 : 96
+        let byCount = PerformanceProfile.isLowPower || PerformanceProfile.isMidPower ? 48 : 96
+        // BITSTREAM AUDIO IS NOT BATCHED. Those 48 were sized for ~0.25s PCM
+        // buffers; a passthrough E-AC-3 buffer is one 32ms frame, so the same
+        // cap held 1.5s of audio — less than the video cushion, and the one
+        // demux thread then parked on a full audio queue with video below the
+        // start/resume gate: a deadlock until the 20s stall watchdog (live
+        // probe: `queues v=20/240 a=48/48`, cache 5MB ahead of an idle
+        // reader). Size it in SECONDS from the buffers actually seen — 12s is
+        // ~1MB of E-AC-3 — and never below the old count.
+        let dur = audioBufferSeconds
+        guard dur > 0 else { return byCount }
+        return min(max(byCount, Int((12.0 / dur).rounded(.up))), 2000)
     }
+
+    /// Duration of the most recent queued audio buffer (demux thread writes,
+    /// any thread reads — a stale value only skews the cap for one sample).
+    @ClassicAtomic private var audioBufferSeconds: Double = 0
 
     /// Audio buffers the underrun hold insists on before it will restart the
     /// clock. Named because `enqueueBounded` has to guarantee this number is
@@ -425,6 +447,18 @@ final class ClassicDVSampleEngine {
     /// NOT to count as starvation. The hold is re-evaluated every 0.5s, so one
     /// second leaves a full tick of margin before the renderer could run dry.
     static let audioHoldLead: Double = 1.0
+
+    /// Compressed H.264 feed: seconds of video the DISPLAY LAYER must still
+    /// hold past the clock for an empty `videoQueue` not to count as a dry
+    /// run. NOT `audioHoldLead`: the layer itself only takes ~1.1s ahead
+    /// (device census `minLead=1080ms` on healthy playback), so a 1.0s bar sat
+    /// inside normal jitter and held the clock over and over — "it keeps
+    /// buffering".
+    static let videoLayerHoldLead: Double = 0.35
+
+    /// Holds/resumes written to the persisted DV trail this session (capped),
+    /// so a buffering report can be read off the device without the probe.
+    private var trailedHolds = 0
 
     /// MKV timestamps are in MILLISECONDS; a 23.976fps frame lasts 41.708ms.
     /// Stamped raw, every frame's PTS lands up to 0.5ms off the panel's frame
@@ -1912,15 +1946,25 @@ final class ClassicDVSampleEngine {
                 // to resume) was true the moment a hold began — so a hold lifted
                 // instantly, ran out of pictures, and held again. That is
                 // stop-go buffering, manufactured by the diagnostic.
-                var prerollReady = depth
-                if self.decodeAheadActive {
-                    self.decodedLock.lock()
-                    let decodedReady = self.decodedHeap.count + self.framesToLayerSinceFlush
-                    self.decodedLock.unlock()
-                    prerollReady = max(depth, decodedReady)
-                }
+                // Both feed paths: the compressed H.264 feed has the same
+                // drained-queue shape (see `framesToLayerSinceFlush`).
+                self.decodedLock.lock()
+                let decodedReady = self.decodedHeap.count + self.framesToLayerSinceFlush
+                self.decodedLock.unlock()
+                // Compressed feed: what the layer took AND what still waits in
+                // the queue are both video ahead of a clock that has not
+                // started, so they add. Decode-ahead keeps `max` (see above).
+                let compressedFeedGate = !self.decodeAheadActive
+                let prerollReady = compressedFeedGate ? depth + decodedReady : max(depth, decodedReady)
                 if !self.playbackClockStarted {
-                    let preroll = self.seekRefill ? self.seekVideoPreroll : self.startupVideoPreroll
+                    // Compressed feed: start on SECONDS of cushion, like the
+                    // FFmpeg path's 8s gate does, not 18 AUs (0.75s) — on a
+                    // segmented download the contiguous edge arrives in bursts,
+                    // and starting on under a second was an underrun two
+                    // seconds in, then stop-go (live probe, HOLD #1-#3).
+                    let preroll = compressedFeedGate
+                        ? (self.seekRefill ? 48 : 72)
+                        : (self.seekRefill ? self.seekVideoPreroll : self.startupVideoPreroll)
                     // START ON BOTH TRACKS, NOT JUST THE PICTURE.
                     //
                     // This gate counted VIDEO access units only. 18 of them is
@@ -2004,7 +2048,24 @@ final class ClassicDVSampleEngine {
                 let audioStarving = aqDepth == 0 && audioLead < Self.audioHoldLead
                     && videoQueued < self.videoQueueCap
                     && self.lastAudioHandedEnd > 0
-                if !eof, (depth == 0 || audioStarving), !self.autoPaused,
+                // AN EMPTY VIDEO QUEUE IS NOT AN EMPTY DISPLAY LAYER either —
+                // on the compressed H.264 feed. There the layer pulls samples
+                // straight out of `videoQueue` while it has room, so the queue
+                // sits at or near zero through perfectly healthy playback, and
+                // `depth == 0` held the clock seconds into every H.264 session;
+                // the resume below then waited for 16+ queued AUs the layer
+                // kept draining, until the 20s stall watchdog failed it over
+                // (device trail: `display settled at 24fps — attaching video`
+                // → 30s → `direct engine failover — Playback stalled for 20s`).
+                // Judge it by what the layer holds past the clock, as audio is.
+                // Decode-ahead (HEVC) keeps its proven queue rule.
+                let compressedFeed = !self.decodeAheadActive
+                let videoLead = self.lastVideoHandedEnd
+                    - CMTimeGetSeconds(self.synchronizer.currentTime())
+                let videoDry = compressedFeed
+                    ? depth == 0 && videoLead < Self.videoLayerHoldLead
+                    : depth == 0
+                if !eof, (videoDry || audioStarving), !self.autoPaused,
                    self.userRate > 0, self.synchronizer.rate > 0 {
                     ClassicPlayerProbe.event("dv", String(format: "underrun HOLD vq=%d aq=%d audioLead=%.2fs",
                                                    depth, aqDepth, audioLead))
@@ -2021,6 +2082,13 @@ final class ClassicDVSampleEngine {
                     self.lastUnderrunAt = Date()
                     NSLog("[DVSample] underrun #%d — holding clock (vq=%d aq=%d)",
                           self.recentUnderruns, depth, aqDepth)
+                    if self.trailedHolds < 40 {
+                        self.trailedHolds += 1
+                        ClassicPlayerViewModel.dvTrail(String(
+                            format: "HOLD #%d vq=%d aq=%d vLead=%.2fs aLead=%.2fs videoDry=%@ audioStarving=%@",
+                            self.recentUnderruns, depth, aqDepth, videoLead, audioLead,
+                            videoDry ? "Y" : "N", audioStarving ? "Y" : "N"))
+                    }
                     self.synchronizer.setRate(0, time: self.synchronizer.currentTime())
                     self.onBuffering?(true)
                 } else if self.autoPaused {
@@ -2045,8 +2113,14 @@ final class ClassicDVSampleEngine {
                     // A full video queue lifts the audio requirement here too, for
                     // the same reason as above: waiting for audio behind a parked
                     // demuxer can never succeed.
+                    // Queue depth only. While the clock is held the layer fills
+                    // and stops pulling, so the queue DOES refill on the
+                    // compressed feed too; resuming on the layer's own ~1s
+                    // (the old `videoLayerResumeLead` shortcut) was the
+                    // machine-gun stop-go the live probe showed.
+                    let videoCushion = depth >= self.underrunResumeDepth(eof: eof)
                     let cushionMet = eof
-                        || (depth >= self.underrunResumeDepth(eof: eof)
+                        || (videoCushion
                             && (aqDepth >= Self.audioResumeCushion
                                 || videoQueued >= self.videoQueueCap))
                     if cushionMet {
@@ -2054,6 +2128,12 @@ final class ClassicDVSampleEngine {
                         self.seekRefill = false
                         NSLog("[DVSample] underrun over — resuming with vq=%d (eof=%@)",
                               depth, eof ? "true" : "false")
+                        if self.trailedHolds < 40 {
+                            self.trailedHolds += 1
+                            ClassicPlayerViewModel.dvTrail(String(
+                                format: "resume after %.1fs vq=%d aq=%d vLead=%.2fs",
+                                Date().timeIntervalSince(self.autoPausedAt), depth, aqDepth, videoLead))
+                        }
                         if self.userRate > 0 {
                             self.synchronizer.setRate(self.userRate, time: self.synchronizer.currentTime())
                         }
@@ -2382,6 +2462,8 @@ final class ClassicDVSampleEngine {
             lastQueuedVideoPTS = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample))
         } else {
             censusAudioPTS(sample)
+            let d = CMTimeGetSeconds(CMSampleBufferGetDuration(sample))
+            if d.isFinite, d > 0 { audioBufferSeconds = d }
         }
         queueLock.lock()
         // NEVER PARK THIS THREAD ON A FULL QUEUE WHILE THE OTHER ONE IS
@@ -2974,11 +3056,16 @@ final class ClassicDVSampleEngine {
     /// Guarded by `decodedLock` (see `vtSession`).
     private var displayFormatCache: CMFormatDescription?
 
-    /// Decode-ahead only: frames handed to the display layer since the last
-    /// flush. With the heap, this is how much DECODED video exists — the
-    /// startup preroll needs that, not the compressed-queue depth, on a codec
-    /// VideoToolbox drains faster than the demuxer fills (see the gate in
-    /// `run`). Guarded by `decodedLock`; reset on flush and at open.
+    /// Displayable frames handed to the display layer since the last flush,
+    /// on BOTH feed paths. The startup preroll needs this, not the
+    /// compressed-queue depth: on decode-ahead VideoToolbox drains that queue
+    /// faster than the demuxer fills it, and on the compressed H.264 feed the
+    /// layer itself does (it pulls greedily while the clock is held at 0).
+    /// Counting it only on decode-ahead left every H.264 direct session
+    /// waiting on a queue that never reached 18, until the 25s first-frame
+    /// watchdog failed it over to FFmpeg — measured on the device:
+    /// `direct sample engine started` → 25s → `opened but never played`.
+    /// Guarded by `decodedLock`; reset in `vtFlush` (every seek) and at open.
     private var framesToLayerSinceFlush = 0
 
     private func ensureVTSession() -> VTDecompressionSession? {
@@ -3346,6 +3433,12 @@ final class ClassicDVSampleEngine {
             // accounts in the timing the renderer will actually play.
             let handed = video ? sample : Self.retimedAudio(sample, by: audioDelaySeconds)
             if video { displayLayer.enqueue(handed) } else { audioRenderer.enqueue(handed) }
+            // Count it for the startup preroll gate — see `framesToLayerSinceFlush`.
+            // Seek lead-in (do-not-display) never reaches the screen, so it
+            // must not satisfy the gate.
+            if video, !Self.isDoNotDisplay(handed) {
+                decodedLock.lock(); framesToLayerSinceFlush += 1; decodedLock.unlock()
+            }
             noteHandedToRenderer(pts: CMSampleBufferGetPresentationTimeStamp(handed),
                                  duration: CMSampleBufferGetDuration(handed))
             if video {
