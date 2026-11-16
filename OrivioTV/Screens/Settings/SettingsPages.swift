@@ -768,6 +768,7 @@ struct DeviceFlowSheet: View {
 
 private struct AboutSettings: View {
     @State private var confirm: ConfirmAction?
+    @State private var captureDiagnostics = ProbeGate.isEnabled
 
     private var version: String {
         let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
@@ -789,6 +790,22 @@ private struct AboutSettings: View {
         SettingsGroup(header: "System") {
             SettingsRow(label: "tvOS", value: UIDevice.current.systemVersion) {}
             SettingsRow(label: "Device", value: PerformanceProfile.deviceName) {}
+        }
+        // The one switch that makes a Release/sideloaded build diagnosable.
+        // Turn it on, reproduce the problem, then read the log with
+        // scripts/probe.sh or scripts/record.sh. `ProbeGate` is a plain lock,
+        // not observable, so the row mirrors it in local state.
+        SettingsGroup(header: "Advanced", footer: "Records app and playback events (navigation, buffering, stalls, seeks, source picks, errors, memory) and serves a live plain-text log at http://<this Apple TV's IP>:8123. Use scripts/probe.sh <ip> or scripts/record.sh <ip>. Off by default; costs a little CPU while on.") {
+            ToggleRow(label: "Capture diagnostics (LAN log server)", isOn: Binding(
+                get: { captureDiagnostics },
+                set: { on in
+                    UserDefaults.standard.set(on, forKey: ProbeGate.defaultsKey)
+                    ProbeGate.set(on)
+                    if on { ColorProbeServer.shared.start() }
+                    else { ColorProbeServer.shared.stop() }
+                    captureDiagnostics = on
+                }
+            ))
         }
         SettingsGroup(footer: "Clears downloaded artwork, catalog and response caches. Your library, collections and settings stay.") {
             SettingsRow(label: "Clear Cache", destructive: true) {
