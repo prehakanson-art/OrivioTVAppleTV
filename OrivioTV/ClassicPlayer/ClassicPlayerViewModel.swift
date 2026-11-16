@@ -702,14 +702,11 @@ final class OrivioPlayerOptions: KSOptions {
         // over; this one was missed, and it is the one every FFmpeg and native
         // session goes through.
         let contentRate = SessionDisplayMode.snapToBroadcastRate(refreshRate)
-        // RATE: only ask for the content's rate when the viewer opted in. With
-        // `matchFrameRate` OFF (the default) we pass the rate the panel is
-        // ALREADY running, so the request changes only the dynamic range — the
-        // 60↔24 renegotiation is the heavy HDMI mode switch that wedges some
-        // panels into a solid grey screen, while a range-only change is
-        // handled in-band. This is exactly what the setting's own doc always
-        // said ("off = keep the current rate, only vary dynamic range"); it was
-        // simply read nowhere and the content rate was always sent.
+        // RATE: the content's, so tvOS's Match Frame Rate can act on it.
+        // `matchFrameRate` is ON (see `ClassicPlayerSettings.matchFrameRate`);
+        // OFF passes the rate the panel is ALREADY running, which makes the
+        // request range-only and keeps 24p film in 60 Hz pulldown even when
+        // the viewer enabled Match Frame Rate on the Apple TV.
         let rate = matchFrameRate ? contentRate : Float(UIScreen.main.maximumFramesPerSecond)
         // (The pin may already hold this content's cadence — a previous title
         // at the same rate in this foreground stint. `refreshPulldownPolicy`
@@ -2286,7 +2283,7 @@ final class ClassicPlayerViewModel: ObservableObject {
                     ClassicPlayerViewModel.colorTrail(
                         "display gate (direct) profile=\(profile) isPQ=\(probe.isPQ)"
                             + " forceHDR10=\(engine.forceHDR10) fps=\(engine.videoFPS)"
-                            + " will request=\(profile > 0 && !engine.forceHDR10 ? "DolbyVision" : (probe.isPQ ? "HDR10" : "NOTHING"))"
+                            + " will request=\(profile > 0 && !engine.forceHDR10 ? "DolbyVision" : (probe.isPQ ? "HDR10" : "SDR rate only"))"
                             + " panelNow=\(UIScreen.main.maximumFramesPerSecond)fps"
                             + " pin=\(SessionDisplayMode.pinDescription)"
                             + " panelSupports=[\(DynamicRange.availableHDRModes.map(\.description).joined(separator: ","))]"
@@ -2308,6 +2305,8 @@ final class ClassicPlayerViewModel: ObservableObject {
                         switching = self.requestDVDisplayMode(fps: engine.videoFPS)
                     } else if probe.isPQ {
                         switching = self.requestHDR10DisplayMode(fps: engine.videoFPS)
+                    } else {
+                        switching = self.requestSDRRateDisplayMode(fps: engine.videoFPS)
                     }
                     if switching {
                         engine.pause()
@@ -2548,6 +2547,29 @@ final class ClassicPlayerViewModel: ObservableObject {
               ) else { return false }
         if SessionDisplayMode.applyOnce(criteria, via: displayManager, rate: rate,
                                         range: DynamicRange.hdr10.rawValue) {
+            displayCriteriaApplied = true
+            return true
+        }
+        return false
+    }
+
+    /// SDR direct sessions: a RATE-only request, so tvOS's Match Frame Rate
+    /// can take 23.976 film out of 60 Hz pulldown. This engine used to ask for
+    /// nothing on SDR (`will request=NOTHING`), which left every SDR film it
+    /// played in 3:2 judder — the same stutter the KSPlayer path had, through
+    /// the other door. Skipped when the content already matches the panel.
+    @discardableResult
+    private func requestSDRRateDisplayMode(fps: Float) -> Bool {
+        guard self.settings.matchFrameRate, SessionDisplayMode.isPlausibleRate(fps),
+              let displayManager = UIApplication.shared.ks_keyWindow?.avDisplayManager,
+              displayManager.isDisplayCriteriaMatchingEnabled else { return false }
+        let rate = SessionDisplayMode.snapToBroadcastRate(fps)
+        guard abs(rate - Float(UIScreen.main.maximumFramesPerSecond)) > 0.5,
+              let criteria = AVDisplayCriteria(
+                refreshRate: rate, videoDynamicRange: DynamicRange.sdr.rawValue
+              ) else { return false }
+        if SessionDisplayMode.applyOnce(criteria, via: displayManager, rate: rate,
+                                        range: DynamicRange.sdr.rawValue) {
             displayCriteriaApplied = true
             return true
         }
@@ -9005,6 +9027,11 @@ final class ClassicPlayerViewModel: ObservableObject {
             ClassicPlayerProbe.event("watchdog", "FIRST-FRAME TIMEOUT — open for 25s, never played")
             ClassicPlayerProbe.count("watchdog.first-frame")
             Self.dvTrail("first-frame watchdog: opened but never played — failing over")
+            // Which start condition never came true (clock, queue depths,
+            // renderer readiness) — persisted, so it survives without the probe.
+            if let engine = self.dvDirectEngine {
+                Self.dvTrail("  direct engine at timeout: " + engine.probeLines.prefix(3).joined(separator: " | "))
+            }
             self.showToast("Source opened but never played — trying another")
             self.attemptFailover(
                 afterError: NSError(
