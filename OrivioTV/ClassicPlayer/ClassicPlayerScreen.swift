@@ -575,9 +575,10 @@ struct ClassicPlayerScreen: View {
             // tap, so every skip press over bare video raised the transport
             // and every bar press silently flipped the clock readout.
             viewModel.noteSelectPressed()
-            // Fine-tune has the pad locked: swallow the move commands a
-            // circling thumb generates at the edges rather than letting them
-            // through to the jump/seek paths below.
+            // Fine-tune has the pad locked while it is TURNING: swallow the
+            // move commands a circling thumb generates at the edges. A wheel
+            // that engaged but was never turned yields — the press wins.
+            if viewModel.isScrubbing, !viewModel.wheelYieldsToPress() { return }
             if viewModel.wheelEngaged { return }
             if viewModel.isScrubbing {
                 switch direction {
