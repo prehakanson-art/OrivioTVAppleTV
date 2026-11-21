@@ -987,8 +987,10 @@ final class PlayerViewModel: ObservableObject {
 
     func saveProgress(transient: Bool) {
         guard !isLive, !isRecording, firstFrameShown, duration > 0, !isNoticeClip else { return }
-        let position = max(currentTime, pendingResume ?? 0, min(sessionFloor, duration))
+        var position = max(currentTime, pendingResume ?? 0, min(sessionFloor, duration))
         guard position > 5 else { return }
+        // Into the end credits = finished: leaves Continue Watching and marks watched.
+        if let credits = creditsStart, position >= credits { position = duration }
         var p = WatchProgress(id: titleKey, metaID: meta.id, type: meta.type, videoID: video?.id, season: video?.season,
                               episode: video?.episode, position: position, duration: duration, updatedAt: Date(),
                               name: meta.name, poster: meta.poster, background: meta.background, logo: meta.logo,

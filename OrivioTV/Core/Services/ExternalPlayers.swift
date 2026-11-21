@@ -2,9 +2,25 @@ import UIKit
 
 /// Infuse, VLC, nPlayer, VidHub, SenPlayer via URL schemes (detected with `canOpenURL`).
 enum ExternalPlayers {
+    /// `canOpenURL` is a synchronous round trip to the system, and source rows
+    /// ask it from their view bodies — once per row on every redraw, which
+    /// stalled the main thread (and the video's render loop) behind the
+    /// player. Installed apps don't change while you're in this app, so the
+    /// answer is cached until it comes back to the foreground.
+    private static var installedCache: [ExternalPlayerApp: Bool] = [:]
+    private static var cacheObserver: NSObjectProtocol?
+
     static func isInstalled(_ app: ExternalPlayerApp) -> Bool {
+        if let known = installedCache[app] { return known }
+        if cacheObserver == nil {
+            cacheObserver = NotificationCenter.default.addObserver(
+                forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main
+            ) { _ in installedCache.removeAll() }
+        }
         guard let probe = URL(string: probeScheme(app) + "://") else { return false }
-        return UIApplication.shared.canOpenURL(probe)
+        let result = UIApplication.shared.canOpenURL(probe)
+        installedCache[app] = result
+        return result
     }
 
     static var infuseInstalled: Bool { isInstalled(.infuse) }

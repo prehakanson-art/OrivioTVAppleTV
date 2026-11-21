@@ -34,7 +34,7 @@ enum LocalBackup {
                                                    mdblist: mdblist, torrent: s.torrent.value, traktFlags: s.traktFlags.value,
                                                    simklFlags: s.simklFlags.value, ratings: s.ratings.ratings)
         let blob = Blob(addons: s.addons.addons.map(\.manifestURL), library: s.library.items,
-                        progress: Array(s.progress.entries.values), watched: Array(s.watched.items.values),
+                        progress: Array(s.progress.allEntries.values), watched: Array(s.watched.items.values),
                         collections: s.collections.library, preferences: prefs)
         let enc = JSONEncoder()
         enc.outputFormatting = [.prettyPrinted, .sortedKeys]

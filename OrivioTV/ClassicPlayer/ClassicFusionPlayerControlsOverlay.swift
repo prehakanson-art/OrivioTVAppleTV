@@ -324,8 +324,15 @@ struct FusionPlayerControlsOverlay: View {
             let order = glyphOrder
             guard let index = order.firstIndex(of: control) else { return }
             let next = direction == .left ? index - 1 : index + 1
-            if order.indices.contains(next) { focusedControl = order[next] }
-            else { viewModel.restartHideTimer() }
+            if order.indices.contains(next) {
+                focusedControl = order[next]
+            } else {
+                // Nowhere further along the glyphs: a dead press looked like
+                // the ±10 button "not working". Treat it as the skip it was
+                // meant to be and hand focus back to the bar.
+                focusedControl = .bar
+                viewModel.barDirectionalPress(forward: direction == .right)
+            }
         @unknown default: break
         }
     }

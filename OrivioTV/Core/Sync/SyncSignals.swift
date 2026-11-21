@@ -55,6 +55,11 @@ struct Tombstones: Codable {
     mutating func remove(_ id: String) { ids[id] = nil }
     func contains(_ id: String) -> Bool { ids[id] != nil }
 
+    /// Drop tombstones older than `cutoff`.
+    mutating func prune(olderThan cutoff: Date) {
+        ids = ids.filter { $0.value >= cutoff }
+    }
+
     /// Retire tombstones whose id no longer appears in a fresh pull.
     mutating func retire(absentFrom remote: Set<String>) {
         for id in ids.keys where !remote.contains(id) { ids[id] = nil }

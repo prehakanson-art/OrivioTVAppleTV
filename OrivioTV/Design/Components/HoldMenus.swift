@@ -72,7 +72,12 @@ struct ContinueWatchingHoldMenu: ViewModifier {
                 Button { onStartOver() } label: { Label("Start Over", systemImage: "gobackward") }
             }
             Button(role: .destructive) {
-                progress.removeFromContinueWatching(metaID: item.meta.id)
+                // The card id carries the store's own show key ("cw:<id>" /
+                // "nu:<id>"); a Next Up card's meta comes from the add-on and
+                // its id can differ, which removed nothing.
+                let showID = item.id.split(separator: ":", maxSplits: 1).last.map(String.init) ?? item.meta.id
+                progress.removeFromContinueWatching(metaID: showID)
+                if showID != item.meta.id { progress.removeFromContinueWatching(metaID: item.meta.id) }
                 toasts.show("Removed from Continue Watching", systemImage: "xmark.circle.fill")
             } label: { Label("Remove from Continue Watching", systemImage: "xmark") }
         }

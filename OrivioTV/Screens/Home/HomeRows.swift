@@ -87,11 +87,25 @@ struct FocusRow<Item: Identifiable, Card: View>: View where Item.ID == String {
             }
         }
         .focusSection()
+        // The focused card left the row (removed from Continue Watching, or a
+        // finished movie dropping out): its neighbour takes focus, rather than
+        // the focus engine's own pick, which can be nothing at all.
+        .onChange(of: items.map(\.id)) { old, new in
+            guard let held = frames.held, focused == nil || focused == held,
+                  focusRouter.focusedItem == held,
+                  let i = old.firstIndex(of: held), !new.contains(held), !new.isEmpty else { return }
+            let next = new[min(i, new.count - 1)]
+            DispatchQueue.main.async {
+                guard focused == nil || focused == held else { return }
+                focused = next
+            }
+        }
         .onChange(of: focused) { _, id in
             #if DEBUG
             if CommandLine.arguments.contains("-traceNav") { DebugLog.write("[row] \(rowKey) focused=\(id ?? "nil")") }
             #endif
             frames.focused = id
+            if let id { frames.held = id }
             guard let id, let i = items.firstIndex(where: { $0.id == id }) else { return }
             focusRouter.noteFocus(tab: tab, rowID: rowKey, index: i)
             focusRouter.focusedMidX = frames.all[id]?.midX
@@ -356,6 +370,8 @@ struct CollectionsSharedRow: View {
 final class CardFrames {
     private(set) var all: [String: CGRect] = [:]
     var focused: String?
+    /// The last card this row focused (kept when focus leaves, unlike `focused`).
+    var held: String?
 
     @MainActor
     func set(_ id: String, _ frame: CGRect, router: ContentFocusRouter) {

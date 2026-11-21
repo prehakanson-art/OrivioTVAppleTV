@@ -190,6 +190,19 @@ struct HomeView: View {
                 if rowKeys.contains(l.rowID) {
                     focus.pendingRowKey = l.rowID
                     if !focus.inRows { withAnimation(Motion.pageScroll) { focus.inRows = true } }
+                } else if l.rowID == "cw" || (focus.inRows && focus.focusedRowKey == l.rowID) {
+                    // Back to a row that emptied meanwhile (the finished movie
+                    // was the last in Continue Watching): nothing would take the
+                    // landing and focus would be lost. Use the row now in its place.
+                    if let first = rowKeys.first {
+                        focus.pendingRowKey = first
+                        if !focus.inRows { withAnimation(Motion.pageScroll) { focus.inRows = true } }
+                        DispatchQueue.main.async { focusRouter.land(row: first, x: nil, tab: tab) }
+                        watchPending(first, x: focusRouter.focusedMidX ?? 300)
+                    } else {
+                        withAnimation(Motion.pageScroll) { focus.inRows = false }
+                        focusHero(attempt: 0)
+                    }
                 }
                 return
             }
@@ -209,6 +222,7 @@ struct HomeView: View {
         }
         .onChange(of: showsRollingHero) { _, on in if on { carryOutTopLanding() } }
         .onChange(of: rowKeys.first) { _, first in if first != nil { carryOutTopLanding() } }
+        .onChange(of: rowKeys) { old, new in rowsChanged(from: old, to: new) }
         .onChange(of: infoFor) { _, m in
             if let m { InfoPresenter.shared.present(m); infoFor = nil }
         }
@@ -316,6 +330,7 @@ struct HomeDataLifecycle: ViewModifier {
             Task { await model.refreshRecommendations(stores: stores) }
         }
         .onChange(of: progress.entries.count) { _, _ in model.refreshContinueWatching(stores: stores) }
+        .onChange(of: progress.removalRevision) { _, _ in model.refreshContinueWatching(stores: stores) }
         .onReceive(progress.$entries.debounce(for: .seconds(1.5), scheduler: RunLoop.main)) { _ in model.refreshContinueWatching(stores: stores) }
         .onReceive(watched.$items.debounce(for: .seconds(1), scheduler: RunLoop.main)) { _ in model.refreshContinueWatching(stores: stores) }
         .onChange(of: model.heroItems.count) { _, n in
@@ -399,6 +414,36 @@ extension HomeView {
         // SwiftUI would retry it on every update. Only the newest move lands.
         rowLandWork?.cancel()
         focus.pendingRowKey = target
+        let work = DispatchWorkItem { focusRouter.land(row: target, x: x, tab: tab) }
+        rowLandWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: work)
+        watchPending(target, x: x)
+    }
+
+    /// The row holding focus went away under it (Continue Watching emptied when
+    /// a finished movie left it). The layout and Up/Down both key off that row,
+    /// so with it gone the stack fell back to its resting offset and every move
+    /// found no starting row: the remote was stranded. Move to the row that took
+    /// its place (or the hero when nothing is left).
+    private func rowsChanged(from old: [String], to new: [String]) {
+        guard focus.inRows, let gone = focus.activeRowKey, !new.contains(gone) else { return }
+        focus.pendingRowKey = nil
+        // Still moving elsewhere is fine: only a stranded row needs a new home.
+        if let held = focus.focusedRowKey, new.contains(held) { return }
+        #if DEBUG
+        DebugLog.write("[home] row \(gone) vanished under focus; rows=\(new)")
+        #endif
+        let i = old.firstIndex(of: gone) ?? 0
+        guard !new.isEmpty else {
+            rowLandWork?.cancel()
+            withAnimation(Motion.pageScroll) { focus.inRows = false }
+            focusHero(attempt: 0)
+            return
+        }
+        let target = new[min(i, new.count - 1)]
+        rowLandWork?.cancel()
+        focus.pendingRowKey = target
+        let x = focusRouter.focusedMidX ?? 300
         let work = DispatchWorkItem { focusRouter.land(row: target, x: x, tab: tab) }
         rowLandWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: work)

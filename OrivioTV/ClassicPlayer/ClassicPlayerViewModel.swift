@@ -6680,7 +6680,18 @@ final class ClassicPlayerViewModel: ObservableObject {
     /// A trackpad swipe ALSO emits an `.onMoveCommand`; suppress those briefly
     /// after handling a gesture so they don't double-fire.
     private var suppressMoveUntil = Date.distantPast
-    var moveSuppressed: Bool { Date() < suppressMoveUntil }
+    /// Suppressed after a swipe — unless the clickpad was PHYSICALLY pressed
+    /// just now. A press of the ring always lands with the thumb rolling a few
+    /// dozen points, which starts the pan recognizer, and that used to block
+    /// the press's own move command: "sometimes the ±10 button doesn't work".
+    /// A swipe never depresses the pad, so a real click always wins.
+    var moveSuppressed: Bool { Date() < suppressMoveUntil && !padClickedRecently }
+
+    /// When the clickpad last physically clicked down (`buttonA`, centre or
+    /// ring). The dpad handler only reports where the thumb IS, which cannot
+    /// tell a click with a rolling thumb from a short swipe.
+    private var padClickedAt = Date.distantPast
+    private var padClickedRecently: Bool { Date().timeIntervalSince(padClickedAt) < 0.5 }
     private func suppressMoveBriefly() { suppressMoveUntil = Date().addingTimeInterval(0.4) }
 
     /// Pan translation (points) → seconds for scrub.
@@ -6752,6 +6763,10 @@ final class ClassicPlayerViewModel: ObservableObject {
         case .consumed:
             break
         case .undecided:
+            // A click in progress is not a swipe: its move/select command is
+            // the action, and the thumb's roll must not also open the controls
+            // or the info sheet.
+            if padClickedRecently { return }
             let adx = abs(dx), ady = abs(dy)
             // Skip Intro first. While the pill is up it is the one thing the
             // viewer is reaching for, so ANY perceptible movement highlights
@@ -7377,6 +7392,13 @@ final class ClassicPlayerViewModel: ObservableObject {
             pad.reportsAbsoluteDpadValues = true
             pad.dpad.valueChangedHandler = { [weak self] _, x, y in
                 MainActor.assumeIsolated { self?.dpadSample(x: Double(x), y: Double(y)) }
+            }
+            pad.buttonA.pressedChangedHandler = { [weak self] _, _, pressed in
+                guard pressed else { return }
+                MainActor.assumeIsolated {
+                    self?.padClickedAt = Date()
+                    self?.debug("pad click")
+                }
             }
         }
     }
@@ -9751,6 +9773,14 @@ final class ClassicPlayerViewModel: ObservableObject {
     /// the runtime) — so the card pops as the credits roll and you can skip
     /// them — and falls back to the configured percentage / minutes-before-end
     /// threshold for content without chapter markers.
+    /// A position inside the end-credits chapter saves as the full duration,
+    /// so stopping during the credits retires the title from Continue
+    /// Watching and marks it watched.
+    private func creditsAdjusted(_ saved: Double) -> Double {
+        guard duration > 0, let credits = creditsChapter, saved >= credits.start else { return saved }
+        return duration
+    }
+
     private func crossedNextEpisodeThreshold() -> Bool {
         guard duration > 0 else { return false }
         if let credits = creditsChapter { return position >= credits.start }
@@ -10398,7 +10428,7 @@ final class ClassicPlayerViewModel: ObservableObject {
             // consumed: it is the last position a seek or switch aimed at, and
             // a user seek REPLACES it (down included), so it never drags a
             // save forward of the viewer's own intent.
-            position: max(max(position, pendingResume ?? 0), sessionResumeFloor),
+            position: creditsAdjusted(max(max(position, pendingResume ?? 0), sessionResumeFloor)),
             duration: duration,
             signature: currentEntry.stream.signature(addonName: currentEntry.addonName)
         )
@@ -10429,7 +10459,7 @@ final class ClassicPlayerViewModel: ObservableObject {
             meta: meta,
             video: currentVideo,
             streamURL: currentEntry.stream.url,
-            position: max(max(position, pendingResume ?? 0), sessionResumeFloor),
+            position: creditsAdjusted(max(max(position, pendingResume ?? 0), sessionResumeFloor)),
             duration: duration,
             signature: currentEntry.stream.signature(addonName: currentEntry.addonName)
         )
@@ -10639,6 +10669,7 @@ final class ClassicPlayerViewModel: ObservableObject {
             // wheel (and its swipe-vs-tap disambiguation) dead for good.
             for controller in GCController.controllers() {
                 controller.microGamepad?.dpad.valueChangedHandler = nil
+                controller.microGamepad?.buttonA.pressedChangedHandler = nil
             }
         }
         playerLayer?.pause()

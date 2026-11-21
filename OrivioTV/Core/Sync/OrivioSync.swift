@@ -285,7 +285,7 @@ final class OrivioSync {
     private func pushProgress(_ p: Int) async throws {
         // One entry per account row — the newest per episode.
         var newest: [String: WatchProgress] = [:]
-        for w in stores.progress.entries.values {
+        for w in stores.progress.allEntries.values {
             let k = Self.accountKey(w)
             if let held = newest[k], held.updatedAt >= w.updatedAt { continue }
             newest[k] = w
